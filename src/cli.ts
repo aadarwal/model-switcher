@@ -1,10 +1,13 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { execLaunch } from "./exec.ts";
 
 export type Verb = (args: string[]) => Promise<number>;
 const verbs = new Map<string, Verb>();
 export function registerVerb(name: string, fn: Verb): void { verbs.set(name, fn); }
+
+registerVerb("_exec", execLaunch);
 
 const USAGE = `usage: ms <verb> [args]
   setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach

@@ -128,6 +128,11 @@ function sessionRow(s: SessionRow, st: State): string[] {
   // it just isn't there yet — so it keeps reporting its own store state.
   const state = hasPane && !exists ? "gone" : s.state;
   const rec = st.pendingRecovery(s.id);
+  // TOCTOU: the pane can die between this paneExists check and the capture
+  // below. That's fine — capture-pane on a gone pane never throws (tmux.ts's
+  // `run`, not `must`), it just returns "", so wallKindFromText reads no
+  // wall and the row simply shows last-known STATE this render; the next
+  // render's paneExists catches up and shows "gone".
   const screen = exists ? tmux.capture(s.pane) : null;
   const walled = sessionWalled(s, rec !== null, screen, exists ? readEvents(s.id) : []);
   return [

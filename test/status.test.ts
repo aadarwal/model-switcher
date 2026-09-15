@@ -352,6 +352,29 @@ test("ms status --watch clears the screen and redraws exactly once when bounded"
   assert.ok(r.stdout.includes("SESSION"), r.stdout);
 });
 
+test("ms status --watch actually loops: MS_WATCH_ITERATIONS=2 redraws twice, not once", async () => {
+  const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
+  await seedSessions(w);
+
+  const r = run(["status", "--watch"], env({ MS_WATCH_ITERATIONS: "2", MS_WATCH_MS: "20" }));
+  assert.equal(r.code, 0, r.stderr);
+
+  // A single-print implementation (the loop body deleted, or run once and
+  // exiting) would print one CLEAR and one header no matter what
+  // MS_WATCH_ITERATIONS says — this only passes when the loop truly ran
+  // twice.
+  const occurrences = r.stdout.split(CLEAR).length - 1;
+  assert.equal(occurrences, 2, r.stdout);
+  // The CLEAR sequence and the redraw's first line share one line (no
+  // newline between them), so "starts with NAME" per split("\n") line only
+  // matches the SECOND redraw onward — count occurrences in the raw text
+  // instead.
+  const headerCount = (r.stdout.match(/NAME\s+LABEL\s+5H\s+WEEK\s+FABLE\s+RESETS\s+STATE/g) ?? []).length;
+  assert.equal(headerCount, 2, r.stdout);
+  const sessionHeaderCount = (r.stdout.match(/SESSION\s+PANE\s+ACCOUNT\s+NEED\s+STATE\s+GEN\s+PENDING\s+WAKEUP\s+WALLED\?/g) ?? []).length;
+  assert.equal(sessionHeaderCount, 2, r.stdout);
+});
+
 test("ms status: a session whose pane no longer exists shows STATE gone, with no WALLED? flag", async () => {
   // %2 is deliberately left out of `list-panes` — sess-2's pane is gone.
   const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": "" } });

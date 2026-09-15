@@ -424,7 +424,9 @@ test("nothing has room: the session waits, a wake-up is scheduled and the recove
   const resetsAt = new Date(Date.now() + 2 * HOUR).toISOString();
   const w = await world(t, {
     usage: {
-      dirk: { session: 100, weekly: 40 },
+      // dirk is the account being left; its own reset counts towards the wait
+      // too, so it is pinned well past gmail's to keep this about the others.
+      dirk: { session: 100, weekly: 40, sessionReset: new Date(Date.now() + 8 * HOUR).toISOString() },
       gmail: { session: 100, weekly: 20, sessionReset: resetsAt },
       work: { session: 10, weekly: 100, weeklyReset: new Date(Date.now() + 5 * HOUR).toISOString() },
     },
@@ -480,6 +482,31 @@ test("a deadline that already has a timer does not get a second one", async (t) 
   assert.equal(s.wakeupAt, at, "the deadline itself is unchanged");
   assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "a second timer for one deadline is a second worker");
   assert.match(recoverLog(w), /a timer is already armed for/);
+});
+
+test("the account being left is excluded from the pick, never from the wait", async (t) => {
+  // One registered account, walled: it is excluded as a CANDIDATE — we will not
+  // hand it straight back the session it just walled — but it is still the only
+  // thing that can have room again, and its five-hour window says when. Without
+  // it the session re-dispatched every ten minutes, for ever, and `ms status`
+  // showed that as the ETA.
+  const resetsAt = new Date(Date.now() + 5 * HOUR).toISOString();
+  const w = await world(t, {
+    registry: JSON.stringify({ version: 1, accounts: [{ name: "dirk", provider: "claude", label: "dirk", shared: false }] }),
+    usage: { dirk: { session: 100, weekly: 40, sessionReset: resetsAt } },
+  });
+
+  assert.equal(await recoverSession("s1"), 2);
+
+  const s = session(w);
+  assert.equal(s.state, "waiting");
+  assert.equal(s.account, "dirk", "nothing moved");
+  const at = Math.floor(Date.parse(resetsAt) / 1000);
+  assert.ok(Math.abs(s.wakeupAt! - at) < 5, `wakeup ${s.wakeupAt} is not dirk's own five-hour reset (${at})`);
+  const dispatch = logLines(w).find((l) => l.includes("run-shell"));
+  const delay = Number(dispatch!.match(/run-shell -b -d (\d+)/)![1]);
+  assert.ok(delay > 600, `the timer is ${delay}s — the ten-minute "we do not know" fallback, not the reset`);
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "nothing is typed when nothing has room");
 });
 
 test("a resume that falls back to a new conversation parks the session", async (t) => {
@@ -865,7 +892,7 @@ test("a failure against the account being left does not spend a candidate", asyn
   const resetsAt = new Date(Date.now() + 2 * HOUR).toISOString();
   const w = await world(t, {
     usage: {
-      dirk: { session: 100, weekly: 40 },
+      dirk: { session: 100, weekly: 40, sessionReset: new Date(Date.now() + 8 * HOUR).toISOString() },
       gmail: { session: 100, weekly: 20, sessionReset: resetsAt },
       work: { session: 100, weekly: 35, sessionReset: new Date(Date.now() + 5 * HOUR).toISOString() },
     },

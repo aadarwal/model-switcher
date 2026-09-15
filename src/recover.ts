@@ -32,7 +32,7 @@ import { readEvents } from "./events.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
-import { pickAccounts, type PickInput } from "./pick.ts";
+import { pickAccounts, type PickInput, type Window } from "./pick.ts";
 import { ownerDead } from "./reconcile.ts";
 import { NAME_PATTERN, findAccount, loadRegistry } from "./registry.ts";
 import { getSnapshot, toPickInputs } from "./snapshot.ts";
@@ -445,16 +445,32 @@ async function waitForReady(id: string, generation: number, cliSessionId: string
  * grant will still be dead in ten minutes, but ten minutes is the honest
  * "check again" rather than a guess at a fix.
  */
-function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[]): number {
+function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[], from: string, need: SessionRow["need"]): number {
   const by = new Map(inputs.map((i) => [i.name, i]));
   const times: number[] = [];
+  const consider = (w: Window | null | undefined): void => {
+    const at = w?.resetsAt ? Date.parse(w.resetsAt) : NaN;
+    if (Number.isFinite(at)) times.push(Math.floor(at / 1000));
+  };
   for (const o of out) {
     if (!/ at 100$/.test(o.why)) continue;
     const input = by.get(o.name);
     if (!input) continue;
-    const window = o.why.startsWith("session") ? input.session : o.why.startsWith("fable") ? input.weeklyFable : input.weeklyAll;
-    const at = window?.resetsAt ? Date.parse(window.resetsAt) : NaN;
-    if (Number.isFinite(at)) times.push(Math.floor(at / 1000));
+    consider(o.why.startsWith("session") ? input.session : o.why.startsWith("fable") ? input.weeklyFable : input.weeklyAll);
+  }
+  // The account this session is LEAVING counts here too. It is excluded from
+  // the PICK — we will not hand a walled session back to the account that
+  // walled it in this transaction — but that is not a reason to ignore when it
+  // comes back. Without it, a one-account fleet re-dispatched every ten
+  // minutes for ever, and a two-account one waited days for the other's weekly
+  // reset while its own five-hour window was minutes away.
+  const leaving = by.get(from);
+  if (leaving) {
+    for (const w of [leaving.session, leaving.weeklyAll, ...(need === "fable" ? [leaving.weeklyFable] : [])]) {
+      // Only a window that is actually FULL says anything about when there
+      // will be room; one with room left is not what we are waiting on.
+      if (w && Number.isFinite(w.usedPercent) && w.usedPercent >= 100) consider(w);
+    }
   }
   const soonest = times.length ? Math.min(...times) : 0;
   return Math.max(soonest || nowSeconds() + NO_ROOM_SECONDS, nowSeconds() + MIN_DISPATCH_SECONDS);
@@ -683,7 +699,7 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
       const said = failures.map((a) => `${a.account}: ${a.note || a.outcome}`).join("; ");
       return park(st, id, rec.id, g, `all candidates failed: ${said}`);
     }
-    const at = nextAttemptAt(inputs, out);
+    const at = nextAttemptAt(inputs, out, from, session.need);
     const delaySeconds = Math.max(MIN_DISPATCH_SECONDS, at - nowSeconds());
     // Is a timer for THIS deadline already out there? The recorded wake-up is
     // what says so — it is written beside every timer this line arms, and

@@ -114,10 +114,11 @@ if [ "$1" = "setup-token" ]; then
     exit 0
   fi
   if [ "$MS_TEST_TOKEN_ONLINE" = "two" ]; then
-    # The same bytes, split so the token lands on its own chunk.
-    printf 'Paste code: '
+    # The same bytes, split MID-TOKEN: the first chunk carries the prose and
+    # the token prefix plus three body characters, the second the rest.
+    printf 'Paste code: %s' "$(printf %s "$MS_TEST_TOKEN" | cut -c1-16)"
     sleep 0.2
-    printf '%s\\n' "$MS_TEST_TOKEN"
+    printf '%s\\n' "$(printf %s "$MS_TEST_TOKEN" | cut -c17-)"
     exit 0
   fi
   if [ -n "$MS_TEST_PROMPT_HOLD" ]; then

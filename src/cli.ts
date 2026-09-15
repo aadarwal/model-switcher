@@ -4,6 +4,7 @@ import path from "node:path";
 import { execLaunch } from "./exec.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
 import { launchClaude } from "./launch.ts";
+import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { recoverVerb } from "./recover.ts";
 
 export type Verb = (args: string[]) => Promise<number>;
@@ -14,6 +15,9 @@ registerVerb("_exec", execLaunch);
 registerVerb("_hook", async ([which]) => (which === "claude" ? claudeHook() : 0));
 registerVerb("claude", launchClaude);
 registerVerb("_recover", recoverVerb);
+registerVerb("rotate", rotateVerb);
+registerVerb("switch", switchVerb);
+registerVerb("stop", stopVerb);
 
 const USAGE = `usage: ms <verb> [args]
   setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach

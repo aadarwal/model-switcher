@@ -239,8 +239,12 @@ async function waitForExit(tmux: Tmux, pane: string, budgetMs: number): Promise<
 /**
  * Ask the CLI to leave, and make it leave if it will not. Returns whether the
  * exit had to be forced.
+ *
+ * Exported for Task 16's `ms stop`, which ends a session with the same
+ * sequence: a handoff and a stop differ in what happens to the pane
+ * afterwards, never in how the CLI is asked to go.
  */
-async function stopPane(tmux: Tmux, session: SessionRow, generation: number): Promise<boolean> {
+export async function stopPane(tmux: Tmux, session: SessionRow, generation: number): Promise<boolean> {
   const modal = isModal(safeCapture(tmux, session.pane));
   if (modal) {
     logLine(session.id, generation, "a modal choice is on screen; signalling rather than typing into it");

@@ -4,6 +4,13 @@
 // `ms` child process (a NODE_OPTIONS preload — the verb runs as a real
 // subprocess so every test can grep ALL of its stdout and stderr), and the
 // store lives in a temp MS_HOME.
+//
+// The `security` stub models the one thing that makes this verb delicate: an
+// account string can answer BEFORE a login (the operator's own default Claude
+// Code credential) or only AFTER it (the one this login just minted). The
+// `claude` stub touches MS_TEST_MARKER on `auth login`, and the `security`
+// stub answers MS_TEST_KEYCHAIN_OK always and MS_TEST_KEYCHAIN_AFTER only
+// once that marker exists.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -15,6 +22,7 @@ import { pathToFileURL } from "node:url";
 import { run, stubDir, tempHome } from "./helpers.ts";
 
 const TOKEN = "sk-ant-oat01-TESTtoken1234567890_-abcdefghijklmnop";
+const BANNER = "Opening your browser to mint a token...";
 const PROFILE = {
   account: { email: "someone@example.com" },
   organization: { uuid: "org-1", name: "Someone's Org", rate_limit_tier: "default_claude_max_20x" },
@@ -23,26 +31,38 @@ const CRED = JSON.stringify({
   claudeAiOauth: { accessToken: "at-1", refreshToken: "rt-1", expiresAt: Date.now() + 3_600_000 },
 });
 
-// Records argv (so a test can prove no secret ever reached it), then plays
-// the four calls `ms accounts` makes.
 const CLAUDE_STUB = `
 printf '%s\\n' "$*" >> "$MS_TEST_ARGV"
+printf 'claude %s\\n' "$*" >> "$MS_TEST_TIMELINE"
+logcfg() { printf '%s\\t%s\\n' "$1" "$CLAUDE_CONFIG_DIR" >> "$MS_TEST_CFGDIR"; }
 if [ "$1" = "auth" ] && [ "$2" = "login" ]; then
+  logcfg login
   [ -n "$CLAUDE_CONFIG_DIR" ] || { echo "no CLAUDE_CONFIG_DIR" >&2; exit 9; }
+  : > "$MS_TEST_MARKER"
   if [ "$MS_TEST_NO_CRED_FILE" != "1" ]; then printf '%s' "$MS_TEST_CRED" > "$CLAUDE_CONFIG_DIR/.credentials.json"; fi
   exit 0
 fi
 if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  logcfg status
   [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || { echo "auth status ran without the token env" >&2; exit 9; }
   printf '%s\\n' "$MS_TEST_AUTH_STATUS"
   exit 0
 fi
 if [ "$1" = "setup-token" ]; then
-  echo "Opening your browser to mint a token..."
-  printf '%s\\n' "$MS_TEST_TOKEN"
+  logcfg setup-token
+  if [ "$MS_TEST_TOKEN_STREAM" = "stderr" ]; then
+    printf '%s\\n' "$MS_TEST_BANNER" >&2
+    [ "$MS_TEST_TOKEN_INLINE" = "1" ] && printf 'Your token is %s - copy it.\\n' "$MS_TEST_TOKEN" >&2
+    printf '%s\\n' "$MS_TEST_TOKEN" >&2
+  else
+    printf '%s\\n' "$MS_TEST_BANNER"
+    [ "$MS_TEST_TOKEN_INLINE" = "1" ] && printf 'Your token is %s - copy it.\\n' "$MS_TEST_TOKEN"
+    printf '%s\\n' "$MS_TEST_TOKEN"
+  fi
   exit 0
 fi
 if [ "$1" = "-p" ]; then
+  logcfg probe
   [ "$CLAUDE_CODE_OAUTH_TOKEN" = "$MS_TEST_TOKEN" ] || { echo "probe ran without the token env" >&2; exit 9; }
   printf '%s\\n' "$MS_TEST_PROBE_OUT"
   exit 0
@@ -50,16 +70,25 @@ fi
 exit 3
 `;
 
-// Answers only for the account names listed in MS_TEST_KEYCHAIN_OK; -w (the
-// read) hands back the credential JSON, a bare probe just exits 0.
 const SECURITY_STUB = `
 printf '%s\\n' "$*" >> "$MS_TEST_SECURITY_ARGV"
+printf 'security %s\\n' "$*" >> "$MS_TEST_TIMELINE"
+# The account is whatever follows -a, compared EXACTLY: a substring match
+# would let the bare username stand in for the dir-scoped form built from it.
+prev=""; acct=""; wflag=0
+for a in "$@"; do
+  [ "$prev" = "-a" ] && acct="$a"
+  [ "$a" = "-w" ] && wflag=1
+  prev="$a"
+done
+ok="$MS_TEST_KEYCHAIN_OK"
+if [ -f "$MS_TEST_MARKER" ]; then ok="$ok $MS_TEST_KEYCHAIN_AFTER"; fi
 match=0
-for cand in $MS_TEST_KEYCHAIN_OK; do
-  case "$*" in *"-a $cand"*) match=1 ;; esac
+for cand in $ok; do
+  [ "$acct" = "$cand" ] && match=1
 done
 [ "$match" = 1 ] || exit 44
-case "$*" in *-w*) printf '%s' "$MS_TEST_CRED" ;; esac
+[ "$wflag" = 1 ] && printf '%s' "$MS_TEST_CRED"
 exit 0
 `;
 
@@ -68,8 +97,11 @@ type Opts = {
   token?: string;
   noCredFile?: boolean;
   keychainOk?: string[];
+  keychainAfter?: string[];
   authStatus?: string;
   probeOut?: string;
+  tokenStream?: "stdout" | "stderr";
+  tokenInline?: boolean;
 };
 
 function scene(opts: Opts = {}) {
@@ -85,8 +117,9 @@ function scene(opts: Opts = {}) {
   );
   const argv = path.join(home, "claude-argv.log");
   const securityArgv = path.join(home, "security-argv.log");
-  writeFileSync(argv, "");
-  writeFileSync(securityArgv, "");
+  const timeline = path.join(home, "timeline.log");
+  const cfgdir = path.join(home, "cfgdir.log");
+  for (const f of [argv, securityArgv, timeline, cfgdir]) writeFileSync(f, "");
   const env: Record<string, string> = {
     HOME: home,
     MS_HOME: msHome,
@@ -94,10 +127,17 @@ function scene(opts: Opts = {}) {
     NODE_OPTIONS: `--import=${pathToFileURL(fetchStub).href}`,
     MS_TEST_ARGV: argv,
     MS_TEST_SECURITY_ARGV: securityArgv,
+    MS_TEST_TIMELINE: timeline,
+    MS_TEST_CFGDIR: cfgdir,
+    MS_TEST_MARKER: path.join(home, "logged-in.marker"),
     MS_TEST_TOKEN: opts.token ?? TOKEN,
+    MS_TEST_BANNER: BANNER,
+    MS_TEST_TOKEN_STREAM: opts.tokenStream ?? "stdout",
+    MS_TEST_TOKEN_INLINE: opts.tokenInline ? "1" : "0",
     MS_TEST_CRED: CRED,
     MS_TEST_NO_CRED_FILE: opts.noCredFile ? "1" : "0",
     MS_TEST_KEYCHAIN_OK: (opts.keychainOk ?? []).join(" "),
+    MS_TEST_KEYCHAIN_AFTER: (opts.keychainAfter ?? []).join(" "),
     MS_TEST_AUTH_STATUS: opts.authStatus ?? '{"organization":{"uuid":"org-1"}}',
     MS_TEST_PROBE_OUT: opts.probeOut ?? "ok",
   };
@@ -107,8 +147,22 @@ function scene(opts: Opts = {}) {
     argvLog: () => readFileSync(argv, "utf8"),
     truncateArgv: () => writeFileSync(argv, ""),
     securityLog: () => readFileSync(securityArgv, "utf8"),
+    truncateSecurity: () => writeFileSync(securityArgv, ""),
+    timeline: () => readFileSync(timeline, "utf8"),
+    /** [tag, CLAUDE_CONFIG_DIR] for each `claude` call. */
+    cfgFor: (tag: string): string | undefined =>
+      readFileSync(cfgdir, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => l.split("\t"))
+        .find(([t]) => t === tag)?.[1],
     configDir: (n: string) => path.join(msHome, "claude", n),
+    scopedAccount(n: string) {
+      const dir = this.configDir(n);
+      return `${userInfo().username}-${createHash("sha256").update(dir).digest("hex").slice(0, 8)}`;
+    },
     tokenFile: (n: string) => path.join(msHome, "launch", `${n}.token`),
+    registryFile: path.join(msHome, "accounts.json"),
     accounts: (): Record<string, unknown>[] => {
       const f = path.join(msHome, "accounts.json");
       return existsSync(f) ? JSON.parse(readFileSync(f, "utf8")).accounts : [];
@@ -121,6 +175,8 @@ function scene(opts: Opts = {}) {
     ms: (args: string[], extra: Record<string, string> = {}) => run(["accounts", ...args], { ...env, ...extra }),
   };
 }
+
+const BARE = userInfo().username;
 
 // --- add ---------------------------------------------------------------
 
@@ -170,7 +226,7 @@ test("accounts login mints both credentials, sets the org and verifies identity"
   const log = s.argvLog();
   assert.match(log, /^auth login$/m);
   assert.match(log, /^setup-token$/m);
-  assert.match(log, /^-p Reply with the single word ok\./m);
+  assert.match(log, /^-p Reply with the single word ok\. --model haiku$/m);
   assert.match(log, /^auth status --json$/m);
 });
 
@@ -227,25 +283,113 @@ test("accounts login fails when setup-token prints nothing token-shaped", () => 
   assert.equal(s.row("gmail").identityVerified, false);
 });
 
-// --- locating the poll credential --------------------------------------
+// --- setup-token streaming ---------------------------------------------
 
-test("accounts login records the keychain account when there is no credentials file", () => {
+test("setup-token's chatter reaches the human on stderr, from either stream, and the token never does", () => {
+  for (const tokenStream of ["stdout", "stderr"] as const) {
+    const s = scene({ tokenStream });
+    s.ms(["add", "gmail"]);
+    const r = s.ms(["login", "gmail"]);
+    assert.equal(r.code, 0, `${tokenStream}: ${r.stderr}`);
+    assert.ok(r.stderr.includes(BANNER), `${tokenStream}: banner not forwarded`);
+    assert.equal(r.stdout.includes(BANNER), false, `${tokenStream}: banner must not be on stdout`);
+    assert.equal((r.stdout + r.stderr).includes(TOKEN), false, `${tokenStream}: token leaked`);
+    // a token LINE is dropped outright, not echoed as a redaction
+    assert.equal(r.stderr.includes("<redacted>"), false, `${tokenStream}: token line was forwarded`);
+    assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), TOKEN);
+  }
+});
+
+test("a token sharing a line with other text is redacted before that line is forwarded", () => {
+  for (const tokenStream of ["stdout", "stderr"] as const) {
+    const s = scene({ tokenStream, tokenInline: true });
+    s.ms(["add", "gmail"]);
+    const r = s.ms(["login", "gmail"]);
+    assert.equal(r.code, 0, `${tokenStream}: ${r.stderr}`);
+    assert.equal((r.stdout + r.stderr).includes(TOKEN), false, `${tokenStream}: token leaked`);
+    assert.match(r.stderr, /Your token is sk-ant-oat01-<redacted> - copy it\./);
+    assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), TOKEN);
+  }
+});
+
+// --- the launch-token probe --------------------------------------------
+
+test("a launch token that cannot answer the headless check is an error, recorded unverified", () => {
+  const s = scene({ probeOut: "I am sorry, I cannot do that." });
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /did not answer the headless check/);
+  assert.equal(s.row("gmail").orgId, "org-1");
+  assert.equal(s.row("gmail").identityVerified, false);
+  assert.ok(existsSync(s.tokenFile("gmail")), "the token is kept, so `ls` can say what is on disk");
+});
+
+test("the probe wants the word ok, not the letters", () => {
+  const s = scene({ probeOut: "the connection is broken" });
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /did not answer the headless check/);
+});
+
+test("the probe and the identity read run under an empty config dir, not an ambient login", () => {
+  const s = scene();
+  s.ms(["add", "gmail"]);
+  assert.equal(s.ms(["login", "gmail"]).code, 0);
+  const probeDir = s.cfgFor("probe");
+  const statusDir = s.cfgFor("status");
+  assert.ok(probeDir && statusDir, "both calls must carry a CLAUDE_CONFIG_DIR");
+  assert.equal(probeDir, statusDir, "one scratch dir for one check");
+  for (const d of [probeDir!, statusDir!]) {
+    assert.notEqual(d, s.configDir("gmail"));
+    assert.notEqual(d, path.join(s.home, ".claude"));
+    assert.match(d, /ms-probe-/);
+  }
+  // the login itself, by contrast, uses the account's own dir
+  assert.equal(s.cfgFor("login"), s.configDir("gmail"));
+  assert.equal(s.cfgFor("setup-token"), s.configDir("gmail"));
+  // and the scratch dir does not outlive the check
+  assert.equal(existsSync(probeDir!), false);
+});
+
+// --- attributing the keychain credential -------------------------------
+
+test("accounts login records a dir-scoped keychain account that answers only after the login", () => {
   const s = scene({ noCredFile: true });
   const dir = s.configDir("gmail");
-  const sha8 = createHash("sha256").update(dir).digest("hex").slice(0, 8);
-  const cand = `${userInfo().username}-${sha8}`;
+  const scoped = s.scopedAccount("gmail");
   s.ms(["add", "gmail"]);
-  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_OK: cand });
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: scoped });
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(readFileSync(path.join(dir, "keychain-account"), "utf8").trim(), cand);
-  // the bare username is tried first, then the dir-scoped form
-  const log = s.securityLog();
-  const bare = log.indexOf(`-a ${userInfo().username}\n`);
-  const scoped = log.indexOf(`-a ${cand}`);
-  assert.ok(bare >= 0 && scoped > bare, `probe order: ${JSON.stringify(log)}`);
-  // the probe asks whether the item exists, never for its value
-  assert.equal(log.split("\n")[0].includes("-w"), false);
+  assert.equal(readFileSync(path.join(dir, "keychain-account"), "utf8").trim(), scoped);
   assert.equal(s.row("gmail").orgId, "org-1");
+  // the unattributable form is snapshotted BEFORE the login, or "new" means nothing
+  const tl = s.timeline();
+  assert.ok(tl.indexOf(`-a ${BARE}\n`) >= 0 && tl.indexOf(`-a ${BARE}\n`) < tl.indexOf("claude auth login"));
+  // the probe asks whether an item exists, never for its value
+  assert.equal(s.securityLog().split("\n")[0].includes("-w"), false);
+});
+
+test("accounts login accepts the bare-username form only when this login created it", () => {
+  const s = scene({ noCredFile: true });
+  assert.equal(s.ms(["add", "gmail"]).code, 0);
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: BARE });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(readFileSync(path.join(s.configDir("gmail"), "keychain-account"), "utf8").trim(), BARE);
+});
+
+test("a bare-username item that pre-dates the login is never bound to the account", () => {
+  const s = scene({ noCredFile: true, keychainOk: [BARE] });
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /could not locate the poll credential for gmail/);
+  assert.match(r.stderr, /cannot be attributed to/);
+  assert.match(r.stderr, new RegExp(`account ${BARE}`));
+  assert.equal(existsSync(path.join(s.configDir("gmail"), "keychain-account")), false);
+  assert.equal(existsSync(s.tokenFile("gmail")), false);
+  assert.equal(s.row("gmail").orgId, null);
 });
 
 test("accounts login fails loudly when no candidate keychain account answers", () => {
@@ -274,17 +418,37 @@ test("accounts verify re-runs the checks without logging in", () => {
   assert.equal(s.row("gmail").identityVerified, true);
 });
 
-test("accounts verify re-locates the poll credential and repairs a lost keychain note", () => {
+test("accounts verify honours an existing keychain note this tool would never have guessed", () => {
   const s = scene({ noCredFile: true });
   const dir = s.configDir("gmail");
-  const sha8 = createHash("sha256").update(dir).digest("hex").slice(0, 8);
-  const cand = `${userInfo().username}-${sha8}`;
   s.ms(["add", "gmail"]);
-  assert.equal(s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_OK: cand }).code, 0);
-  rmSync(path.join(dir, "keychain-account"));
-  const r = s.ms(["verify", "gmail"], { MS_TEST_KEYCHAIN_OK: cand });
+  assert.equal(s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: s.scopedAccount("gmail") }).code, 0);
+  writeFileSync(path.join(dir, "keychain-account"), "hand-written-acct\n");
+  const r = s.ms(["verify", "gmail"], { MS_TEST_KEYCHAIN_OK: "hand-written-acct" });
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(readFileSync(path.join(dir, "keychain-account"), "utf8").trim(), cand);
+  assert.equal(readFileSync(path.join(dir, "keychain-account"), "utf8").trim(), "hand-written-acct");
+});
+
+test("accounts verify re-locates the poll credential when the keychain note is lost", () => {
+  const s = scene({ noCredFile: true });
+  const dir = s.configDir("gmail");
+  const scoped = s.scopedAccount("gmail");
+  s.ms(["add", "gmail"]);
+  assert.equal(s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: scoped }).code, 0);
+  rmSync(path.join(dir, "keychain-account"));
+  const r = s.ms(["verify", "gmail"], { MS_TEST_KEYCHAIN_OK: scoped });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(readFileSync(path.join(dir, "keychain-account"), "utf8").trim(), scoped);
+});
+
+test("accounts verify will not adopt an unattributable keychain item", () => {
+  const s = scene({ noCredFile: true, keychainOk: [BARE] });
+  s.ms(["add", "gmail"]);
+  // no login has ever run for this account, so there is no snapshot to make
+  // "new" meaningful — the bare form must stay refused
+  const r = s.ms(["verify", "gmail"]);
+  assert.notEqual(r.code, 0);
+  assert.equal(existsSync(path.join(s.configDir("gmail"), "keychain-account")), false);
 });
 
 test("accounts verify fails when there is no launch token yet", () => {
@@ -335,6 +499,20 @@ test("accounts ls shows a registered-but-uncredentialed account as no/no/no", ()
   assert.match(r.stdout, /gmail\s+gmail\s+-\s+no\s+no\s+no/);
 });
 
+test("accounts ls fills the POLL column without reading any secret", () => {
+  const s = scene({ noCredFile: true });
+  const scoped = s.scopedAccount("gmail");
+  s.ms(["add", "gmail"]);
+  assert.equal(s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: scoped }).code, 0);
+  s.truncateSecurity();
+  const r = s.ms(["ls"], { MS_TEST_KEYCHAIN_OK: scoped });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /gmail\s+gmail\s+org-1\s+yes\s+yes\s+yes/);
+  const probes = s.securityLog().split("\n").filter(Boolean);
+  assert.ok(probes.length > 0, "ls did check the keychain");
+  for (const line of probes) assert.equal(line.includes("-w"), false, `ls asked for a secret: ${line}`);
+});
+
 test("accounts remove deletes the row, the token file and the config dir", () => {
   const s = scene();
   s.ms(["add", "gmail"]);
@@ -347,6 +525,8 @@ test("accounts remove deletes the row, the token file and the config dir", () =>
   assert.equal(existsSync(s.configDir("gmail")), false);
 });
 
+// --- exits and warnings ------------------------------------------------
+
 test("accounts with no subcommand, an unknown one, or a missing name exits 2 with usage", () => {
   const s = scene();
   assert.equal(s.ms([]).code, 2);
@@ -358,4 +538,35 @@ test("accounts with no subcommand, an unknown one, or a missing name exits 2 wit
     assert.equal(m.code, 2, `${v} with no name`);
     assert.match(m.stderr, /usage: ms accounts/);
   }
+});
+
+test("usage-shaped problems exit 2, not 1", () => {
+  const s = scene();
+  assert.equal(s.ms(["login", "nobody"]).code, 2, "unknown account");
+  assert.equal(s.ms(["token", "nobody"]).code, 2, "unknown account");
+  assert.equal(s.ms(["remove", "nobody"]).code, 2, "unknown account");
+  assert.equal(s.ms(["add", "Not A Name"]).code, 2, "unusable name");
+  assert.equal(s.ms(["add", "gmail"]).code, 0);
+  assert.equal(s.ms(["add", "gmail"]).code, 2, "already registered");
+  assert.equal(s.ms(["add", "gmail2", "--nope"]).code, 2, "unknown option");
+  assert.equal(s.ms(["add", "gmail2", "--label"]).code, 2, "--label with no value");
+});
+
+test("a row the registry skips is named once per command, not once per read", () => {
+  const s = scene();
+  writeFileSync(
+    s.registryFile,
+    JSON.stringify({
+      version: 1,
+      accounts: [
+        { name: "gmail", provider: "claude", label: "gmail", orgId: null, shared: false, identityVerified: false },
+        { name: "weird", provider: "nope" },
+      ],
+    }),
+  );
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 0, r.stderr);
+  const warnings = r.stderr.split("\n").filter((l) => l.includes("accounts.json"));
+  assert.equal(warnings.length, 1, `expected one warning, got: ${JSON.stringify(warnings)}`);
+  assert.match(warnings[0], /unknown provider/);
 });

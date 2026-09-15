@@ -136,6 +136,14 @@ export class State {
       .run(now(), id, expect.owner, expect.updatedAt);
     return Number(res.changes) === 1;
   }
+  /**
+   * Stamp a recovery as acted on, without changing what it says. Reconciliation
+   * dispatches a worker at an orphaned `pending` row and writes nothing else;
+   * without this the row stays exactly as old as it was and the NEXT invocation
+   * dispatches a second worker at it. `updatedAt` is "when someone last did
+   * something about this", so moving it is the whole record of the dispatch.
+   */
+  touchRecovery(id: number): void { this.db.prepare("UPDATE recoveries SET updatedAt=? WHERE id=?").run(now(), id); }
   addAttempt(a: { recoveryId: number; account: string; outcome: AttemptOutcome; note: string }): void {
     const t = now();
     this.db.exec("BEGIN");

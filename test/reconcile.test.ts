@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { hostname } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
@@ -27,7 +29,9 @@ const SHELL = "/bin/testsh";
  *
  * Every failure mode the repairs must tell apart is switchable:
  * `MS_TMUX_NO_SERVER` (the identity query fails), an empty `MS_TMUX_IDENTITY`
- * (it answers nothing), and `MS_TMUX_LIST_FAILS` (list-panes fails).
+ * (it answers nothing), and `MS_TMUX_LIST_FAILS` (list-panes fails). Panes are
+ * alive unless a test says otherwise (`MS_TMUX_PANE_DEAD=1`): a corpse is an
+ * event, and a fixture that leaves every pane dead by accident tests nothing.
  */
 const TMUX_STUB = `printf '%s\\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
@@ -43,7 +47,7 @@ case "$verb" in
     if [ "\${MS_TMUX_NO_SERVER:-0}" = "1" ]; then echo "no server running" >&2; exit 1; fi
     case "$*" in
       *"#{pane_dead}"*)
-        if [ -f "$deadfile" ]; then cat "$deadfile"; else echo "\${MS_TMUX_PANE_DEAD:-1}"; fi ;;
+        if [ -f "$deadfile" ]; then cat "$deadfile"; else echo "\${MS_TMUX_PANE_DEAD:-0}"; fi ;;
       *) echo "\${MS_TMUX_IDENTITY}" ;;
     esac ;;
   list-panes)
@@ -146,6 +150,27 @@ async function captureStderr<T>(fn: () => Promise<T>): Promise<{ value: T; err: 
   } finally {
     process.stderr.write = orig;
   }
+}
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+/** Hold SQLite's write lock on locks.sqlite from another process, so every
+ * `acquire` in this one comes back Locked. Reuses lock.test.ts's own fixture. */
+function holdLockDb(msHome: string, sync: string, holdMs: number): { child: ChildProcess; exit: Promise<number> } {
+  const child = spawn(process.execPath, ["--import", "tsx", path.join(HERE, "fixtures", "lock-busy-child.ts"), sync, String(holdMs)], {
+    env: { ...process.env, MS_HOME: msHome },
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  return { child, exit: new Promise((resolve) => child.on("exit", (c) => resolve(c ?? -1))) };
+}
+
+async function waitForFile(file: string, boundMs: number): Promise<boolean> {
+  const until = Date.now() + boundMs;
+  while (Date.now() < until) {
+    if (existsSync(file)) return true;
+    await sleep(5);
+  }
+  return existsSync(file);
 }
 
 // --- (a) abandoned locks ------------------------------------------------
@@ -397,6 +422,42 @@ test("(5) an ownerless pending recovery with no timer is re-dispatched after the
   });
 });
 
+
+test("(5) a dispatched orphan is not dispatched again by the next invocation", () => {
+  const w = world();
+  withState((st) => {
+    st.createSession({ id: "s1", ...base, state: "parked" });
+    st.addRecovery({ sessionId: "s1", generation: 1, turnId: null, kind: "session" });
+  });
+  planted(w.msHome, "UPDATE recoveries SET updatedAt=?", nowSec() - 60);
+
+  reconcile();
+  reconcile();
+
+  // The dispatch stamps the row, so the grace starts again and the worker on
+  // its way is not raced by the next `ms status`. (It is also why the grace is
+  // 45s and not 30: recover.ts's own no-slot path arms a `run-shell -d 30`
+  // retry without a wake-up, and the two must not come due together.)
+  assert.deepEqual(dispatches(w), [`-S ${SOCK} run-shell -b '${MS_BIN}' '_recover' 's1'`]);
+  withState((st) => assert.ok(nowSec() - st.pendingRecovery("s1")!.updatedAt < 45));
+});
+
+test("(5) the dispatch grace outlasts the worker's own retry timer", () => {
+  const w = world();
+  withState((st) => {
+    st.createSession({ id: "s1", ...base, state: "waiting" });
+    st.addRecovery({ sessionId: "s1", generation: 1, turnId: null, kind: "session" });
+  });
+  // recover.ts asks tmux for a 30-second retry when every handoff slot is
+  // taken, and records no wake-up for it. A row that age is a worker still on
+  // its way, not an orphan.
+  planted(w.msHome, "UPDATE recoveries SET updatedAt=?", nowSec() - 35);
+
+  reconcile();
+
+  assert.deepEqual(dispatches(w), []);
+});
+
 // --- (e)/(f) transitions that never completed ---------------------------
 
 test("(e) resuming or continuing for over five minutes with no resumed event is parked", () => {
@@ -463,6 +524,7 @@ test("(6) a live handoff in stopping is left to its worker", () => {
 
 test("(6) an abandoned stopping session honours the stop the human asked for", () => {
   const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1"; // the pane is a corpse: that is why we are here
   withState((st) => {
     st.createSession({ id: "s-stop", ...base, state: "stopping", desired: "stopped" });
     st.addRecovery({ sessionId: "s-stop", generation: 1, turnId: null, kind: "session" });
@@ -492,10 +554,89 @@ test("(6) an abandoned stopping session that was mid-rotation is parked, not sto
   assert.equal(last.generation, 2);
 });
 
+
+// --- (h) a corpse nobody handled ----------------------------------------
+
+test("(h) a dead pane the hook could not act on is settled by the next reconcile", async () => {
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  withState((st) => st.createSession({ id: "s1", ...base, state: "running" }));
+  appendEvent({ t: nowSec() - 5, kind: "started", session: "s1", generation: 1, cliSessionId: "c1" });
+  appendEvent({ t: nowSec(), kind: "ended", session: "s1", generation: 1, cliSessionId: "c1", kindDetail: "exit" });
+
+  // tmux delivers `pane-died` exactly once, and this one lands while a worker
+  // holds the session: the hook must decline, and then nothing else in the
+  // system knows the pane is a corpse.
+  const held = acquire(sessionLockName("s1"));
+  assert.ok(held);
+  try {
+    assert.equal(await paneDied(["s1"]), 0);
+  } finally {
+    held!();
+  }
+  assert.deepEqual(respawns(w), [], "the hook declined, as it should have");
+  assert.equal(stateOf("s1"), "running");
+
+  const repaired = reconcile();
+
+  assert.deepEqual(respawns(w), [`-S ${SOCK} respawn-pane -k -c /tmp/work -t %7 '${SHELL}' '-l'`],
+    "the next invocation is the net the hook does not have");
+  assert.equal(stateOf("s1"), "stopped");
+  assert.ok(repaired.some((l) => l.includes("s1")), repaired.join("\n"));
+
+  // And it is once-only for the same reason the hook is: the pane is alive now.
+  assert.deepEqual(reconcile(), []);
+  assert.equal(respawns(w).length, 1);
+});
+
+test("(h) a dead pane with no ended event is parked, and a live pane is left alone", () => {
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  withState((st) => {
+    st.createSession({ id: "s-crashed", ...base, state: "running", generation: 2 });
+    st.createSession({ id: "s-alive", ...base, state: "running" });
+  });
+  appendEvent({ t: nowSec() - 10, kind: "resumed", session: "s-crashed", generation: 2, cliSessionId: "c1" });
+  appendEvent({ t: nowSec() - 10, kind: "started", session: "s-alive", generation: 1, cliSessionId: "c1" });
+  // The stub answers per pane from a file; give s-alive a live one.
+  writeFileSync(path.join(process.env.MS_TMUX_STATE!, "dead%7"), "1\n");
+
+  const repaired = reconcile();
+
+  assert.equal(stateOf("s-crashed"), "parked");
+  const last = readEvents("s-crashed").at(-1)!;
+  assert.equal(last.kind, "died");
+  assert.equal(last.generation, 2);
+  assert.deepEqual(respawns(w), [], "a crash leaves its pane for inspection");
+  assert.ok(repaired.some((l) => l.includes("s-crashed")), repaired.join("\n"));
+});
+
+test("(h) a pane that is dead because a handoff is in flight is left to the worker", () => {
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  withState((st) => {
+    // `ms _recover` step 6 has just asked the CLI to leave; between that and
+    // its own respawn the pane IS a corpse, and it is not ours to settle.
+    st.createSession({ id: "s1", ...base, state: "resuming", generation: 2 });
+    const rec = st.addRecovery({ sessionId: "s1", generation: 2, turnId: null, kind: "session" });
+    assert.ok(st.ownRecovery(rec, `${process.pid}@${hostname()}`));
+  });
+  // Past the `stopping` grace (120s) and short of the stuck rule (300s), so the
+  // live owner is the ONLY thing standing between this corpse and a repair.
+  planted(w.msHome, "UPDATE sessions SET updatedAt=?", nowSec() - 200);
+
+  reconcile();
+
+  assert.equal(stateOf("s1"), "resuming", "a live owner means a live handoff");
+  assert.deepEqual(respawns(w), []);
+  assert.ok(!readEvents("s1").some((e) => e.kind === "died"));
+});
+
 // --- ms _pane_died ------------------------------------------------------
 
 test("_pane_died: a normal end respawns the login shell and stops the session", async () => {
   const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1"; // the pane is a corpse: that is why we are here
   withState((st) => {
     st.createSession({ id: "s1", ...base });
     st.addRecovery({ sessionId: "s1", generation: 1, turnId: null, kind: "session" });
@@ -522,6 +663,7 @@ test("_pane_died: a normal end respawns the login shell and stops the session", 
 
 test("_pane_died: no ended event for this generation appends died, parks, and leaves the pane", async () => {
   const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1"; // the pane is a corpse: that is why we are here
   withState((st) => {
     st.createSession({ id: "s2", ...base, generation: 2 });
     st.createSession({ id: "s2b", ...base, generation: 2 });
@@ -566,6 +708,7 @@ test("_pane_died: a late callback for a generation that is over does nothing", a
 
 test("_pane_died: the pane must be this session's, on this server, and dead", async () => {
   const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1"; // the pane is a corpse: that is why we are here
   withState((st) => {
     st.createSession({ id: "s-restarted", ...base, serverStart: "1:1" });
     st.createSession({ id: "s-nopane", ...base, pane: "%9" });
@@ -585,6 +728,7 @@ test("_pane_died: the pane must be this session's, on this server, and dead", as
 
 test("_pane_died: `ms stop` gets the login shell back even with no ended event", async () => {
   const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1"; // the pane is a corpse: that is why we are here
   withState((st) => st.createSession({ id: "s3", ...base, desired: "stopped" }));
 
   assert.equal(await paneDied(["s3"]), 0);
@@ -595,6 +739,7 @@ test("_pane_died: `ms stop` gets the login shell back even with no ended event",
 
 test("_pane_died: a pane dying mid-handoff belongs to the recovery worker", async () => {
   const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1"; // the pane is a corpse: that is why we are here
   // The lock is the whole guarantee here, so nothing else may be standing in
   // for it: this row is old enough and ordinary enough that an unfenced hook
   // would give the pane straight back as a shell.
@@ -623,6 +768,42 @@ test("_pane_died: an unmanaged pane is not ours", async () => {
   const w = world();
   assert.equal(await paneDied(["nobody"]), 0);
   assert.deepEqual(tmuxLines(w), [], "not even a query for a session we never launched");
+});
+
+
+// --- (N3) a lock store that will not answer -----------------------------
+
+test("a busy lock database skips that item and never aborts the pass", async () => {
+  const w = world();
+  const sync = path.join(w.home, "busy");
+  // Held long enough that every acquire in the pass below comes back Locked
+  // (the lock module's busy timeout is 250 ms), then released.
+  const holder = holdLockDb(w.msHome, sync, 2_000);
+  try {
+    assert.ok(await waitForFile(path.join(sync, "holding"), 15_000), "the other process holds the write lock");
+    withState((st) => {
+      st.createSession({ id: "s-gone", ...base, pane: "%9" });
+      st.createSession({ id: "s-due", ...base, state: "waiting" });
+      st.setWakeup("s-due", nowSec() - 5);
+    });
+
+    const repaired = reconcile();
+
+    // One busy hit used to throw out of the loop, skipping every later session
+    // AND rule (d) — so the verb saw "reconcile failed" and nothing was done.
+    assert.equal(repaired.filter((l) => l.includes("lock store")).length, 3,
+      `both sessions and the wake-up are each accounted for:\n${repaired.join("\n")}`);
+    assert.equal(stateOf("s-gone"), "running", "and nothing was repaired on a lock we never took");
+    assert.deepEqual(dispatches(w), []);
+    assert.equal(await holder.exit, 0);
+  } finally {
+    holder.child.kill();
+  }
+
+  // With the database free again, the same pass repairs both.
+  reconcile();
+  assert.equal(stateOf("s-gone"), "stopped");
+  assert.deepEqual(dispatches(w), [`-S ${SOCK} run-shell -b '${MS_BIN}' '_recover' 's-due'`]);
 });
 
 // --- wiring -------------------------------------------------------------

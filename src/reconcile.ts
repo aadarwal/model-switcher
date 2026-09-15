@@ -37,7 +37,7 @@ import { appendFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { appendEvent, readEvents } from "./events.ts";
 import type { Verb } from "./cli.ts"; // type-only: erased, no import cycle at runtime
-import { acquire, sweepStaleLocks } from "./lock.ts";
+import { acquire, sweepStaleLocks, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
 import { openState, type RecoveryRow, type SessionRow, type State } from "./state.ts";
 import { Tmux } from "./tmux.ts";
@@ -55,8 +55,13 @@ const STUCK_SECONDS = 300;
  * to start Node and take the lock; a row younger than this is simply one whose
  * worker is still on its way. Past it, with no owner and no timer, nobody is
  * coming — that is the crashed-hook and the failed-dispatch case.
+ *
+ * 45 and not 30 on purpose: recover.ts arms a `run-shell -d 30` retry when all
+ * four handoff slots are taken, and records no wake-up for it. A grace of 30
+ * would come due at the same moment as that timer and send a second worker at
+ * a recovery the first is already on its way back to.
  */
-const PENDING_GRACE_SECONDS = 30;
+const PENDING_GRACE_SECONDS = 45;
 /**
  * A `stopping` row younger than this is a handoff in flight. The lock is the
  * primary evidence (a worker inside its transaction holds it), and this is the
@@ -229,12 +234,23 @@ function stopGone(st: State, s: SessionRow): string[] {
   return [`session ${s.id}: pane ${s.pane} is gone, marked stopped`];
 }
 
-/** Is a `stopping` row a handoff still in flight? We already hold the session
- * lock, so a worker INSIDE its transaction cannot be here at all; these two
- * tests cover the window around its writes. */
-function handoffIsLive(st: State, s: SessionRow, rec: RecoveryRow | null): boolean {
-  if (nowSeconds() - s.updatedAt <= HANDOFF_GRACE_SECONDS) return true;
+/**
+ * A worker is mid-transaction on this session. We already hold the session
+ * lock, so one INSIDE its transaction cannot be here at all — this is the
+ * window around its writes, when it may have released the lock but the store
+ * has not caught up. It is the only reason to leave a corpse alone.
+ */
+function workerOnIt(rec: RecoveryRow | null): boolean {
   return !!rec && rec.status === "owned" && !ownerDead(rec.owner);
+}
+
+/** Is a `stopping` row a handoff still in flight? A worker on it, or a row the
+ * worker stamped moments ago — `stopping` is written immediately before the
+ * step that kills the CLI, so its age is meaningful evidence here in a way it
+ * is not for any other state. */
+function handoffIsLive(s: SessionRow, rec: RecoveryRow | null): boolean {
+  if (nowSeconds() - s.updatedAt <= HANDOFF_GRACE_SECONDS) return true;
+  return workerOnIt(rec);
 }
 
 /**
@@ -248,7 +264,7 @@ function handoffIsLive(st: State, s: SessionRow, rec: RecoveryRow | null): boole
  */
 function abandonedStopping(st: State, servers: Servers, s: SessionRow, presence: Presence): string[] {
   const rec = st.pendingRecovery(s.id);
-  if (handoffIsLive(st, s, rec)) return [];
+  if (handoffIsLive(s, rec)) return [];
   if (s.desired === "stopped") {
     if (presence === "present" && paneIsDead(servers, s)) respawnShell(servers, s);
     closeOut(st, s);
@@ -261,6 +277,44 @@ function abandonedStopping(st: State, servers: Servers, s: SessionRow, presence:
     /* the state change below is the load-bearing record */
   }
   return [park(st, s, "abandoned mid-handoff with no live worker")];
+}
+
+/**
+ * What a dead pane MEANS for its session — the one decision, in one place.
+ *
+ * Two callers reach it. tmux's `pane-died` hook calls it the moment the CLI
+ * exits, which is the fast path and the usual one. Reconciliation calls it when
+ * it finds a corpse nobody handled: the hook is delivered exactly once, and it
+ * declines whenever a worker holds the session or tmux could not be asked, so
+ * without this rule a declined delivery leaves a dead pane and a store that
+ * says `running` forever.
+ *
+ * The session's own record decides. An `ended` event for THIS generation is the
+ * human leaving (`/exit`, logout, a `/clear` that restarts the CLI) — give the
+ * pane back as their login shell. No `ended` is a death: append `died`, park,
+ * and leave the corpse, because its last screen is the only evidence of why and
+ * the human decides what to do with it. A `desired` of `stopped` is the promise
+ * `ms stop` made and outranks both.
+ */
+function settleDeadPane(st: State, servers: Servers, s: SessionRow, presence: Presence): string[] {
+  if (s.state === "stopping") return abandonedStopping(st, servers, s, presence);
+  const events = readEvents(s.id).filter((e) => e.generation === s.generation);
+  const normalEnd = events[events.length - 1]?.kind === "ended";
+  if (s.desired === "stopped" || normalEnd) {
+    // Close the row out BEFORE the respawn: a pending recovery would otherwise
+    // find a live pane (the shell we are about to put there) and respawn claude
+    // over the human's prompt.
+    closeOut(st, s);
+    respawnShell(servers, s);
+    log(s.id, s.generation, "pane ended; the login shell is back and the session is stopped");
+    return [`session ${s.id}: pane ended, login shell restored, marked stopped`];
+  }
+  try {
+    appendEvent({ t: nowSeconds(), kind: "died", session: s.id, generation: s.generation, cliSessionId: s.cliSessionId });
+  } catch {
+    /* the park below is the load-bearing record */
+  }
+  return [park(st, s, "pane died with no ended event")];
 }
 
 /**
@@ -305,6 +359,11 @@ function redispatchOrphan(st: State, servers: Servers, s: SessionRow, rec: Recov
   if (s.wakeupAt !== null) return [];
   if (nowSeconds() - rec.updatedAt <= PENDING_GRACE_SECONDS) return [];
   servers.tmux(s.socket).runShell([msBinary(), "_recover", s.id]);
+  // Record the dispatch on the row itself, so the grace starts again: the next
+  // invocation must not send a second worker at a recovery this one is already
+  // on its way to. The worker's own `ownRecovery` would refuse the loser, but
+  // two workers racing for one session is not a thing to leave to a CAS.
+  st.touchRecovery(rec.id);
   log(s.id, s.generation, `recovery ${rec.id} was pending with no worker and no timer; dispatched`);
   return [`session ${s.id}: recovery ${rec.id} had no worker and no timer, dispatched`];
 }
@@ -333,7 +392,13 @@ function stuck(st: State, s: SessionRow): string[] {
 function wakeups(st: State, servers: Servers): string[] {
   const out: string[] = [];
   for (const scanned of st.dueWakeups(nowSeconds())) {
-    const release = acquire(sessionLockName(scanned.id));
+    let release: Release | null;
+    try {
+      release = acquire(sessionLockName(scanned.id));
+    } catch (e) {
+      out.push(`session ${scanned.id}: could not reach the lock store (${reason(e)}), wake-up left`);
+      continue;
+    }
     if (!release) {
       out.push(`session ${scanned.id}: a worker holds it, wake-up left for them`);
       continue;
@@ -360,7 +425,11 @@ function wakeups(st: State, servers: Servers): string[] {
     } catch (e) {
       out.push(`session ${scanned.id}: wake-up dispatch failed: ${reason(e)}`);
     } finally {
-      release();
+      try {
+        release();
+      } catch (e) {
+        out.push(`session ${scanned.id}: could not release its lock (${reason(e)})`);
+      }
     }
   }
   return out;
@@ -391,7 +460,17 @@ export function reconcile(): string[] {
     const noted = new Set<string>();
     for (const scanned of st.listSessions()) {
       if (scanned.state === "stopped") continue; // already reconciled; say it once
-      const release = acquire(sessionLockName(scanned.id));
+      let release: Release | null;
+      try {
+        release = acquire(sessionLockName(scanned.id));
+      } catch (e) {
+        // `Locked` here is the lock DATABASE being too busy to decide, not a
+        // held lock. Either way this one session is unrepairable right now, and
+        // that must cost this session only: throwing would skip every session
+        // after it and rule (d) with them.
+        out.push(`session ${scanned.id}: could not reach the lock store (${reason(e)}), skipped`);
+        continue;
+      }
       if (!release) {
         // A worker is inside its transaction. Whatever we think we know about
         // this session is older than what it is doing.
@@ -417,13 +496,23 @@ export function reconcile(): string[] {
           continue;
         }
         const rec = st.pendingRecovery(s.id);
+        // (h) A corpse nobody handled. `_pane_died` is the fast path for this
+        // and tmux delivers it once; when it declined, this is the only net.
+        if (presence === "present" && !workerOnIt(rec) && paneIsDead(servers, s)) {
+          out.push(...settleDeadPane(st, servers, s, presence));
+          continue;
+        }
         out.push(...reclaimRecovery(st, servers, s, rec)); // (b)
         out.push(...redispatchOrphan(st, servers, s, rec)); // (5)
         out.push(...stuck(st, s)); // (e), (f)
       } catch (e) {
         out.push(`session ${scanned.id}: reconcile failed: ${reason(e)}`);
       } finally {
-        release();
+        try {
+          release();
+        } catch (e) {
+          out.push(`session ${scanned.id}: could not release its lock (${reason(e)})`);
+        }
       }
     }
     // (d) last: a session (c) just stopped has had its wake-up cleared
@@ -464,7 +553,14 @@ export function paneDiedSession(id: string): number {
   // A worker holding this session owns the pane: `ms _recover` kills the CLI
   // itself (step 6) and its own respawn is what revives the pane. Acting here
   // would clobber the rotation. If that worker dies, reconciliation repairs it.
-  const release = acquire(sessionLockName(id));
+  let release: Release | null;
+  try {
+    release = acquire(sessionLockName(id));
+  } catch {
+    // The lock database was too busy to decide. A hook never fails loudly, and
+    // reconciliation's rule (h) is the net for the death we just declined.
+    return 0;
+  }
   if (!release) return 0;
   try {
     const st = openState();
@@ -479,28 +575,7 @@ export function paneDiedSession(id: string): number {
       if (presence !== "present") return 0;
       if (!paneIsDead(servers, s)) return 0; // something is running in it: not this death
 
-      if (s.state === "stopping") {
-        // The worker that asked the CLI to leave is gone; `abandonedStopping`
-        // is the one place that decides what an interrupted handoff becomes.
-        abandonedStopping(st, servers, s, presence);
-        return 0;
-      }
-
-      const events = readEvents(id).filter((e) => e.generation === s.generation);
-      const normalEnd = events[events.length - 1]?.kind === "ended";
-      if (s.desired === "stopped" || normalEnd) {
-        // Close the row out BEFORE the respawn: a pending recovery would
-        // otherwise find a live pane (the shell we are about to put there) and
-        // respawn claude over the human's prompt.
-        closeOut(st, s);
-        respawnShell(servers, s);
-        log(id, s.generation, "pane ended normally; the login shell is back and the session is stopped");
-        return 0;
-      }
-
-      appendEvent({ t: nowSeconds(), kind: "died", session: id, generation: s.generation, cliSessionId: s.cliSessionId });
-      st.updateSession(id, { state: "parked" });
-      log(id, s.generation, "pane died with no ended event; parked (pane left for inspection)");
+      settleDeadPane(st, servers, s, presence);
       return 0;
     } finally {
       st.close();

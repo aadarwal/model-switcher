@@ -38,6 +38,13 @@ function msStreaming(
     let stdout = "";
     let stderr = "";
     let markerAt: number | null = null;
+    // A stub that never exits must not hang the whole suite, and a spawn that
+    // fails must fail the test rather than reject out of this promise.
+    const kill = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    const done = (code: number) => {
+      clearTimeout(kill);
+      resolve({ code, stdout, stderr, markerAt, exitAt: Date.now() });
+    };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (c: string) => (stdout += c));
@@ -45,7 +52,11 @@ function msStreaming(
       stderr += c;
       if (markerAt === null && stderr.includes(marker)) markerAt = Date.now();
     });
-    child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr, markerAt, exitAt: Date.now() }));
+    child.on("error", (e) => {
+      stderr += `\nspawn failed: ${e.message}\n`;
+      done(-1);
+    });
+    child.on("close", (code) => done(code ?? -1));
   });
 }
 
@@ -93,6 +104,19 @@ if [ "$1" = "setup-token" ]; then
     printf 'Your token is sk-ant-'
     sleep 0.2
     printf 'oat01-%s - copy it.\\n' "\${MS_TEST_TOKEN#sk-ant-oat01-}"
+    printf '%s\\n' "$MS_TEST_TOKEN"
+    exit 0
+  fi
+  if [ "$MS_TEST_TOKEN_ONLINE" = "one" ]; then
+    # Prose and the token on a single line, in a single write, and NO bare
+    # token line anywhere: the only copy of the token is inside that line.
+    printf 'Paste code: %s\\n' "$MS_TEST_TOKEN"
+    exit 0
+  fi
+  if [ "$MS_TEST_TOKEN_ONLINE" = "two" ]; then
+    # The same bytes, split so the token lands on its own chunk.
+    printf 'Paste code: '
+    sleep 0.2
     printf '%s\\n' "$MS_TEST_TOKEN"
     exit 0
   fi
@@ -162,6 +186,7 @@ type Opts = {
   tokenInline?: boolean;
   tokenSplit?: "prefix" | "partial";
   promptHold?: string;
+  tokenOnline?: "one" | "two";
 };
 
 function scene(opts: Opts = {}) {
@@ -196,6 +221,7 @@ function scene(opts: Opts = {}) {
     MS_TEST_TOKEN_INLINE: opts.tokenInline ? "1" : "0",
     MS_TEST_TOKEN_SPLIT: opts.tokenSplit ?? "",
     MS_TEST_PROMPT_HOLD: opts.promptHold ?? "",
+    MS_TEST_TOKEN_ONLINE: opts.tokenOnline ?? "",
     MS_TEST_CRED: CRED,
     MS_TEST_NO_CRED_FILE: opts.noCredFile ? "1" : "0",
     MS_TEST_KEYCHAIN_OK: (opts.keychainOk ?? []).join(" "),
@@ -403,6 +429,24 @@ test("a token split part way through the prefix never reaches stderr either", ()
   assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), TOKEN);
 });
 
+test("a token sharing a line with prose is captured however the chunks fall", () => {
+  // The only copy of the token is inside `Paste code: <token>`. Whether that
+  // line arrives whole or split, the mint must end with the token on disk and
+  // no token text anywhere the human can see — capture cannot be left to pipe
+  // scheduling.
+  for (const tokenOnline of ["one", "two"] as const) {
+    const s = scene({ tokenOnline });
+    s.ms(["add", "gmail"]);
+    const r = s.ms(["login", "gmail"]);
+    assert.equal(r.code, 0, `${tokenOnline}: ${r.stderr}`);
+    assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), TOKEN, `${tokenOnline}: token not captured`);
+    const all = r.stdout + r.stderr;
+    assert.equal(all.includes(TOKEN), false, `${tokenOnline}: token leaked`);
+    assert.equal(all.includes(TOKEN.slice("sk-ant-oat01-".length)), false, `${tokenOnline}: token body leaked`);
+    assert.match(r.stderr, /Paste code: /);
+  }
+});
+
 test("an unterminated prompt reaches the human while the mint is still waiting", async () => {
   const s = scene({ promptHold: "1" });
   s.ms(["add", "gmail"]);
@@ -533,11 +577,15 @@ test("a keychain item that is genuinely absent before the login is attributable 
   assert.equal(readFileSync(path.join(s.configDir("gmail"), "keychain-account"), "utf8").trim(), BARE);
 });
 
-test("a scoped form that answers after the login beats a bare form that answered before it", () => {
-  const s = scene({ noCredFile: true, keychainOk: [BARE] });
+test("when both forms are equally new, the dir-scoped one wins", () => {
+  // Neither answers before the login and BOTH answer after, so both are
+  // "newly created" and the attribution rule alone cannot choose. The winner
+  // is then decided by candidate ORDER, and it must be the form that names
+  // this account's own config dir — the one that is attributable outright.
+  const s = scene({ noCredFile: true });
   const scoped = s.scopedAccount("gmail");
   s.ms(["add", "gmail"]);
-  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: scoped });
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: `${BARE} ${scoped}` });
   assert.equal(r.code, 0, r.stderr);
   assert.equal(readFileSync(path.join(s.configDir("gmail"), "keychain-account"), "utf8").trim(), scoped);
   assert.equal(s.row("gmail").orgId, "org-1");

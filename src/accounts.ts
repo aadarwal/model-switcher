@@ -112,8 +112,12 @@ class UsageError extends Error {
 /** Anything matching a launch token is scrubbed before a line is forwarded to
  *  the human, so a CLI that ever prints a token beside other text still cannot
  *  leak it through this process. */
+function tokenPattern(): RegExp {
+  return new RegExp(`${TOKEN_PREFIX}[A-Za-z0-9_-]+`, "g");
+}
+
 function redact(s: string): string {
-  return s.replace(new RegExp(`${TOKEN_PREFIX}[A-Za-z0-9_-]+`, "g"), `${TOKEN_PREFIX}<redacted>`);
+  return s.replace(tokenPattern(), `${TOKEN_PREFIX}<redacted>`);
 }
 
 /** May this UNTERMINATED fragment be part of a token, either already or once
@@ -233,8 +237,13 @@ async function mintLaunchToken(name: string, dir: string): Promise<string> {
       const t = line.trim();
       if (looksLikeSetupToken(t)) {
         token ??= t;
-        return; // never forwarded
+        return; // a line that is nothing but the token: captured, never forwarded
       }
+      // A token can also arrive INSIDE a line (`Paste code: sk-ant-oat01-…`).
+      // Capture it there too, then let the line through redacted: which of
+      // those two shapes we see must not depend on where a chunk boundary
+      // happened to fall, or the mint fails on pipe scheduling alone.
+      for (const m of line.match(tokenPattern()) ?? []) if (looksLikeSetupToken(m)) token ??= m;
       forward(`${line}\n`);
     };
     const pending: Record<"stdout" | "stderr", string> = { stdout: "", stderr: "" };

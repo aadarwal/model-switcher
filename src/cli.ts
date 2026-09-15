@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { execLaunch } from "./exec.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
+import { launchClaude } from "./launch.ts";
 
 export type Verb = (args: string[]) => Promise<number>;
 const verbs = new Map<string, Verb>();
@@ -10,6 +11,7 @@ export function registerVerb(name: string, fn: Verb): void { verbs.set(name, fn)
 
 registerVerb("_exec", execLaunch);
 registerVerb("_hook", async ([which]) => (which === "claude" ? claudeHook() : 0));
+registerVerb("claude", launchClaude);
 
 const USAGE = `usage: ms <verb> [args]
   setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach

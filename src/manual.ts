@@ -51,7 +51,8 @@ const EXIT_REFUSED = 1;
 const EXIT_USAGE = 2;
 
 /** How long `stop` waits for a recovery worker to finish before giving up.
- * A whole handoff (exit, respawn, readiness) fits inside it. */
+ * A handoff can take longer (exit ~14 s plus readiness up to 60 s); the
+ * refusal leaves the stop intent written, so a retry is cheap and correct. */
 const STOP_LOCK_WAIT_MS = 30_000;
 /** How long `stop` waits for the pane to settle after the exit sequence. */
 const SETTLE_MS = 10_000;
@@ -370,7 +371,7 @@ export const stopVerb: Verb = async (argv) => {
     //    means a stop which did not finish (a lock it could not take, a CLI
     //    that would not exit), and it is only ever written while the pane still
     //    holds the CLI — a handed-back pane is `stopped` — so it stays
-    //    retryable, which is what the `a recovery is in progress; retry` line
+    //    retryable, which is what the `a recovery is in progress (a handoff can take ~75 s); retry` line
     //    below promises.
     if (session.state === "stopped" || (session.desired === "stopped" && session.state !== "stopping")) {
       process.stderr.write(`ms: ${session.id} already stopped\n`);
@@ -410,7 +411,7 @@ export const stopVerb: Verb = async (argv) => {
       if (e instanceof Locked || (e as Error)?.name === "Locked") {
         // The intent stays written: whoever holds the lock reads it, and a
         // second `ms stop` picks up where this one stood down.
-        return refuse("stop", `${session.id}: a recovery is in progress; retry`);
+        return refuse("stop", `${session.id}: a recovery is in progress (a handoff can take ~75 s); retry`);
       }
       throw e;
     }

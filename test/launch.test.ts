@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { run, tempHome, stubDir } from "./helpers.ts";
@@ -57,18 +57,31 @@ globalThis.fetch = async (url, init = {}) => {
 }
 
 /** tmux, as far as a launch drives it: logs every argv line, answers the
- *  identity query and the `-P -F #{pane_id}` spawns with a pane id. */
+ *  identity query and the `-P -F #{pane_id}` spawns with a pane id.
+ *
+ *  It also copies the store aside the moment `respawn-pane` is issued, which
+ *  is the only way a test can see what the session row said BEFORE the CLI
+ *  was started (`ms` has already returned by the time the test looks). */
 const TMUX_STUB = `printf '%s\\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
 case "$1" in
   display-message) echo "${IDENTITY}" ;;
   new-session|new-window) echo "%42" ;;
   has-session) exit "\${MS_TMUX_HAS_SESSION:-1}" ;;
+  respawn-pane)
+    mkdir -p "$MS_TMUX_SNAPSHOT"
+    cp "$MS_HOME/state.sqlite" "$MS_TMUX_SNAPSHOT/state.sqlite" 2>/dev/null
+    cp "$MS_HOME/state.sqlite-wal" "$MS_TMUX_SNAPSHOT/state.sqlite-wal" 2>/dev/null
+    ;;
+  attach-session) exit "\${MS_TMUX_ATTACH:-0}" ;;
 esac
 exit 0`;
 
+/** A literal path inside a RegExp: a temp dir can hold `.` and `+`. */
+const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 type World = {
-  home: string; msHome: string; log: string;
+  home: string; msHome: string; log: string; atRespawn: string;
   env: (over?: Record<string, string>) => Record<string, string>;
 };
 
@@ -78,6 +91,7 @@ async function world(usage: Record<string, unknown> = { gmail: { body: GMAIL_OK 
   const { home, msHome } = tempHome();
   const { dir, stub } = stubDir();
   const log = path.join(dir, "tmux.log");
+  const atRespawn = path.join(dir, "at-respawn");
   stub("tmux", TMUX_STUB);
   const stubUrl = usageStub(dir);
 
@@ -109,9 +123,9 @@ async function world(usage: Record<string, unknown> = { gmail: { body: GMAIL_OK 
   }
 
   return {
-    home, msHome, log,
+    home, msHome, log, atRespawn,
     env: (over = {}) => ({
-      HOME: home, MS_HOME: msHome, MS_TMUX_LOG: log,
+      HOME: home, MS_HOME: msHome, MS_TMUX_LOG: log, MS_TMUX_SNAPSHOT: atRespawn,
       PATH: `${dir}:${process.env.PATH}`,
       ANTHROPIC_MODEL: "",
       MS_TEST_USAGE: JSON.stringify(table),
@@ -124,6 +138,19 @@ async function world(usage: Record<string, unknown> = { gmail: { body: GMAIL_OK 
 
 const OUTSIDE = { TMUX: "", TMUX_PANE: "" };
 const logLines = (w: World): string[] => readFileSync(w.log, "utf8").trim().split("\n");
+
+/** The session rows as they stood at the instant tmux was told to respawn the
+ *  pane into the CLI — i.e. what `ms _exec` could possibly have read. */
+async function sessionsAtRespawn(w: World) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(path.join(w.atRespawn, "state.sqlite"));
+  try {
+    return db.prepare("SELECT id, pane, socket, serverStart, state, account FROM sessions").all() as unknown as
+      { id: string; pane: string; socket: string; serverStart: string; state: string; account: string }[];
+  } finally {
+    db.close();
+  }
+}
 
 /** The store as the launch left it, read in-process (the subprocess shares
  *  the same sqlite file on disk). */
@@ -196,6 +223,15 @@ test("inside tmux: picks, records, and respawns the caller's own pane", async ()
   assert.equal(launch!.account, "gmail");
   assert.equal(launch!.generation, 1);
   assert.deepEqual(launch!.command, ["claude", "--session-id", s.cliSessionId, "hello", "world"]);
+  // nothing but the record: no environment is carried in the launch row
+  assert.deepEqual(launch!.env, {});
+
+  // the row was whole before tmux was told to start the CLI
+  const early = await sessionsAtRespawn(w);
+  assert.equal(early.length, 1);
+  assert.equal(early[0]!.pane, PANE);
+  assert.equal(early[0]!.serverStart, IDENTITY);
+  assert.equal(early[0]!.account, "gmail");
 
   // no secret anywhere tmux can see it
   assert.equal(readFileSync(w.log, "utf8").includes(SAMPLE_TOKEN), false);
@@ -333,42 +369,151 @@ test("a bad --need, and claude args not behind --, are usage errors", async () =
 
 // --- outside tmux ------------------------------------------------------
 
-test("outside tmux: the tool's own server, session `ms`, then attach", async () => {
+test("outside tmux: a placeholder pane first, then the CLI respawned into it", async () => {
   const w = await world();
   const r = run(["claude", "--", "hi"], w.env(OUTSIDE));
   assert.equal(r.code, 0, r.stderr);
 
   const sock = path.join(w.msHome, "tmux.sock");
   const lines = logLines(w);
+  const at = (needle: string) => {
+    const i = lines.findIndex((l) => l.includes(needle));
+    assert.ok(i >= 0, `no ${needle} in:\n${lines.join("\n")}`);
+    return i;
+  };
+
+  // The pane is made to exist FIRST, running something that cannot exit on
+  // its own — never the CLI, which would start before the hook watching it.
   assert.ok(lines.includes(`-S ${sock} has-session -t ms`), lines.join("\n"));
-  const spawn = lines.find((l) => l.includes("new-session"));
-  assert.ok(spawn, lines.join("\n"));
-  const m = spawn!.match(new RegExp(`^-S ${sock.replace(/[/]/g, "\\/")} new-session -d -P -F #\\{pane_id\\} -s ms -c (\\S+) '(\\S+)' '_exec' '(${UUID})'$`));
-  assert.ok(m, `new-session line not as expected: ${spawn}`);
+  const spawn = at("new-session");
+  assert.equal(lines[spawn], `-S ${sock} new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`);
+
+  const remain = at("remain-on-exit on");
+  const opt = at("@ms_session");
+  const hook = at("pane-died");
+  const respawn = at("respawn-pane");
+  const attach = at("attach-session");
+  assert.ok(spawn < remain && remain < respawn, lines.join("\n"));
+  assert.ok(spawn < opt && opt < respawn, lines.join("\n"));
+  assert.ok(spawn < hook && hook < respawn, lines.join("\n"));
+  assert.ok(respawn < attach, lines.join("\n"));
+  assert.equal(attach, lines.length - 1);
+  assert.equal(lines[attach], `-S ${sock} attach-session -t ms`);
+  assert.equal(lines[remain], `-S ${sock} set-option -p -t %42 remain-on-exit on`);
+
+  const m = lines[respawn]!.match(
+    new RegExp(`^-S ${esc(sock)} respawn-pane -k -c (\\S+) -t %42 '(\\S+)' '_exec' '(${UUID})'$`),
+  );
+  assert.ok(m, `respawn line not as expected: ${lines[respawn]}`);
   assert.equal(m![1], CWD);
   assert.equal(m![2], MS_BIN);
+  const launchId = m![3]!;
 
-  assert.ok(lines.includes(`-S ${sock} set-option -p -t %42 remain-on-exit on`), lines.join("\n"));
-  assert.ok(lines.some((l) => l.includes("set-option -p -t %42 @ms_session")));
-  assert.ok(lines.some((l) => l.includes("set-hook -p -t %42 pane-died")));
-  assert.equal(lines.at(-1), `-S ${sock} attach-session -t ms`);
-  assert.ok(lines.indexOf(spawn!) < lines.indexOf(lines.at(-1)!));
+  // The row was already whole when the CLI was started: `_exec` can never
+  // read an empty pane into MS_PANE.
+  const early = await sessionsAtRespawn(w);
+  assert.equal(early.length, 1);
+  assert.equal(early[0]!.pane, "%42");
+  assert.equal(early[0]!.socket, sock);
+  assert.equal(early[0]!.serverStart, IDENTITY);
+  assert.equal(early[0]!.state, "launching");
 
-  const st = await readState(w);
-  const s = st.sessions[0]!;
-  assert.equal(s.socket, sock);
-  assert.equal(s.pane, "%42");
-  assert.equal(s.serverStart, IDENTITY);
-  assert.equal(s.state, "launching");
+  const st = await readState(w, launchId);
+  const session = st.sessions[0]!;
+  assert.equal(session.id, early[0]!.id);
+  assert.equal(session.socket, sock);
+  assert.equal(session.pane, "%42");
+  assert.equal(session.serverStart, IDENTITY);
+  assert.equal(session.state, "launching");
+  assert.deepEqual(session.flags, ["hi"]);
+  assert.deepEqual(st.launch!.command, ["claude", "--session-id", session.cliSessionId, "hi"]);
+  assert.deepEqual(st.launch!.env, {});
   assert.match(r.stderr, /^ms: gmail \(any\) → pane %42$/m);
+  assert.equal(readFileSync(w.log, "utf8").includes(SAMPLE_TOKEN), false);
 });
 
 test("outside tmux with the session already up: a new window in it", async () => {
   const w = await world();
   const r = run(["claude"], w.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(r.code, 0, r.stderr);
+  const sock = path.join(w.msHome, "tmux.sock");
   const lines = logLines(w);
   assert.equal(lines.some((l) => l.includes("new-session")), false, lines.join("\n"));
-  assert.ok(lines.some((l) => l.includes("new-window -P -F #{pane_id} -t ms")), lines.join("\n"));
-  assert.equal(lines.at(-1), `-S ${path.join(w.msHome, "tmux.sock")} attach-session -t ms`);
+  assert.ok(lines.includes(`-S ${sock} new-window -P -F #{pane_id} -t ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes("respawn-pane")), lines.join("\n"));
+  assert.equal(lines.at(-1), `-S ${sock} attach-session -t ms`);
+  assert.equal((await sessionsAtRespawn(w))[0]!.pane, "%42");
+});
+
+test("a launch whose attach fails is still a launch: exit 0 and how to get back", async () => {
+  const w = await world();
+  const r = run(["claude"], w.env({ ...OUTSIDE, MS_TMUX_ATTACH: "1" }));
+  const sock = path.join(w.msHome, "tmux.sock");
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, new RegExp(`^ms: launched in the ms tmux server; attach with: tmux -S ${esc(sock)} attach -t ms$`, "m"));
+  assert.equal(r.stderr.includes(SAMPLE_TOKEN), false);
+  // and the launch really happened
+  assert.ok(logLines(w).some((l) => l.includes("respawn-pane")));
+  assert.equal((await readState(w)).sessions.length, 1);
+});
+
+// --- the pick is only remembered once it has been acted on ---------------
+
+test("a picked account with no launch token exits 1 and leaves no fallback", async () => {
+  const w = await world();
+  const { deleteLaunchToken } = await import("../src/launch-credentials.ts");
+  process.env.MS_HOME = w.msHome;
+  deleteLaunchToken("gmail"); // the account that wins on `any`
+
+  const r = run(["claude"], w.env());
+
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /gmail/);
+  assert.equal(r.stderr.includes(SAMPLE_TOKEN), false);
+  assert.equal(existsSync(path.join(w.msHome, "last-pick.json")), false, "a pick that never ran must not become the fallback");
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
+test("an empty registry is a configuration answer, not a full pool: exit 1", async () => {
+  const w = await world();
+  writeFileSync(path.join(w.msHome, "accounts.json"), JSON.stringify({ version: 1, accounts: [] }), { mode: 0o600 });
+  const r = run(["claude"], w.env());
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /^ms claude: no claude account is registered/m);
+});
+
+// --- flag spellings and the settings read --------------------------------
+
+test("the equals forms of --need and --as are the same flags", async () => {
+  const w = await world();
+  const need = run(["claude", "--need=fable"], w.env());
+  assert.equal(need.code, 0, need.stderr);
+  assert.match(need.stderr, /^ms: work \(fable\) → pane %7$/m);
+
+  const w2 = await world();
+  const as = run(["claude", "--as=work"], w2.env());
+  assert.equal(as.code, 0, as.stderr);
+  assert.match(as.stderr, /^ms: work \(any\) → pane %7$/m);
+  assert.equal((await readState(w2)).sessions[0]!.account, "work");
+});
+
+test("an empty --model= does not swallow the other sources", async () => {
+  const w = await world();
+  const r = run(["claude", "--", "--model="], w.env({ ANTHROPIC_MODEL: "claude-fable-5" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /\(fable\)/);
+});
+
+test("the settings read follows CLAUDE_CONFIG_DIR when it is set", async () => {
+  const w = await world();
+  const configDir = path.join(w.home, "elsewhere");
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(path.join(configDir, "settings.json"), JSON.stringify({ model: "claude-fable-5" }));
+  // ~/.claude/settings.json says otherwise, and must not be the one consulted
+  mkdirSync(path.join(w.home, ".claude"), { recursive: true });
+  writeFileSync(path.join(w.home, ".claude", "settings.json"), JSON.stringify({ model: "claude-sonnet-4" }));
+
+  const r = run(["claude"], w.env({ CLAUDE_CONFIG_DIR: configDir }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /\(fable\)/);
 });

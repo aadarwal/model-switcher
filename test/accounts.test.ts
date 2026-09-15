@@ -50,6 +50,15 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
 fi
 if [ "$1" = "setup-token" ]; then
   logcfg setup-token
+  if [ "$MS_TEST_TOKEN_SPLIT" = "1" ]; then
+    # Two writes that straddle the token prefix exactly: the first chunk ends
+    # with "sk-ant-oat01-" and carries no secret, the second carries the body.
+    printf 'Your token is sk-ant-oat01-'
+    sleep 0.2
+    printf '%s - copy it.\\n' "\${MS_TEST_TOKEN#sk-ant-oat01-}"
+    printf '%s\\n' "$MS_TEST_TOKEN"
+    exit 0
+  fi
   if [ "$MS_TEST_TOKEN_STREAM" = "stderr" ]; then
     printf '%s\\n' "$MS_TEST_BANNER" >&2
     [ "$MS_TEST_TOKEN_INLINE" = "1" ] && printf 'Your token is %s - copy it.\\n' "$MS_TEST_TOKEN" >&2
@@ -73,6 +82,10 @@ exit 3
 const SECURITY_STUB = `
 printf '%s\\n' "$*" >> "$MS_TEST_SECURITY_ARGV"
 printf 'security %s\\n' "$*" >> "$MS_TEST_TIMELINE"
+# An indeterminate probe: hangs past the caller's bound until a login has run.
+if [ "$MS_TEST_KEYCHAIN_HANG_BEFORE" = "1" ] && [ ! -f "$MS_TEST_MARKER" ]; then sleep 5; fi
+# ...and one that fails with a status that is NOT security's errSecItemNotFound.
+if [ -n "$MS_TEST_KEYCHAIN_ERR_BEFORE" ] && [ ! -f "$MS_TEST_MARKER" ]; then exit "$MS_TEST_KEYCHAIN_ERR_BEFORE"; fi
 # The account is whatever follows -a, compared EXACTLY: a substring match
 # would let the bare username stand in for the dir-scoped form built from it.
 prev=""; acct=""; wflag=0
@@ -102,6 +115,7 @@ type Opts = {
   probeOut?: string;
   tokenStream?: "stdout" | "stderr";
   tokenInline?: boolean;
+  tokenSplit?: boolean;
 };
 
 function scene(opts: Opts = {}) {
@@ -134,6 +148,7 @@ function scene(opts: Opts = {}) {
     MS_TEST_BANNER: BANNER,
     MS_TEST_TOKEN_STREAM: opts.tokenStream ?? "stdout",
     MS_TEST_TOKEN_INLINE: opts.tokenInline ? "1" : "0",
+    MS_TEST_TOKEN_SPLIT: opts.tokenSplit ? "1" : "0",
     MS_TEST_CRED: CRED,
     MS_TEST_NO_CRED_FILE: opts.noCredFile ? "1" : "0",
     MS_TEST_KEYCHAIN_OK: (opts.keychainOk ?? []).join(" "),
@@ -312,6 +327,20 @@ test("a token sharing a line with other text is redacted before that line is for
   }
 });
 
+test("a token split across two writes at the prefix boundary never reaches stderr", () => {
+  const s = scene({ tokenSplit: true });
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 0, r.stderr);
+  const all = r.stdout + r.stderr;
+  assert.equal(all.includes(TOKEN), false, "the whole token reached the human");
+  // the body alone is just as bad: the prefix is public, the rest is the secret
+  assert.equal(all.includes(TOKEN.slice("sk-ant-oat01-".length)), false, "the token body reached the human");
+  // the line IS forwarded, once its newline arrives, with the token scrubbed
+  assert.match(r.stderr, /Your token is sk-ant-oat01-<redacted> - copy it\./);
+  assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), TOKEN);
+});
+
 // --- the launch-token probe --------------------------------------------
 
 test("a launch token that cannot answer the headless check is an error, recorded unverified", () => {
@@ -390,6 +419,52 @@ test("a bare-username item that pre-dates the login is never bound to the accoun
   assert.equal(existsSync(path.join(s.configDir("gmail"), "keychain-account")), false);
   assert.equal(existsSync(s.tokenFile("gmail")), false);
   assert.equal(s.row("gmail").orgId, null);
+});
+
+test("an indeterminate pre-login probe counts as present, so the bare form stays refused", () => {
+  // The snapshot probe times out; the same account answers after the login.
+  // Reading that as "newly created" would bind gmail to whatever was already
+  // there, so an unreadable probe must fail SHUT, not open.
+  const s = scene({ noCredFile: true, keychainAfter: [BARE] });
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_HANG_BEFORE: "1" });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /could not locate the poll credential for gmail/);
+  assert.match(r.stderr, /cannot be attributed to/);
+  assert.equal(existsSync(path.join(s.configDir("gmail"), "keychain-account")), false);
+  assert.equal(existsSync(s.tokenFile("gmail")), false);
+});
+
+test("a pre-login probe that fails with anything but 'not found' also counts as present", () => {
+  // 44 is security's errSecItemNotFound, and it is the ONLY status that means
+  // absent. Any other failure is "could not tell", which must not read as no.
+  const s = scene({ noCredFile: true, keychainAfter: [BARE] });
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_ERR_BEFORE: "1" });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /could not locate the poll credential for gmail/);
+  assert.match(r.stderr, /cannot be attributed to/);
+  assert.equal(existsSync(path.join(s.configDir("gmail"), "keychain-account")), false);
+});
+
+test("a keychain item that is genuinely absent before the login is attributable after it", () => {
+  // The other side of the same rule: exit 44 really does mean absent, so a
+  // form that appears afterwards is this login's and must be accepted.
+  const s = scene({ noCredFile: true, keychainAfter: [BARE] });
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_ERR_BEFORE: "44" });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(readFileSync(path.join(s.configDir("gmail"), "keychain-account"), "utf8").trim(), BARE);
+});
+
+test("a scoped form that answers after the login beats a bare form that answered before it", () => {
+  const s = scene({ noCredFile: true, keychainOk: [BARE] });
+  const scoped = s.scopedAccount("gmail");
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: scoped });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(readFileSync(path.join(s.configDir("gmail"), "keychain-account"), "utf8").trim(), scoped);
+  assert.equal(s.row("gmail").orgId, "org-1");
 });
 
 test("accounts login fails loudly when no candidate keychain account answers", () => {

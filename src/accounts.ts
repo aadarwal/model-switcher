@@ -116,15 +116,6 @@ function redact(s: string): string {
   return s.replace(new RegExp(`${TOKEN_PREFIX}[A-Za-z0-9_-]+`, "g"), `${TOKEN_PREFIX}<redacted>`);
 }
 
-/** Could this unterminated output still become a token line? Used to hold
- *  back a half-arrived token while letting a prompt without a trailing
- *  newline (`Paste the token: `) reach the human immediately. */
-function couldBeTokenStart(s: string): boolean {
-  const t = s.trimStart();
-  if (!t) return false;
-  return t.length < TOKEN_PREFIX.length ? TOKEN_PREFIX.startsWith(t) : t.startsWith(TOKEN_PREFIX);
-}
-
 // --- Registry helpers --------------------------------------------------
 
 /** A row `validateRegistry` skipped is dropped the next time the file is
@@ -200,10 +191,10 @@ function runAuthLogin(name: string, dir: string): void {
 /** `claude setup-token`, streamed.
  *
  *  Both output streams are piped and scanned, because a CLI is free to put
- *  its prompts on either and its answer on either. Every line that is not a
- *  token is forwarded to the human's stderr AS IT ARRIVES, so the browser and
- *  paste prompts stay visible; a token line is captured and never forwarded,
- *  and anything else that happens to carry a token is redacted first. stdin
+ *  its prompts on either and its answer on either. The unit of forwarding is
+ *  a LINE, never a chunk: a line that is a token is captured and dropped, and
+ *  every other line is redacted and written to the human's stderr as soon as
+ *  its newline arrives, so the browser prompt and the URL stay visible. stdin
  *  stays with the human so a paste prompt still works. */
 async function mintLaunchToken(name: string, dir: string): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
@@ -236,12 +227,15 @@ async function mintLaunchToken(name: string, dir: string): Promise<string> {
         pending[which] = pending[which].slice(i + 1);
         handleLine(line);
       }
-      // An unterminated prompt reaches the human now; a half-arrived token waits.
-      if (pending[which] && !couldBeTokenStart(pending[which])) {
-        forward(pending[which]);
-        pending[which] = "";
-      }
+      // Whatever has no newline yet waits for one. A FRAGMENT is never
+      // forwarded: redaction can only work on a whole line, and a chunk
+      // boundary can fall anywhere — `Your token is sk-ant-oat01-` carries no
+      // secret to scrub and leaves none of the prefix for the next chunk to
+      // match, so forwarding it would print the token across two writes.
     };
+    // At exit there will be no newline coming: the trailing partial line is
+    // handled exactly like a complete one — captured if it is a token,
+    // redacted and forwarded otherwise.
     const flush = () => {
       for (const which of ["stdout", "stderr"] as const) {
         if (!pending[which]) continue;
@@ -353,15 +347,33 @@ function readKeychainNote(dir: string): string | null {
   }
 }
 
-/** Does an item exist under this account string? An EXISTENCE probe: no `-w`,
- *  so the secret is never asked for and never lands in this process. */
-function keychainItemExists(acct: string): boolean {
+/** Is there an item under this account string? An EXISTENCE probe: no `-w`,
+ *  so the secret is never asked for and never lands in this process.
+ *
+ *  Tri-state on purpose. `security` exits 44 for "the specified item could not
+ *  be found in the keychain" — the only answer that actually means absent. A
+ *  spawn failure, a timeout on a locked keychain, or any other status means we
+ *  COULD NOT TELL, and the difference matters: see snapshotAmbientAccounts. */
+type KeychainProbe = "present" | "absent" | "unknown";
+/** `security`'s errSecItemNotFound. */
+const KEYCHAIN_NOT_FOUND = 44;
+
+function probeKeychainItem(acct: string): KeychainProbe {
   const r = spawnSync("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct], {
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
     timeout: KEYCHAIN_TIMEOUT_MS,
   });
-  return !r.error && r.status === 0;
+  if (r.error) return "unknown";
+  if (r.status === 0) return "present";
+  if (r.status === KEYCHAIN_NOT_FOUND) return "absent";
+  return "unknown";
+}
+
+/** The boolean the readers want: only a definite "present" is an item. An
+ *  unreadable probe is not an item to bind to, adopt or report. */
+function keychainItemExists(acct: string): boolean {
+  return probeKeychainItem(acct) === "present";
 }
 
 function candidateAccounts(dir: string): { acct: string; scoped: boolean }[] {
@@ -380,7 +392,14 @@ function candidateAccounts(dir: string): { acct: string; scoped: boolean }[] {
  *  it has nothing to do with. */
 function snapshotAmbientAccounts(dir: string): Set<string> {
   const seen = new Set<string>();
-  for (const c of candidateAccounts(dir)) if (!c.scoped && keychainItemExists(c.acct)) seen.add(c.acct);
+  for (const c of candidateAccounts(dir)) {
+    if (c.scoped) continue;
+    // Anything but a definite "absent" counts as already there. This snapshot
+    // exists to answer "did THIS login create it?", and a probe that merely
+    // failed cannot say no — failing open here would hand the account the
+    // operator's own default credential on nothing more than a flaky read.
+    if (probeKeychainItem(c.acct) !== "absent") seen.add(c.acct);
+  }
   return seen;
 }
 

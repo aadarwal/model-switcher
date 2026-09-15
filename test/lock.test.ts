@@ -210,31 +210,35 @@ test("withLock never enters after its wait has expired", async () => {
   }
 });
 
-test("withLock makes no attempt once the deadline has passed", async () => {
-  // The test above passes either way: with waitMs 40 the lock is still held at
-  // every attempt, so checking the deadline after the attempt reaches the same
-  // verdict. This one separates them.
-  //
-  // waitMs is NOT a multiple of intervalMs, so the last attempt (~900) is a
-  // clean interval short of the deadline and the final wake-up exists only to
-  // make the deadline check. Attempts land at ~0/300/600/900; the holder
-  // releases at 960, after the last attempt and before the ~1000 check. A
-  // correct withLock never attempts again, so it never sees the lock go free;
-  // one that attempts before checking takes it at ~1000 and enters fn after its
-  // wait expired. (The final sleep is rounded up in the implementation, so it
-  // cannot end a fraction of a millisecond early and turn this into a
-  // coin toss — the flake the first version of this test hit.)
+test("withLock gives up at its own deadline, not at the holder's convenience", async () => {
+  // The holder keeps the lock until well AFTER the wait expires, so there is
+  // no instant at which a correct implementation and a broken one could
+  // disagree by a few milliseconds of timer drift: whatever the scheduling,
+  // every attempt inside the wait finds the lock held, and the only question
+  // left is whether the waiter stopped at ITS deadline or sat on for the
+  // holder. (The previous version of this test released the lock 40 ms before
+  // the deadline and asked which side of it four sqlite-backed attempts landed
+  // on — a coin toss on a loaded machine, and the class of flake this module's
+  // ledger already records once.)
   useTempHome();
   const held = acquire("busy");
   assert.ok(held);
-  const timer = setTimeout(() => held(), 960);
+  let released = false;
+  const timer = setTimeout(() => {
+    held();
+    released = true;
+  }, 1_300);
   let entered = false;
+  const t0 = performance.now();
   try {
     await assert.rejects(
-      withLock("busy", () => { entered = true; }, { waitMs: 1_000, intervalMs: 300 }),
-      (e: unknown) => e instanceof Locked,
+      withLock("busy", () => { entered = true; }, { waitMs: 1_000, intervalMs: 200 }),
+      (e: unknown) => e instanceof Locked && e.name === "Locked",
     );
-    assert.equal(entered, false, "the deadline was checked before the attempt, not after");
+    const elapsed = performance.now() - t0;
+    assert.equal(entered, false, "fn was entered although the lock was never free");
+    assert.equal(released, false, "it waited for the holder to let go instead of for its own deadline");
+    assert.ok(elapsed >= 1_000, `it gave up after ${Math.round(elapsed)}ms, before its own 1000ms deadline`);
   } finally {
     clearTimeout(timer);
     held();

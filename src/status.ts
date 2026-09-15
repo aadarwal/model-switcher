@@ -156,7 +156,7 @@ function table(headers: string[], rows: string[][]): string[] {
   return [line(headers), ...rows.map(line)];
 }
 
-type JsonOutput = { accounts: AccountUsage[]; sessions: SessionRow[]; takenAt: number };
+type JsonOutput = { accounts: AccountUsage[]; sessions: SessionRow[]; takenAt: number | null };
 
 async function render(json: boolean): Promise<string> {
   const { registry, parseError } = loadRegistry();

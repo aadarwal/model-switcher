@@ -5,6 +5,7 @@ import { execLaunch } from "./exec.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
 import { launchClaude } from "./launch.ts";
 import { recoverVerb } from "./recover.ts";
+import { status } from "./status.ts";
 
 export type Verb = (args: string[]) => Promise<number>;
 const verbs = new Map<string, Verb>();
@@ -14,6 +15,7 @@ registerVerb("_exec", execLaunch);
 registerVerb("_hook", async ([which]) => (which === "claude" ? claudeHook() : 0));
 registerVerb("claude", launchClaude);
 registerVerb("_recover", recoverVerb);
+registerVerb("status", status);
 
 const USAGE = `usage: ms <verb> [args]
   setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach

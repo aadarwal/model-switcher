@@ -19,8 +19,11 @@ export function pickAccounts(inputs: PickInput[], need: Need, exclude: string[] 
     if (exclude.includes(a.name)) { out.push({ name: a.name, why: "excluded" }); continue; }
     if (a.error) { out.push({ name: a.name, why: `error: ${a.error}` }); continue; }
     if (!a.session) { out.push({ name: a.name, why: "no session window" }); continue; }
+    if (!Number.isFinite(a.session.usedPercent)) { out.push({ name: a.name, why: "malformed session percent" }); continue; }
     if (!a.weeklyAll) { out.push({ name: a.name, why: "no weekly window" }); continue; }
+    if (!Number.isFinite(a.weeklyAll.usedPercent)) { out.push({ name: a.name, why: "malformed weekly percent" }); continue; }
     if (need === "fable" && !a.weeklyFable) { out.push({ name: a.name, why: "no fable window" }); continue; }
+    if (need === "fable" && !Number.isFinite(a.weeklyFable!.usedPercent)) { out.push({ name: a.name, why: "malformed fable percent" }); continue; }
     if (a.session.usedPercent >= 100) { out.push({ name: a.name, why: "session window at 100" }); continue; }
     if (a.weeklyAll.usedPercent >= 100) { out.push({ name: a.name, why: "weekly window at 100" }); continue; }
     if (need === "fable" && a.weeklyFable!.usedPercent >= 100) { out.push({ name: a.name, why: "fable window at 100" }); continue; }

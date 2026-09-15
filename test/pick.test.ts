@@ -49,6 +49,26 @@ test("exclude and error", () => {
   assert.deepEqual(r.out.map((o) => o.why), ["excluded", "error: token dead"]);
 });
 
+test("an excluded name that also has an error reports only excluded", () => {
+  const r = pickAccounts([acct("a", { error: "token dead" })], "any", ["a"]);
+  assert.deepEqual(r.out, [{ name: "a", why: "excluded" }]);
+});
+
+test("a non-finite usedPercent is malformed, not eligible", () => {
+  const rSession = pickAccounts([acct("s", { session: w(NaN) })], "any");
+  assert.deepEqual(rSession.out, [{ name: "s", why: "malformed session percent" }]);
+
+  const rWeekly = pickAccounts(
+    [acct("w", { weeklyAll: { usedPercent: "80" as unknown as number, resetsAt: null } })],
+    "any",
+  );
+  assert.deepEqual(rWeekly.out, [{ name: "w", why: "malformed weekly percent" }]);
+
+  const fableBad = acct("f", { weeklyFable: { usedPercent: NaN, resetsAt: null } });
+  assert.deepEqual(pickAccounts([fableBad], "fable").out, [{ name: "f", why: "malformed fable percent" }]);
+  assert.equal(pickAccounts([fableBad], "any").picks.length, 1);
+});
+
 test("parseNeed", () => {
   assert.equal(parseNeed(undefined), "any"); assert.equal(parseNeed("fable"), "fable"); assert.equal(parseNeed("fabel"), null);
 });

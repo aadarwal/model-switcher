@@ -15,12 +15,13 @@ const SESSION_BASE = {
  * returns the env `run()` needs to see the same store and stub PATH. */
 async function seedLaunch(opts: {
   home: string; msHome: string; account?: string; generation?: number; env?: Record<string, string>;
+  skipSession?: boolean;
 }) {
   const account = opts.account ?? "gmail";
   process.env.HOME = opts.home; process.env.MS_HOME = opts.msHome;
   const { openState } = await import("../src/state.ts");
   const st = openState();
-  st.createSession({ id: "s1", ...SESSION_BASE, account, generation: opts.generation ?? 2 });
+  if (!opts.skipSession) st.createSession({ id: "s1", ...SESSION_BASE, account, generation: opts.generation ?? 2 });
   st.createLaunch({
     id: "L1", sessionId: "s1", generation: opts.generation ?? 2, account,
     command: ["claude", "--resume", "c-1", "hello"], env: opts.env ?? {}, createdAt: Math.floor(Date.now() / 1000),
@@ -62,9 +63,33 @@ test("_exec sets the environment and execs the CLI in place, with the token neve
   assert.equal(lines.ARGS, "--resume c-1 hello");
   assert.equal(lines.FOO, "bar");
   assert.match(lines.MS_BIN, /bin\/ms$/);
-  // the credential lives only in the environment, never in argv
+  // The credential lives only in the environment, never in argv. Note the stub's `$0`
+  // is bash's own report of the path the kernel exec'd (not something `_exec` writes),
+  // so this line only proves "no token on argv" — it says nothing about which path was
+  // resolved; that's covered separately by the "not found on PATH" test below, which
+  // does exercise PATH resolution end to end.
   assert.equal(lines.ARGV0.includes(SAMPLE_TOKEN), false);
   assert.equal(lines.ARGS.includes(SAMPLE_TOKEN), false);
+});
+
+test("launch.env cannot shadow the token or MS_* identity variables", async () => {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  await seedLaunch({ home, msHome, env: { MS_ACCOUNT: "evil", CLAUDE_CODE_OAUTH_TOKEN: "evil-token", MS_SESSION: "evil-session" } });
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  saveLaunchToken("gmail", SAMPLE_TOKEN);
+  stub("claude", STUB_SCRIPT);
+
+  const r = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+
+  assert.equal(r.code, 0, r.stderr);
+  const lines = Object.fromEntries(
+    r.stdout.trim().split("\n").map((l) => { const i = l.indexOf("="); return [l.slice(0, i), l.slice(i + 1)]; }),
+  );
+  // the real values always win, regardless of what a launch.env entry claims
+  assert.equal(lines.MS_ACCOUNT, "gmail");
+  assert.equal(lines.TOKEN, SAMPLE_TOKEN);
+  assert.equal(lines.MS_SESSION, "s1");
 });
 
 test("a missing launch token exits 3 and stderr names only the account", async () => {
@@ -85,6 +110,21 @@ test("a missing launch row exits 3 with a one-line message", async () => {
 
   assert.equal(r.code, 3);
   assert.equal(r.stderr.trim().split("\n").length, 1);
+});
+
+test("a missing session row exits 3 naming the launch/session id, no token anywhere", async () => {
+  const { home, msHome } = tempHome();
+  await seedLaunch({ home, msHome, account: "gmail", skipSession: true });
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  saveLaunchToken("gmail", SAMPLE_TOKEN);
+
+  const r = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome });
+
+  assert.equal(r.code, 3);
+  assert.equal(r.stderr.trim().split("\n").length, 1);
+  assert.match(r.stderr, /L1/);
+  assert.match(r.stderr, /s1/);
+  assert.equal(r.stderr.includes(SAMPLE_TOKEN), false);
 });
 
 test("a CLI not found on PATH exits 3 naming the binary", async () => {

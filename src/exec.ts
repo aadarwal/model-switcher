@@ -70,18 +70,27 @@ export const execLaunch: Verb = async (args) => {
   }
 
   const session = st.getSession(launch.sessionId);
+  if (!session) {
+    st.close();
+    process.stderr.write(`ms _exec: no session ${launch.sessionId} for launch ${launch.id}\n`);
+    return 3;
+  }
   st.close();
 
+  // Strip the conflicting provider vars, then layer launch.env (non-secret
+  // extras recorded at launch) *before* the token and the identity
+  // variables below — never after, so a launch.env entry (whatever wrote
+  // it) can never shadow the real credential or MS_* identity.
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of STRIP_ENV_KEYS) delete env[key];
+  for (const [k, v] of Object.entries(launch.env)) env[k] = v;
   env.CLAUDE_CODE_OAUTH_TOKEN = token;
   env.MS_SESSION = launch.sessionId;
   env.MS_GENERATION = String(launch.generation);
-  env.MS_SOCKET = session?.socket ?? "";
-  env.MS_PANE = session?.pane ?? "";
+  env.MS_SOCKET = session.socket;
+  env.MS_PANE = session.pane;
   env.MS_ACCOUNT = launch.account;
   env.MS_BIN = msBinary();
-  for (const [k, v] of Object.entries(launch.env)) env[k] = v;
 
   execve(cli, [cli, ...launch.command.slice(1)], env);
   return 0; // unreachable: a successful execve replaces this process image

@@ -16,7 +16,8 @@
 //
 // Error contract, for the callers that have to decide what to do next:
 //   AuthError      the credential is dead — re-login (400/401/403, invalid_grant)
-//   TransientError try again later (429, 5xx, timeouts, network, non-JSON)
+//   TransientError try again later (429, 5xx, timeouts, network, non-JSON);
+//                  carries `retryAfterMs` when the response said how long
 //   Error          anything else: neither retryable nor a reason to re-login
 // No token or credential value ever appears in a message or a log line here;
 // error text carries only a status and a URL path.
@@ -51,7 +52,44 @@ export class AuthError extends Error {
 }
 export class TransientError extends Error {
   override name = "TransientError";
+  /** What the endpoint asked us to wait, in milliseconds, when it said so
+   *  (`retry-after` on a 429 or a 503). Advisory and unbounded-by-us beyond a
+   *  day: a caller decides how long it is actually willing to sit out, and
+   *  src/snapshot.ts clamps it to 15 minutes. Absent when the response carried
+   *  no usable advice. */
+  retryAfterMs?: number;
+  constructor(message: string, retryAfterMs?: number) {
+    super(message);
+    if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs;
+  }
 }
+
+/** Nothing past this is advice worth carrying; `retry-after` is attacker- and
+ *  accident-reachable, and a header must never be able to park an account for
+ *  longer than the caller's own clamp would. */
+const RETRY_AFTER_MAX_MS = 86_400_000;
+
+/** `retry-after`, per RFC 9110 §10.2.3: either delta-seconds or an HTTP-date.
+ *  Bounded parse — absent, malformed, non-positive or absurd all read as "no
+ *  advice" (undefined) rather than as zero, so a caller can tell "wait this
+ *  long" from "it did not say". */
+export function parseRetryAfter(value: string | null, now: number = Date.now()): number | undefined {
+  if (value === null) return undefined;
+  const raw = value.trim();
+  if (raw === "") return undefined;
+  let ms: number;
+  if (/^\d{1,9}$/.test(raw)) {
+    ms = Number(raw) * 1000;
+  } else {
+    const at = Date.parse(raw);
+    if (!Number.isFinite(at)) return undefined;
+    ms = at - now;
+  }
+  if (!Number.isFinite(ms) || ms <= 0) return undefined;
+  return Math.min(ms, RETRY_AFTER_MAX_MS);
+}
+
+const retryAfterOf = (res: Response): number | undefined => parseRetryAfter(res.headers.get("retry-after"));
 
 export type PollCredentials = {
   accessToken: string;
@@ -221,7 +259,9 @@ export async function refreshPollCredentials(
     if (res.status === 400 || res.status === 401 || res.status === 403) {
       throw new AuthError(`refresh rejected (${res.status})`);
     }
-    if (res.status === 429 || res.status >= 500) throw new TransientError(`refresh failed (${res.status})`);
+    if (res.status === 429 || res.status >= 500) {
+      throw new TransientError(`refresh failed (${res.status})`, retryAfterOf(res));
+    }
     throw new Error(`refresh failed (${res.status})`);
   }
 
@@ -272,7 +312,9 @@ async function authed(url: string, c: PollCredentials, signal: AbortSignal): Pro
   if (res.status === 400 || res.status === 401 || res.status === 403) {
     throw new AuthError(`${res.status} from ${where}`);
   }
-  if (res.status === 429 || res.status >= 500) throw new TransientError(`${res.status} from ${where}`);
+  if (res.status === 429 || res.status >= 500) {
+    throw new TransientError(`${res.status} from ${where}`, retryAfterOf(res));
+  }
   if (!res.ok) throw new Error(`${res.status} from ${where}`);
   const raw = await res.text().catch(() => "");
   try {

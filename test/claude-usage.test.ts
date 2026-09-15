@@ -334,3 +334,52 @@ test("the refresh posts the proven grant, client id and headers to the token URL
   // The refresh sends no bearer: the grant IS the refresh token.
   assert.equal(headers.get("authorization"), null);
 });
+
+// `retry-after` is the only thing the endpoint ever tells us about WHEN to
+// come back. Dropping it (as this module did until now) left every caller
+// guessing, so the header is parsed here, at the only place that can see it,
+// and carried on the error. Bounded, because a header is not a promise: the
+// caller (src/snapshot.ts) clamps whatever it is told.
+test("parseRetryAfter reads delta-seconds and HTTP-dates, and refuses the rest", async (t) => {
+  env(t);
+  const { parseRetryAfter } = await import("../src/providers/claude-usage.ts");
+  const now = Date.parse("2026-09-15T12:00:00Z");
+
+  assert.equal(parseRetryAfter("120", now), 120_000);
+  assert.equal(parseRetryAfter(" 86400 ", now), 86_400_000);
+  assert.equal(parseRetryAfter("Tue, 15 Sep 2026 12:02:00 GMT", now), 120_000);
+  // Bounded: a year of delta-seconds is still only a day of advice.
+  assert.equal(parseRetryAfter("31536000", now), 86_400_000);
+  // "No advice" is undefined, never 0 — a caller must be able to tell them apart.
+  assert.equal(parseRetryAfter(null, now), undefined);
+  assert.equal(parseRetryAfter("", now), undefined);
+  assert.equal(parseRetryAfter("soon", now), undefined);
+  assert.equal(parseRetryAfter("-5", now), undefined);
+  assert.equal(parseRetryAfter("0", now), undefined);
+  // A date already past is not a wait.
+  assert.equal(parseRetryAfter("Tue, 15 Sep 2026 11:59:00 GMT", now), undefined);
+});
+
+test("a 429 carries its retry-after to the caller, on both endpoints", async (t) => {
+  env(t);
+  const { fetchUsage, refreshPollCredentials, TransientError } =
+    await import("../src/providers/claude-usage.ts");
+  const c = { accessToken: "at", refreshToken: "rt", expiresAt: 0, source: "file" as const };
+
+  globalThis.fetch = (async () =>
+    new Response("slow down", { status: 429, headers: { "retry-after": "86400" } })) as typeof fetch;
+  const usageErr = await fetchUsage(c, AbortSignal.timeout(1000)).then(() => null, (e: unknown) => e);
+  assert.ok(usageErr instanceof TransientError);
+  assert.equal((usageErr as InstanceType<typeof TransientError>).retryAfterMs, 86_400_000);
+
+  const refreshErr = await refreshPollCredentials("gmail", c, AbortSignal.timeout(1000))
+    .then(() => null, (e: unknown) => e);
+  assert.ok(refreshErr instanceof TransientError);
+  assert.equal((refreshErr as InstanceType<typeof TransientError>).retryAfterMs, 86_400_000);
+
+  // A 503 that says nothing leaves the field absent, not zero.
+  globalThis.fetch = (async () => new Response("boom", { status: 503 })) as typeof fetch;
+  const quiet = await fetchUsage(c, AbortSignal.timeout(1000)).then(() => null, (e: unknown) => e);
+  assert.ok(quiet instanceof TransientError);
+  assert.equal((quiet as InstanceType<typeof TransientError>).retryAfterMs, undefined);
+});

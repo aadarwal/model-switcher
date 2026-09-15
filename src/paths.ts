@@ -11,6 +11,7 @@ export const p = {
   get registry() { return sub("accounts.json"); },
   get state() { return sub("state.sqlite"); },
   get snapshot() { return sub("snapshot.json"); },
+  get lastPick() { return sub("last-pick.json"); },
   get locks() { return sub("locks"); },
   sessionDir: (id: string) => sub("sessions", id),
   eventsFile: (id: string) => sub("sessions", id, "events.jsonl"),

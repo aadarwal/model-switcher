@@ -7,7 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { tempHome } from "./helpers.ts";
-import { acquire, lockedBy, withLock, Locked } from "../src/lock.ts";
+import { acquire, lockedBy, sweepStaleLocks, withLock, Locked } from "../src/lock.ts";
 
 /** A fresh MS_HOME per test; every path these tests touch is under it. */
 function useTempHome(): { home: string; msHome: string } {
@@ -274,4 +274,20 @@ test("only one of eight racing processes takes the lock", async () => {
     assert.equal(readdirSync(path.join(sync, "attempted")).length, N, "all eight really attempted");
     assert.equal(lockedBy("race"), null, "the winner released on its way out");
   });
+});
+
+test("sweepStaleLocks removes only the rows whose holder is gone", () => {
+  const { msHome } = useTempHome();
+  plant(msHome, "session-s1", deadPid(), nowSec() - 5);
+  plant(msHome, "session-s2", process.pid, nowSec() - 5);
+  // Not stale by age: sweeping is about a holder that cannot come back, not a
+  // slow one. A long-running holder is still a holder.
+  plant(msHome, "handoffs", process.pid, nowSec() - 86_400);
+
+  assert.deepEqual(sweepStaleLocks().sort(), ["session-s1"]);
+
+  assert.equal(lockedBy("session-s1"), null);
+  assert.equal(lockedBy("session-s2")!.pid, process.pid);
+  assert.equal(lockedBy("handoffs")!.pid, process.pid);
+  assert.deepEqual(sweepStaleLocks(), [], "a second sweep has nothing left to do");
 });

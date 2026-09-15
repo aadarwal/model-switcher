@@ -209,3 +209,43 @@ function locked(name: string): Locked {
   const who = by ? ` (pid ${by.pid}, since ${new Date(by.since * 1000).toISOString()})` : "";
   return new Locked(`another process holds the '${name}' lock${who}`);
 }
+
+/**
+ * Remove every lock whose holder pid is gone, and report their names. This is
+ * reconciliation's (a): `ms` processes are short lived and nothing of ours
+ * stays resident, so a killed worker leaves its row behind with no one to
+ * clean it up, and the next process to want that name would wait out the full
+ * `staleAfterMs` for a holder that cannot come back.
+ *
+ * Age is deliberately NOT a reason to sweep: a slow holder is still a holder,
+ * and only the caller that is actually waiting (via `acquire`'s
+ * `staleAfterMs`) may decide a live one has taken too long.
+ *
+ * One `BEGIN IMMEDIATE` transaction for the whole sweep, so read-decide-delete
+ * is indivisible against a concurrent `acquire`; the `pid` predicate on the
+ * DELETE is the same belt-and-braces as `release()`.
+ */
+export function sweepStaleLocks(): string[] {
+  return withDb((db) => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const removed: string[] = [];
+      for (const raw of db.prepare("SELECT name, pid FROM locks").all()) {
+        const name = String(raw.name);
+        const pid = Number(raw.pid);
+        if (alive(pid)) continue;
+        db.prepare("DELETE FROM locks WHERE name = ? AND pid = ?").run(name, pid);
+        removed.push(name);
+      }
+      db.exec("COMMIT");
+      return removed;
+    } catch (e) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* the transaction is already finished */
+      }
+      throw e;
+    }
+  });
+}

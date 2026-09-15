@@ -157,15 +157,92 @@ export function readPollCredentials(name: string): PollCredentials | null {
 
 // --- Refresh, with write-back -----------------------------------------
 
-/** Atomic, best-effort, never throws: a refresh that landed must not be lost
- *  to a write problem, and the write-back signal is a note, not an error (the
- *  dashboard learned this — an errored account drops out of the pool). The
- *  caller holds the fresh credential in memory either way. */
+/**
+ * Put the refreshed credential back where it came from. Best-effort, never
+ * throws: a refresh that landed must not be lost to a write problem, and the
+ * write-back signal is a note, not an error (the dashboard learned this — an
+ * errored account drops out of the pool). The caller holds the fresh
+ * credential in memory either way.
+ *
+ * Not writing it back at all is what a resident process can afford and a
+ * one-shot `ms` cannot: the token endpoint ROTATES the refresh token, so the
+ * credential we were handed is spent the moment we exit, and the next poll
+ * reads the old one out of the keychain and gets `invalid_grant` — an account
+ * that reads `auth`, drops out of the pool and stays out until a re-login.
+ */
 function writeBack(name: string, c: PollCredentials): boolean {
-  // A keychain write-back would put the secret on `security`'s argv, where
-  // every process on the box can read it; Claude Code's own refresh keeps that
-  // copy fresh, so we simply re-read it next time.
-  if (c.source !== "file") return true;
+  if (c.source === "keychain") {
+    if (writeKeychain(name, c)) return true;
+    // The file is what `readPollCredentials` prefers, so this is not a
+    // second-best copy — it is where the credential now lives.
+    const ok = writeCredFile(name, c);
+    if (process.env.MS_VERBOSE === "1") {
+      console.error(
+        `ms: could not write the refreshed Claude credentials for ${name} back to the keychain; ` +
+          `they are in ${credFile(name)} (0600) instead, which is where the poller looks first. ` +
+          `(No token value is ever logged.)`,
+      );
+    }
+    return ok;
+  }
+  return writeCredFile(name, c);
+}
+
+/** The keychain account this config dir's item is stored under, as
+ *  `ms accounts login` recorded it. No note ⇒ nothing to write to. */
+function keychainAccount(name: string): string | null {
+  try {
+    const acct = readFileSync(path.join(p.claudeConfigDir(name), "keychain-account"), "utf8").trim();
+    return acct || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Update the account's keychain item in place, keeping every other key in it
+ * (Claude Code owns the rest of that blob). Returns whether it landed.
+ *
+ * The secret never touches argv. `security add-generic-password -w <value>`
+ * would put it there, where any process on the box can read it out of `ps`;
+ * given as the LAST option with no value, `security` prompts instead and reads
+ * the password — the value, then a confirmation — from stdin, which nothing
+ * else can see. Bounded like every other `security` call here: a locked
+ * keychain puts up a GUI prompt nobody will answer, and a write we could not
+ * make is an ordinary answer (the file is the fallback), never a hang.
+ */
+function writeKeychain(name: string, c: PollCredentials): boolean {
+  const acct = keychainAccount(name);
+  if (!acct) return false;
+  const find = spawnSync("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct, "-w"], {
+    encoding: "utf8",
+    timeout: KEYCHAIN_TIMEOUT_MS,
+  });
+  // No readable item is no item to update: writing our three fields over it
+  // would drop whatever else Claude Code keeps in that blob.
+  if (find.status !== 0 || !find.stdout?.trim()) return false;
+  let blob: string;
+  try {
+    const parsed: unknown = JSON.parse(find.stdout.trim());
+    const j = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    const prev = (j.claudeAiOauth ?? {}) as Record<string, unknown>;
+    j.claudeAiOauth = { ...prev, accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt };
+    blob = JSON.stringify(j);
+  } catch {
+    return false;
+  }
+  const r = spawnSync("security", ["add-generic-password", "-U", "-a", acct, "-s", KEYCHAIN_SERVICE, "-w"], {
+    // The value and its confirmation, one line each: that is what the prompt
+    // asks for, in that order.
+    input: `${blob}\n${blob}\n`,
+    encoding: "utf8",
+    timeout: KEYCHAIN_TIMEOUT_MS,
+  });
+  return r.status === 0;
+}
+
+/** Atomic (temp + rename), 0600, never throws. */
+function writeCredFile(name: string, c: PollCredentials): boolean {
   const f = credFile(name);
   const tmp = `${f}.${process.pid}.tmp`;
   try {

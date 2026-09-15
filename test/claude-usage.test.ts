@@ -14,7 +14,7 @@
 
 import { test, after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { stubDir, tempHome } from "./helpers.ts";
 
@@ -212,21 +212,98 @@ test("refreshPollCredentials keeps unrelated keys in the credentials file", asyn
   assert.ok(written.claudeAiOauth.expiresAt > Date.now());
 });
 
-test("refreshPollCredentials never writes back a keychain-sourced credential", async (t) => {
+/** A keychain that really holds an item: `find` serves the vault file (the
+ *  seeded credential until something writes it), `add -U` takes the new value
+ *  off STDIN — the first of the two lines `security` prompts for — and every
+ *  argv line is logged so a test can prove no secret was ever on it. */
+function keychainScene(t: TestContext, opts: { writeFails?: boolean } = {}) {
   const { dir } = env(t);
-  const { readPollCredentials, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
   writeFileSync(path.join(dir, "keychain-account"), "aadarwal-abc123\n");
   const { stub, dir: bin } = stubDir();
+  const vault = path.join(dir, "vault.json");
+  const argv = path.join(dir, "security-argv.log");
+  writeFileSync(vault, JSON.stringify({ ...cred, otherThing: { keep: true } }));
+  writeFileSync(argv, "");
   process.env.PATH = `${bin}:${process.env.PATH}`;
-  stub("security", `case "$*" in *"-a aadarwal-abc123"*) printf '%s' '${JSON.stringify(cred)}' ;; *) exit 44 ;; esac`);
+  process.env.MS_TEST_VAULT = vault;
+  process.env.MS_TEST_SECURITY_ARGV = argv;
+  process.env.MS_TEST_KEYCHAIN_WRITE_FAILS = opts.writeFails ? "1" : "";
+  t.after(() => {
+    delete process.env.MS_TEST_VAULT;
+    delete process.env.MS_TEST_SECURITY_ARGV;
+    delete process.env.MS_TEST_KEYCHAIN_WRITE_FAILS;
+  });
+  stub(
+    "security",
+    `printf '%s\\n' "$*" >> "$MS_TEST_SECURITY_ARGV"
+case "$1" in
+  find-generic-password) case "$*" in *"-a aadarwal-abc123"*) cat "$MS_TEST_VAULT" ;; *) exit 44 ;; esac ;;
+  add-generic-password)
+    [ "$MS_TEST_KEYCHAIN_WRITE_FAILS" = "1" ] && exit 1
+    head -1 > "$MS_TEST_VAULT" ;;
+esac
+exit 0`,
+  );
+  return { dir, vault, argv: () => readFileSync(argv, "utf8") };
+}
+
+test("a refreshed keychain-sourced credential is written back to the keychain, never onto argv", async (t) => {
+  // The token endpoint rotates the refresh token, so a one-shot `ms` that only
+  // held the new one in memory left the OLD, spent one in the keychain: the
+  // next poll read it, got invalid_grant, and the account dropped out of the
+  // pool until a re-login. (A resident dashboard survives that; nothing here
+  // is resident.)
+  const scene = keychainScene(t);
+  const { readPollCredentials, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
   globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 3600 }), { status: 200 })) as typeof fetch;
+
   const c = readPollCredentials("gmail")!;
   assert.equal(c.source, "keychain");
   const c2 = await refreshPollCredentials("gmail", c, AbortSignal.timeout(1000));
   assert.equal(c2.accessToken, "at-2");
   assert.equal(c2.source, "keychain");
-  // Writing it would put the secret on `security`'s argv; the CLI owns that copy.
-  assert.equal(readPollCredentials("gmail")!.source, "keychain");
+
+  const stored = JSON.parse(readFileSync(scene.vault, "utf8"));
+  assert.equal(stored.claudeAiOauth.refreshToken, "rt-2", "the rotated refresh token is the one the keychain now holds");
+  assert.equal(stored.claudeAiOauth.accessToken, "at-2");
+  assert.deepEqual(stored.otherThing, { keep: true }, "and the rest of Claude Code's own blob is kept");
+  const seen = readPollCredentials("gmail")!;
+  assert.equal(seen.source, "keychain", "no stray file was left beside it");
+  assert.equal(seen.refreshToken, "rt-2");
+
+  // argv is world-readable through `ps`. `-w` is passed as the last option
+  // with no value, so the blob goes in on stdin.
+  const argv = scene.argv();
+  assert.equal(argv.includes("rt-2"), false, argv);
+  assert.equal(argv.includes("at-2"), false, argv);
+  assert.match(argv, /add-generic-password -U -a aadarwal-abc123 -s Claude Code-credentials -w$/m);
+});
+
+test("a keychain write that fails leaves the refreshed credential in the file the poller prefers", async (t) => {
+  const scene = keychainScene(t, { writeFails: true });
+  process.env.MS_VERBOSE = "1";
+  t.after(() => delete process.env.MS_VERBOSE);
+  const said: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => void said.push(args.join(" "));
+  t.after(() => {
+    console.error = originalError;
+  });
+
+  const { readPollCredentials, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
+  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 3600 }), { status: 200 })) as typeof fetch;
+  await refreshPollCredentials("gmail", readPollCredentials("gmail")!, AbortSignal.timeout(1000));
+
+  const file = path.join(scene.dir, ".credentials.json");
+  const written = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(written.claudeAiOauth.refreshToken, "rt-2");
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  // The file is where readPollCredentials looks FIRST, so the credential now
+  // lives there rather than in a keychain item nothing will read again.
+  assert.equal(readPollCredentials("gmail")!.source, "file");
+  assert.equal(said.length, 1, said.join("\n"));
+  assert.match(said[0]!, /could not write the refreshed Claude credentials for gmail back to the keychain/);
+  assert.equal(said[0]!.includes("rt-2"), false, "no token value is ever logged");
 });
 
 test("refresh rejections: invalid_grant and 400/401 are auth, 5xx is transient", async (t) => {

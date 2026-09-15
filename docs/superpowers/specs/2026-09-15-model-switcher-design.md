@@ -58,7 +58,7 @@ Deferred until the live matrix passes (§13): `ms dashboard` (localhost page ove
   accounts.json           registry: name, provider, label, organisation id (identity), credential refs
   claude/<name>/          the poll grant's config dir (CLAUDE_CONFIG_DIR for `claude auth login`)
   codex/<name>/           CODEX_HOME for that account
-  launch/<name>.token     Claude setup-token, 0600 (or in the keychain; default on)
+  launch/<name>.token     Claude setup-token, 0600 (keychain storage deferred: the `security` tool takes secrets on argv)
   state.sqlite            sessions, generations, pending recovery, attempts, wake-ups, continuation ack
   sessions/<id>/events.jsonl   audit log written by hooks and workers
   sessions/<id>/recover.log    worker output (never shown in the pane)
@@ -137,12 +137,12 @@ Screen text (`tmux capture-pane`) is read only to name the wall's kind (session,
 - Prerequisites check: `claude` and `codex` versions against the tested range; tmux version; the hooks' absolute paths.
 - Accounts: "How many Claude accounts?" then per account: a name, the poll login (browser), the launch token (`claude setup-token`, captured, never shown), identity verification, and a headless one-shot to prove the launch works. Then "How many ChatGPT accounts?" and per account `codex login` (device-auth offered when headless). Duplicate organisations are refused.
 - Hooks: merge only the `hooks` entries into `~/.claude/settings.json` (backup first; a plain file whose other keys are preserved) and install the Codex hooks file, then obtain Codex's trust for them; verify with a throwaway session that a `started` event arrives.
-- Options, each yes/no, off by default: a statusline badge showing the account (merged into the existing statusline command with a backup); a shell alias (`alias claude='ms claude'`, `codex` likewise) appended to the user's rc file; keychain storage for launch tokens (on by default).
+- Options, each yes/no, off by default: a statusline badge showing the account (merged into the existing statusline command with a backup); a shell alias (`alias claude='ms claude'`, `codex` likewise) appended to the user's rc file.
 - Finish with `ms doctor` and `ms status`.
 
 ## 11. Security
 
-No secret on argv, in a tmux command, in a tmux environment, in a log, or in the pane. `ms _exec` reads the credential from the store or the keychain and puts it only in the CLI's environment. Rotation logs may contain pane screen text; the store is 0700. `ms accounts token` is the one verb that prints a secret.
+No secret on argv, in a tmux command, in a tmux environment, in a log, or in the pane. `ms _exec` reads the credential from the store and puts it only in the CLI's environment. Rotation logs may contain pane screen text; the store is 0700. `ms accounts token` is the one verb that prints a secret.
 
 ## 12. Release gates and spikes (in this order, each with pass/fail)
 

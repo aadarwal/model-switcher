@@ -5,7 +5,7 @@
  * milliseconds (`now()` below floors `Date.now() / 1000`).
  */
 import { DatabaseSync } from "node:sqlite";
-import { chmodSync, existsSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, openSync } from "node:fs";
 import { ensureStore, p } from "./paths.ts";
 
 export type Provider = "claude" | "codex";
@@ -183,12 +183,19 @@ export class State {
 
 export function openState(): State {
   ensureStore();
+  // Create the file ourselves, at 0600, before SQLite can — exactly as
+  // src/lock.ts does for locks.sqlite. Letting SQLite create it means it is
+  // born 0644 (minus umask) and stays world-readable until the chmod below
+  // lands: a window, however short, in which every session's id, account and
+  // cwd is readable by anything on the box. `open(…, "a")` on a file that is
+  // already there changes nothing about it.
+  closeSync(openSync(p.state, "a", 0o600));
   const db = new DatabaseSync(p.state);
-  // Chmod the main file unconditionally — a pre-existing file (created by
-  // an older build, or anything else) may be 0644 — and do it BEFORE
-  // enabling WAL: SQLite copies the main db file's permissions onto the
-  // -wal/-shm sidecar files at the moment it creates them, so chmodding
-  // first means those sidecars are born 0600 rather than inheriting umask.
+  // Chmod unconditionally all the same — a pre-existing file (created by an
+  // older build, or anything else) may be 0644 — and do it BEFORE enabling
+  // WAL: SQLite copies the main db file's permissions onto the -wal/-shm
+  // sidecar files at the moment it creates them, so chmodding first means
+  // those sidecars are born 0600 rather than inheriting umask.
   chmodSync(p.state, 0o600);
   for (const suffix of ["-wal", "-shm"]) {
     const f = `${p.state}${suffix}`;

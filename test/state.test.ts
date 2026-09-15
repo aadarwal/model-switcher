@@ -98,6 +98,26 @@ test("updateSession whitelists columns: unknown keys and injected column syntax 
   st.close();
 });
 
+test("the state file is 0600 from the moment it exists, whatever the umask", async () => {
+  // src/lock.ts's pattern: create it ourselves at 0600 rather than letting
+  // SQLite create it 0644-minus-umask and chmod it afterwards. Under a
+  // permissive umask that gap is a window in which every session's id,
+  // account and cwd is readable by anything on the box. The umask is set to 0
+  // here so the creation mode is the ONLY thing deciding the answer.
+  const { home, msHome } = tempHome();
+  process.env.HOME = home;
+  process.env.MS_HOME = msHome;
+  const previous = process.umask(0o000);
+  try {
+    const { openState } = await import("../src/state.ts");
+    const st = openState();
+    assert.equal(statSync(`${msHome}/state.sqlite`).mode & 0o777, 0o600);
+    st.close();
+  } finally {
+    process.umask(previous);
+  }
+});
+
 test("openState chmods a pre-existing 0644 state file to 0600", async () => {
   const { home, msHome } = tempHome();
   process.env.HOME = home; process.env.MS_HOME = msHome;

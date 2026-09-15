@@ -347,6 +347,24 @@ test("rotate hands a walled pane to the next account and continues the work", as
   assert.match(say(), /^ms: s1 rotated → gmail$/m);
 });
 
+
+test("rotate is the human's intent: an old wall followed by activity does not make it obsolete", async (t) => {
+  // The automatic worker stands down when the session went on working after
+  // the wall (spec §9 races). A manual move must not: the human is asking for
+  // it now, whatever the generation's log says about an earlier wall.
+  const w = await world(t, { wall: true, recovery: true, session: { state: "walled" } });
+  appendEvent({ t: nowSeconds() - 5, kind: "activity", session: "s1", generation: 2, cliSessionId: "c-1" });
+  const say = stderr(t);
+  const stop = reportOnRespawn(w);
+  t.after(stop);
+
+  assert.equal(await rotateVerb(["s1"]), 0, say());
+
+  const s = session(w);
+  assert.equal(s.generation, 3, "the manual move went ahead");
+  assert.equal(s.account, "gmail");
+  assert.doesNotMatch(say(), /obsolete/);
+});
 test("rotate takes over at once from a worker that was killed mid-handoff", async (t) => {
   // Task 20's case 9: `kill -9` on the worker after its respawn line. The row
   // is still `owned` by a pid that is gone, the session still reads `resuming`,

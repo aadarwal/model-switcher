@@ -802,14 +802,16 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // The same is true of the failure itself — the poll above took as long as it
   // took, and a turn the human started in the meantime makes it obsolete.
   if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, g, "before the exit");
-  const workedBeforeExit = workedPastWall(session, rec);
+  // A manual move is the human's own intent: only the automatic worker
+  // asks whether the session went on working after the wall.
+  const workedBeforeExit = manual ? null : workedPastWall(session, rec);
   if (workedBeforeExit) return standDownObsolete(st, tmux, session, rec, g, workedBeforeExit, "before the exit");
 
   // 6. Ask the CLI to leave; make it leave if it will not.
   const forced = await stopPane(tmux, session, g);
 
   if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, g, "before the respawn");
-  const workedBeforeRespawn = workedPastWall(session, rec);
+  const workedBeforeRespawn = manual ? null : workedPastWall(session, rec);
   if (workedBeforeRespawn) return standDownObsolete(st, tmux, session, rec, g, workedBeforeRespawn, "before the respawn");
 
   // 7. The new generation, written down before it is started.

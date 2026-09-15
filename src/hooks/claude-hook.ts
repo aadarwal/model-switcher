@@ -1,6 +1,6 @@
 import { appendEvent, type EventKind } from "../events.ts";
 import { msBinary } from "../paths.ts";
-import { openState, type WallKind as RecoveryWallKind } from "../state.ts";
+import type { WallKind as RecoveryWallKind } from "../state.ts";  // type-only: erased, never loads node:sqlite
 import { Tmux } from "../tmux.ts";
 import { wallKindFromText } from "../wall.ts";
 
@@ -30,7 +30,9 @@ export async function claudeHook(): Promise<number> {
     const gen = Number(process.env.MS_GENERATION);
     const socket = process.env.MS_SOCKET;
     const pane = process.env.MS_PANE;
-    if (!session || !Number.isFinite(gen) || !socket || !pane) return 0;
+    // A generation is a positive counter. `Number("")` is 0 and `Number(" ")`
+    // is 0 too, so "finite" is not enough to tell a real one from a blank.
+    if (!session || !Number.isInteger(gen) || gen <= 0 || !socket || !pane) return 0;
 
     if (process.stdin.isTTY) return 0;
     let input: Record<string, unknown>;
@@ -47,9 +49,10 @@ export async function claudeHook(): Promise<number> {
     } else if (name === "UserPromptSubmit") {
       appendEvent({ t, kind: "activity", session, generation: gen, cliSessionId });
     } else if (name === "SessionEnd") {
-      appendEvent({ t, kind: "ended", session, generation: gen, cliSessionId, kindDetail: String(input.reason ?? "") });
+      const reason = typeof input.reason === "string" && input.reason ? input.reason : null;
+      appendEvent({ t, kind: "ended", session, generation: gen, cliSessionId, ...(reason ? { kindDetail: reason } : {}) });
     } else if (name === "StopFailure" && input.error === "rate_limit") {
-      rateLimited({ session, gen, socket, pane, cliSessionId, t });
+      await rateLimited({ session, gen, socket, pane, cliSessionId, t });
     }
     return 0;
   } catch {
@@ -64,13 +67,19 @@ export async function claudeHook(): Promise<number> {
  * The event is appended BEFORE the recovery and the recovery BEFORE the
  * dispatch, so a crash anywhere in here leaves evidence reconciliation can
  * repair, never a silent loss. */
-function rateLimited(a: { session: string; gen: number; socket: string; pane: string; cliSessionId: string | null; t: number }): void {
+async function rateLimited(a: { session: string; gen: number; socket: string; pane: string; cliSessionId: string | null; t: number }): Promise<void> {
   const tmux = new Tmux(a.socket);
   // Screen text only NAMES the wall; the provider's own report is the trigger.
   let kind: RecoveryWallKind = "unknown";
   try { kind = wallKindFromText(tmux.capture(a.pane, 200)) ?? "unknown"; } catch { /* a dead pane still gets its event */ }
-  appendEvent({ t: a.t, kind: "rate_limited", session: a.session, generation: a.gen, cliSessionId: a.cliSessionId, kindDetail: kind });
+  // A log-write failure (full disk, bad perms) must not cost the rotation:
+  // the recovery in the store is what the worker acts on, not this line.
+  try { appendEvent({ t: a.t, kind: "rate_limited", session: a.session, generation: a.gen, cliSessionId: a.cliSessionId, kindDetail: kind }); } catch { /* the recovery below is the load-bearing record */ }
 
+  // Loaded here, not at module scope: `state.ts` pulls in `node:sqlite`, whose
+  // ExperimentalWarning would print on EVERY hook invocation — including the
+  // unmanaged-pane early return — straight into the human's transcript.
+  const { openState } = await import("../state.ts");
   const st = openState();
   try {
     const s = st.getSession(a.session);

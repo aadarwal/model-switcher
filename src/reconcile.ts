@@ -36,6 +36,7 @@
 import { appendFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { appendEvent, readEvents } from "./events.ts";
+import { handBackShell } from "./handback.ts";
 import type { Verb } from "./cli.ts"; // type-only: erased, no import cycle at runtime
 import { acquire, sweepStaleLocks, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
@@ -205,11 +206,19 @@ function park(st: State, s: SessionRow, why: string): string {
   return `session ${s.id}: ${why}, parked`;
 }
 
-/** Give the pane back to the human as their login shell. Only ever called for
- * a pane we have just confirmed is dead. */
+/**
+ * Give the pane back to the human as their login shell. Only ever called for
+ * a pane we have just confirmed is dead.
+ *
+ * `handBackShell` (src/handback.ts) is the same release-then-respawn `ms stop`
+ * does, in the same order: `remain-on-exit` OFF and then the shell. Respawning
+ * without turning it off left a pane the human could not close — their `exit`
+ * made it dead again, `pane-died` fired, found a session already `stopped` and
+ * returned, and the pane stayed a corpse.
+ */
 function respawnShell(servers: Servers, s: SessionRow): void {
   try {
-    servers.tmux(s.socket).respawn(s.pane, s.cwd, [process.env.SHELL || "/bin/zsh", "-l"]);
+    handBackShell(servers.tmux(s.socket), s.pane, s.cwd);
   } catch {
     /* the pane went away between the check and the respawn; the row is what matters */
   }

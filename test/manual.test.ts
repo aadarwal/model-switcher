@@ -519,7 +519,11 @@ test("stop records the intent before anything reaches the pane, then gives the p
   const respawn = respawnLine(w);
   assert.ok(respawn, "the pane was never given back");
   assert.match(respawn!, new RegExp(`respawn-pane -k -c ${rx(w.cwd)} -t %7 '${SHELL}' '-l'$`), "the login shell was not respawned in the session's cwd");
-  assert.ok(at("remain-on-exit off") > at("respawn-pane"), "the pane is still the tool's after it was handed back");
+  assert.ok(at("remain-on-exit off") >= 0, "the pane was never released");
+  assert.ok(
+    at("remain-on-exit off") < at("respawn-pane"),
+    "remain-on-exit must go off BEFORE the shell goes in: left on, the human's own exit leaves a dead pane nothing will ever close",
+  );
   assert.match(say(), /^ms: s1 stopped$/m);
 });
 

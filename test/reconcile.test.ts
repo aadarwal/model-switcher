@@ -657,6 +657,15 @@ test("_pane_died: a normal end respawns the login shell and stops the session", 
   assert.equal(await paneDied(["s1"]), 0);
 
   assert.deepEqual(respawns(w), [`-S ${SOCK} respawn-pane -k -c /tmp/work -t %7 '${SHELL}' '-l'`]);
+  // Spec §7: the pane returns to a prompt exactly as one that ran `claude`
+  // would — which means it must also CLOSE when the human exits that prompt.
+  // With remain-on-exit left on, their exit makes the pane dead again,
+  // pane-died fires, finds a session already stopped and returns, and the
+  // corpse sits there until it is killed by hand.
+  const lines = tmuxLines(w);
+  const at = (needle: string) => lines.findIndex((l) => l.includes(needle));
+  assert.ok(at("remain-on-exit off") >= 0, "the pane was handed back still owned by the tool");
+  assert.ok(at("remain-on-exit off") < at("respawn-pane"), "the pane is released before the shell goes in");
   withState((st) => {
     assert.equal(st.getSession("s1")!.state, "stopped");
     assert.equal(st.getSession("s1")!.wakeupAt, null);

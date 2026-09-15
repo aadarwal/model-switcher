@@ -39,6 +39,7 @@
 
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
+import { handBackShell, releasePane } from "./handback.ts";
 import { Locked, withLock } from "./lock.ts";
 import { isBusy, recoverSession, safeCapture, sessionLockName, stopPane } from "./recover.ts";
 import { findAccount, loadRegistry } from "./registry.ts";
@@ -61,8 +62,6 @@ const SETTLE_MS = 10_000;
 const lockWaitMs = (): number => Number(process.env.MS_LOCK_WAIT_MS) || STOP_LOCK_WAIT_MS;
 const settleMs = (): number => Number(process.env.MS_SETTLE_MS) || SETTLE_MS;
 const pollMs = (): number => Number(process.env.MS_POLL_MS) || 500;
-/** The shell a stopped pane is handed back to. */
-const loginShell = (): string => process.env.SHELL || "/bin/zsh";
 
 const USAGE: Record<string, string> = {
   rotate: "usage: ms rotate [<session|pane>] [--force]",
@@ -299,20 +298,6 @@ async function settle(tmux: Tmux, pane: string, was: number | null, budgetMs: nu
   }
 }
 
-/**
- * The pane is not the tool's any more: a shell the human exits should close it
- * rather than leave a dead pane behind, and with `remain-on-exit` off the
- * pane-died hook still set on it never fires again (which would otherwise
- * respawn a login shell forever — the session's `desired` is `stopped`).
- */
-function releasePane(tmux: Tmux, pane: string): void {
-  try {
-    tmux.remainOnExit(pane, false);
-  } catch {
-    /* the pane may have gone in the meantime; it is still not ours */
-  }
-}
-
 /** Ask the CLI to leave and give the pane back to a shell. */
 async function endPane(tmux: Tmux, session: SessionRow): Promise<Ending> {
   if (!tmux.paneExists(session.pane)) return { stopped: true, note: "the pane was already gone" };
@@ -324,13 +309,16 @@ async function endPane(tmux: Tmux, session: SessionRow): Promise<Ending> {
       // The CLI has gone either way, so a tmux that will not respawn is a note
       // for the human, not an exception: throwing here would leave the session
       // recorded as `stopping`, the one state that would be untrue.
+      //
+      // `handBackShell` is the shared release-then-respawn (src/handback.ts):
+      // `remain-on-exit` goes OFF first, so the shell the human eventually
+      // exits closes the pane instead of leaving a corpse behind.
       let note: string | null = null;
       try {
-        tmux.respawn(session.pane, session.cwd, [loginShell(), "-l"]);
+        handBackShell(tmux, session.pane, session.cwd);
       } catch (e) {
         note = `the pane could not be given back to a shell: ${(e as Error).message}`;
       }
-      releasePane(tmux, session.pane);
       return { stopped: true, note };
     }
     case "revived":

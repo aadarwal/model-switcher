@@ -405,6 +405,23 @@ test("(d) a wake-up the dispatched worker replaces is not then cleared from unde
 
 // --- (5) a pending recovery nobody is coming for ------------------------
 
+test("(d) a due wake-up stamps the recovery it dispatched for, so the next pass sends nobody", () => {
+  const w = world();
+  withState((st) => {
+    st.createSession({ id: "s1", ...base, state: "waiting" });
+    st.addRecovery({ sessionId: "s1", generation: 1, turnId: null, kind: "session" });
+    st.setWakeup("s1", nowSec() - 5);
+  });
+  // The row has been pending, with a timer, since long before the dispatch
+  // grace — which is the ordinary shape of a session waiting out a reset.
+  planted(w.msHome, "UPDATE recoveries SET updatedAt=?", nowSec() - 600);
+
+  reconcile(); // the wake-up is due: one worker
+  reconcile(); // the wake-up is gone now, so rule (5) is what could fire here
+
+  assert.deepEqual(dispatches(w), [`-S ${SOCK} run-shell -b '${MS_BIN}' '_recover' 's1'`], "exactly one worker for one deadline");
+});
+
 test("(5) an ownerless pending recovery with no timer is re-dispatched after the grace", () => {
   const w = world();
   withState((st) => {

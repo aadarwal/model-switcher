@@ -430,6 +430,13 @@ function wakeups(st: State, servers: Servers): string[] {
       // promise silently dropped. Clearing after means the worst case is one
       // repeat on the next invocation.
       servers.tmux(s.socket).runShell([msBinary(), "_recover", s.id]);
+      // Stamp the recovery this dispatch is for, exactly as `redispatchOrphan`
+      // does. Without it the row goes on looking as old as it was while its
+      // wake-up disappears — so the next invocation (an `ms status --watch`
+      // tick seconds later) reads a pending row with no owner and no timer,
+      // and sends a SECOND worker at the one this pass already dispatched.
+      const rec = st.pendingRecovery(s.id);
+      if (rec) st.touchRecovery(rec.id);
       if (st.clearWakeupIf(s.id, deadline)) {
         log(s.id, s.generation, "wake-up was due; dispatched _recover");
         out.push(`session ${s.id}: wake-up was due, dispatched _recover`);

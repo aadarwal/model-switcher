@@ -452,6 +452,36 @@ test("nothing has room: the session waits, a wake-up is scheduled and the recove
   assert.match(recoverLog(w), /nothing has room/);
 });
 
+test("a deadline that already has a timer does not get a second one", async (t) => {
+  // The session came back round to the same wake-up — a re-dispatch, or a
+  // timer reconciliation fired after a tmux restart. Arming another
+  // `run-shell -d` for the instant one is already armed for puts two workers
+  // on one deadline, every time round.
+  const soon = new Date(Date.now() + 2 * HOUR).toISOString();
+  const w = await world(t, {
+    usage: {
+      dirk: { session: 100, weekly: 40, sessionReset: new Date(Date.now() + 5 * HOUR).toISOString() },
+      gmail: { session: 100, weekly: 20, sessionReset: soon },
+      work: { session: 100, weekly: 35, sessionReset: new Date(Date.now() + 3 * HOUR).toISOString() },
+    },
+  });
+  const at = Math.floor(Date.parse(soon) / 1000);
+  const st = openState();
+  try {
+    st.setWakeup("s1", at);
+  } finally {
+    st.close();
+  }
+
+  assert.equal(await recoverSession("s1"), 2);
+
+  const s = session(w);
+  assert.equal(s.state, "waiting");
+  assert.equal(s.wakeupAt, at, "the deadline itself is unchanged");
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "a second timer for one deadline is a second worker");
+  assert.match(recoverLog(w), /a timer is already armed for/);
+});
+
 test("a resume that falls back to a new conversation parks the session", async (t) => {
   const w = await world(t);
   const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-BRAND-NEW", kind: "started" });

@@ -685,12 +685,23 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     }
     const at = nextAttemptAt(inputs, out);
     const delaySeconds = Math.max(MIN_DISPATCH_SECONDS, at - nowSeconds());
+    // Is a timer for THIS deadline already out there? The recorded wake-up is
+    // what says so — it is written beside every timer this line arms, and
+    // reconciliation's due-wake-up rule is the other half of the same promise.
+    // A session that comes back round to the same deadline (a re-dispatch, a
+    // wake-up reconciliation fired) would otherwise collect one more `run-shell
+    // -d` every time, all of them due at the same instant.
+    const armed = st.getSession(id)?.wakeupAt ?? null;
     st.setWakeup(id, at);
     st.updateSession(id, { state: "waiting" });
-    try {
-      tmux.runShell([msBinary(), "_recover", id], { delaySeconds });
-    } catch (e) {
-      logLine(id, g, `could not schedule the next try: ${(e as Error).message}`);
+    if (armed !== at) {
+      try {
+        tmux.runShell([msBinary(), "_recover", id], { delaySeconds });
+      } catch (e) {
+        logLine(id, g, `could not schedule the next try: ${(e as Error).message}`);
+      }
+    } else {
+      logLine(id, g, `a timer is already armed for ${new Date(at * 1000).toISOString()}; not arming a second`);
     }
     st.releaseRecovery(rec.id);
     const reasons = out.map((o) => `${o.name}: ${o.why}`).join("; ");

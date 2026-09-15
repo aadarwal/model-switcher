@@ -18,10 +18,11 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
+import { hostname } from "node:os";
 import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
 import { appendEvent } from "../src/events.ts";
@@ -87,6 +88,13 @@ const WALLED_BUSY_SCREEN = [
 
 type UsageRow = { session: number; weekly: number };
 type World = { home: string; msHome: string; log: string; state: string; screen: string; snap: string; pid: number; cwd: string };
+
+/** A pid that is certainly not running: a child we already waited for. */
+function deadPid(): number {
+  const r = spawnSync(process.execPath, ["-e", ""]);
+  assert.equal(r.status, 0);
+  return r.pid as number;
+}
 
 /** A live, disposable process whose pid the stub pane reports. */
 function liveProcess(t: TestContext): number {
@@ -337,6 +345,32 @@ test("rotate hands a walled pane to the next account and continues the work", as
   const launch = launchOf(respawnLaunchId(w))!;
   assert.deepEqual(launch.command, ["claude", "--resume", "c-1", CONTINUATION, "--model", "sonnet"]);
   assert.match(say(), /^ms: s1 rotated → gmail$/m);
+});
+
+test("rotate takes over at once from a worker that was killed mid-handoff", async (t) => {
+  // Task 20's case 9: `kill -9` on the worker after its respawn line. The row
+  // is still `owned` by a pid that is gone, the session still reads `resuming`,
+  // and reconciliation's lock sweep has already freed the lock it died holding.
+  // The human's verb must adopt that recovery now, not be refused for the ten
+  // minutes an age bound used to hold it.
+  const w = await world(t, { wall: true, recovery: true, session: { state: "resuming" } });
+  const say = stderr(t);
+  const st = openState();
+  try {
+    assert.ok(st.ownRecovery(st.pendingRecovery("s1")!.id, `${deadPid()}@${hostname()}`));
+  } finally {
+    st.close();
+  }
+  const stop = reportOnRespawn(w);
+  t.after(stop);
+
+  const started = Date.now();
+  assert.equal(await rotateVerb(["s1"]), 0);
+  assert.ok(Date.now() - started < 10_000, "the human waited for a worker that no longer exists");
+  assert.doesNotMatch(say(), /already owned/);
+  assert.match(say(), /^ms: s1 rotated → gmail$/m);
+  assert.equal(session(w).account, "gmail");
+  assert.equal(rows(w, "recoveries")[0].status, "done");
 });
 
 test("rotate refuses a busy pane that shows no wall, and forces past it with --force", async (t) => {

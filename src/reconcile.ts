@@ -42,10 +42,6 @@ import { ensureSessionDir, msBinary, p } from "./paths.ts";
 import { openState, type RecoveryRow, type SessionRow, type State } from "./state.ts";
 import { Tmux } from "./tmux.ts";
 
-/** A recovery owned this long by a worker that is gone is not coming back.
- * Longer than the whole transaction's own budget in §9 (readiness polling caps
- * at 60 s), so a live-but-slow worker is never stolen from. */
-const OWNED_STALE_SECONDS = 600;
 /** A handoff or a launch that has not produced its event in this long has
  * failed in a way nothing else will report: park it for the human. */
 const STUCK_SECONDS = 300;
@@ -105,7 +101,7 @@ function alive(pid: number): boolean {
  * An unparseable or missing owner is dead: an `owned` row with no usable owner
  * can only have come from a crash.
  */
-function ownerDead(owner: string | null): boolean {
+export function ownerDead(owner: string | null): boolean {
   if (!owner) return true;
   const at = owner.lastIndexOf("@");
   const host = at < 0 ? "" : owner.slice(at + 1);
@@ -322,10 +318,19 @@ function settleDeadPane(st: State, servers: Servers, s: SessionRow, presence: Pr
  *
  * Only `owned` rows are reclaimed here; a `pending` one is not an orphan by
  * this rule — see `redispatchOrphan`, which knows about timers.
+ *
+ * A DEAD owner is reclaimed at once, with no age bound. The pid is gone: we
+ * asked the kernel, `sweepStaleLocks` freed that worker's session lock in this
+ * same pass, and nothing it was doing can resume. Waiting out ten minutes for
+ * a certainty we already have was ten minutes in which `ms status` read
+ * `owned`, every manual verb was refused ("already owned by <pid>@host") and
+ * the session never left `resuming` — for a worker somebody `kill -9`'d.
+ * An owner we CANNOT judge — an alive-but-hung pid, or one on another host —
+ * is left alone at any age; the lock's own stale bound (src/lock.ts) is what
+ * eventually frees a hung holder, and only for the caller that waits on it.
  */
 function reclaimRecovery(st: State, servers: Servers, s: SessionRow, rec: RecoveryRow | null): string[] {
   if (!rec || rec.status !== "owned") return [];
-  if (nowSeconds() - rec.updatedAt <= OWNED_STALE_SECONDS) return [];
   if (!ownerDead(rec.owner)) return [];
   // Conditional on exactly the row that was judged: between reading it and
   // asking the kernel about that pid, a real worker may have claimed it.

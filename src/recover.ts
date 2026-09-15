@@ -33,6 +33,7 @@ import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
 import { pickAccounts, type PickInput } from "./pick.ts";
+import { ownerDead } from "./reconcile.ts";
 import { NAME_PATTERN, findAccount, loadRegistry } from "./registry.ts";
 import { getSnapshot, toPickInputs } from "./snapshot.ts";
 import { openState, type AttemptOutcome, type RecoveryRow, type SessionRow, type State } from "./state.ts";
@@ -608,7 +609,19 @@ function claimManual(st: State, session: SessionRow, tmux: Tmux, opts: RecoverOp
   const wall = wallKindFromText(screen);
   if (!wall && isBusy(screen) && !opts.force) return { why: "the pane is busy and shows no wall (use --force)" };
 
-  const open = st.pendingRecovery(session.id);
+  let open = st.pendingRecovery(session.id);
+  // A row still `owned` by a worker that no longer exists is not somebody
+  // else's work in progress: the pid is gone, we hold the session lock it
+  // died holding, and refusing the human for ten minutes over it ("already
+  // owned by <pid>@host") is how a `kill -9` used to take `ms rotate` and
+  // `ms switch` out of service. Released on exactly the row that was judged,
+  // so a live worker that claimed it in the meantime is never overwritten.
+  if (open && open.status === "owned" && ownerDead(open.owner)) {
+    if (st.releaseRecoveryIf(open.id, { owner: open.owner, updatedAt: open.updatedAt })) {
+      logLine(session.id, session.generation, `recovery ${open.id} was owned by a dead worker (${open.owner}); taking it over`);
+      open = st.pendingRecovery(session.id);
+    }
+  }
   const recId = open ? open.id : st.addRecovery({ sessionId: session.id, generation: session.generation, turnId: null, kind: wall ?? "unknown" });
   if (!st.ownRecovery(recId, owner())) return { why: `recovery ${recId} is already owned by ${open?.owner ?? "another worker"}` };
   const rec = st.pendingRecovery(session.id);

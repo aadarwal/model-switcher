@@ -234,11 +234,11 @@ test("(b) an owned recovery whose worker died goes back to pending and is re-dis
   const w = world();
   const dead = deadPid();
   withState((st) => {
-    for (const id of ["s-dead", "s-live", "s-fresh", "s-elsewhere"]) st.createSession({ id, ...base });
+    for (const id of ["s-dead", "s-live", "s-just-died", "s-elsewhere"]) st.createSession({ id, ...base });
     const owners: Record<string, string> = {
       "s-dead": `${dead}@${hostname()}`,
       "s-live": `${process.pid}@${hostname()}`,
-      "s-fresh": `${dead}@${hostname()}`,
+      "s-just-died": `${dead}@${hostname()}`,
       "s-elsewhere": `${dead}@some-other-mac`,
     };
     for (const [sessionId, owner] of Object.entries(owners)) {
@@ -246,8 +246,9 @@ test("(b) an owned recovery whose worker died goes back to pending and is re-dis
       assert.ok(st.ownRecovery(rec, owner));
     }
   });
-  // Everything but s-fresh has been owned for eleven minutes.
-  planted(w.msHome, "UPDATE recoveries SET updatedAt=? WHERE sessionId<>'s-fresh'", nowSec() - 660);
+  // Every row but s-just-died's has been owned for eleven minutes; that one was
+  // claimed a second ago by a worker somebody has since `kill -9`'d.
+  planted(w.msHome, "UPDATE recoveries SET updatedAt=? WHERE sessionId<>'s-just-died'", nowSec() - 660);
 
   const repaired = reconcile();
 
@@ -256,10 +257,18 @@ test("(b) an owned recovery whose worker died goes back to pending and is re-dis
     assert.equal(reclaimed.status, "pending");
     assert.equal(reclaimed.owner, null);
     assert.equal(st.pendingRecovery("s-live")!.status, "owned", "a live owner is not disturbed");
-    assert.equal(st.pendingRecovery("s-fresh")!.status, "owned", "ten minutes have not passed");
+    // A pid that is gone is gone: the kernel already said so and the worker's
+    // own lock was swept in this same pass. Ten minutes of `owned` bought
+    // nothing but ten minutes of refused manual verbs.
+    const fresh = st.pendingRecovery("s-just-died")!;
+    assert.equal(fresh.status, "pending", "a dead owner is reclaimable at once, whatever the row's age");
+    assert.equal(fresh.owner, null);
     assert.equal(st.pendingRecovery("s-elsewhere")!.status, "owned", "another host's pid is not ours to judge");
   });
-  assert.deepEqual(dispatches(w), [`-S ${SOCK} run-shell -b '${MS_BIN}' '_recover' 's-dead'`]);
+  assert.deepEqual(dispatches(w), [
+    `-S ${SOCK} run-shell -b '${MS_BIN}' '_recover' 's-dead'`,
+    `-S ${SOCK} run-shell -b '${MS_BIN}' '_recover' 's-just-died'`,
+  ]);
   assert.ok(repaired.some((l) => l.includes("s-dead")), repaired.join("\n"));
 });
 

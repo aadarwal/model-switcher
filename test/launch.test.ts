@@ -457,6 +457,32 @@ test("a launch whose attach fails is still a launch: exit 0 and how to get back"
   assert.equal((await readState(w)).sessions.length, 1);
 });
 
+// --- ms attach -----------------------------------------------------------
+
+test("attach refuses when there is no tool-owned server, and otherwise attaches to it", async () => {
+  // USAGE has advertised `ms attach` since the first cut; unregistered, it
+  // answered "unknown verb" and exit 2. It is the only way back to a session
+  // launched from outside tmux once the terminal that attached has gone.
+  const w = await world();
+  const sock = path.join(w.msHome, "tmux.sock");
+
+  const absent = run(["attach"], w.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "1" }));
+  assert.equal(absent.code, 1);
+  assert.match(absent.stderr, /^ms attach: no ms tmux server yet; run ms claude$/m);
+  assert.equal(logLines(w).some((l) => l.includes("attach-session")), false, "nothing is attached to a server that is not there");
+  assert.ok(logLines(w).some((l) => l === `-S ${sock} has-session -t ms`), logLines(w).join("\n"));
+
+  const w2 = await world();
+  const sock2 = path.join(w2.msHome, "tmux.sock");
+  const r = run(["attach"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(logLines(w2).at(-1), `-S ${sock2} attach-session -t ms`);
+
+  const bad = run(["attach", "ms"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
+  assert.equal(bad.code, 2, "the verb takes no arguments; a session name is a mistake, not a target");
+  assert.match(bad.stderr, /usage: ms attach/);
+});
+
 // --- the pick is only remembered once it has been acted on ---------------
 
 test("a picked account with no launch token exits 1 and leaves no fallback", async () => {

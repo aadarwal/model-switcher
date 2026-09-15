@@ -195,6 +195,32 @@ export function usageUnreachable(rows: AccountUsage[], inputs: PickInput[]): boo
 
 // --- The verb ----------------------------------------------------------
 
+/**
+ * `ms attach` (spec §4): get back to the tool-owned tmux server.
+ *
+ * A launch from OUTSIDE tmux puts the session in `<store>/tmux.sock`, session
+ * `ms`, and attaches — but a detach, a closed terminal or an attach that could
+ * not run (a script, no tty) leaves the CLI running there with no way back that
+ * the tool itself offers. This is that way back, and the only thing it is: one
+ * bounded `has-session` and then tmux's own attach, which is deliberately
+ * unbounded because an interactive attach lives as long as the session does.
+ *
+ * A server that is not there is a refusal, not an error to interpret: nothing
+ * of ours is resident, so "no session" means no launch has happened yet.
+ */
+export const attachVerb: Verb = async (argv) => {
+  if (argv.length) {
+    process.stderr.write(`ms attach: unexpected argument ${JSON.stringify(argv[0])}\nusage: ms attach\n`);
+    return EXIT_USAGE_ERROR;
+  }
+  const tmux = new Tmux(TOOL_SOCKET());
+  if (!tmux.hasSession(TOOL_SESSION)) {
+    process.stderr.write("ms attach: no ms tmux server yet; run ms claude\n");
+    return EXIT_ACCOUNT;
+  }
+  return tmux.attach(TOOL_SESSION);
+};
+
 export const launchClaude: Verb = async (argv) => {
   const parsed = parseLaunchArgs(argv);
   if ("error" in parsed) { say(parsed.error); return EXIT_USAGE_ERROR; }

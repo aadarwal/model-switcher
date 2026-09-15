@@ -494,25 +494,23 @@ test("a tmux that fails mid-handoff is a failed recovery, not an exception", asy
 
   assert.equal(await recoverSession("s1"), 1, "the worker reports the failure rather than throwing past its caller");
   assert.match(recoverLog(w), /could not respawn the pane/);
+  assert.match(recoverLog(w), /parked with its CLI stopped/);
 
-  // What is left: the launch row for the generation that never started, the
-  // session still ON THE OLD GENERATION (so it and the open recovery agree),
-  // and an attempt naming the failure.
+  // The CLI is already dead and the pane did not come back, so the episode is
+  // over: no next account, no re-dispatch, no wake-up. A human decides.
   const s = session(w);
-  assert.equal(s.generation, 2, "the generation moves only once the pane really runs the new launch");
-  assert.equal(s.account, "dirk", "and so does the account");
-  assert.equal(s.state, "stopping");
+  assert.equal(s.state, "parked");
+  assert.equal(s.wakeupAt, null);
+  assert.equal(s.generation, 2, "nothing ran, so the generation did not move");
+  assert.equal(s.account, "dirk", "and neither did the account");
   const launch = launchOf(w, respawnLaunchId(w))!;
   assert.equal(launch.generation, 3, "the launch was written down before it was attempted");
   assert.deepEqual(
     rows(w, "attempts").map((a) => [a.account, a.outcome]),
     [["dirk", "exhausted"], ["gmail", "infra"]],
   );
-  // Still open, on the generation the next worker will read, and re-dispatched.
-  const rec = rows(w, "recoveries")[0];
-  assert.equal(rec.status, "pending");
-  assert.equal(rec.generation, 2);
-  assert.match(logLines(w).find((l) => l.includes("run-shell")) ?? "", /run-shell -b '.*ms' '_recover' 's1'/);
+  assert.equal(rows(w, "recoveries")[0].status, "done", "terminal: nothing may retry onto a dead pane");
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "no worker is sent to respawn a pane that would not respawn");
 });
 
 test("with every handoff slot taken the recovery stands down and re-dispatches itself", async (t) => {
@@ -697,4 +695,59 @@ test("the budget counts failures, not the record of a handoff that happened", as
 
   assert.equal(await recoverSession("s1"), 0, "three handoff records are not three failures");
   assert.notEqual(session(w).state, "parked");
+});
+
+test("a failed manual move never dispatches an automatic one behind the human's back", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN, recovery: false, wall: false });
+  rmSync(path.join(w.msHome, "launch", "work.token")); // the account they named
+
+  const code = await recoverSession("s1", { manual: { toAccount: "work", continueAfter: false } });
+  assert.equal(code, 1);
+
+  // A dispatched worker runs as an AUTOMATIC rotation: it would pick an account
+  // the human never named and hand it the continuation they declined.
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "a manual move that failed is over");
+  assert.ok(!respawnLine(w));
+  const s = session(w);
+  assert.equal(s.account, "dirk");
+  assert.equal(s.state, "walled");
+  assert.deepEqual(rows(w, "attempts").map((a) => [a.account, a.outcome]), [["work", "auth"]]);
+  assert.equal(rows(w, "recoveries")[0].status, "pending", "what it claimed is released");
+});
+
+test("candidates used up by failures park the session; they do not wait for a window", async (t) => {
+  const w = await world(t, {
+    usage: {
+      dirk: { session: 100, weekly: 40 },
+      gmail: { session: 10, weekly: 20 },
+      work: { session: 100, weekly: 35, sessionReset: new Date(Date.now() + 2 * HOUR).toISOString() },
+    },
+  });
+  // An earlier pass of this episode already spent gmail on a failure of its own.
+  const st = openState();
+  try {
+    st.addAttempt({ recoveryId: st.pendingRecovery("s1")!.id, account: "gmail", outcome: "auth", note: "no launch token" });
+  } finally {
+    st.close();
+  }
+
+  assert.equal(await recoverSession("s1"), 1, "not 2: the fleet is not full, it is used up");
+
+  const s = session(w);
+  assert.equal(s.state, "parked");
+  assert.equal(s.wakeupAt, null, "no wake-up for a window that was never the problem");
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")));
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
+  assert.equal(rows(w, "recoveries")[0].status, "done");
+  assert.match(recoverLog(w), /all candidates failed: gmail: no launch token/);
+});
+
+test("a corrupt registry says so when a destination is named", async (t) => {
+  const w = await world(t, { registry: "{ this is not json", screen: IDLE_SCREEN, recovery: false, wall: false });
+
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "work", continueAfter: true } }), 1);
+  const log = recoverLog(w);
+  assert.match(log, /cannot read the registry/);
+  assert.doesNotMatch(log, /is not registered/, "an unreadable file is not evidence the account is gone");
+  assert.equal(rows(w, "recoveries").length, 0, "nothing was claimed");
 });

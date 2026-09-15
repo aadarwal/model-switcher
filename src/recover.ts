@@ -195,6 +195,15 @@ const owner = (): string => `${process.pid}@${hostname()}`;
 const FAILURE_OUTCOMES: ReadonlySet<AttemptOutcome> = new Set(["auth", "infra", "resume-broken"]);
 
 /**
+ * The failures that SPEND a candidate — an account this episode tried and
+ * could not use. They are what tells an empty candidate list apart from a full
+ * fleet: with one of these on the record, "nobody is left" means "used up",
+ * not "everybody is at 100", and waiting for a window would be a lie.
+ * (`resume-broken` is not here: it parks and closes on the spot.)
+ */
+const SPENT_OUTCOMES: ReadonlySet<AttemptOutcome> = new Set(["auth", "infra"]);
+
+/**
  * Park the session for a human and close the recovery.
  *
  * `finishRecovery` takes it out of the open set, which is the point: an open
@@ -257,7 +266,11 @@ const stopRequested = (st: State, id: string): boolean => st.getSession(id)?.des
  */
 function badDestination(name: string, session: SessionRow): string | null {
   if (!NAME_PATTERN.test(name)) return `'${name}' is not a valid account name`;
-  const { registry } = loadRegistry();
+  const { registry, parseError } = loadRegistry();
+  // An unreadable registry is not evidence that the account is absent, and
+  // telling a human their account "is not registered" when the file is corrupt
+  // sends them to fix the wrong thing.
+  if (parseError) return `cannot read the registry: ${parseError}`;
   const found = findAccount(registry, name, session.provider);
   if (!found) return `no ${session.provider} account named '${name}' is registered`;
   if (name === session.account) return `${session.id} is already on '${name}'`;
@@ -580,9 +593,12 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     if (found.registryError) {
       st.addAttempt({ recoveryId: rec.id, account: from, outcome: "infra", note: `registry unreadable: ${found.registryError}` });
       // Nothing was touched, so the recovery stays open on this generation and
-      // one more worker is dispatched to try again; the budget bounds it.
+      // one more worker is dispatched to try again; the budget bounds it. Never
+      // for a manual move: the human is right there, and a worker dispatched on
+      // their behalf would run as an AUTOMATIC rotation — a different account
+      // from the one they named, and a continuation they may have declined.
       st.releaseRecovery(rec.id);
-      redispatch(tmux, id, g);
+      if (!manual) redispatch(tmux, id, g);
       return fail(id, g, `cannot read the registry: ${found.registryError}`);
     }
     names = found.names;
@@ -591,6 +607,16 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   }
 
   if (!names.length) {
+    // WHY there is nobody left decides whether waiting is honest. If earlier
+    // passes of this episode burned candidates on failures of their own — no
+    // token, a registry we could not read — then the fleet is not full, it is
+    // used up, and a wake-up would tell the human to wait for a window that
+    // was never the problem. Park instead, and say what actually failed.
+    const failures = st.attempts(rec.id).filter((a) => SPENT_OUTCOMES.has(a.outcome));
+    if (failures.length) {
+      const said = failures.map((a) => `${a.account}: ${a.note || a.outcome}`).join("; ");
+      return park(st, id, rec.id, g, `all candidates failed: ${said}`);
+    }
     const at = nextAttemptAt(inputs, out);
     const delaySeconds = Math.max(MIN_DISPATCH_SECONDS, at - nowSeconds());
     st.setWakeup(id, at);
@@ -620,9 +646,10 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   }
   if (!to) {
     // Nothing has been touched yet: keep the recovery open on this generation
-    // and send one more worker, in case a token lands in the meantime.
+    // and send one more worker, in case a token lands in the meantime — but
+    // only for an automatic rotation (see the registry path above).
     st.releaseRecovery(rec.id);
-    redispatch(tmux, id, g);
+    if (!manual) redispatch(tmux, id, g);
     return fail(id, g, `no candidate account has a launch token (run: ms accounts add <name>)`);
   }
 
@@ -664,13 +691,15 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   try {
     tmux.respawn(session.pane, session.cwd, [msBinary(), "_exec", launchId]);
   } catch (e) {
-    // The pane was not restarted, so the session's generation is deliberately
-    // still `g` — the open recovery and the session agree, and the next worker
-    // sees a live recovery for the generation it is actually looking at.
-    st.addAttempt({ recoveryId: rec.id, account: to, outcome: "infra", note: `respawn failed: ${(e as Error).message}` });
-    st.releaseRecovery(rec.id);
-    redispatch(tmux, id, g);
-    return fail(id, g, `could not respawn the pane: ${(e as Error).message}`);
+    // The CLI is already stopped and the pane did not come back, so this
+    // episode is over: trying the next account would only respawn a dead pane
+    // with a fresh credential, and the retry chain that did that ended up
+    // telling the human the fleet was full when tmux was what broke. Park it —
+    // §12's reconciliation gives a dead pane a shell, and the human runs
+    // `ms rotate`. The generation is deliberately still `g`: nothing ran.
+    const why = (e as Error).message;
+    st.addAttempt({ recoveryId: rec.id, account: to, outcome: "infra", note: `respawn failed: ${why}` });
+    return park(st, id, rec.id, g, `could not respawn the pane: ${why}; ${id} is parked with its CLI stopped`);
   }
 
   // The generation moves only now, once the pane is really running the new

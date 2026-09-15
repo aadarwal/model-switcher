@@ -1,8 +1,9 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdirSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync } from "node:fs";
 import path from "node:path";
-import { stubDir, tempHome } from "./helpers.ts";
+import { pathToFileURL } from "node:url";
+import { stubDir, tempHome, run } from "./helpers.ts";
 import type { Account } from "../src/registry.ts";
 
 // Every test gets its own MS_HOME (via tempHome) and, when it cares about
@@ -48,17 +49,32 @@ function writeHealthyAccountFiles(msHome: string, name: string): void {
   );
 }
 
+/** Writes a due (already-expired) poll credential for `name`, with the given
+ *  access/refresh token text — so a test can prove that text never leaks. */
+function writeDueCredential(msHome: string, name: string, accessToken: string, refreshToken = `${accessToken}-refresh`): void {
+  const dir = path.join(msHome, "claude", name);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(dir, ".credentials.json"),
+    JSON.stringify({ claudeAiOauth: { accessToken, refreshToken, expiresAt: Date.now() - 1000 } }),
+    { mode: 0o600 },
+  );
+}
+
 const account = (over: Partial<Account> = {}): Account => ({
   name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true, ...over,
 });
 
 // --- renderLine -----------------------------------------------------------
 
-test("renderLine: ✓/✗ formatting, plus → fixed", async () => {
+test("renderLine: ✓/✗ formatting, plus → fixed only on the ✓ branch", async () => {
   const { renderLine } = await import("../src/doctor.ts");
   assert.equal(renderLine({ ok: true, what: "a thing" }), "✓ a thing");
   assert.equal(renderLine({ ok: true, what: "a thing", fixed: true }), "✓ a thing → fixed");
   assert.equal(renderLine({ ok: false, what: "a thing", why: "it broke" }), "✗ a thing — it broke");
+  // fixed:true on a ✗ result should never occur in practice, but the
+  // renderer must not append "→ fixed" to a failing line even if it did.
+  assert.equal(renderLine({ ok: false, what: "a thing", why: "it broke", fixed: true }), "✗ a thing — it broke");
 });
 
 // --- Node ------------------------------------------------------------------
@@ -68,6 +84,16 @@ test("checkNode passes on the Node this suite runs under", async () => {
   const r = checkNode();
   assert.equal(r.ok, true);
   assert.equal(typeof process.execve, "function");
+});
+
+test("nodeVersionAtLeast: a real MAJOR.MINOR.PATCH comparison, not vacuous", async () => {
+  const { nodeVersionAtLeast } = await import("../src/doctor.ts");
+  const MIN = [22, 15, 0] as const;
+  assert.equal(nodeVersionAtLeast("21.9.0", MIN), false);
+  assert.equal(nodeVersionAtLeast("22.14.9", MIN), false);
+  assert.equal(nodeVersionAtLeast("22.15.0", MIN), true);
+  assert.equal(nodeVersionAtLeast("22.15.1", MIN), true);
+  assert.equal(nodeVersionAtLeast("23.0.0", MIN), true);
 });
 
 // --- tmux --------------------------------------------------------------
@@ -133,11 +159,11 @@ test("checkHooks: not installed → ✗; --fix installs and reports fixed", asyn
 
 // --- store permissions ---------------------------------------------------
 
-test("checkStorePermissions: a 0644 store file is ✗; --fix chmods it to ✓", async () => {
+test("checkStorePermissions: a 0644 ms-owned file (accounts.json) is ✗; --fix chmods it to ✓", async () => {
   const { msHome } = base();
   const { checkStorePermissions } = await import("../src/doctor.ts");
-  const bad = path.join(msHome, "extra.json");
-  writeFileSync(bad, "{}", { mode: 0o644 });
+  const bad = path.join(msHome, "accounts.json");
+  writeFileSync(bad, JSON.stringify({ version: 1, accounts: [] }), { mode: 0o644 });
 
   const before = checkStorePermissions(false);
   assert.equal(before.length, 1);
@@ -151,7 +177,35 @@ test("checkStorePermissions: a 0644 store file is ✗; --fix chmods it to ✓", 
   assert.equal(statSync(bad).mode & 0o777, 0o600);
 });
 
-test("checkStorePermissions: a wrongly-permissioned directory is ✗; --fix chmods it", async () => {
+test("checkStorePermissions: an arbitrary unlisted file under MS_HOME is neither reported nor touched", async () => {
+  const { msHome } = base();
+  const { checkStorePermissions } = await import("../src/doctor.ts");
+  const stray = path.join(msHome, "not-an-ms-owned-file.json");
+  writeFileSync(stray, "{}", { mode: 0o644 });
+
+  const r = checkStorePermissions(true);
+  assert.equal(r.length, 1);
+  assert.equal(r[0]!.ok, true); // the one aggregate "clean" line — stray is out of scope
+  assert.equal(statSync(stray).mode & 0o777, 0o644, "an unlisted file must never be chmodded");
+});
+
+test("checkStorePermissions: claude/<name>/ is scoped — only the dir and .credentials.json are checked, never a plugin binary underneath", async () => {
+  const { msHome } = base();
+  const { checkStorePermissions } = await import("../src/doctor.ts");
+  const acctDir = path.join(msHome, "claude", "gmail");
+  mkdirSync(acctDir, { recursive: true, mode: 0o700 });
+  const tool = path.join(acctDir, "plugins", "bin", "tool");
+  mkdirSync(path.dirname(tool), { recursive: true }); // Claude Code's own subtree — arbitrary modes, not ms-owned
+  writeFileSync(tool, "#!/bin/sh\n", { mode: 0o755 });
+
+  const before = checkStorePermissions(false);
+  assert.ok(!before.some((r) => /tool|plugins/.test(r.what)), JSON.stringify(before));
+
+  checkStorePermissions(true);
+  assert.equal(statSync(tool).mode & 0o777, 0o755, "a --fix run must never touch Claude Code's own files");
+});
+
+test("checkStorePermissions: a wrongly-permissioned directory (claude/) is ✗; --fix chmods it", async () => {
   const { msHome } = base();
   const { checkStorePermissions } = await import("../src/doctor.ts");
   const badDir = path.join(msHome, "claude");
@@ -165,12 +219,86 @@ test("checkStorePermissions: a wrongly-permissioned directory is ✗; --fix chmo
   assert.equal(statSync(badDir).mode & 0o777, 0o700);
 });
 
+test("checkStorePermissions --fix: a directory blocked from reading is repaired, then its own contents are found and fixed in the same run", async () => {
+  const { msHome } = base();
+  const { checkStorePermissions } = await import("../src/doctor.ts");
+  mkdirSync(path.join(msHome, "sessions"), { recursive: true, mode: 0o700 });
+  const sessDir = path.join(msHome, "sessions", "s1");
+  mkdirSync(sessDir, { mode: 0o700 });
+  const childFile = path.join(sessDir, "events.jsonl");
+  writeFileSync(childFile, "{}\n", { mode: 0o644 }); // bad mode, written before locking the dir down
+  chmodSync(sessDir, 0o300); // no read bit: readdirSync(sessDir) would fail until repaired
+
+  const fixed = checkStorePermissions(true);
+  assert.ok(fixed.some((r) => r.ok && r.fixed && r.what.endsWith("sessions/s1")), JSON.stringify(fixed));
+  assert.ok(fixed.some((r) => r.ok && r.fixed && /events\.jsonl/.test(r.what)), JSON.stringify(fixed));
+  assert.equal(statSync(sessDir).mode & 0o777, 0o700);
+  assert.equal(statSync(childFile).mode & 0o777, 0o600);
+});
+
+test("checkStorePermissions: a symlink under an ms-owned dir is ✗ and never followed or fixed", async () => {
+  const { msHome } = base();
+  const { checkStorePermissions } = await import("../src/doctor.ts");
+  const sessionsDir = path.join(msHome, "sessions");
+  mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+  const target = path.join(msHome, "outside-target");
+  writeFileSync(target, "hello", { mode: 0o644 });
+  const link = path.join(sessionsDir, "evil-link");
+  symlinkSync(target, link);
+
+  const before = checkStorePermissions(false);
+  const issue = before.find((r) => r.what.includes("evil-link"));
+  assert.ok(issue, JSON.stringify(before));
+  assert.equal(issue!.ok, false);
+  assert.match(issue!.why ?? "", /symlink/);
+
+  checkStorePermissions(true);
+  assert.equal(statSync(target).mode & 0o777, 0o644, "the symlink's target must never be chmodded");
+  assert.ok(lstatSync(link).isSymbolicLink(), "the symlink itself must still be a symlink, never replaced");
+});
+
 test("checkStorePermissions: a clean store is one ✓ line", async () => {
   base();
   const { checkStorePermissions } = await import("../src/doctor.ts");
   const r = checkStorePermissions(false);
   assert.equal(r.length, 1);
   assert.equal(r[0]!.ok, true);
+});
+
+// --- the registry itself ---------------------------------------------------
+
+test("runDoctor: a malformed accounts.json is a ✗ line that fails the whole run", async () => {
+  const { msHome } = base();
+  writeFileSync(path.join(msHome, "accounts.json"), "{ not json", { mode: 0o600 });
+  const { runDoctor } = await import("../src/doctor.ts");
+  const { results, exitCode } = await runDoctor(false);
+  assert.equal(exitCode, 1);
+  const line = results.find((r) => r.what === "accounts.json");
+  assert.ok(line, JSON.stringify(results));
+  assert.equal(line!.ok, false);
+  assert.match(line!.why ?? "", /JSON/);
+});
+
+test("runDoctor: a registry row validateRegistry skips is a ✗ 'accounts.json entry N' line", async () => {
+  const { msHome } = base();
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ name: "ok one", provider: "gemini", label: "bad provider" }] }),
+    { mode: 0o600 },
+  );
+  const { runDoctor } = await import("../src/doctor.ts");
+  const { results, exitCode } = await runDoctor(false);
+  assert.equal(exitCode, 1);
+  assert.ok(results.some((r) => !r.ok && r.what === "accounts.json entry 0" && /provider/.test(r.why ?? "")), JSON.stringify(results));
+});
+
+test("runDoctor: a clean, empty registry is one ✓ 'accounts.json' line", async () => {
+  base();
+  const { runDoctor } = await import("../src/doctor.ts");
+  const { results } = await runDoctor(false);
+  const line = results.find((r) => r.what === "accounts.json");
+  assert.ok(line);
+  assert.equal(line!.ok, true);
 });
 
 // --- accounts ------------------------------------------------------------
@@ -182,7 +310,7 @@ test("checkClaudeAccount: a fully healthy account reports four ✓ lines", async
   saveLaunchToken("gmail", "sk-ant-oat01-AbCdEfGh12345678_-ijklmnop0123456789");
   const { checkClaudeAccount } = await import("../src/doctor.ts");
 
-  const rs = await checkClaudeAccount(account({ name: "gmail", identityVerified: true }));
+  const rs = await checkClaudeAccount(account({ name: "gmail", identityVerified: true }), false);
   assert.equal(rs.length, 4);
   assert.ok(rs.every((r) => r.ok), JSON.stringify(rs));
   assert.ok(rs.some((r) => /poll grant readable/.test(r.what)));
@@ -194,7 +322,7 @@ test("checkClaudeAccount: a fully healthy account reports four ✓ lines", async
 test("checkClaudeAccount: a grant-less account fails readable, launch token, and identity", async () => {
   base();
   const { checkClaudeAccount } = await import("../src/doctor.ts");
-  const rs = await checkClaudeAccount(account({ name: "orphan-acct", identityVerified: false }));
+  const rs = await checkClaudeAccount(account({ name: "orphan-acct", identityVerified: false }), false);
   // No refreshable line at all when the grant cannot even be read.
   assert.equal(rs.length, 3);
   const byWhat = (re: RegExp) => rs.find((r) => re.test(r.what));
@@ -203,45 +331,60 @@ test("checkClaudeAccount: a grant-less account fails readable, launch token, and
   assert.equal(byWhat(/identity verified/)!.ok, false);
 });
 
-test("checkClaudeAccount: a grant due for refresh calls refreshPollCredentials, bounded", async () => {
+test("checkClaudeAccount: a due grant WITHOUT --fix is reported, never refreshed (no network call)", async () => {
   const { msHome } = base();
-  const dir = path.join(msHome, "claude", "gmail");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(
-    path.join(dir, ".credentials.json"),
-    JSON.stringify({ claudeAiOauth: { accessToken: "at-1", refreshToken: "rt-1", expiresAt: Date.now() - 1000 } }),
-    { mode: 0o600 },
-  );
+  writeDueCredential(msHome, "gmail", "at-1", "rt-1");
   const savedFetch = globalThis.fetch;
-  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 3600 }), { status: 200 })) as typeof fetch;
+  globalThis.fetch = (async () => {
+    throw new Error("refreshPollCredentials must never be called without --fix");
+  }) as unknown as typeof fetch;
   try {
     const { checkClaudeAccount } = await import("../src/doctor.ts");
-    const rs = await checkClaudeAccount(account({ name: "gmail" }));
-    const refreshable = rs.find((r) => /poll grant refreshable/.test(r.what));
-    assert.ok(refreshable, JSON.stringify(rs));
-    assert.equal(refreshable!.ok, true);
+    const rs = await checkClaudeAccount(account({ name: "gmail" }), false);
+    const grant = rs.find((r) => r.what === "claude account gmail: poll grant");
+    assert.ok(grant, JSON.stringify(rs));
+    assert.equal(grant!.ok, false);
+    assert.match(grant!.why ?? "", /refresh due/);
+    assert.match(grant!.why ?? "", /--fix/);
   } finally {
     globalThis.fetch = savedFetch;
   }
 });
 
-test("checkClaudeAccount: a dead grant due for refresh reports ✗ with the auth reason", async () => {
+test("checkClaudeAccount: --fix refreshes a due grant and reports it fixed", async () => {
   const { msHome } = base();
-  const dir = path.join(msHome, "claude", "gmail");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(
-    path.join(dir, ".credentials.json"),
-    JSON.stringify({ claudeAiOauth: { accessToken: "at-1", refreshToken: "rt-1", expiresAt: Date.now() - 1000 } }),
-    { mode: 0o600 },
-  );
+  writeDueCredential(msHome, "gmail", "at-1", "rt-1");
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 3600 }), { status: 200 })) as typeof fetch;
+  try {
+    const { checkClaudeAccount } = await import("../src/doctor.ts");
+    const rs = await checkClaudeAccount(account({ name: "gmail" }), true);
+    const grant = rs.find((r) => r.what === "claude account gmail: poll grant");
+    assert.ok(grant, JSON.stringify(rs));
+    assert.equal(grant!.ok, true);
+    assert.equal(grant!.fixed, true);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkClaudeAccount: --fix on a dead grant reports ✗ with the auth reason and never prints the token", async () => {
+  const { msHome } = base();
+  const TOKEN = "SEKRET-ACCESS-TOKEN-VALUE";
+  writeDueCredential(msHome, "gmail", TOKEN);
   const savedFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 })) as typeof fetch;
   try {
     const { checkClaudeAccount } = await import("../src/doctor.ts");
-    const rs = await checkClaudeAccount(account({ name: "gmail" }));
-    const refreshable = rs.find((r) => /poll grant refreshable/.test(r.what));
-    assert.equal(refreshable!.ok, false);
-    assert.match(refreshable!.why ?? "", /auth/);
+    const rs = await checkClaudeAccount(account({ name: "gmail" }), true);
+    const grant = rs.find((r) => r.what === "claude account gmail: poll grant");
+    assert.ok(grant, JSON.stringify(rs));
+    assert.equal(grant!.ok, false);
+    assert.match(grant!.why ?? "", /auth/);
+    for (const r of rs) {
+      assert.ok(!r.what.includes(TOKEN), `token leaked in what: ${r.what}`);
+      assert.ok(!(r.why ?? "").includes(TOKEN), `token leaked in why: ${r.why}`);
+    }
   } finally {
     globalThis.fetch = savedFetch;
   }
@@ -319,6 +462,30 @@ test("checkOrphaned: --fix without reconcile.ts available still reports ✗ (gra
   assert.equal(rs[0]!.ok, false);
 });
 
+test("checkOrphaned: list-panes is memoized per socket — one tmux call for two sessions on the same socket", async () => {
+  const { msHome } = base();
+  const { dir, stub } = stubDir();
+  const log = path.join(dir, "calls.log");
+  stub("tmux", `case "$*" in *"list-panes -a"*) printf 'call\\n' >> "${log}"; echo "%5" ;; esac\nexit 0`);
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  process.env.MS_HOME = msHome;
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  const shared = { provider: "claude" as const, cliSessionId: "c1", cwd: "/tmp", socket: "/private/tmp/tmux-test/default",
+    serverStart: "1", need: "any" as const, account: "gmail", generation: 1, state: "running" as const, desired: "running" as const, flags: [] };
+  st.createSession({ id: "s1", ...shared, pane: "%5" });
+  st.createSession({ id: "s2", ...shared, pane: "%6" });
+  st.close();
+
+  const { checkOrphaned } = await import("../src/doctor.ts");
+  const rs = await checkOrphaned(false);
+  assert.equal(rs.length, 1); // s1's pane exists, s2's does not — one ✗ line
+  assert.equal(rs[0]!.ok, false);
+  const { readFileSync } = await import("node:fs");
+  const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+  assert.equal(calls.length, 1, "two sessions on the same socket must share one list-panes call");
+});
+
 // --- ms on PATH ----------------------------------------------------------
 
 test("checkPathBinary: ✗ when ms is not on PATH", async () => {
@@ -359,7 +526,6 @@ test("checkPathBinary: ✓ when PATH resolves to the same file as msBinary()", a
   process.env.MS_BIN = wanted;
 
   const { dir } = stubDir();
-  const { symlinkSync } = await import("node:fs");
   symlinkSync(wanted, path.join(dir, "ms"));
   process.env.PATH = `${dir}:${process.env.PATH}`;
 
@@ -377,7 +543,6 @@ test("runDoctor: hooks missing + a grant-less account among a healthy one → re
   writeFileSync(process.env.MS_BIN, "#!/bin/sh\n");
   chmodSync(process.env.MS_BIN, 0o755);
   const { dir } = stubDir();
-  const { symlinkSync } = await import("node:fs");
   symlinkSync(process.env.MS_BIN, path.join(dir, "ms"));
   process.env.PATH = `${dir}:${process.env.PATH}`;
 
@@ -413,7 +578,6 @@ test("runDoctor --fix: installs hooks and exits 0 on the healthy subset", async 
   writeFileSync(process.env.MS_BIN, "#!/bin/sh\n");
   chmodSync(process.env.MS_BIN, 0o755);
   const { dir } = stubDir();
-  const { symlinkSync } = await import("node:fs");
   symlinkSync(process.env.MS_BIN, path.join(dir, "ms"));
   process.env.PATH = `${dir}:${process.env.PATH}`;
 
@@ -444,7 +608,6 @@ test("runDoctor --fix: installs hooks and exits 0 on the healthy subset", async 
 
 test("ms doctor is registered on the CLI and runs the real checks", async () => {
   const { home, msHome } = tempHome();
-  const { run } = await import("./helpers.ts");
   const r = run(["doctor"], { HOME: home, MS_HOME: msHome, PATH: "/nonexistent-empty-dir" });
   // tmux/claude are unreachable via the empty PATH, so at least one check
   // fails; the point of this test is that "doctor" is a known verb (not the
@@ -452,4 +615,43 @@ test("ms doctor is registered on the CLI and runs the real checks", async () => 
   assert.equal(r.code, 1);
   assert.match(r.stdout, /Node ≥ 22\.15/);
   assert.match(r.stdout, /tmux ≥ 3\.3/);
+});
+
+test("ms doctor --fix: a due grant that fails to refresh never prints the poll grant or launch token, even on stdout/stderr", async () => {
+  const { home, msHome } = tempHome();
+  const ACCESS_TOKEN = "SEKRET-POLL-TOKEN-VALUE";
+  const LAUNCH_TOKEN = "sk-ant-oat01-SEKRETLAUNCHTOKEN1234567890123456";
+
+  writeDueCredential(msHome, "gmail", ACCESS_TOKEN);
+  process.env.HOME = home;
+  process.env.MS_HOME = msHome;
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  saveLaunchToken("gmail", LAUNCH_TOKEN);
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true }] }),
+    { mode: 0o600 },
+  );
+
+  const { dir: stubBin, stub } = stubDir();
+  stub("tmux", HEALTHY_TMUX);
+  stub("claude", HEALTHY_CLAUDE);
+
+  // Loaded into the subprocess via --import: always fails the refresh, so
+  // this proves a rejected credential is reported without ever echoing the
+  // token that failed.
+  const stubModule = path.join(stubBin, "fail-fetch.mjs");
+  writeFileSync(stubModule, `globalThis.fetch = async () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400, headers: { "content-type": "application/json" } });\n`);
+
+  const r = run(["doctor", "--fix"], {
+    HOME: home, MS_HOME: msHome,
+    PATH: `${stubBin}:${process.env.PATH}`,
+    NODE_OPTIONS: `--disable-warning=ExperimentalWarning --import ${pathToFileURL(stubModule).href}`,
+  });
+  assert.equal(r.code, 1);
+  assert.match(r.stdout, /poll grant.*refresh failed: auth/);
+  assert.ok(!r.stdout.includes(ACCESS_TOKEN), `access token leaked to stdout: ${r.stdout}`);
+  assert.ok(!r.stderr.includes(ACCESS_TOKEN), `access token leaked to stderr: ${r.stderr}`);
+  assert.ok(!r.stdout.includes(LAUNCH_TOKEN), `launch token leaked to stdout: ${r.stdout}`);
+  assert.ok(!r.stderr.includes(LAUNCH_TOKEN), `launch token leaked to stderr: ${r.stderr}`);
 });

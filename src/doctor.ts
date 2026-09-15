@@ -2,33 +2,37 @@
 //
 // `ms doctor [--fix]`: a fixed checklist over the things that make `ms`
 // actually work end to end — the runtime, tmux, claude, the Claude hooks,
-// store permissions, every Claude account's two credentials, orphaned
-// session state, and the `ms` binary on PATH. Read-only by default; `--fix`
-// repairs what it safely can (hooks, store permissions, orphaned state via
-// Task 18's `reconcile()`) and reports the rest. The account checks and the
-// PATH check are never auto-fixed — there is nothing safe to do about a dead
-// credential or a stray `ms` shadowing this one except tell the human.
+// store permissions, the registry itself, every Claude account's two
+// credentials, orphaned session state, and the `ms` binary on PATH.
+// Read-only by default; `--fix` repairs what it safely can (hooks, store
+// permissions, a due poll-grant refresh, orphaned state via Task 18's
+// `reconcile()`) and reports the rest. A malformed registry, a dead
+// account credential, and a stray `ms` shadowing this one are never
+// auto-fixed — there is nothing safe to do about any of them except tell
+// the human.
 //
 // Each check prints exactly one line: `✓ <what>` (plus ` → fixed` when this
 // run just repaired it) or `✗ <what> — <why>`. Exit 1 iff any check is still
 // a ✗ once fixes (if requested) have been applied.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, chmodSync, constants, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { chmodSync, lstatSync, readdirSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
-import { msBinary, msHome } from "./paths.ts";
+import { msBinary, msHome, p } from "./paths.ts";
 import { claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
 import { loadRegistry, type Account } from "./registry.ts";
 import { AuthError, TransientError, readPollCredentials, refreshPollCredentials } from "./providers/claude-usage.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
-import { openState } from "./state.ts";
+import { openState, type SessionRow } from "./state.ts";
 import { Tmux } from "./tmux.ts";
+import { resolveOnPath } from "./exec.ts";
 
 export type Result = { ok: boolean; what: string; why?: string; fixed?: boolean };
 
 const MIN_TMUX = [3, 3] as const;
+const MIN_NODE = [22, 15, 0] as const;
 /** A poll grant due to expire within this window is worth refreshing now;
  *  one further out is left alone — `ms doctor` should not spend an account's
  *  refresh token just to look at it. */
@@ -36,8 +40,8 @@ const REFRESH_DUE_MS = 60_000;
 const REFRESH_TIMEOUT_MS = 10_000;
 
 export function renderLine(r: Result): string {
-  const suffix = r.fixed ? " → fixed" : "";
-  return r.ok ? `✓ ${r.what}${suffix}` : `✗ ${r.what} — ${r.why ?? "failed"}${suffix}`;
+  if (r.ok) return r.fixed ? `✓ ${r.what} → fixed` : `✓ ${r.what}`;
+  return `✗ ${r.what} — ${r.why ?? "failed"}`;
 }
 
 function runBounded(cmd: string, args: string[], timeoutMs: number): { ok: boolean; stdout: string; stderr: string } {
@@ -50,11 +54,28 @@ function runBounded(cmd: string, args: string[], timeoutMs: number): { ok: boole
 
 // --- Runtime -------------------------------------------------------------
 
+/** `"22.15.0" >= [22, 15, 0]` — a plain MAJOR.MINOR.PATCH comparison (no
+ *  pre-release handling; Node's own `process.versions.node` never carries
+ *  one). Exported so the comparison itself is testable without needing an
+ *  actual old Node runtime to prove the ✗ branch. */
+export function nodeVersionAtLeast(version: string, min: readonly [number, number, number]): boolean {
+  const m = version.match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return false;
+  const parts: [number, number, number] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  for (let i = 0; i < 3; i++) {
+    if (parts[i]! > min[i]!) return true;
+    if (parts[i]! < min[i]!) return false;
+  }
+  return true; // exactly equal
+}
+
 export function checkNode(): Result {
   const what = "Node ≥ 22.15 with process.execve";
-  return typeof process.execve === "function"
-    ? { ok: true, what }
-    : { ok: false, what, why: `running ${process.version}, no process.execve` };
+  const versionOk = nodeVersionAtLeast(process.versions.node, MIN_NODE);
+  const execveOk = typeof process.execve === "function";
+  if (versionOk && execveOk) return { ok: true, what };
+  const missing = execveOk ? "" : ", no process.execve";
+  return { ok: false, what, why: `running ${process.version}${missing}` };
 }
 
 export function checkTmux(): Result {
@@ -97,58 +118,138 @@ export function checkHooks(fix: boolean): Result {
 }
 
 // --- Store permissions -----------------------------------------------------
+//
+// The walk covers ONLY paths `ms` itself owns and writes — never Claude
+// Code's or codex's own config directories. Reviewed and scoped after a
+// blanket recursive walk over all of MS_HOME was found to report (and,
+// under --fix, chmod) ~15k files inside a live CLAUDE_CONFIG_DIR, including
+// plugin executables, breaking Claude Code for that account. The only
+// exception carved out of `claude/<name>/` is `.credentials.json` itself,
+// which `ms` reads and rewrites (src/providers/claude-usage.ts).
 
-type PermIssue = { path: string; wantMode: number; foundMode: number };
+type PermIssue = { path: string; wantMode: number; foundMode: number; symlink?: boolean };
 
 function octal(mode: number): string {
   return mode.toString(8).padStart(3, "0");
 }
 
-function walkStore(dir: string, out: PermIssue[]): void {
+/** Records an issue for `entryPath` if it is a symlink (never followed,
+ *  never fixed), or if it exists with the wrong mode. A missing path is not
+ *  an issue — the next command to need it creates it correctly. Returns the
+ *  freshly-`lstat`ed entry so callers that care about type (dir vs file)
+ *  don't stat twice, or `null` when absent/symlinked/unreadable. */
+function checkEntry(entryPath: string, wantMode: number, issues: PermIssue[]): Stats | null {
+  let st: Stats;
+  try {
+    st = lstatSync(entryPath);
+  } catch {
+    return null;
+  }
+  if (st.isSymbolicLink()) {
+    issues.push({ path: entryPath, wantMode: -1, foundMode: -1, symlink: true });
+    return null;
+  }
+  const found = st.mode & 0o777;
+  if (found !== wantMode) issues.push({ path: entryPath, wantMode, foundMode: found });
+  return st;
+}
+
+/** Recursively walks an ms-owned directory (dirs 0700, files 0600). When
+ *  `fix` is set, a bad directory mode is repaired immediately — before this
+ *  same call tries to `readdirSync` it — so a subtree a bad permission was
+ *  blocking gets walked (and its own issues found and fixed) in this same
+ *  run; bounded to that one immediate repair per directory, never a retry
+ *  loop. */
+function walkOwnedDir(dir: string, fix: boolean, issues: PermIssue[]): void {
+  const st = checkEntry(dir, 0o700, issues);
+  if (!st) return; // absent, or a symlink — either way, nothing to recurse into
+  if (!st.isDirectory()) return;
+  if ((st.mode & 0o777) !== 0o700 && fix) {
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      /* already recorded as an issue; the fix pass below reports the failure */
+    }
+  }
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
   } catch {
-    return; // does not exist (yet) — nothing to check
+    return; // still unreadable even after the repair attempt above — bounded, stop
   }
   for (const e of entries) {
     const full = path.join(dir, e.name);
-    let st;
+    let est;
     try {
-      st = lstatSync(full);
+      est = lstatSync(full);
     } catch {
       continue;
     }
-    if (st.isSymbolicLink()) continue; // never followed, never touched
-    const found = st.mode & 0o777;
-    if (st.isDirectory()) {
-      if (found !== 0o700) out.push({ path: full, wantMode: 0o700, foundMode: found });
-      walkStore(full, out);
-    } else if (st.isFile() && found !== 0o600) {
-      out.push({ path: full, wantMode: 0o600, foundMode: found });
+    if (est.isSymbolicLink()) {
+      issues.push({ path: full, wantMode: -1, foundMode: -1, symlink: true });
+      continue;
     }
+    if (est.isDirectory()) {
+      walkOwnedDir(full, fix, issues);
+    } else if (est.isFile()) {
+      const found = est.mode & 0o777;
+      if (found !== 0o600) issues.push({ path: full, wantMode: 0o600, foundMode: found });
+    }
+  }
+}
+
+/** `claude/`: the directory itself (0700), each `claude/<name>` account
+ *  directory (0700), and ONLY `claude/<name>/.credentials.json` (0600)
+ *  inside it — never anything else under an account directory. That
+ *  directory is Claude Code's own CLAUDE_CONFIG_DIR; `ms` does not own its
+ *  contents and must not report on, let alone chmod, the rest of them. */
+function checkClaudeTree(home: string, fix: boolean, issues: PermIssue[]): void {
+  const claudeDir = path.join(home, "claude");
+  const st = checkEntry(claudeDir, 0o700, issues);
+  if (!st || !st.isDirectory()) return;
+  if ((st.mode & 0o777) !== 0o700 && fix) {
+    try {
+      chmodSync(claudeDir, 0o700);
+    } catch {
+      /* recorded already */
+    }
+  }
+  let entries;
+  try {
+    entries = readdirSync(claudeDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const accountDir = path.join(claudeDir, e.name);
+    const ast = checkEntry(accountDir, 0o700, issues);
+    if (!ast || !ast.isDirectory()) continue;
+    checkEntry(path.join(accountDir, ".credentials.json"), 0o600, issues);
   }
 }
 
 export function checkStorePermissions(fix: boolean): Result[] {
   const home = msHome();
   const issues: PermIssue[] = [];
-  try {
-    const st = lstatSync(home);
-    if (!st.isSymbolicLink() && st.isDirectory() && (st.mode & 0o777) !== 0o700) {
-      issues.push({ path: home, wantMode: 0o700, foundMode: st.mode & 0o777 });
-    }
-  } catch {
-    // the store does not exist yet — the next command to touch it creates
-    // it correctly (ensureStore); nothing to flag here.
-  }
-  walkStore(home, issues);
+
+  checkEntry(home, 0o700, issues);
+  checkEntry(p.registry, 0o600, issues);
+  checkEntry(p.state, 0o600, issues);
+  checkEntry(`${p.state}-wal`, 0o600, issues);
+  checkEntry(`${p.state}-shm`, 0o600, issues);
+  checkEntry(path.join(home, "locks.sqlite"), 0o600, issues);
+  checkEntry(p.snapshot, 0o600, issues);
+  checkEntry(p.lastPick, 0o600, issues);
+
+  for (const sub of ["launch", "sessions", "locks", "hooks"]) walkOwnedDir(path.join(home, sub), fix, issues);
+  checkClaudeTree(home, fix, issues);
 
   if (issues.length === 0) return [{ ok: true, what: "store permissions (0700 dirs, 0600 files) under MS_HOME" }];
 
   return issues.map((iss): Result => {
     const rel = path.relative(home, iss.path) || ".";
     const what = `store permission: ${rel}`;
+    if (iss.symlink) return { ok: false, what, why: "symlink in store (never followed, never fixed)" };
     const why = `is 0${octal(iss.foundMode)}, want 0${octal(iss.wantMode)}`;
     if (!fix) return { ok: false, what, why };
     try {
@@ -160,9 +261,27 @@ export function checkStorePermissions(fix: boolean): Result[] {
   });
 }
 
+// --- The registry itself ---------------------------------------------------
+
+/** A malformed `accounts.json`, or rows `validateRegistry` skipped, are
+ *  never fixed here (there is no safe rewrite doctor could apply — see
+ *  `npm run accounts:doctor` for that) but must count toward exit 1: a
+ *  registry that can't be read silently drops every account check, which
+ *  used to report a clean, empty, green run. */
+function checkRegistry(parseError: string | null, problems: string[]): Result[] {
+  const out: Result[] = [];
+  if (parseError) {
+    out.push({ ok: false, what: "accounts.json", why: parseError });
+  } else if (problems.length === 0) {
+    out.push({ ok: true, what: "accounts.json" });
+  }
+  problems.forEach((problem, i) => out.push({ ok: false, what: `accounts.json entry ${i}`, why: problem }));
+  return out;
+}
+
 // --- Claude accounts ---------------------------------------------------
 
-export async function checkClaudeAccount(a: Account): Promise<Result[]> {
+export async function checkClaudeAccount(a: Account, fix: boolean): Promise<Result[]> {
   const tag = `claude account ${a.name}`;
   const out: Result[] = [];
 
@@ -171,17 +290,23 @@ export async function checkClaudeAccount(a: Account): Promise<Result[]> {
     out.push({ ok: false, what: `${tag}: poll grant readable`, why: "no credentials file or keychain entry (npm run add-claude on the serving host)" });
   } else {
     out.push({ ok: true, what: `${tag}: poll grant readable` });
-    const dueInMs = cred.expiresAt - Date.now();
-    if (dueInMs > REFRESH_DUE_MS) {
+    const due = cred.expiresAt - Date.now() <= REFRESH_DUE_MS;
+    if (!due) {
       out.push({ ok: true, what: `${tag}: poll grant refresh not due` });
+    } else if (!fix) {
+      // Never refresh (and so never rotate a live credential) without
+      // --fix: a plain `ms doctor` must be read-only.
+      out.push({ ok: false, what: `${tag}: poll grant`, why: "refresh due (run ms doctor --fix)" });
     } else {
       try {
         await refreshPollCredentials(a.name, cred, AbortSignal.timeout(REFRESH_TIMEOUT_MS));
-        out.push({ ok: true, what: `${tag}: poll grant refreshable` });
+        out.push({ ok: true, what: `${tag}: poll grant`, fixed: true });
       } catch (e) {
-        const why =
-          e instanceof AuthError ? `auth: ${e.message}` : e instanceof TransientError ? `transient: ${e.message}` : (e as Error).message;
-        out.push({ ok: false, what: `${tag}: poll grant refreshable`, why });
+        const kind = e instanceof AuthError ? "auth" : e instanceof TransientError ? "transient" : "error";
+        // e.message is drawn from claude-usage.ts's own error contract, which
+        // never includes a token or credential value — see its tests.
+        const msg = e instanceof Error ? e.message : String(e);
+        out.push({ ok: false, what: `${tag}: poll grant`, why: `refresh failed: ${kind}: ${msg}` });
       }
     }
   }
@@ -203,28 +328,44 @@ export async function checkClaudeAccount(a: Account): Promise<Result[]> {
 
 // --- Orphaned session state -------------------------------------------
 
-function isOrphaned(s: { socket: string; pane: string; state: string }): boolean {
-  if (s.state === "stopped") return false;
-  return !new Tmux(s.socket || null).paneExists(s.pane);
+/** The live pane ids on one tmux socket, memoized for the run: with many
+ *  sessions sharing a socket, `checkOrphaned` used to spawn one
+ *  `tmux list-panes -a` per session. */
+function livePanes(socket: string, cache: Map<string, Set<string>>): Set<string> {
+  const key = socket;
+  const cached = cache.get(key);
+  if (cached) return cached;
+  const panes = new Set(
+    new Tmux(socket || null).run(["list-panes", "-a", "-F", "#{pane_id}"]).stdout.split("\n").filter(Boolean),
+  );
+  cache.set(key, panes);
+  return panes;
+}
+
+function findOrphaned(sessions: SessionRow[], cache: Map<string, Set<string>>): SessionRow[] {
+  return sessions.filter((s) => s.state !== "stopped" && !livePanes(s.socket, cache).has(s.pane));
 }
 
 export async function checkOrphaned(fix: boolean): Promise<Result[]> {
   const st = openState();
-  let sessions;
+  let sessions: SessionRow[];
   try {
     sessions = st.listSessions();
   } finally {
     st.close();
   }
-  let orphaned = sessions.filter(isOrphaned);
+  let orphaned = findOrphaned(sessions, new Map());
   if (orphaned.length === 0) return [{ ok: true, what: "orphaned session state" }];
 
   if (fix) {
-    // Task 18's reconciler, imported dynamically and only here: this branch
-    // must not break before that module lands, and must never be a static
-    // dependency of this one either way. The specifier is built at runtime
-    // (not a string literal at the call site) so `tsc` does not try to
-    // resolve a module that may not exist yet.
+    // TODO(T18 merge): static import — Task 18 (src/reconcile.ts) has not
+    // landed in this worktree yet. Once it does, the controller replaces
+    // this with a plain `import { reconcile } from "./reconcile.ts"` at the
+    // top of the file. Until then this dynamic import — its specifier built
+    // at runtime, not a string literal at the call site, so `tsc` never
+    // tries to resolve a module that does not exist yet — is guarded by the
+    // try/catch below so this branch degrades gracefully (still reports the
+    // orphans, unfixed) rather than crashing `ms doctor --fix`.
     try {
       const reconcileModule: string = [".", "reconcile.ts"].join("/");
       const mod = (await import(reconcileModule)) as { reconcile: () => string[] };
@@ -235,7 +376,7 @@ export async function checkOrphaned(fix: boolean): Promise<Result[]> {
       } finally {
         st2.close();
       }
-      orphaned = sessions.filter(isOrphaned);
+      orphaned = findOrphaned(sessions, new Map());
       if (orphaned.length === 0) return [{ ok: true, what: "orphaned session state", fixed: true }];
     } catch {
       // reconcile.ts not available yet, or it threw — fall through and
@@ -247,26 +388,6 @@ export async function checkOrphaned(fix: boolean): Promise<Result[]> {
 }
 
 // --- ms on PATH ----------------------------------------------------------
-
-/** Walk PATH the way a shell would (first executable regular file named
- *  `name` wins), following symlinks — a private copy of `src/exec.ts`'s
- *  `resolveOnPath`: that one is not exported, and this task touches only its
- *  own files. */
-function resolveOnPath(name: string): string | null {
-  const dirs = (process.env.PATH ?? "").split(path.delimiter);
-  for (const dir of dirs) {
-    if (!dir) continue;
-    const candidate = path.join(dir, name);
-    try {
-      if (!statSync(candidate).isFile()) continue;
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      continue;
-    }
-  }
-  return null;
-}
 
 export function checkPathBinary(): Result {
   const what = "ms on PATH is msBinary()";
@@ -301,9 +422,10 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
   results.push(checkHooks(fix));
   results.push(...checkStorePermissions(fix));
 
-  const { registry } = loadRegistry();
+  const { registry, parseError, problems } = loadRegistry();
+  results.push(...checkRegistry(parseError, problems));
   for (const a of registry.accounts.filter((a) => a.provider === "claude")) {
-    results.push(...(await checkClaudeAccount(a)));
+    results.push(...(await checkClaudeAccount(a, fix)));
   }
 
   results.push(...(await checkOrphaned(fix)));

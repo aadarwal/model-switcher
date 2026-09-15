@@ -20,8 +20,10 @@ const STRIP_ENV_KEYS = [
 ] as const;
 
 /** `execve` takes a path, not a bare name, so we walk PATH ourselves the
- * way a shell would (first executable regular file named `name` wins). */
-function resolveOnPath(name: string): string | null {
+ * way a shell would (first executable regular file named `name` wins).
+ * Exported for `src/doctor.ts`'s "ms on PATH" check — the one other module
+ * that needs to resolve a name on PATH the same way. */
+export function resolveOnPath(name: string): string | null {
   const dirs = (process.env.PATH ?? "").split(path.delimiter);
   for (const dir of dirs) {
     if (!dir) continue;

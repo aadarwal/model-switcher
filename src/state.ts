@@ -1,0 +1,168 @@
+/**
+ * State store for model-switcher, over `node:sqlite`'s `DatabaseSync`.
+ * All timestamps in this module — `createdAt`, `updatedAt`, `wakeupAt`,
+ * `nextAttemptAt`, and launch `createdAt` — are unix SECONDS, not
+ * milliseconds (`now()` below floors `Date.now() / 1000`).
+ */
+import { DatabaseSync } from "node:sqlite";
+import { chmodSync, existsSync } from "node:fs";
+import { ensureStore, p } from "./paths.ts";
+
+export type Provider = "claude" | "codex";
+export type SessionState = "launching" | "running" | "walled" | "stopping" | "resuming" | "continuing" | "parked" | "waiting" | "stopped";
+export type SessionRow = { id: string; provider: Provider; cliSessionId: string | null; cwd: string; socket: string; pane: string;
+  serverStart: string; need: "any" | "fable"; account: string; generation: number; state: SessionState;
+  desired: "running" | "stopped"; flags: string[]; wakeupAt: number | null; createdAt: number; updatedAt: number };
+export type LaunchRow = { id: string; sessionId: string; generation: number; account: string; command: string[]; env: Record<string, string>; createdAt: number };
+export type WallKind = "session" | "weekly" | "fable" | "unknown";
+export type RecoveryRow = { id: number; sessionId: string; generation: number; turnId: string | null; kind: WallKind;
+  status: "pending" | "owned" | "done" | "obsolete"; owner: string | null; attempts: number; nextAttemptAt: number | null; createdAt: number; updatedAt: number };
+export type AttemptOutcome = "ok" | "exhausted" | "auth" | "infra" | "resume-broken" | "forced";
+export type AttemptRow = { id: number; recoveryId: number; account: string; outcome: AttemptOutcome; note: string; createdAt: number };
+type RecoveryInput = Omit<RecoveryRow, "id" | "status" | "owner" | "attempts" | "nextAttemptAt" | "createdAt" | "updatedAt">;
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, provider TEXT, cliSessionId TEXT, cwd TEXT, socket TEXT, pane TEXT,
+  serverStart TEXT, need TEXT, account TEXT, generation INTEGER, state TEXT, desired TEXT, flags TEXT, wakeupAt INTEGER, createdAt INTEGER, updatedAt INTEGER);
+CREATE TABLE IF NOT EXISTS launches (id TEXT PRIMARY KEY, sessionId TEXT, generation INTEGER, account TEXT, command TEXT, env TEXT, createdAt INTEGER);
+CREATE TABLE IF NOT EXISTS recoveries (id INTEGER PRIMARY KEY AUTOINCREMENT, sessionId TEXT, generation INTEGER, turnId TEXT, kind TEXT,
+  status TEXT, owner TEXT, attempts INTEGER DEFAULT 0, nextAttemptAt INTEGER, createdAt INTEGER, updatedAt INTEGER);
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_recovery ON recoveries(sessionId) WHERE status IN ('pending','owned');
+CREATE TABLE IF NOT EXISTS attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, recoveryId INTEGER, account TEXT, outcome TEXT, note TEXT, createdAt INTEGER);
+`;
+const now = () => Math.floor(Date.now() / 1000);
+
+/** Columns `updateSession` is allowed to write. `id` is immutable,
+ * `createdAt` is set once at creation, and `updatedAt` is always stamped
+ * by this class from its own clock, never from the caller's patch — so
+ * none of the three are listed here. Whitelisting instead of trusting
+ * `Object.keys(patch)` also closes an injection hole: a patch key that is
+ * itself a SQL fragment (e.g. `"account=99, state"`, which the old
+ * `${cols.map(c => \`${c}=?\`)}` template would have spliced straight into
+ * the SET clause) can never become a column reference, because it simply
+ * isn't in this set. */
+const SESSION_COLUMNS = new Set<string>([
+  "provider", "cliSessionId", "cwd", "socket", "pane", "serverStart", "need",
+  "account", "generation", "state", "desired", "flags", "wakeupAt",
+]);
+
+function isUniqueConstraintError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  const code = (e as { code?: unknown }).code;
+  return code === "ERR_SQLITE_ERROR" && /UNIQUE constraint failed/.test(e.message);
+}
+
+export class State {
+  private closed = false;
+  constructor(private db: DatabaseSync) { db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); db.exec(SCHEMA); }
+  private rowToSession(r: Record<string, unknown> | undefined): SessionRow | null {
+    if (!r) return null;
+    return { ...(r as unknown as SessionRow), flags: JSON.parse(String(r.flags ?? "[]")) };
+  }
+  createSession(s: Omit<SessionRow, "wakeupAt" | "createdAt" | "updatedAt">): void {
+    const t = now();
+    this.db.prepare(`INSERT INTO sessions (id,provider,cliSessionId,cwd,socket,pane,serverStart,need,account,generation,state,desired,flags,wakeupAt,createdAt,updatedAt)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(s.id, s.provider, s.cliSessionId, s.cwd, s.socket, s.pane, s.serverStart, s.need, s.account, s.generation, s.state, s.desired, JSON.stringify(s.flags), null, t, t);
+  }
+  getSession(id: string): SessionRow | null { return this.rowToSession(this.db.prepare("SELECT * FROM sessions WHERE id=?").get(id) as Record<string, unknown> | undefined); }
+  listSessions(): SessionRow[] { return (this.db.prepare("SELECT * FROM sessions ORDER BY createdAt").all() as Record<string, unknown>[]).map((r) => this.rowToSession(r)!); }
+  updateSession(id: string, patch: Partial<SessionRow>): void {
+    const cols = Object.keys(patch).filter((k) => SESSION_COLUMNS.has(k));
+    if (!cols.length) return;
+    const vals = cols.map((k) => (k === "flags" ? JSON.stringify((patch as Record<string, unknown>)[k]) : (patch as Record<string, unknown>)[k]));
+    this.db.prepare(`UPDATE sessions SET ${cols.map((c) => `${c}=?`).join(",")}, updatedAt=? WHERE id=?`).run(...(vals as (string | number | null)[]), now(), id);
+  }
+  createLaunch(l: LaunchRow): void {
+    this.db.prepare("INSERT INTO launches (id,sessionId,generation,account,command,env,createdAt) VALUES (?,?,?,?,?,?,?)")
+      .run(l.id, l.sessionId, l.generation, l.account, JSON.stringify(l.command), JSON.stringify(l.env), l.createdAt);
+  }
+  getLaunch(id: string): LaunchRow | null {
+    const r = this.db.prepare("SELECT * FROM launches WHERE id=?").get(id) as Record<string, unknown> | undefined;
+    return r ? { ...(r as unknown as LaunchRow), command: JSON.parse(String(r.command)), env: JSON.parse(String(r.env)) } : null;
+  }
+  /** Raw insert of a new pending recovery row, with no pre-check — this is
+   * the fix for the addRecovery TOCTOU race: two processes (e.g. a
+   * StopFailure hook and a tmux-dispatched worker, or two hooks) can both
+   * observe `pendingRecovery` return null and both reach here. The
+   * `one_open_recovery` partial unique index lets only one INSERT win;
+   * the loser catches the constraint error and returns the winner's id
+   * instead of throwing — a hook must never fail loudly, and the losing
+   * process still gets a valid recovery id to act on. Exposed (not
+   * private) so this race can be exercised directly: calling it twice for
+   * the same session is exactly what two racing processes look like from
+   * the database's point of view. */
+  insertRecovery(r: RecoveryInput): number {
+    const t = now();
+    try {
+      const res = this.db.prepare("INSERT INTO recoveries (sessionId,generation,turnId,kind,status,createdAt,updatedAt) VALUES (?,?,?,?,'pending',?,?)")
+        .run(r.sessionId, r.generation, r.turnId, r.kind, t, t);
+      return Number(res.lastInsertRowid);
+    } catch (e) {
+      if (isUniqueConstraintError(e)) {
+        const winner = this.pendingRecovery(r.sessionId);
+        if (winner) return winner.id;
+      }
+      throw e;
+    }
+  }
+  addRecovery(r: RecoveryInput): number {
+    const open = this.pendingRecovery(r.sessionId);
+    if (open) return open.id;
+    return this.insertRecovery(r);
+  }
+  pendingRecovery(sessionId: string): RecoveryRow | null {
+    return (this.db.prepare("SELECT * FROM recoveries WHERE sessionId=? AND status IN ('pending','owned') LIMIT 1").get(sessionId) as RecoveryRow | undefined) ?? null;
+  }
+  ownRecovery(id: number, owner: string): boolean {
+    const res = this.db.prepare("UPDATE recoveries SET status='owned', owner=?, updatedAt=? WHERE id=? AND status='pending'").run(owner, now(), id);
+    return Number(res.changes) === 1;
+  }
+  finishRecovery(id: number, status: "done" | "obsolete"): void { this.db.prepare("UPDATE recoveries SET status=?, updatedAt=? WHERE id=?").run(status, now(), id); }
+  releaseRecovery(id: number): void { this.db.prepare("UPDATE recoveries SET status='pending', owner=NULL, updatedAt=? WHERE id=?").run(now(), id); }
+  addAttempt(a: { recoveryId: number; account: string; outcome: AttemptOutcome; note: string }): void {
+    const t = now();
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("INSERT INTO attempts (recoveryId,account,outcome,note,createdAt) VALUES (?,?,?,?,?)").run(a.recoveryId, a.account, a.outcome, a.note, t);
+      this.db.prepare("UPDATE recoveries SET attempts=attempts+1, updatedAt=? WHERE id=?").run(t, a.recoveryId);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+  attempts(recoveryId: number): AttemptRow[] { return this.db.prepare("SELECT * FROM attempts WHERE recoveryId=? ORDER BY id").all(recoveryId) as AttemptRow[]; }
+  setWakeup(sessionId: string, at: number | null): void { this.db.prepare("UPDATE sessions SET wakeupAt=?, updatedAt=? WHERE id=?").run(at, now(), sessionId); }
+  dueWakeups(t: number): SessionRow[] {
+    return (this.db.prepare("SELECT * FROM sessions WHERE wakeupAt IS NOT NULL AND wakeupAt<=? ORDER BY wakeupAt").all(t) as Record<string, unknown>[]).map((r) => this.rowToSession(r)!);
+  }
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.db.close();
+  }
+}
+
+export function openState(): State {
+  ensureStore();
+  const db = new DatabaseSync(p.state);
+  // Chmod the main file unconditionally — a pre-existing file (created by
+  // an older build, or anything else) may be 0644 — and do it BEFORE
+  // enabling WAL: SQLite copies the main db file's permissions onto the
+  // -wal/-shm sidecar files at the moment it creates them, so chmodding
+  // first means those sidecars are born 0600 rather than inheriting umask.
+  chmodSync(p.state, 0o600);
+  for (const suffix of ["-wal", "-shm"]) {
+    const f = `${p.state}${suffix}`;
+    if (existsSync(f)) chmodSync(f, 0o600);
+  }
+  const state = new State(db);
+  // Belt-and-suspenders: the constructor's PRAGMA is what actually creates
+  // the sidecars on a brand-new file, so chmod them again now that they
+  // exist, in case the copy-on-create behavior above didn't apply.
+  for (const suffix of ["-wal", "-shm"]) {
+    const f = `${p.state}${suffix}`;
+    if (existsSync(f)) chmodSync(f, 0o600);
+  }
+  return state;
+}

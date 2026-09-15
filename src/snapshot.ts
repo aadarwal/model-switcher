@@ -6,7 +6,7 @@
 // launch choosing an account, a hook-dispatched recovery worker rotating a
 // walled pane, a human running `ms status`. Sixty simultaneous walls must
 // produce one poll per account, not sixty — the usage endpoint rate-limits,
-// and sixty refreshes of one credential would race each other's write-back.
+// and sixty refreshes of one credential would spend each other's grant.
 //
 // Three mechanisms do it, and none of them is a daemon:
 //
@@ -15,17 +15,29 @@
 //     finds the file fresh and returns it without a call of their own. A
 //     waiter that runs out of patience serves the last file rather than
 //     stampeding (a stale reading beats a duplicate poll beats an exception).
-//   * inside one process — one in-flight promise per scope, so a process that
-//     asks twice before the first answer arrives shares the answer.
-//   * per credential — `account-<name>`, held across a refresh, because the
-//     token endpoint rotates the refresh token and two processes spending one
-//     grant leave the loser holding a dead one.
+//   * inside one process — one in-flight promise per request shape, so a
+//     process that asks twice before the first answer arrives shares it.
+//   * per credential — `account-<provider>-<name>`, held across a refresh,
+//     because the token endpoint rotates the refresh token and two processes
+//     spending one grant leave the loser holding a dead one.
+//
+// LOCK ORDERING: `snapshot` is always taken BEFORE `account-<provider>-<name>`,
+// never the other way round. Anything that holds an account lock (`ms accounts
+// login`) must not then ask for the snapshot. Both locks are bounded waits, so
+// a violation degrades to a `Locked` — classified transient here — rather than
+// hanging, but the order is the contract.
+//
+// IDENTITY: an account is `(provider, name)`, never `name` alone — the registry
+// deliberately allows `claude:work` and `codex:work` to coexist. Every map and
+// every key in this file, including the cache file's `backoff` record, is
+// `"<provider>:<name>"`. Keying on the bare name silently merged the two rows
+// and dropped a live Claude account out of the pool.
 //
 // The file (0600, written temp+rename) is the whole of the shared state:
-// `{ takenAt, accounts, backoff }`. `backoff` is what keeps a rate-limited
-// account from being re-asked every 20 seconds; it is bounded at 15 minutes
-// both when written and when read, so neither a hostile `retry-after` nor a
-// clock jump can pin an account out of the pool for a day.
+// `{ takenAt, accounts, backoff }`, where `backoff` maps `"<provider>:<name>"`
+// to the epoch-millisecond instant that account may be polled again. That
+// window is bounded at 15 minutes when written AND when read, so neither a
+// hostile `retry-after` nor a clock jump can pin an account out for a day.
 
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { ensureStore, p } from "./paths.ts";
@@ -44,10 +56,14 @@ import {
 
 export type ErrorKind = "auth" | "transient" | "other";
 
-/** One account as the last poll left it. `observedAt` is the time of the last
- *  SUCCESSFUL read — carried over when this round failed — so `usage` and its
- *  age are always the same reading. `stale` says this round did not refresh
- *  it (a backoff, a failure, or a scoped poll that skipped it). */
+/** One account as the last poll left it.
+ *
+ *  `observedAt` is the time of the last SUCCESSFUL read — carried over when
+ *  this round failed — so `usage` and its age are always the same reading, and
+ *  null when there has never been one. `stale` says this round did not refresh
+ *  the row: a backoff, a failed poll, a scoped poll that skipped it, or a
+ *  snapshot served while another process held the lock. A stale row is not
+ *  wrong, it is old, and `toPickInputs` is where that stops being good enough. */
 export type AccountUsage = {
   name: string;
   provider: Provider;
@@ -55,18 +71,27 @@ export type AccountUsage = {
   usage: Usage | null;
   error: string | null;
   errorKind: ErrorKind | null;
-  observedAt: number;
+  observedAt: number | null;
   stale: boolean;
 };
 
-export type Snapshot = { takenAt: number; accounts: AccountUsage[] };
+/** `takenAt` is null only when nothing has ever been written: a snapshot
+ *  served while another process polls, with no cache file to serve from.
+ *  `registryError` is accounts.json being unreadable — the one condition
+ *  under which an empty `accounts` means "could not look", not "none". */
+export type Snapshot = {
+  takenAt: number | null;
+  accounts: AccountUsage[];
+  registryError: string | null;
+};
 
 export type SnapshotOptions = {
   /** Serve the cache file when it is younger than this. Default 20 s; 0
    *  forces a poll. */
   maxAgeMs?: number;
-  /** Poll (and return) only these account names. Accounts left out keep their
-   *  last reading in the file, marked stale. */
+  /** Poll (and return) only accounts with these NAMES — both providers' rows
+   *  when a name is registered twice. Accounts left out keep their last
+   *  reading in the file, marked stale. */
   only?: string[];
   /** How long to wait for another process's poll before giving up and serving
    *  the last file. Default: long enough to outlast that poll. A caller that
@@ -74,8 +99,10 @@ export type SnapshotOptions = {
   lockWaitMs?: number;
 };
 
-/** The cache file, which is the snapshot plus the per-account retry timers. */
-type CacheFile = Snapshot & { backoff: Record<string, number> };
+/** The cache file: the rows plus the per-account retry timers. `registryError`
+ *  is deliberately NOT persisted — it describes this moment's read of
+ *  accounts.json, and a fixed registry must not keep reporting an old fault. */
+type CacheFile = { takenAt: number; accounts: AccountUsage[]; backoff: Record<string, number> };
 
 export const DEFAULT_MAX_AGE_MS = 20_000;
 /** Per-account wall clock for the whole refresh+read, per spec §9. */
@@ -84,14 +111,20 @@ export const POLL_TIMEOUT_MS = 15_000;
 export const REFRESH_SKEW_MS = 60_000;
 export const DEFAULT_BACKOFF_MS = 60_000;
 export const MAX_BACKOFF_MS = 900_000;
-/** A reading older than this stops being evidence, even for a live account. */
-export const ALIVE_AFTER_ERROR_MS = 600_000;
+/** How long a reading goes on being evidence once it stops being current —
+ *  whether it stopped because a poll failed or because nothing re-read it. */
+export const MAX_READING_AGE_MS = 600_000;
 /** Long enough to outlast the holder's own poll, so waiting beats stampeding. */
 const LOCK_WAIT_MS = POLL_TIMEOUT_MS + 5_000;
 const LOCK = "snapshot";
 const NO_POLLER = "no poller yet";
-/** Key separator for the in-flight map: no account name can contain it. */
-const KEY_SEP = "\u0000";
+
+/** The identity of an account, everywhere: provider first, then name. */
+const keyOf = (a: { provider: Provider; name: string }): string => `${a.provider}:${a.name}`;
+/** The credential lock's name. `-` not `:`, because src/lock.ts's name pattern
+ *  admits only `[A-Za-z0-9_-]` — a name it rejects would throw, not lock. */
+const lockOf = (a: { provider: Provider; name: string }): string => `account-${a.provider}-${a.name}`;
+const whoOf = (a: Account) => ({ name: a.name, provider: a.provider, shared: a.shared });
 
 // --- The cache file ----------------------------------------------------
 
@@ -108,7 +141,8 @@ function parseEntry(v: unknown): AccountUsage | null {
   const e = v as Record<string, unknown>;
   if (typeof e.name !== "string") return null;
   if (e.provider !== "claude" && e.provider !== "codex") return null;
-  if (typeof e.observedAt !== "number" || !Number.isFinite(e.observedAt)) return null;
+  const seen = e.observedAt;
+  if (seen !== null && (typeof seen !== "number" || !Number.isFinite(seen))) return null;
   return {
     name: e.name,
     provider: e.provider,
@@ -116,7 +150,7 @@ function parseEntry(v: unknown): AccountUsage | null {
     usage: e.usage && typeof e.usage === "object" ? (e.usage as Usage) : null,
     error: typeof e.error === "string" ? e.error : null,
     errorKind: isKind(e.errorKind) ? e.errorKind : null,
-    observedAt: e.observedAt,
+    observedAt: seen,
     stale: e.stale === true,
   };
 }
@@ -139,8 +173,8 @@ function readCache(): CacheFile | null {
   }
   const backoff: Record<string, number> = {};
   if (o.backoff && typeof o.backoff === "object" && !Array.isArray(o.backoff)) {
-    for (const [name, until] of Object.entries(o.backoff as Record<string, unknown>)) {
-      if (typeof until === "number" && Number.isFinite(until)) backoff[name] = until;
+    for (const [k, until] of Object.entries(o.backoff as Record<string, unknown>)) {
+      if (typeof until === "number" && Number.isFinite(until)) backoff[k] = until;
     }
   }
   return { takenAt: o.takenAt, accounts, backoff };
@@ -150,6 +184,8 @@ function writeCache(file: CacheFile): void {
   ensureStore();
   const tmp = `${p.snapshot}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   try {
+    // Only ever percentages, reset times and error strings: no credential of
+    // any kind reaches this file (test/snapshot.test.ts pins that).
     writeFileSync(tmp, JSON.stringify(file) + "\n", { mode: 0o600 });
     renameSync(tmp, p.snapshot);
   } catch {
@@ -196,14 +232,11 @@ export function classify(err: unknown): ErrorKind {
   return "other";
 }
 
-/** How long to leave a transiently-failed account alone. An error that names
- *  its own `retryAfterMs` is honoured up to the clamp; anything else waits a
- *  minute. The clamp is the point: an endpoint asking for a day must not take
- *  an account out of the pool for a day.
- *
- *  Note: today's provider does not surface a 429's `retry-after` header, so a
- *  real rate limit takes the one-minute default. When it learns to (Plan 2),
- *  this needs no change. */
+/** How long to leave a transiently-failed account alone. A 429 or 503 that
+ *  named a `retry-after` is honoured up to the clamp (the provider parses the
+ *  header onto `TransientError.retryAfterMs`); anything else waits a minute.
+ *  The clamp is the point: an endpoint asking for a day must not take an
+ *  account out of the pool for a day. */
 export function backoffMs(err: unknown): number {
   const raw = (err as { retryAfterMs?: unknown } | null)?.retryAfterMs;
   const asked = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_BACKOFF_MS;
@@ -223,14 +256,20 @@ export function backoffMs(err: unknown): number {
  *
  * Re-reading inside the lock is the other half of it: whoever we waited for
  * has just written a fresh credential where we found the stale one, so the
- * common case costs no network call at all.
+ * common case costs no network call at all. The wait is bounded by this
+ * account's own poll budget — sitting longer than the poll may run would be
+ * spending a deadline we do not have.
  */
-async function refreshGrant(name: string, c: PollCredentials, signal: AbortSignal): Promise<PollCredentials> {
-  return await withLock(`account-${name}`, async () => {
-    const latest = readPollCredentials(name) ?? c;
-    if (latest.expiresAt >= Date.now() + REFRESH_SKEW_MS) return latest;
-    return await refreshPollCredentials(name, latest, signal);
-  });
+async function refreshGrant(a: Account, c: PollCredentials, signal: AbortSignal): Promise<PollCredentials> {
+  return await withLock(
+    lockOf(a),
+    async () => {
+      const latest = readPollCredentials(a.name) ?? c;
+      if (latest.expiresAt >= Date.now() + REFRESH_SKEW_MS) return latest;
+      return await refreshPollCredentials(a.name, latest, signal);
+    },
+    { waitMs: POLL_TIMEOUT_MS },
+  );
 }
 
 type Polled = { entry: AccountUsage; backoffUntil: number | null };
@@ -238,9 +277,9 @@ type Polled = { entry: AccountUsage; backoffUntil: number | null };
 /** Never throws: every outcome is an entry, because one account's failure must
  *  not cost the caller the other accounts' numbers. */
 async function pollOne(a: Account, prev: AccountUsage | null, backoffUntil: number): Promise<Polled> {
-  const who = { name: a.name, provider: a.provider, shared: a.shared };
+  const who = whoOf(a);
   const keep = (over: Partial<AccountUsage>): AccountUsage => ({
-    ...(prev ?? { ...who, usage: null, error: null, errorKind: null, observedAt: 0, stale: false }),
+    ...(prev ?? { ...who, usage: null, error: null, errorKind: null, observedAt: null, stale: false }),
     ...who,
     ...over,
   });
@@ -248,7 +287,12 @@ async function pollOne(a: Account, prev: AccountUsage | null, backoffUntil: numb
   if (a.provider !== "claude") {
     // Plan 2 adds the codex poller. Until then this is a named absence, not a
     // silent null: `ms status` should say why, and the chooser should skip it.
-    return { entry: keep({ usage: null, error: NO_POLLER, errorKind: "other", stale: false }), backoffUntil: null };
+    // `observedAt` is null because nothing has ever been read, and `stale` is
+    // false because this IS current — there is simply nothing to be current.
+    return {
+      entry: keep({ usage: null, error: NO_POLLER, errorKind: "other", observedAt: null, stale: false }),
+      backoffUntil: null,
+    };
   }
 
   if (backoffUntil > Date.now()) {
@@ -278,7 +322,7 @@ async function pollOne(a: Account, prev: AccountUsage | null, backoffUntil: numb
         backoffUntil: null,
       };
     }
-    if (c.expiresAt < Date.now() + REFRESH_SKEW_MS) c = await refreshGrant(a.name, c, signal);
+    if (c.expiresAt < Date.now() + REFRESH_SKEW_MS) c = await refreshGrant(a, c, signal);
     const usage = await fetchUsage(c, signal);
     return {
       entry: { ...who, usage, error: null, errorKind: null, observedAt: Date.now(), stale: false },
@@ -304,14 +348,12 @@ function scopeOf(only: string[] | null, accounts: Account[]): Account[] {
   return only ? accounts.filter((a) => only.includes(a.name)) : accounts;
 }
 
-function project(file: CacheFile, scope: Account[]): Snapshot {
-  const by = new Map(file.accounts.map((e) => [e.name, e]));
-  const accounts: AccountUsage[] = [];
-  for (const a of scope) {
-    const e = by.get(a.name);
-    if (e) accounts.push({ ...e, provider: a.provider, shared: a.shared });
-  }
-  return { takenAt: file.takenAt, accounts };
+function project(file: CacheFile, scope: Account[], registryError: string | null): Snapshot {
+  const by = new Map(file.accounts.map((e) => [keyOf(e), e]));
+  // Total by construction: the fresh path is gated on `covers()`, and the poll
+  // path emits exactly one row per scoped account before calling this.
+  const accounts = scope.map((a): AccountUsage => ({ ...by.get(keyOf(a))!, ...whoOf(a) }));
+  return { takenAt: file.takenAt, accounts, registryError };
 }
 
 /** A negative age is a clock that went backwards; one poll is cheaper than a
@@ -322,100 +364,106 @@ const isFresh = (takenAt: number, maxAgeMs: number, now: number): boolean => {
 };
 
 const covers = (file: CacheFile, scope: Account[]): boolean => {
-  const names = new Set(file.accounts.map((e) => e.name));
-  return scope.every((a) => names.has(a.name));
+  const keys = new Set(file.accounts.map(keyOf));
+  return scope.every((a) => keys.has(keyOf(a)));
 };
 
 async function poll(maxAgeMs: number, only: string[] | null): Promise<Snapshot> {
-  const now = Date.now();
+  const startedAt = Date.now();
   const prev = readCache();
   const { registry, parseError } = loadRegistry();
   const scope = scopeOf(only, registry.accounts);
 
   // A file that is fresh but silent about an account registered since it was
   // written would hide that account for a whole window.
-  if (prev && isFresh(prev.takenAt, maxAgeMs, now) && covers(prev, scope)) return project(prev, scope);
+  if (prev && isFresh(prev.takenAt, maxAgeMs, startedAt) && covers(prev, scope)) {
+    return project(prev, scope, parseError);
+  }
 
-  const prevByName = new Map(prev?.accounts.map((e) => [e.name, e]) ?? []);
+  const prevByKey = new Map(prev?.accounts.map((e) => [keyOf(e), e]) ?? []);
   const backoff: Record<string, number> = {};
-  for (const [name, until] of Object.entries(prev?.backoff ?? {})) {
+  for (const [k, until] of Object.entries(prev?.backoff ?? {})) {
     // Clamped on the way in too: a file written by a future version, or across
     // a clock jump, cannot strand an account for longer than the clamp allows.
-    backoff[name] = Math.min(until, now + MAX_BACKOFF_MS);
+    backoff[k] = Math.min(until, startedAt + MAX_BACKOFF_MS);
   }
 
   const settled = await Promise.allSettled(
-    scope.map((a) => pollOne(a, prevByName.get(a.name) ?? null, backoff[a.name] ?? 0)),
+    scope.map((a) => pollOne(a, prevByKey.get(keyOf(a)) ?? null, backoff[keyOf(a)] ?? 0)),
   );
 
   const polled: AccountUsage[] = [];
   settled.forEach((r, i) => {
     const a = scope[i]!;
+    const k = keyOf(a);
     if (r.status === "fulfilled") {
       polled.push(r.value.entry);
-      if (r.value.backoffUntil) backoff[a.name] = r.value.backoffUntil;
-      else delete backoff[a.name];
+      if (r.value.backoffUntil) backoff[k] = r.value.backoffUntil;
+      else delete backoff[k];
       return;
     }
     // pollOne is written not to throw; if it ever does, that is this tool's
     // bug and it belongs on the account's row rather than in a swallowed
     // catch — "other", so no backoff timer pretends it is the network.
-    const prevEntry = prevByName.get(a.name) ?? null;
+    const prevEntry = prevByKey.get(k) ?? null;
     polled.push({
-      ...(prevEntry ?? { usage: null, observedAt: 0 }),
-      name: a.name,
-      provider: a.provider,
-      shared: a.shared,
+      ...(prevEntry ?? { usage: null, observedAt: null }),
+      ...whoOf(a),
       error: errMessage(r.reason),
       errorKind: "other",
       stale: true,
     });
-    delete backoff[a.name];
+    delete backoff[k];
   });
 
   // Accounts this round did not cover keep their last reading, marked stale —
   // a scoped poll must not blank the rest of the file. Rows for accounts that
   // have left the registry are dropped, but only when the registry read
   // cleanly: an unreadable accounts.json is not evidence that anything is gone.
-  const inScope = new Set(scope.map((a) => a.name));
-  const known = new Set(registry.accounts.map((a) => a.name));
-  const kept = (name: string) => parseError !== null || known.has(name);
+  const inScope = new Set(scope.map(keyOf));
+  const known = new Set(registry.accounts.map(keyOf));
+  const kept = (k: string) => parseError !== null || known.has(k);
   const carried = (prev?.accounts ?? [])
-    .filter((e) => !inScope.has(e.name) && kept(e.name))
+    .filter((e) => !inScope.has(keyOf(e)) && kept(keyOf(e)))
     .map((e) => ({ ...e, stale: true }));
-  for (const name of Object.keys(backoff)) if (!kept(name)) delete backoff[name];
+  for (const k of Object.keys(backoff)) if (!kept(k)) delete backoff[k];
 
-  const file: CacheFile = { takenAt: now, accounts: [...polled, ...carried], backoff };
+  // Stamped at the END of the poll: `takenAt` says how old the readings are,
+  // and the newest of them is this instant, not the instant we started.
+  const file: CacheFile = { takenAt: Date.now(), accounts: [...polled, ...carried], backoff };
   writeCache(file);
-  return project(file, scope);
+  return project(file, scope, parseError);
 }
 
 /** Another process is mid-poll and we ran out of patience. Its answer is
  *  moments away but we cannot block a launch on it, so serve the last file —
- *  every row marked stale, because none of it is this moment's reading. */
+ *  every row marked stale, because none of it is this moment's reading, and
+ *  `toPickInputs` will retire whatever has gone cold. */
 function servedWhileBusy(only: string[] | null): Snapshot {
   const prev = readCache();
-  const { registry } = loadRegistry();
+  const { registry, parseError } = loadRegistry();
   const scope = scopeOf(only, registry.accounts);
-  const by = new Map(prev?.accounts.map((e) => [e.name, e]) ?? []);
+  const by = new Map(prev?.accounts.map((e) => [keyOf(e), e]) ?? []);
   const accounts = scope.map((a): AccountUsage => {
-    const who = { name: a.name, provider: a.provider, shared: a.shared };
-    const e = by.get(a.name);
+    const who = whoOf(a);
+    const e = by.get(keyOf(a));
     if (e) return { ...e, ...who, stale: true };
     return {
       ...who,
       usage: null,
       error: "another process is polling usage",
       errorKind: "transient",
-      observedAt: 0,
+      observedAt: null,
       stale: true,
     };
   });
-  return { takenAt: prev?.takenAt ?? 0, accounts };
+  return { takenAt: prev?.takenAt ?? null, accounts, registryError: parseError };
 }
 
 async function take(maxAgeMs: number, only: string[] | null, waitMs: number): Promise<Snapshot> {
   try {
+    // The snapshot lock is the OUTER one; `refreshGrant` takes the account
+    // lock beneath it. Never the reverse (see LOCK ORDERING at the top).
     return await withLock(LOCK, () => poll(maxAgeMs, only), { waitMs });
   } catch (err) {
     if (!(err instanceof Locked) && errName(err) !== "Locked") throw err;
@@ -432,11 +480,11 @@ export function getSnapshot(opts: SnapshotOptions = {}): Promise<Snapshot> {
   const maxAgeMs = opts.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
   const waitMs = opts.lockWaitMs ?? LOCK_WAIT_MS;
   const only = opts.only ? [...new Set(opts.only)].sort() : null;
-  // Keyed by what was actually asked: a caller wanting a forced re-poll, or a
-  // different set of accounts, must not be handed a narrower answer meant for
-  // somebody else. (`lockWaitMs` is not part of the key — it bounds how long
-  // this caller waits for a poll, not what the answer contains.)
-  const key = `${maxAgeMs}${KEY_SEP}${only ? only.join(KEY_SEP) : "*"}`;
+  // Keyed by everything the caller asked for, `lockWaitMs` included: a caller
+  // that can only spare 50 ms must not be joined to somebody else's 20-second
+  // wait, any more than it should be handed a narrower set of accounts or a
+  // staler answer than it asked for.
+  const key = JSON.stringify([maxAgeMs, waitMs, only]);
   const running = inFlight.get(key);
   if (running) return running;
   const promise = take(maxAgeMs, only, waitMs).finally(() => {
@@ -446,20 +494,44 @@ export function getSnapshot(opts: SnapshotOptions = {}): Promise<Snapshot> {
   return promise;
 }
 
+/** Rounded, human-sized, and never precise: this only ever lands in an error
+ *  string a person reads. */
+function ageLabel(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m}m`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h`;
+  return `${Math.round(h / 24)}d`;
+}
+
 /**
  * The snapshot as the chooser (src/pick.ts) reads it.
  *
- * An account is alive when there is a reading AND either nothing went wrong or
- * what went wrong was transient and the reading is still recent. Everything
- * else carries an `error`, which `pickAccounts` reports as the reason it was
- * passed over — a dead account must never look like an absent one.
+ * An account is alive when there is a reading, AND that reading is either
+ * current or under ten minutes old, AND nothing went wrong beyond a transient
+ * failure over a reading that is itself still that recent. The age test covers
+ * BOTH ways a row goes cold — a failed poll and a row nothing re-read (a
+ * scoped poll, or a snapshot served while another process held the lock) —
+ * because an errorless row that is four hours old is four hours old, and
+ * feeding those percentages to the chooser is how a walled account gets picked.
+ *
+ * Everything else carries an `error`, which `pickAccounts` reports as the
+ * reason it was passed over: a dead account must never look like an absent
+ * one. An unreadable registry yields no inputs at all — `registryError` is
+ * there so `ms status` can say why rather than print "no accounts".
  */
 export function toPickInputs(s: Snapshot): PickInput[] {
+  if (s.registryError !== null) return [];
   const now = Date.now();
   return s.accounts.map((a): PickInput => {
+    const seen = a.observedAt;
+    const recent = seen !== null && now - seen < MAX_READING_AGE_MS;
     const alive =
       a.usage !== null &&
-      (a.error === null || (a.errorKind === "transient" && now - a.observedAt < ALIVE_AFTER_ERROR_MS));
+      (!a.stale || recent) &&
+      (a.error === null || (a.errorKind === "transient" && recent));
     return {
       name: a.name,
       provider: a.provider,
@@ -467,7 +539,16 @@ export function toPickInputs(s: Snapshot): PickInput[] {
       session: a.usage?.session ?? null,
       weeklyAll: a.usage?.weeklyAll ?? null,
       weeklyFable: a.usage?.weeklyFable ?? null,
-      error: alive ? null : (a.error ?? "no usage reading yet"),
+      error: alive ? null : deadReason(a, now),
     };
   });
+}
+
+function deadReason(a: AccountUsage, now: number): string {
+  if (a.error !== null) return a.error;
+  if (a.usage === null) return "no usage reading yet";
+  // Nothing went wrong; the reading simply aged out while nothing refreshed it.
+  return a.observedAt === null
+    ? "usage stale (never read)"
+    : `usage stale (${ageLabel(now - a.observedAt)})`;
 }

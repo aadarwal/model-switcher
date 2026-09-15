@@ -8,12 +8,23 @@ export class RegistryUnreadable extends Error {}
 
 export const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
+/** The registry's top-level shape: a plain object with an `accounts` array.
+ * Anything else (null, a scalar, an array root, or an object whose
+ * `accounts` field isn't an array) is corrupted-but-parseable JSON, which
+ * `loadRegistry` treats the same as a JSON parse error: unreadable, never
+ * silently replaced by `saveRegistry`. */
+function topShapeProblem(raw: unknown): string | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return "top level is not an object";
+  if (!Array.isArray((raw as { accounts?: unknown }).accounts)) return "accounts is not an array";
+  return null;
+}
+
 export function validateRegistry(raw: unknown): { registry: Registry; problems: string[] } {
   const problems: string[] = [];
   const out: Account[] = [];
-  const rows = raw && typeof raw === "object" && Array.isArray((raw as { accounts?: unknown }).accounts)
-    ? ((raw as { accounts: unknown[] }).accounts) : [];
-  if (!rows.length && raw && typeof raw === "object" && !("accounts" in raw)) problems.push("accounts: missing array");
+  const shapeProblem = topShapeProblem(raw);
+  if (shapeProblem) { problems.push(shapeProblem); return { registry: { version: 1, accounts: out }, problems }; }
+  const rows = (raw as { accounts: unknown[] }).accounts;
   const seen = new Set<string>();
   rows.forEach((row, i) => {
     const at = `accounts[${i}]`;
@@ -42,6 +53,8 @@ export function loadRegistry(): { registry: Registry; parseError: string | null;
   let raw: unknown;
   try { raw = JSON.parse(readFileSync(p.registry, "utf8")); }
   catch (e) { return { registry: { version: 1, accounts: [] }, parseError: `accounts.json: ${(e as Error).message} (JSON)`, problems: [] }; }
+  const shapeProblem = topShapeProblem(raw);
+  if (shapeProblem) return { registry: { version: 1, accounts: [] }, parseError: `accounts.json: ${shapeProblem}`, problems: [] };
   const v = validateRegistry(raw);
   return { registry: v.registry, parseError: null, problems: v.problems };
 }
@@ -49,7 +62,7 @@ export function loadRegistry(): { registry: Registry; parseError: string | null;
 export function saveRegistry(r: Registry, prev: { parseError: string | null }): void {
   if (prev.parseError) throw new RegistryUnreadable(`refusing to write over an unreadable registry: ${prev.parseError}`);
   ensureStore();
-  const tmp = `${p.registry}.${process.pid}.${Date.now()}.tmp`;
+  const tmp = `${p.registry}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   try {
     writeFileSync(tmp, JSON.stringify(r, null, 2) + "\n", { mode: 0o600 });
     renameSync(tmp, p.registry);

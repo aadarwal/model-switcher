@@ -62,3 +62,42 @@ test("msBinary() honors MS_BIN override", async () => {
     if (prev === undefined) delete process.env.MS_BIN; else process.env.MS_BIN = prev;
   }
 });
+
+test("msBinary() defaults to the absolute path of bin/ms when MS_BIN is unset", async () => {
+  const { msBinary } = await import("../src/paths.ts");
+  const prev = process.env.MS_BIN;
+  delete process.env.MS_BIN;
+  try {
+    const b = msBinary();
+    assert.ok(path.isAbsolute(b), `expected an absolute path, got ${b}`);
+    assert.match(b, /bin[\\/]ms$/);
+  } finally {
+    if (prev !== undefined) process.env.MS_BIN = prev;
+  }
+});
+
+test("accounts present but not an array, or the top level not an object, is unreadable and never rewritten", async () => {
+  const { loadRegistry, saveRegistry } = await import("../src/registry.ts");
+  const cases = [
+    '{"version":1,"accounts":{}}',
+    "42",
+    '"just a string"',
+  ];
+  for (const content of cases) {
+    const { home, msHome } = tempHome();
+    process.env.HOME = home; process.env.MS_HOME = msHome;
+    const file = path.join(msHome, "accounts.json");
+    writeFileSync(file, content);
+    const r = loadRegistry();
+    assert.notEqual(r.parseError, null, `expected a parseError for ${content}`);
+    assert.throws(() => saveRegistry({ version: 1, accounts: [] }, r), /unreadable/);
+    assert.equal(readFileSync(file, "utf8"), content);
+  }
+});
+
+test("validateRegistry reports a non-array accounts field as a problem", async () => {
+  const { validateRegistry } = await import("../src/registry.ts");
+  const v = validateRegistry({ accounts: "x" });
+  assert.equal(v.problems.length, 1);
+  assert.match(v.problems[0], /not an array/);
+});

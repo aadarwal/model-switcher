@@ -612,7 +612,12 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     // token, a registry we could not read — then the fleet is not full, it is
     // used up, and a wake-up would tell the human to wait for a window that
     // was never the problem. Park instead, and say what actually failed.
-    const failures = st.attempts(rec.id).filter((a) => SPENT_OUTCOMES.has(a.outcome));
+    // Only attempts against CANDIDATES count as spent. The registry-read
+    // failure above is recorded against the account we are LEAVING, which is
+    // never a candidate (it heads the exclude list) — and a transient one of
+    // those on an earlier pass must not, a pass later, turn a fleet that is
+    // genuinely at 100 into a park with no wake-up.
+    const failures = st.attempts(rec.id).filter((a) => SPENT_OUTCOMES.has(a.outcome) && a.account !== from);
     if (failures.length) {
       const said = failures.map((a) => `${a.account}: ${a.note || a.outcome}`).join("; ");
       return park(st, id, rec.id, g, `all candidates failed: ${said}`);

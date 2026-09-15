@@ -751,3 +751,30 @@ test("a corrupt registry says so when a destination is named", async (t) => {
   assert.doesNotMatch(log, /is not registered/, "an unreadable file is not evidence the account is gone");
   assert.equal(rows(w, "recoveries").length, 0, "nothing was claimed");
 });
+
+test("a failure against the account being left does not spend a candidate", async (t) => {
+  const resetsAt = new Date(Date.now() + 2 * HOUR).toISOString();
+  const w = await world(t, {
+    usage: {
+      dirk: { session: 100, weekly: 40 },
+      gmail: { session: 100, weekly: 20, sessionReset: resetsAt },
+      work: { session: 100, weekly: 35, sessionReset: new Date(Date.now() + 5 * HOUR).toISOString() },
+    },
+  });
+  // An earlier pass could not read the registry. That failure is recorded
+  // against dirk — the account being LEFT, which is never a candidate.
+  const st = openState();
+  try {
+    st.addAttempt({ recoveryId: st.pendingRecovery("s1")!.id, account: "dirk", outcome: "infra", note: "registry unreadable: boom" });
+  } finally {
+    st.close();
+  }
+
+  assert.equal(await recoverSession("s1"), 2, "no candidate was spent; the fleet really is at 100");
+
+  const s = session(w);
+  assert.equal(s.state, "waiting");
+  assert.ok(Math.abs(s.wakeupAt! - Math.floor(Date.parse(resetsAt) / 1000)) < 5, "and it waits for the earliest reset");
+  assert.equal(rows(w, "recoveries")[0].status, "pending");
+  assert.match(logLines(w).find((l) => l.includes("run-shell")) ?? "", /run-shell -b -d \d+ '.*ms' '_recover' 's1'/);
+});

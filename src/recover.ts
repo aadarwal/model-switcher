@@ -33,7 +33,7 @@ import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
 import { pickAccounts, type PickInput } from "./pick.ts";
-import { loadRegistry } from "./registry.ts";
+import { NAME_PATTERN, findAccount, loadRegistry } from "./registry.ts";
 import { getSnapshot, toPickInputs } from "./snapshot.ts";
 import { openState, type AttemptOutcome, type RecoveryRow, type SessionRow, type State } from "./state.ts";
 import { Tmux } from "./tmux.ts";
@@ -161,6 +161,14 @@ const isBusy = (screen: string): boolean => tail(screen, 6).some((l) => INTERRUP
 const lockToken = (id: string): string => id.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 48);
 
 /**
+ * The lock this worker holds for the whole transaction. Exported because it is
+ * a shared name, not an implementation detail: Tasks 16 and 18 serialise
+ * against this worker by taking the SAME lock, and they can only do that if
+ * they derive the name the same way.
+ */
+export const sessionLockName = (id: string): string => `session-${lockToken(id)}`;
+
+/**
  * One of four handoff slots, taken without waiting — `acquire` is `withLock`
  * minus the wait, which is exactly what a counting bound wants: a caller that
  * cannot have a slot now must go away and come back, not queue.
@@ -174,6 +182,87 @@ function takeHandoffSlot(): Release | null {
 }
 
 const owner = (): string => `${process.pid}@${hostname()}`;
+
+// --- Endings -----------------------------------------------------------
+
+/**
+ * The outcomes that are FAILURES of a try, as opposed to the record of a
+ * handoff that happened. `exhausted`, `forced` and `ok` all describe the
+ * account this worker LEFT — one of them is written on every successful
+ * handoff — so counting them against the budget would let two rows from one
+ * transaction spend three tries in a session and a half.
+ */
+const FAILURE_OUTCOMES: ReadonlySet<AttemptOutcome> = new Set(["auth", "infra", "resume-broken"]);
+
+/**
+ * Park the session for a human and close the recovery.
+ *
+ * `finishRecovery` takes it out of the open set, which is the point: an open
+ * row is what the StopFailure hook's `addRecovery` returns for the NEXT wall,
+ * so a recovery left open here would swallow the next real wall on a later
+ * generation. The wake-up goes too — a parked session is not waiting for a
+ * window to reset, it is waiting for a person.
+ *
+ * NOTE: the store has no terminal `failed` status (`finishRecovery` takes
+ * `"done" | "obsolete"`), and `src/state.ts` is outside this task's files. The
+ * reason therefore lives in the attempt row and the log rather than in the
+ * status column; see the task report.
+ */
+function park(st: State, id: string, recoveryId: number, generation: number, why: string): 1 {
+  st.updateSession(id, { state: "parked" });
+  st.setWakeup(id, null);
+  st.finishRecovery(recoveryId, "done");
+  return fail(id, generation, why);
+}
+
+/**
+ * The human asked for this session to stop while we were mid-handoff. Their
+ * intent wins over ours: the recovery is obsolete, the pane is left exactly as
+ * it is, and this is not a failure — a stop that arrives during a rotation is
+ * a stop that worked, so it exits 0.
+ */
+function standDown(st: State, tmux: Tmux, session: SessionRow, recoveryId: number, generation: number, when: string): 0 {
+  st.finishRecovery(recoveryId, "obsolete");
+  try {
+    tmux.unsetPaneOption(session.pane, "@ms_handoff");
+  } catch {
+    /* the mark is cosmetic; the stop is what matters */
+  }
+  logLine(session.id, generation, `${session.id} was asked to stop ${when}; standing down`);
+  return 0;
+}
+
+/** Ask tmux to run this worker again. Once — the budget is what bounds it. */
+function redispatch(tmux: Tmux, id: string, generation: number, delaySeconds?: number): void {
+  try {
+    tmux.runShell([msBinary(), "_recover", id], delaySeconds ? { delaySeconds } : {});
+  } catch (e) {
+    logLine(id, generation, `could not re-dispatch: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * Has the human asked for this session to stop since we last looked? Read
+ * fresh from the store, never from the row this transaction started with:
+ * `ms stop` can land at any moment, and §9 checks it before every destructive
+ * step for exactly that reason.
+ */
+const stopRequested = (st: State, id: string): boolean => st.getSession(id)?.desired === "stopped";
+
+/**
+ * Why `--as <name>` cannot be honoured, or null. Checked before the name is
+ * used for anything: unvalidated it reaches `readLaunchToken`, where a name
+ * like `../../x` is a path traversal under MS_HOME/launch, and a codex account
+ * that happens to share a name would be launched as claude.
+ */
+function badDestination(name: string, session: SessionRow): string | null {
+  if (!NAME_PATTERN.test(name)) return `'${name}' is not a valid account name`;
+  const { registry } = loadRegistry();
+  const found = findAccount(registry, name, session.provider);
+  if (!found) return `no ${session.provider} account named '${name}' is registered`;
+  if (name === session.account) return `${session.id} is already on '${name}'`;
+  return null;
+}
 
 // --- Is the failure still true? ----------------------------------------
 
@@ -346,14 +435,21 @@ async function candidatesFor(session: SessionRow, exclude: string[]): Promise<Ca
  */
 export async function recoverSession(id: string, opts: RecoverOptions = {}): Promise<RecoverCode> {
   try {
-    return await withLock(`session-${lockToken(id)}`, () => transaction(id, opts), { waitMs: SESSION_LOCK_WAIT_MS });
+    return await withLock(sessionLockName(id), () => transaction(id, opts), { waitMs: SESSION_LOCK_WAIT_MS });
   } catch (e) {
     if (e instanceof Locked || (e as Error)?.name === "Locked") return fail(id, 0, `another recovery holds ${id}`);
-    // Anything else — a tmux call that failed, a store that would not write —
-    // is still a failed recovery, and the contract says the reason goes to
-    // stderr AND the log. Throwing past here would put it only on stderr, in a
-    // process nobody is watching, and leave the log silent about the attempt.
-    // The store is left exactly as it was: reconciliation (§12) repairs it.
+    // Anything else — a store that would not write, a tmux call with no
+    // handler of its own — is still a failed recovery, and the contract says
+    // the reason goes to stderr AND the log. Throwing past here would put it
+    // only on stderr, in a process nobody is watching, and leave the log
+    // silent about the attempt.
+    //
+    // What is left behind is whatever the transaction had already written when
+    // it threw, which is why the steps are ordered so that no half-state lies:
+    // the session's generation is bumped only AFTER the respawn succeeds, so a
+    // throw before that leaves the session and its open recovery on the same
+    // generation, and the next worker (or §12's reconciliation) can simply try
+    // again. The respawn itself is handled where it happens, not here.
     return fail(id, 0, `recovery failed: ${(e as Error)?.message ?? String(e)}`);
   }
 }
@@ -373,27 +469,31 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
       return fail(id, g, `${id} is stopping; the recovery is obsolete`);
     }
 
+    // A named destination is checked before it can become anything — a path, a
+    // launch account, a provider mismatch — and a bad one changes nothing at
+    // all: no recovery is opened, no pane is touched.
+    const named = opts.manual?.toAccount;
+    if (named !== undefined) {
+      const why = badDestination(named, session);
+      if (why) return fail(id, g, why);
+    }
+
     // 2. Own the recovery and recheck that it is still true.
     const claimed = opts.manual ? claimManual(st, session, tmux, opts) : claimAutomatic(st, session, tmux);
     if ("why" in claimed) return fail(id, g, claimed.why);
     const rec = claimed.rec;
 
-    // 9. The budget, before anything is disturbed.
-    const failedSoFar = st.attempts(rec.id).filter((a) => a.outcome !== "ok").length;
-    if (failedSoFar >= MAX_FAILED_ATTEMPTS) {
-      st.updateSession(id, { state: "parked" });
-      st.finishRecovery(rec.id, "done");
-      return fail(id, g, `gave up after ${MAX_FAILED_ATTEMPTS} attempts`);
-    }
+    // 9. The budget, before anything is disturbed. Only FAILURES count: the row
+    // written for the account we left (`exhausted`/`forced`/`ok`) is the record
+    // of a handoff that happened, not of one that went wrong — counting it made
+    // "three failed transactions" arrive after one and a half.
+    const failedSoFar = st.attempts(rec.id).filter((a) => FAILURE_OUTCOMES.has(a.outcome)).length;
+    if (failedSoFar >= MAX_FAILED_ATTEMPTS) return park(st, id, rec.id, g, `gave up after ${MAX_FAILED_ATTEMPTS} attempts`);
 
     // Without a CLI session id there is nothing to resume, and a respawn would
     // start a new conversation — the exact failure §9 calls resume-broken. Park
     // now, while the walled CLI is still alive and its transcript still on screen.
-    if (!session.cliSessionId) {
-      st.updateSession(id, { state: "parked" });
-      st.finishRecovery(rec.id, "done");
-      return fail(id, g, "the session never reported a CLI session id; nothing to resume");
-    }
+    if (!session.cliSessionId) return park(st, id, rec.id, g, "the session never reported a CLI session id; nothing to resume");
 
     const slot = takeHandoffSlot();
     if (!slot) {
@@ -479,7 +579,10 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     // session for a human instead of retrying forever.
     if (found.registryError) {
       st.addAttempt({ recoveryId: rec.id, account: from, outcome: "infra", note: `registry unreadable: ${found.registryError}` });
+      // Nothing was touched, so the recovery stays open on this generation and
+      // one more worker is dispatched to try again; the budget bounds it.
       st.releaseRecovery(rec.id);
+      redispatch(tmux, id, g);
       return fail(id, g, `cannot read the registry: ${found.registryError}`);
     }
     names = found.names;
@@ -516,11 +619,17 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     logLine(id, g, `${name}: no launch token; trying the next account`);
   }
   if (!to) {
+    // Nothing has been touched yet: keep the recovery open on this generation
+    // and send one more worker, in case a token lands in the meantime.
     st.releaseRecovery(rec.id);
+    redispatch(tmux, id, g);
     return fail(id, g, `no candidate account has a launch token (run: ms accounts add <name>)`);
   }
 
-  // 5. Say what is happening, and keep the pane alive across the exit.
+  // 5. Say what is happening, and keep the pane alive across the exit. The
+  // session reads `stopping` BEFORE anything is sent to the pane, so a reader
+  // that catches this transaction mid-flight never sees a killed CLI under a
+  // session that still claims to be running.
   st.updateSession(id, { state: "stopping" });
   try {
     tmux.setPaneOption(session.pane, "@ms_handoff", `${from}→${to}`);
@@ -530,8 +639,14 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   }
   logLine(id, g, `${id}: handing ${from} → ${to} (${rec.kind} wall)`);
 
+  // §9 checks the human's intent before EVERY destructive step, and `ms stop`
+  // can land at any moment: re-read it, never trust the row we started with.
+  if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, g, "before the exit");
+
   // 6. Ask the CLI to leave; make it leave if it will not.
   const forced = await stopPane(tmux, session, g);
+
+  if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, g, "before the respawn");
 
   // 7. The new generation, written down before it is started.
   const next = g + 1;
@@ -539,12 +654,30 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   const command = ["claude", "--resume", session.cliSessionId!, ...(continuing ? [CONTINUATION] : []), ...session.flags];
   const launchId = randomUUID();
   st.createLaunch({ id: launchId, sessionId: id, generation: next, account: to, command, env: {}, createdAt: nowSeconds() });
-  st.updateSession(id, { account: to, generation: next, state: "resuming" });
   // The attempt records the account we LEFT — that is what was consumed, and
-  // what the next try through this recovery must not go back to.
-  const outcome: AttemptOutcome = forced ? "forced" : manual ? "ok" : "exhausted";
+  // what the next try through this recovery must not go back to. A forced exit
+  // is worth recording, but when a human asked for the move it is still their
+  // `ok`, not a failure of the account.
+  const outcome: AttemptOutcome = manual ? "ok" : forced ? "forced" : "exhausted";
   st.addAttempt({ recoveryId: rec.id, account: from, outcome, note: `left for ${to}${forced ? " (forced exit)" : ""}` });
-  tmux.respawn(session.pane, session.cwd, [msBinary(), "_exec", launchId]);
+
+  try {
+    tmux.respawn(session.pane, session.cwd, [msBinary(), "_exec", launchId]);
+  } catch (e) {
+    // The pane was not restarted, so the session's generation is deliberately
+    // still `g` — the open recovery and the session agree, and the next worker
+    // sees a live recovery for the generation it is actually looking at.
+    st.addAttempt({ recoveryId: rec.id, account: to, outcome: "infra", note: `respawn failed: ${(e as Error).message}` });
+    st.releaseRecovery(rec.id);
+    redispatch(tmux, id, g);
+    return fail(id, g, `could not respawn the pane: ${(e as Error).message}`);
+  }
+
+  // The generation moves only now, once the pane is really running the new
+  // launch. Bumping it earlier is what left a released recovery describing a
+  // generation the session had already left — a stale row that the hook's own
+  // `addRecovery` then handed to the NEXT wall, swallowing it.
+  st.updateSession(id, { account: to, generation: next, state: "resuming" });
   logLine(id, next, `respawned pane ${session.pane} on ${to} (launch ${launchId}${forced ? ", forced exit" : ""})`);
 
   // 8. Readiness, from the hook's own report.
@@ -552,12 +685,14 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   if (ready !== "ok") {
     for (const line of lastNonBlank(safeCapture(tmux, session.pane), 8)) logLine(id, next, `screen| ${line}`);
     st.addAttempt({ recoveryId: rec.id, account: to, outcome: "resume-broken", note: ready });
-    st.updateSession(id, { state: "parked" });
-    // Not done: the recovery goes back to pending so a later try (Task 18's
-    // reconciliation, or `ms rotate --force`) can pick up where this left off.
-    st.releaseRecovery(rec.id);
-    return fail(
+    // Terminal. The conversation did not come back, and that is not something
+    // another account would fix — so the recovery is CLOSED rather than
+    // released: leaving it open would hand this stale row to the next wall.
+    // The human runs `ms rotate`, or the next real wall opens a fresh one.
+    return park(
+      st,
       id,
+      rec.id,
       next,
       ready === "timeout"
         ? `no resume report within ${Math.round(readyMs() / 1000)}s; ${id} is parked`

@@ -15,7 +15,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
@@ -260,6 +260,16 @@ const respawnLaunchId = (w: World): string => {
   return m![1];
 };
 
+/** Run `fn` the first time `needle` shows up in the tmux log. */
+function onFirst(w: World, needle: string, fn: () => void): () => void {
+  const timer = setInterval(() => {
+    if (!logLines(w).some((l) => l.includes(needle))) return;
+    clearInterval(timer);
+    fn();
+  }, 5);
+  return () => clearInterval(timer);
+}
+
 /** Stand in for Claude Code's SessionStart hook: as soon as the worker has
  *  respawned the pane, report the resume it is waiting for. */
 function reportOnRespawn(w: World, event: { generation: number; cliSessionId: string; kind?: "resumed" | "started" }): () => void {
@@ -380,7 +390,8 @@ test("a resume that falls back to a new conversation parks the session", async (
   assert.equal(s.generation, 3, "the respawn did happen; it is the resume that broke");
   const attempts = rows(w, "attempts");
   assert.equal(attempts.at(-1)!.outcome, "resume-broken");
-  assert.equal(rows(w, "recoveries")[0].status, "pending", "a broken resume is not a finished recovery");
+  assert.equal(rows(w, "recoveries")[0].status, "done", "terminal: an open row here would swallow the next wall");
+  assert.equal(s.wakeupAt, null, "a parked session waits for a person, not for a window");
   // The screen is evidence: the last non-blank lines land in the log.
   assert.match(recoverLog(w), /screen\| /);
   // Named for what it is — a new conversation, not merely a silent resume.
@@ -397,6 +408,8 @@ test("a resume that never reports parks the session too", async (t) => {
   assert.equal(s.state, "parked");
   assert.ok(respawnLine(w), "the pane was respawned before anyone waited on it");
   assert.equal(rows(w, "attempts").at(-1)!.outcome, "resume-broken");
+  assert.equal(rows(w, "recoveries")[0].status, "done", "terminal, like any broken resume");
+  assert.equal(s.wakeupAt, null);
   assert.match(recoverLog(w), /no resume report within/);
 });
 
@@ -406,12 +419,14 @@ test("a fourth try is not taken: three failed attempts park the session", async 
   try {
     const rec = st.pendingRecovery("s1")!;
     for (const account of ["gmail", "work", "gmail"]) st.addAttempt({ recoveryId: rec.id, account, outcome: "resume-broken", note: "" });
+    st.setWakeup("s1", nowSeconds() + 3600); // left over from a "nothing has room" round
   } finally {
     st.close();
   }
 
   assert.equal(await recoverSession("s1"), 1);
   assert.equal(session(w).state, "parked");
+  assert.equal(session(w).wakeupAt, null, "a parked session is not also waiting for a window");
   assert.equal(rows(w, "recoveries")[0].status, "done");
   assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
   assert.match(recoverLog(w), /gave up after 3 attempts/);
@@ -420,7 +435,9 @@ test("a fourth try is not taken: three failed attempts park the session", async 
 test("a held session lock refuses the recovery without typing anything", async (t) => {
   const w = await world(t);
   const { acquire } = await import("../src/lock.ts");
-  const release = acquire("session-s1")!;
+  const { sessionLockName } = await import("../src/recover.ts");
+  assert.equal(sessionLockName("s1"), "session-s1");
+  const release = acquire(sessionLockName("s1"))!;
   assert.ok(release, "the test could not take the lock it means to hold");
   t.after(release);
 
@@ -476,9 +493,26 @@ test("a tmux that fails mid-handoff is a failed recovery, not an exception", asy
   const w = await world(t, { failOn: "respawn-pane" });
 
   assert.equal(await recoverSession("s1"), 1, "the worker reports the failure rather than throwing past its caller");
-  assert.match(recoverLog(w), /recovery failed: tmux respawn-pane failed/);
-  // The store is left as it was found, for reconciliation to read.
-  assert.equal(rows(w, "recoveries")[0].status, "owned");
+  assert.match(recoverLog(w), /could not respawn the pane/);
+
+  // What is left: the launch row for the generation that never started, the
+  // session still ON THE OLD GENERATION (so it and the open recovery agree),
+  // and an attempt naming the failure.
+  const s = session(w);
+  assert.equal(s.generation, 2, "the generation moves only once the pane really runs the new launch");
+  assert.equal(s.account, "dirk", "and so does the account");
+  assert.equal(s.state, "stopping");
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.equal(launch.generation, 3, "the launch was written down before it was attempted");
+  assert.deepEqual(
+    rows(w, "attempts").map((a) => [a.account, a.outcome]),
+    [["dirk", "exhausted"], ["gmail", "infra"]],
+  );
+  // Still open, on the generation the next worker will read, and re-dispatched.
+  const rec = rows(w, "recoveries")[0];
+  assert.equal(rec.status, "pending");
+  assert.equal(rec.generation, 2);
+  assert.match(logLines(w).find((l) => l.includes("run-shell")) ?? "", /run-shell -b '.*ms' '_recover' 's1'/);
 });
 
 test("with every handoff slot taken the recovery stands down and re-dispatches itself", async (t) => {
@@ -518,11 +552,149 @@ test("a registry that cannot be read is a failed attempt, not an empty fleet", a
   assert.equal(s.account, "dirk");
   assert.equal(s.wakeupAt, null, "no wake-up invented out of a fleet nobody could look at");
   assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
-  assert.ok(!logLines(w).some((l) => l.includes("run-shell")));
+  // Nothing was touched, so one more worker is sent — immediately, not on a
+  // wake-up timer, because there is no window to wait for.
+  const dispatches = logLines(w).filter((l) => l.includes("run-shell"));
+  assert.equal(dispatches.length, 1, "once, not a loop");
+  assert.match(dispatches[0], /run-shell -b '.*ms' '_recover' 's1'/);
+  assert.doesNotMatch(dispatches[0], /-d /);
 
   const attempt = rows(w, "attempts")[0];
   assert.equal(attempt.outcome, "infra", "it counts against the budget: a registry that stays broken parks the session");
   assert.match(String(attempt.note), /registry unreadable/);
   assert.equal(rows(w, "recoveries")[0].status, "pending");
   assert.match(recoverLog(w), /cannot read the registry/);
+});
+
+test("a recovery for a generation the session has left is obsolete", async (t) => {
+  const w = await world(t);
+  // The session moved on (another rotation, a reconciliation) while this
+  // recovery still described generation 2.
+  const st = openState();
+  try {
+    st.updateSession("s1", { generation: 3 });
+  } finally {
+    st.close();
+  }
+
+  assert.equal(await recoverSession("s1"), 1);
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "a session at another generation is not ours to move");
+  assert.ok(!respawnLine(w));
+  assert.match(recoverLog(w), /generation 2 and the session is at 3/);
+});
+
+test("the session reads stopping before a single key is sent", async (t) => {
+  const w = await world(t);
+  let stateWhenTyping: string | null = null;
+  // Read the row the moment the first key goes out — the worker then waits
+  // 300 ms before `/exit`, so this is not a race.
+  const stop = onFirst(w, "send-keys", () => {
+    stateWhenTyping = session(w).state;
+  });
+  t.after(stop);
+  const stopReport = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stopReport);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.equal(stateWhenTyping, "stopping", "a reader must never find a killed CLI under a session that claims to be running");
+});
+
+test("a stop that lands mid-handoff stands the worker down and leaves the pane", async (t) => {
+  const w = await world(t);
+  // The human runs `ms stop` between the exit and the respawn.
+  const stop = onFirst(w, "send-keys", () => {
+    const st = openState();
+    try {
+      st.updateSession("s1", { desired: "stopped" });
+    } finally {
+      st.close();
+    }
+  });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0, "a stop that arrives during a rotation is a stop that worked");
+  assert.ok(!respawnLine(w), "the pane is left as the stop found it");
+  assert.equal(session(w).generation, 2);
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  assert.ok(logLines(w).some((l) => l.includes("set-option -pu -t %7 @ms_handoff")), "the handoff mark is taken back");
+  assert.match(recoverLog(w), /asked to stop before the respawn; standing down/);
+});
+
+test("a candidate with no launch token is skipped for the next one", async (t) => {
+  const w = await world(t);
+  rmSync(path.join(w.msHome, "launch", "gmail.token")); // the best-ranked account
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.equal(session(w).account, "work", "the chooser's first pick was unlaunchable; the next one took it");
+  assert.deepEqual(
+    rows(w, "attempts").map((a) => [a.account, a.outcome]),
+    [["gmail", "auth"], ["dirk", "exhausted"]],
+  );
+  assert.match(recoverLog(w), /gmail: no launch token/);
+});
+
+test("no launch token ever reaches a tmux command line", async (t) => {
+  const w = await world(t);
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  // The tokens exist and are readable — this is not vacuous.
+  const { readLaunchToken } = await import("../src/launch-credentials.ts");
+  assert.match(readLaunchToken("gmail") ?? "", /^sk-ant-/);
+  // tmux command strings are readable by anything that can talk to the server.
+  assert.doesNotMatch(readFileSync(w.log, "utf8"), /sk-ant-/);
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.doesNotMatch(JSON.stringify(launch), /sk-ant-/, "the credential is the pane environment's, not the launch row's");
+});
+
+test("a forced exit on a manual move is still the human's ok", async (t) => {
+  const w = await world(t, { screen: MODAL_SCREEN, recovery: false, wall: false });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "work", continueAfter: true }, force: true }), 0);
+  const attempt = rows(w, "attempts")[0];
+  assert.equal(attempt.outcome, "ok", "the human asked for this; the account did not fail");
+  assert.match(String(attempt.note), /forced exit/, "but the force is still on the record");
+});
+
+test("a named destination is checked before it can become anything", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN, recovery: false, wall: false });
+  const move = (toAccount: string) => recoverSession("s1", { manual: { toAccount, continueAfter: true } });
+
+  assert.equal(await move("../../etc/passwd"), 1, "a name that is a path is not a name");
+  assert.equal(await move("nosuchaccount"), 1, "an unregistered account is not a destination");
+  assert.equal(await move("dirk"), 1, "the session is already there");
+
+  assert.equal(rows(w, "recoveries").length, 0, "a refused destination opens no recovery");
+  assert.equal(rows(w, "attempts").length, 0);
+  assert.equal(session(w).account, "dirk");
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
+  assert.ok(!respawnLine(w));
+  const log = recoverLog(w);
+  assert.match(log, /is not a valid account name/);
+  assert.match(log, /no claude account named 'nosuchaccount' is registered/);
+  assert.match(log, /already on 'dirk'/);
+});
+
+test("the budget counts failures, not the record of a handoff that happened", async (t) => {
+  const w = await world(t);
+  const st = openState();
+  try {
+    const rec = st.pendingRecovery("s1")!;
+    // Three rows for accounts this recovery LEFT — one is written on every
+    // successful handoff. None of them is a try that went wrong.
+    for (const account of ["a", "b", "c"]) st.addAttempt({ recoveryId: rec.id, account, outcome: "exhausted", note: "" });
+  } finally {
+    st.close();
+  }
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0, "three handoff records are not three failures");
+  assert.notEqual(session(w).state, "parked");
 });

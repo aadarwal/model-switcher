@@ -4,6 +4,7 @@ import path from "node:path";
 import { execLaunch } from "./exec.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
 import { launchClaude } from "./launch.ts";
+import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { recoverVerb } from "./recover.ts";
 import { status } from "./status.ts";
 import { doctor } from "./doctor.ts";
@@ -20,6 +21,9 @@ registerVerb("_recover", recoverVerb);
 registerVerb("status", status);
 registerVerb("doctor", doctor);
 registerVerb("accounts", accountsVerb);
+registerVerb("rotate", rotateVerb);
+registerVerb("switch", switchVerb);
+registerVerb("stop", stopVerb);
 
 const USAGE = `usage: ms <verb> [args]
   setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach

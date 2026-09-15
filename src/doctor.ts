@@ -241,7 +241,9 @@ export function checkStorePermissions(fix: boolean): Result[] {
   checkEntry(p.snapshot, 0o600, issues);
   checkEntry(p.lastPick, 0o600, issues);
 
-  for (const sub of ["launch", "sessions", "locks", "hooks"]) walkOwnedDir(path.join(home, sub), fix, issues);
+  // "locks" is deliberately absent here: locking moved to one file,
+  // locks.sqlite (checked above), and the locks/ directory no longer exists.
+  for (const sub of ["launch", "sessions", "hooks"]) walkOwnedDir(path.join(home, sub), fix, issues);
   checkClaudeTree(home, fix, issues);
 
   if (issues.length === 0) return [{ ok: true, what: "store permissions (0700 dirs, 0600 files) under MS_HOME" }];

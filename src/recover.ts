@@ -213,15 +213,17 @@ const SPENT_OUTCOMES: ReadonlySet<AttemptOutcome> = new Set(["auth", "infra"]);
  * generation. The wake-up goes too — a parked session is not waiting for a
  * window to reset, it is waiting for a person.
  *
- * NOTE: the store has no terminal `failed` status (`finishRecovery` takes
- * `"done" | "obsolete"`), and `src/state.ts` is outside this task's files. The
- * reason therefore lives in the attempt row and the log rather than in the
- * status column; see the task report.
+ * The recovery closes as `failed`, not `done`: a park is never a completed
+ * handoff, and a terminal `failed` status lets a reader (`ms status`, a
+ * future audit) tell "rotated fine" apart from "gave up and needs a human"
+ * without parsing the log. `one_open_recovery`'s partial index already
+ * treats anything outside `('pending','owned')` as closed, so `failed`
+ * needs no schema change to let a fresh recovery open after it.
  */
 function park(st: State, id: string, recoveryId: number, generation: number, why: string): 1 {
   st.updateSession(id, { state: "parked" });
   st.setWakeup(id, null);
-  st.finishRecovery(recoveryId, "done");
+  st.finishRecovery(recoveryId, "failed");
   return fail(id, generation, why);
 }
 
@@ -517,6 +519,11 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
     if (!slot) {
       st.releaseRecovery(rec.id);
       logLine(id, g, `too many handoffs in flight; retrying in ${REDISPATCH_SECONDS}s`);
+      // Record the wake-up before arming the delayed re-dispatch: without
+      // this, `ms status` shows nothing waiting and reconciliation's orphan
+      // rule (45 s grace) has no way to see that a worker is already timed
+      // to come back, so it can double-dispatch on top of this one.
+      st.setWakeup(id, nowSeconds() + REDISPATCH_SECONDS);
       try {
         tmux.runShell([msBinary(), "_recover", id], { delaySeconds: REDISPATCH_SECONDS });
       } catch (e) {

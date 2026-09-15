@@ -42,6 +42,18 @@ test("one pending recovery per session; owning it is atomic", async () => {
   st.close();
 });
 
+test("a failed recovery is closed: it does not block addRecovery from opening a new one", async () => {
+  const { st } = await fresh();
+  st.createSession({ id: "s1", ...base });
+  const id = st.addRecovery({ sessionId: "s1", generation: 1, turnId: "t1", kind: "fable" });
+  st.finishRecovery(id, "failed");
+  assert.equal(st.pendingRecovery("s1"), null, "failed is a closed status, like done/obsolete");
+  const next = st.addRecovery({ sessionId: "s1", generation: 2, turnId: "t2", kind: "weekly" });
+  assert.notEqual(next, id, "a fresh recovery opens rather than joining the failed one");
+  assert.equal(st.pendingRecovery("s1")!.id, next);
+  st.close();
+});
+
 test("wakeups come due in order", async () => {
   const { st } = await fresh();
   st.createSession({ id: "s1", ...base }); st.createSession({ id: "s2", ...base, pane: "%6" });

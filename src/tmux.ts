@@ -24,6 +24,22 @@ export class Tmux {
     const [pid, command, dead, cwd] = r.stdout.trim().split("\t");
     return { pid: Number(pid), command, dead: dead === "1", cwd };
   }
+  /**
+   * `#{pane_dead}` for one pane: true when the pane's command has exited and
+   * `remain-on-exit` is holding the corpse open, false when something is
+   * running in it, and **null when tmux did not answer** — no server, no such
+   * pane, a timeout, or a tmux that is not on PATH.
+   *
+   * The null is the point. A caller deciding whether to respawn over a pane
+   * must be able to tell "it is dead" from "I could not ask"; collapsing the
+   * two into a boolean is how a live pane gets killed.
+   */
+  paneDead(pane: string): boolean | null {
+    const r = this.run(["display-message", "-p", "-t", pane, "#{pane_dead}"]);
+    if (r.code !== 0) return null;
+    const v = r.stdout.trim();
+    return v === "1" ? true : v === "0" ? false : null;
+  }
   setPaneOption(pane: string, name: string, value: string): void { this.must(["set-option", "-p", "-t", pane, name, value]); }
   unsetPaneOption(pane: string, name: string): void { this.run(["set-option", "-pu", "-t", pane, name]); }
   paneOptions(pane: string): Record<string, string> {

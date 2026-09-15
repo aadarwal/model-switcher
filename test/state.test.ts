@@ -171,3 +171,50 @@ test("setWakeup(null) clears a wakeup so the session drops out of dueWakeups", a
   assert.equal(st.getSession("s1")!.wakeupAt, null);
   st.close();
 });
+
+test("releaseRecoveryIf only releases the exact row it judged stale", async () => {
+  const { st } = await fresh();
+  st.createSession({ id: "s1", ...base });
+  const id = st.addRecovery({ sessionId: "s1", generation: 1, turnId: null, kind: "session" });
+  assert.equal(st.ownRecovery(id, "1@mac"), true);
+  const seen = st.pendingRecovery("s1")!;
+
+  // A fresh worker took it over between the judgement and the release.
+  st.releaseRecovery(id);
+  assert.equal(st.ownRecovery(id, "2@mac"), true);
+  assert.equal(st.releaseRecoveryIf(id, { owner: seen.owner, updatedAt: seen.updatedAt }), false,
+    "a different owner is a different row");
+  assert.equal(st.pendingRecovery("s1")!.owner, "2@mac", "the new owner is untouched");
+
+  // The row exactly as read back is releasable, once.
+  const now = st.pendingRecovery("s1")!;
+  assert.equal(st.releaseRecoveryIf(now.id, { owner: now.owner, updatedAt: now.updatedAt }), true);
+  assert.equal(st.pendingRecovery("s1")!.status, "pending");
+  assert.equal(st.releaseRecoveryIf(now.id, { owner: now.owner, updatedAt: now.updatedAt }), false,
+    "a row that is no longer owned is not reopened again");
+
+  // A finished recovery is never dragged back to pending.
+  const again = st.addRecovery({ sessionId: "s1", generation: 1, turnId: null, kind: "session" });
+  assert.equal(st.ownRecovery(again, "3@mac"), true);
+  const owned = st.pendingRecovery("s1")!;
+  st.finishRecovery(again, "done");
+  assert.equal(st.releaseRecoveryIf(again, { owner: owned.owner, updatedAt: owned.updatedAt }), false);
+  assert.equal(st.pendingRecovery("s1"), null);
+  st.close();
+});
+
+test("clearWakeupIf clears only the deadline it is consuming", async () => {
+  const { st } = await fresh();
+  st.createSession({ id: "s1", ...base });
+  st.setWakeup("s1", 100);
+
+  // A worker rescheduled while we were deciding to consume the old one.
+  st.setWakeup("s1", 500);
+  assert.equal(st.clearWakeupIf("s1", 100), false);
+  assert.equal(st.getSession("s1")!.wakeupAt, 500, "the newer deadline survives");
+
+  assert.equal(st.clearWakeupIf("s1", 500), true);
+  assert.equal(st.getSession("s1")!.wakeupAt, null);
+  assert.equal(st.clearWakeupIf("s1", 500), false, "there is nothing left to clear");
+  st.close();
+});

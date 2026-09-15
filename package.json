@@ -4,7 +4,7 @@
   "description": "Run claude and codex on whichever of your accounts has room; rotate a walled session in place.",
   "type": "module",
   "bin": { "ms": "bin/ms" },
-  "engines": { "node": ">=22.13" },
+  "engines": { "node": ">=22.15" },
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "MS_ENTRY=src node --disable-warning=ExperimentalWarning --import tsx --test test/*.test.ts",

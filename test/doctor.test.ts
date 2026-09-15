@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { stubDir, tempHome, run } from "./helpers.ts";
@@ -84,6 +84,18 @@ test("checkNode passes on the Node this suite runs under", async () => {
   const r = checkNode();
   assert.equal(r.ok, true);
   assert.equal(typeof process.execve, "function");
+});
+
+test("package.json declares the engine floor the tool actually needs", async () => {
+  // `ms _exec` and `ms doctor` both require process.execve, which arrived in
+  // Node 22.15. A package that says 22.13 installs happily on a runtime where
+  // every launch then fails with "Node 22.15+ with process.execve is required".
+  const { nodeVersionAtLeast } = await import("../src/doctor.ts");
+  const pkg = JSON.parse(readFileSync(path.resolve("package.json"), "utf8")) as { engines?: { node?: string } };
+  const declared = pkg.engines?.node ?? "";
+  assert.match(declared, /^>=\d+\.\d+$/, `engines.node is ${JSON.stringify(declared)}`);
+  const floor = `${declared.slice(2)}.0`;
+  assert.equal(nodeVersionAtLeast(floor, [22, 15, 0]), true, `engines.node allows ${floor}, which has no process.execve`);
 });
 
 test("nodeVersionAtLeast: a real MAJOR.MINOR.PATCH comparison, not vacuous", async () => {

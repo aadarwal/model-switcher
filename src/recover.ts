@@ -244,6 +244,24 @@ function standDown(st: State, tmux: Tmux, session: SessionRow, recoveryId: numbe
   return 0;
 }
 
+/**
+ * The wall this transaction is acting on is no longer true: the human worked
+ * past it while we were polling. Close the recovery, take back the mark, and
+ * put the session's state back the way we found it — by now `stopping` is
+ * written, and a row claiming a handoff nobody is doing is what reconciliation
+ * would park (or stop) two minutes later, over a session that is alive.
+ */
+function standDownObsolete(st: State, tmux: Tmux, session: SessionRow, rec: RecoveryRow, generation: number, why: string, when: string): 1 {
+  st.finishRecovery(rec.id, "obsolete");
+  st.updateSession(session.id, { state: session.state });
+  try {
+    tmux.unsetPaneOption(session.pane, "@ms_handoff");
+  } catch {
+    /* the mark is cosmetic; standing down is what matters */
+  }
+  return fail(session.id, generation, `obsolete: ${why} (noticed ${when})`);
+}
+
 /** Ask tmux to run this worker again. Once — the budget is what bounds it. */
 function redispatch(tmux: Tmux, id: string, generation: number, delaySeconds?: number): void {
   try {
@@ -292,8 +310,28 @@ function obsoleteReason(session: SessionRow, rec: RecoveryRow, tmux: Tmux): stri
   if (rec.generation !== session.generation) {
     return `the recovery is for generation ${rec.generation} and the session is at ${session.generation}`;
   }
-  // Append order, not timestamps: events are seconds-resolution, so a wall and
-  // the activity that followed it can share a second.
+  const worked = workedPastWall(session, rec);
+  if (worked) return worked;
+  if (!tmux.paneExists(session.pane)) return "the pane is gone";
+  return null;
+}
+
+/**
+ * The session went on working after the wall, or null — re-read from the event
+ * log every time it is asked (spec §9: "User starts a new turn during polling:
+ * the failure is obsolete, nothing is killed").
+ *
+ * Asked once at claim time this misses the race it exists for: the pick polls
+ * usage, which can take tens of seconds on a cold cache, and a human whose
+ * window has just reset submits a new prompt in that gap. So the destructive
+ * steps ask it again — before `/exit` and again before the respawn — and a
+ * `activity` event for this generation newer than the wall stands the whole
+ * transaction down.
+ *
+ * Append order, not timestamps: events are seconds-resolution, so a wall and
+ * the activity that followed it can share a second.
+ */
+function workedPastWall(session: SessionRow, rec: RecoveryRow): string | null {
   let wallAt = -1;
   let activityAt = -1;
   const events = readEvents(session.id);
@@ -303,9 +341,7 @@ function obsoleteReason(session: SessionRow, rec: RecoveryRow, tmux: Tmux): stri
     if (e.kind === "activity") activityAt = i;
   });
   const worked = wallAt >= 0 ? activityAt > wallAt : activityAt >= 0 && events[activityAt]!.t > rec.createdAt;
-  if (worked) return "the session went on working after the wall";
-  if (!tmux.paneExists(session.pane)) return "the pane is gone";
-  return null;
+  return worked ? "the session went on working after the wall" : null;
 }
 
 // --- Waiting -----------------------------------------------------------
@@ -685,12 +721,18 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
 
   // §9 checks the human's intent before EVERY destructive step, and `ms stop`
   // can land at any moment: re-read it, never trust the row we started with.
+  // The same is true of the failure itself — the poll above took as long as it
+  // took, and a turn the human started in the meantime makes it obsolete.
   if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, g, "before the exit");
+  const workedBeforeExit = workedPastWall(session, rec);
+  if (workedBeforeExit) return standDownObsolete(st, tmux, session, rec, g, workedBeforeExit, "before the exit");
 
   // 6. Ask the CLI to leave; make it leave if it will not.
   const forced = await stopPane(tmux, session, g);
 
   if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, g, "before the respawn");
+  const workedBeforeRespawn = workedPastWall(session, rec);
+  if (workedBeforeRespawn) return standDownObsolete(st, tmux, session, rec, g, workedBeforeRespawn, "before the respawn");
 
   // 7. The new generation, written down before it is started.
   const next = g + 1;

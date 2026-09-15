@@ -38,6 +38,7 @@ const HOUR = 3_600_000;
 
 /** tmux, as far as the recovery drives it. One pane, one state file. */
 const TMUX_STUB = String.raw`printf '%s\n' "$*" >> "$MS_TMUX_LOG"
+if [ -n "$MS_TMUX_ON_MATCH" ]; then case "$*" in *$MS_TMUX_ON_MATCH*) eval "$MS_TMUX_ON" ;; esac; fi
 if [ "$1" = "-S" ]; then shift 2; fi
 if [ -n "$MS_TMUX_FAIL" ] && [ "$1" = "$MS_TMUX_FAIL" ]; then exit 1; fi
 st="$MS_TMUX_STATE"
@@ -166,6 +167,13 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   process.env.MS_TMUX_STATE = state;
   process.env.MS_TMUX_SCREEN = screen;
   process.env.MS_TMUX_FAIL = opts.failOn ?? "";
+  // The stub's synchronous injection hook: a test sets these to run a shell
+  // command the instant the worker makes a particular tmux call. Every tmux
+  // call is a `spawnSync`, so this is the only way to land something in the
+  // store or the event log at an exact point INSIDE the transaction — a timer
+  // in this process could not, the event loop never runs there.
+  process.env.MS_TMUX_ON_MATCH = "";
+  process.env.MS_TMUX_ON = "";
   process.env.MS_POLL_MS = "20";
   process.env.MS_READY_MS = "10000"; // generous: the report below arrives in milliseconds
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
@@ -360,6 +368,47 @@ test("activity newer than the wall makes the recovery obsolete, and nothing is t
   assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "a live session must never be typed into");
   assert.ok(!respawnLine(w), "a live session must never be respawned");
   assert.match(recoverLog(w), /obsolete/);
+});
+
+/** Claude Code's UserPromptSubmit hook, fired from inside the stub tmux: the
+ *  human starts a new turn at the exact moment the worker makes `match`. */
+function typesDuring(match: string): void {
+  const line = JSON.stringify({ t: nowSeconds(), kind: "activity", session: "s1", generation: 2, cliSessionId: "c-1" });
+  process.env.MS_TMUX_ON_MATCH = match;
+  process.env.MS_TMUX_ON = `printf '%s\\n' '${line}' >> "$MS_HOME/sessions/s1/events.jsonl"`;
+}
+
+test("a turn started while the worker polled is noticed before the exit; nothing is killed", async (t) => {
+  // The wall is real and the claim was right, but polling usage takes seconds
+  // and the human's window reset in the meantime. The recheck happens after the
+  // pane is marked and before the first keystroke.
+  const w = await world(t);
+  typesDuring("@ms_handoff");
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "a live turn must never be typed into");
+  assert.ok(!respawnLine(w), "and it must never be respawned out from under itself");
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  const s = session(w);
+  assert.equal(s.generation, 2, "nothing moved");
+  assert.equal(s.account, "dirk");
+  assert.equal(s.state, "walled", "the row does not go on claiming a handoff nobody is doing");
+  assert.ok(logLines(w).some((l) => l.includes("set-option -pu -t %7 @ms_handoff")), "the handoff mark is taken back");
+  assert.match(recoverLog(w), /obsolete: the session went on working after the wall \(noticed before the exit\)/);
+});
+
+test("a turn that lands while the CLI is leaving stands the worker down before the respawn", async (t) => {
+  const w = await world(t);
+  typesDuring("/exit");
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  assert.ok(!respawnLine(w), "the pane is left as the new turn found it");
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  assert.equal(session(w).generation, 2);
+  assert.equal(session(w).state, "walled");
+  assert.match(recoverLog(w), /obsolete: the session went on working after the wall \(noticed before the respawn\)/);
 });
 
 test("a pane that is gone makes the recovery obsolete", async (t) => {

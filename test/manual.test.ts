@@ -550,7 +550,7 @@ test("stop stands down while a recovery holds the session, and leaves the intent
   t.after(() => release?.());
 
   assert.equal(await stopVerb(["s1"]), 1);
-  assert.match(say(), /a recovery is in progress; retry/);
+  assert.match(say(), /a recovery is in progress .*; retry/);
   assert.ok(!typedAnything(w), "nothing reaches a pane another worker is inside");
   assert.ok(!respawnLine(w));
 

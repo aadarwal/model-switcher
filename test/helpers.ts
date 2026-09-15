@@ -27,7 +27,10 @@ export function run(args: string[], env: Record<string, string> = {}, input = ""
   const r = spawnSync(process.execPath, ["--import", "tsx", path.resolve("bin/ms"), ...args], {
     input,
     encoding: "utf8",
-    env: { ...process.env, ...env },
+    // Child processes do not inherit the test runner's --disable-warning flag; without this,
+    // every `ms` verb that opens node:sqlite on Node 22 prints an ExperimentalWarning to stderr
+    // and one-line-stderr assertions break.
+    env: { NODE_OPTIONS: "--disable-warning=ExperimentalWarning", ...process.env, ...env },
     timeout: 60_000,
   });
   return { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };

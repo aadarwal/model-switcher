@@ -539,6 +539,25 @@ test("a second stop never types into the login shell the first one handed back",
   assert.deepEqual(logLines(w), [], "tmux was never asked to touch the human's shell");
 });
 
+test("a retried stop finishes the CLI a worker put back, rather than calling it already stopped", async (t) => {
+  // What the first `ms stop` leaves when it loses the lock to a live worker:
+  // the intent is written, and the worker then completes its handoff and
+  // overwrites `stopping` with a state of its own. The pane holds a fresh CLI
+  // on a new account — and nothing but this retry will ever stop it, because
+  // the hook ignores walls once `desired` is not `running` and reconciliation
+  // only acts on dead panes.
+  const w = await world(t, { screen: IDLE_SCREEN, session: { desired: "stopped", state: "resuming" } });
+  const say = stderr(t);
+
+  assert.equal(await stopVerb(["s1"]), 0);
+
+  assert.doesNotMatch(say(), /already stopped/, "a live CLI is not an ended session");
+  assert.ok(logLines(w).some((l) => l.includes("send-keys -t %7 /exit Enter")), "the CLI in the pane was never asked to leave");
+  assert.ok(respawnLine(w), "and the pane was never given back");
+  assert.equal(session(w).state, "stopped");
+  assert.match(say(), /^ms: s1 stopped$/m);
+});
+
 test("stop stands down while a recovery holds the session, and leaves the intent written", async (t) => {
   const w = await world(t, { screen: IDLE_SCREEN, recovery: true, wakeup: true });
   const say = stderr(t);

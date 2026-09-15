@@ -367,13 +367,17 @@ export const stopVerb: Verb = async (argv) => {
     //    already handed back — must never type `/exit` into the human's login
     //    shell and then SIGKILL it.
     //
-    //    `stopping` is deliberately NOT that case. It is the one state that
-    //    means a stop which did not finish (a lock it could not take, a CLI
-    //    that would not exit), and it is only ever written while the pane still
-    //    holds the CLI — a handed-back pane is `stopped` — so it stays
-    //    retryable, which is what the `a recovery is in progress (a handoff can take ~75 s); retry` line
-    //    below promises.
-    if (session.state === "stopped" || (session.desired === "stopped" && session.state !== "stopping")) {
+    //    `stopped` is the ONLY state that means that. A recorded INTENT does
+    //    not: `ms stop` writes `desired: stopped` before it takes the lock, so
+    //    a first attempt that lost the lock to a live worker leaves exactly
+    //    that — and the worker then finishes its handoff and overwrites
+    //    `stopping` with `continuing` or `parked`. Short-circuiting on the
+    //    intent told the human "already stopped" while the replacement CLI ran
+    //    on in the pane, with nothing left that would ever stop it: the hook
+    //    ignores walls once `desired` is not `running`, and reconciliation only
+    //    acts on dead panes. Every other state is a retry over a live or stale
+    //    row, and proceeds.
+    if (session.state === "stopped") {
       process.stderr.write(`ms: ${session.id} already stopped\n`);
       return EXIT_OK;
     }

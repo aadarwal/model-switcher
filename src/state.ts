@@ -119,6 +119,31 @@ export class State {
   }
   finishRecovery(id: number, status: "done" | "obsolete"): void { this.db.prepare("UPDATE recoveries SET status=?, updatedAt=? WHERE id=?").run(status, now(), id); }
   releaseRecovery(id: number): void { this.db.prepare("UPDATE recoveries SET status='pending', owner=NULL, updatedAt=? WHERE id=?").run(now(), id); }
+  /**
+   * Release a recovery ONLY if it is still the exact row the caller judged
+   * abandoned — same `owner`, same `updatedAt`. Returns whether it moved.
+   *
+   * Reconciliation decides a worker is dead by reading a row and then asking
+   * the kernel about a pid, which takes time; a real worker can claim the row
+   * in that window, and an unconditional `releaseRecovery` would erase a live
+   * owner (or drag a finished recovery back to `pending`). The WHERE clause is
+   * the compare-and-set that makes the judgement and the write one decision:
+   * `status='owned'` bounds it to a row still in that state, and `owner IS ?`
+   * compares NULL as a value rather than as SQL's unknown.
+   */
+  releaseRecoveryIf(id: number, expect: { owner: string | null; updatedAt: number }): boolean {
+    const res = this.db.prepare("UPDATE recoveries SET status='pending', owner=NULL, updatedAt=? WHERE id=? AND status='owned' AND owner IS ? AND updatedAt=?")
+      .run(now(), id, expect.owner, expect.updatedAt);
+    return Number(res.changes) === 1;
+  }
+  /**
+   * Stamp a recovery as acted on, without changing what it says. Reconciliation
+   * dispatches a worker at an orphaned `pending` row and writes nothing else;
+   * without this the row stays exactly as old as it was and the NEXT invocation
+   * dispatches a second worker at it. `updatedAt` is "when someone last did
+   * something about this", so moving it is the whole record of the dispatch.
+   */
+  touchRecovery(id: number): void { this.db.prepare("UPDATE recoveries SET updatedAt=? WHERE id=?").run(now(), id); }
   addAttempt(a: { recoveryId: number; account: string; outcome: AttemptOutcome; note: string }): void {
     const t = now();
     this.db.exec("BEGIN");
@@ -133,6 +158,19 @@ export class State {
   }
   attempts(recoveryId: number): AttemptRow[] { return this.db.prepare("SELECT * FROM attempts WHERE recoveryId=? ORDER BY id").all(recoveryId) as AttemptRow[]; }
   setWakeup(sessionId: string, at: number | null): void { this.db.prepare("UPDATE sessions SET wakeupAt=?, updatedAt=? WHERE id=?").run(at, now(), sessionId); }
+  /**
+   * Clear a wake-up ONLY if it is still the exact deadline being consumed.
+   * Returns whether it cleared.
+   *
+   * A wake-up is a promise with a time on it. Whoever acts on a due deadline
+   * clears that deadline — not "the wake-up", which by then may be a NEWER one
+   * a recovery worker scheduled in the meantime. Clearing that would drop a
+   * scheduled retry on the floor and leave the session waiting forever.
+   */
+  clearWakeupIf(sessionId: string, deadline: number): boolean {
+    const res = this.db.prepare("UPDATE sessions SET wakeupAt=NULL, updatedAt=? WHERE id=? AND wakeupAt=?").run(now(), sessionId, deadline);
+    return Number(res.changes) === 1;
+  }
   dueWakeups(t: number): SessionRow[] {
     return (this.db.prepare("SELECT * FROM sessions WHERE wakeupAt IS NOT NULL AND wakeupAt<=? ORDER BY wakeupAt").all(t) as Record<string, unknown>[]).map((r) => this.rowToSession(r)!);
   }

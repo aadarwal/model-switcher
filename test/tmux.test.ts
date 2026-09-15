@@ -12,6 +12,7 @@ function setup() {
 case "$*" in
   *"#{pid}:#{start_time}"*) echo "4242:1789000000" ;;
   *"#{pane_pid}"*) echo "777	2.1.272	0	/tmp/work" ;;
+  *"#{pane_dead}"*) printf '%s\\n' "$MS_TMUX_DEAD" ;;
   *"show-options -p"*) printf '%s\\n' '@ms_session s1' '@ms_generation 3' '@ms_note "has \\"quotes\\" inside"' '@ms_path "/tmp/a b"' '@ms_bs "x\\\\"' ;;
   *capture-pane*) printf 'line one\\nline two\\n' ;;
   *"list-panes"*) echo "%5" ;;
@@ -64,4 +65,23 @@ test("tmuxFromEnv reads the socket from $TMUX", async () => {
   assert.equal(tmuxFromEnv().socket, "/private/tmp/tmux-501/default");
   delete process.env.TMUX;
   assert.equal(tmuxFromEnv().socket, null);
+});
+
+test("paneDead answers 1/0, and null when tmux could not say", async () => {
+  setup();
+  const { Tmux } = await import("../src/tmux.ts");
+  const t = new Tmux(null);
+  // The stub's display-message answers the pane_dead query from $MS_TMUX_DEAD.
+  process.env.MS_TMUX_DEAD = "1";
+  assert.equal(t.paneDead("%5"), true);
+  process.env.MS_TMUX_DEAD = "0";
+  assert.equal(t.paneDead("%5"), false);
+  // An answer tmux did not give (no such pane, no server, a timeout) is not
+  // "alive" and not "dead" — it is "we could not ask", and callers that would
+  // kill or respawn on the strength of it must be able to tell.
+  process.env.MS_TMUX_DEAD = "";
+  assert.equal(t.paneDead("%5"), null);
+  process.env.MS_TMUX_DEAD = "boom";
+  assert.equal(t.paneDead("%5"), null);
+  delete process.env.MS_TMUX_DEAD;
 });

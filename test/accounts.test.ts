@@ -19,7 +19,35 @@ import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:
 import { userInfo } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { spawn } from "node:child_process";
 import { run, stubDir, tempHome } from "./helpers.ts";
+
+/** `run` (spawnSync) only hands back the output at exit, which cannot answer
+ *  "did the human see the prompt WHILE the mint was waiting?". This runs `ms`
+ *  asynchronously and timestamps the moment `marker` first lands on stderr. */
+function msStreaming(
+  args: string[],
+  env: Record<string, string>,
+  marker: string,
+): Promise<{ code: number; stdout: string; stderr: string; markerAt: number | null; exitAt: number }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ["--import", "tsx", path.resolve("bin/ms"), ...args], {
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let markerAt: number | null = null;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (c: string) => (stdout += c));
+    child.stderr.on("data", (c: string) => {
+      stderr += c;
+      if (markerAt === null && stderr.includes(marker)) markerAt = Date.now();
+    });
+    child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr, markerAt, exitAt: Date.now() }));
+  });
+}
 
 const TOKEN = "sk-ant-oat01-TESTtoken1234567890_-abcdefghijklmnop";
 const BANNER = "Opening your browser to mint a token...";
@@ -50,13 +78,30 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
 fi
 if [ "$1" = "setup-token" ]; then
   logcfg setup-token
-  if [ "$MS_TEST_TOKEN_SPLIT" = "1" ]; then
+  if [ "$MS_TEST_TOKEN_SPLIT" = "prefix" ]; then
     # Two writes that straddle the token prefix exactly: the first chunk ends
     # with "sk-ant-oat01-" and carries no secret, the second carries the body.
     printf 'Your token is sk-ant-oat01-'
     sleep 0.2
     printf '%s - copy it.\\n' "\${MS_TEST_TOKEN#sk-ant-oat01-}"
     printf '%s\\n' "$MS_TEST_TOKEN"
+    exit 0
+  fi
+  if [ "$MS_TEST_TOKEN_SPLIT" = "partial" ]; then
+    # The first chunk ends PART WAY through the prefix, so there is nothing in
+    # it for a redaction to match and nothing to recognise but "sk-ant-".
+    printf 'Your token is sk-ant-'
+    sleep 0.2
+    printf 'oat01-%s - copy it.\\n' "\${MS_TEST_TOKEN#sk-ant-oat01-}"
+    printf '%s\\n' "$MS_TEST_TOKEN"
+    exit 0
+  fi
+  if [ -n "$MS_TEST_PROMPT_HOLD" ]; then
+    # A prompt with no newline, then a long wait: the human must see it while
+    # the mint is still running, not when it finally exits.
+    printf 'Paste code: '
+    sleep "$MS_TEST_PROMPT_HOLD"
+    printf '\\n%s\\n' "$MS_TEST_TOKEN"
     exit 0
   fi
   if [ "$MS_TEST_TOKEN_STREAM" = "stderr" ]; then
@@ -115,7 +160,8 @@ type Opts = {
   probeOut?: string;
   tokenStream?: "stdout" | "stderr";
   tokenInline?: boolean;
-  tokenSplit?: boolean;
+  tokenSplit?: "prefix" | "partial";
+  promptHold?: string;
 };
 
 function scene(opts: Opts = {}) {
@@ -148,7 +194,8 @@ function scene(opts: Opts = {}) {
     MS_TEST_BANNER: BANNER,
     MS_TEST_TOKEN_STREAM: opts.tokenStream ?? "stdout",
     MS_TEST_TOKEN_INLINE: opts.tokenInline ? "1" : "0",
-    MS_TEST_TOKEN_SPLIT: opts.tokenSplit ? "1" : "0",
+    MS_TEST_TOKEN_SPLIT: opts.tokenSplit ?? "",
+    MS_TEST_PROMPT_HOLD: opts.promptHold ?? "",
     MS_TEST_CRED: CRED,
     MS_TEST_NO_CRED_FILE: opts.noCredFile ? "1" : "0",
     MS_TEST_KEYCHAIN_OK: (opts.keychainOk ?? []).join(" "),
@@ -188,6 +235,8 @@ function scene(opts: Opts = {}) {
       return a;
     },
     ms: (args: string[], extra: Record<string, string> = {}) => run(["accounts", ...args], { ...env, ...extra }),
+    msStream: (args: string[], marker: string, extra: Record<string, string> = {}) =>
+      msStreaming(["accounts", ...args], { ...env, ...extra }, marker),
   };
 }
 
@@ -328,7 +377,7 @@ test("a token sharing a line with other text is redacted before that line is for
 });
 
 test("a token split across two writes at the prefix boundary never reaches stderr", () => {
-  const s = scene({ tokenSplit: true });
+  const s = scene({ tokenSplit: "prefix" });
   s.ms(["add", "gmail"]);
   const r = s.ms(["login", "gmail"]);
   assert.equal(r.code, 0, r.stderr);
@@ -339,6 +388,33 @@ test("a token split across two writes at the prefix boundary never reaches stder
   // the line IS forwarded, once its newline arrives, with the token scrubbed
   assert.match(r.stderr, /Your token is sk-ant-oat01-<redacted> - copy it\./);
   assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), TOKEN);
+});
+
+test("a token split part way through the prefix never reaches stderr either", () => {
+  const s = scene({ tokenSplit: "partial" });
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 0, r.stderr);
+  const all = r.stdout + r.stderr;
+  assert.equal(all.includes(TOKEN), false, "the whole token reached the human");
+  assert.equal(all.includes(TOKEN.slice("sk-ant-oat01-".length)), false, "the token body reached the human");
+  // held until its newline, then forwarded once, redacted
+  assert.match(r.stderr, /Your token is sk-ant-oat01-<redacted> - copy it\./);
+  assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), TOKEN);
+});
+
+test("an unterminated prompt reaches the human while the mint is still waiting", async () => {
+  const s = scene({ promptHold: "1" });
+  s.ms(["add", "gmail"]);
+  const r = await s.msStream(["login", "gmail"], "Paste code: ");
+  assert.equal(r.code, 0, r.stderr);
+  assert.notEqual(r.markerAt, null, "the prompt never reached stderr at all");
+  // the stub waits a second after writing it; seeing it only at exit is the bug
+  assert.ok(
+    r.exitAt - r.markerAt! > 500,
+    `the prompt was held until exit (${r.exitAt - r.markerAt!}ms before exit)`,
+  );
+  assert.equal((r.stdout + r.stderr).includes(TOKEN), false);
 });
 
 // --- the launch-token probe --------------------------------------------

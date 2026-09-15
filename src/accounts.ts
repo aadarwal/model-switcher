@@ -116,6 +116,22 @@ function redact(s: string): string {
   return s.replace(new RegExp(`${TOKEN_PREFIX}[A-Za-z0-9_-]+`, "g"), `${TOKEN_PREFIX}<redacted>`);
 }
 
+/** May this UNTERMINATED fragment be part of a token, either already or once
+ *  the next chunk lands? Redaction only works on text it can see whole, and a
+ *  chunk boundary falls wherever the pipe says: `Your token is sk-ant-oat01-`
+ *  has nothing for the regex to scrub and leaves no prefix for the next chunk
+ *  to match, and `…is sk-ant-` is the same trap one character earlier. So a
+ *  fragment carrying the prefix, or ending in any part of it, waits for its
+ *  newline; everything else — a prompt with no newline, which the human needs
+ *  to SEE while the mint waits — goes straight out. */
+function mightCarryToken(fragment: string): boolean {
+  if (fragment.includes(TOKEN_PREFIX)) return true;
+  for (let n = Math.min(fragment.length, TOKEN_PREFIX.length - 1); n > 0; n--) {
+    if (fragment.endsWith(TOKEN_PREFIX.slice(0, n))) return true;
+  }
+  return false;
+}
+
 // --- Registry helpers --------------------------------------------------
 
 /** A row `validateRegistry` skipped is dropped the next time the file is
@@ -192,10 +208,12 @@ function runAuthLogin(name: string, dir: string): void {
  *
  *  Both output streams are piped and scanned, because a CLI is free to put
  *  its prompts on either and its answer on either. The unit of forwarding is
- *  a LINE, never a chunk: a line that is a token is captured and dropped, and
- *  every other line is redacted and written to the human's stderr as soon as
- *  its newline arrives, so the browser prompt and the URL stay visible. stdin
- *  stays with the human so a paste prompt still works. */
+ *  a LINE: a line that is a token is captured and dropped, and every other one
+ *  is redacted and written to the human's stderr as soon as its newline
+ *  arrives. The single exception is a trailing fragment that cannot be part of
+ *  a token (see `mightCarryToken`) — an unterminated `Paste code: ` is
+ *  forwarded at once, because a prompt nobody sees is a hang. stdin stays with
+ *  the human so that prompt still works. */
 async function mintLaunchToken(name: string, dir: string): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     const child = spawn("claude", ["setup-token"], {
@@ -227,11 +245,14 @@ async function mintLaunchToken(name: string, dir: string): Promise<string> {
         pending[which] = pending[which].slice(i + 1);
         handleLine(line);
       }
-      // Whatever has no newline yet waits for one. A FRAGMENT is never
-      // forwarded: redaction can only work on a whole line, and a chunk
-      // boundary can fall anywhere — `Your token is sk-ant-oat01-` carries no
-      // secret to scrub and leaves none of the prefix for the next chunk to
-      // match, so forwarding it would print the token across two writes.
+      // What is left has no newline yet. A fragment that could be carrying a
+      // token — or could become one when the next chunk lands — waits for it;
+      // anything else is a prompt the human needs now, so it goes out and the
+      // remainder of the line is handled as its own when the newline arrives.
+      if (pending[which] && !mightCarryToken(pending[which])) {
+        forward(pending[which]);
+        pending[which] = "";
+      }
     };
     // At exit there will be no newline coming: the trailing partial line is
     // handled exactly like a complete one — captured if it is a token,

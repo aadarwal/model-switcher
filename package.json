@@ -7,7 +7,7 @@
   "engines": { "node": ">=22.13" },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "NODE_NO_WARNINGS=1 node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "devDependencies": {

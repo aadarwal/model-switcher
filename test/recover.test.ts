@@ -129,6 +129,8 @@ type WorldOptions = {
   panes?: string;
   /** Make the stub tmux fail this subcommand, and only this one. */
   failOn?: string;
+  /** Raw accounts.json content, for the unreadable-registry case. */
+  registry?: string;
 };
 
 async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
@@ -149,10 +151,11 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   );
   writeFileSync(
     path.join(msHome, "accounts.json"),
-    JSON.stringify({
-      version: 1,
-      accounts: ["dirk", "gmail", "work"].map((name) => ({ name, provider: "claude", label: name, shared: false })),
-    }),
+    opts.registry ??
+      JSON.stringify({
+        version: 1,
+        accounts: ["dirk", "gmail", "work"].map((name) => ({ name, provider: "claude", label: name, shared: false })),
+      }),
     { mode: 0o600 },
   );
 
@@ -503,4 +506,23 @@ test("ms _recover is a registered verb and needs a session id", async (t) => {
   assert.equal(r.code, 1);
   assert.match(r.stderr, /needs a session id/);
   assert.doesNotMatch(r.stderr, /unknown verb/);
+});
+
+test("a registry that cannot be read is a failed attempt, not an empty fleet", async (t) => {
+  const w = await world(t, { registry: "{ this is not json" });
+
+  assert.equal(await recoverSession("s1"), 1, "not 2: the fleet was never read, so it cannot be full");
+
+  const s = session(w);
+  assert.equal(s.state, "walled", "the pane was never disturbed");
+  assert.equal(s.account, "dirk");
+  assert.equal(s.wakeupAt, null, "no wake-up invented out of a fleet nobody could look at");
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")));
+
+  const attempt = rows(w, "attempts")[0];
+  assert.equal(attempt.outcome, "infra", "it counts against the budget: a registry that stays broken parks the session");
+  assert.match(String(attempt.note), /registry unreadable/);
+  assert.equal(rows(w, "recoveries")[0].status, "pending");
+  assert.match(recoverLog(w), /cannot read the registry/);
 });

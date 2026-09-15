@@ -314,14 +314,26 @@ function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[]
   return Math.max(soonest || nowSeconds() + NO_ROOM_SECONDS, nowSeconds() + MIN_DISPATCH_SECONDS);
 }
 
+type Candidates = { names: string[]; inputs: PickInput[]; out: { name: string; why: string }[]; registryError: string | null };
+
 /** The accounts worth trying, best first, and why each of the others is out. */
-async function candidatesFor(session: SessionRow, exclude: string[]): Promise<{ names: string[]; inputs: PickInput[]; out: { name: string; why: string }[] }> {
+async function candidatesFor(session: SessionRow, exclude: string[]): Promise<Candidates> {
   const { registry } = loadRegistry();
   const mine = new Set(registry.accounts.filter((a) => a.provider === session.provider).map((a) => a.name));
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
-  const inputs = toPickInputs({ takenAt: snapshot.takenAt, accounts: snapshot.accounts.filter((a) => mine.has(a.name)) });
+  // The registry can break between our read and the snapshot's own, and an
+  // unreadable one yields NO inputs at all — which must never be mistaken for
+  // "nothing has room", because the fleet was never looked at.
+  if (snapshot.registryError) return { names: [], inputs: [], out: [], registryError: snapshot.registryError };
+  // Identity is (provider, name): a codex account sharing a name is a
+  // different account, not this session's.
+  const rows = snapshot.accounts.filter((a) => a.provider === session.provider && mine.has(a.name));
+  // The whole snapshot travels, only its rows narrowed. `toPickInputs` reads
+  // more than `accounts` — a hand-built partial silently drops whatever it
+  // learns next, and an absent field is not the same as a null one.
+  const inputs = toPickInputs({ ...snapshot, accounts: rows });
   const { picks, out } = pickAccounts(inputs, session.need, exclude);
-  return { names: picks.map((x) => x.name), inputs, out };
+  return { names: picks.map((x) => x.name), inputs, out, registryError: null };
 }
 
 // --- The transaction ---------------------------------------------------
@@ -460,6 +472,16 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     names = [manual.toAccount];
   } else {
     const found = await candidatesFor(session, exclude);
+    // A registry we could not read is a failed attempt, not an empty fleet:
+    // scheduling a wake-up here would pick a time out of nothing, and exit 2
+    // would tell the caller the accounts are full when they were never read.
+    // It counts against the budget, so a registry that stays broken parks the
+    // session for a human instead of retrying forever.
+    if (found.registryError) {
+      st.addAttempt({ recoveryId: rec.id, account: from, outcome: "infra", note: `registry unreadable: ${found.registryError}` });
+      st.releaseRecovery(rec.id);
+      return fail(id, g, `cannot read the registry: ${found.registryError}`);
+    }
     names = found.names;
     inputs = found.inputs;
     out = found.out;

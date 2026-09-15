@@ -390,7 +390,7 @@ test("a resume that falls back to a new conversation parks the session", async (
   assert.equal(s.generation, 3, "the respawn did happen; it is the resume that broke");
   const attempts = rows(w, "attempts");
   assert.equal(attempts.at(-1)!.outcome, "resume-broken");
-  assert.equal(rows(w, "recoveries")[0].status, "done", "terminal: an open row here would swallow the next wall");
+  assert.equal(rows(w, "recoveries")[0].status, "failed", "terminal: an open row here would swallow the next wall");
   assert.equal(s.wakeupAt, null, "a parked session waits for a person, not for a window");
   // The screen is evidence: the last non-blank lines land in the log.
   assert.match(recoverLog(w), /screen\| /);
@@ -408,7 +408,7 @@ test("a resume that never reports parks the session too", async (t) => {
   assert.equal(s.state, "parked");
   assert.ok(respawnLine(w), "the pane was respawned before anyone waited on it");
   assert.equal(rows(w, "attempts").at(-1)!.outcome, "resume-broken");
-  assert.equal(rows(w, "recoveries")[0].status, "done", "terminal, like any broken resume");
+  assert.equal(rows(w, "recoveries")[0].status, "failed", "terminal, like any broken resume");
   assert.equal(s.wakeupAt, null);
   assert.match(recoverLog(w), /no resume report within/);
 });
@@ -427,7 +427,7 @@ test("a fourth try is not taken: three failed attempts park the session", async 
   assert.equal(await recoverSession("s1"), 1);
   assert.equal(session(w).state, "parked");
   assert.equal(session(w).wakeupAt, null, "a parked session is not also waiting for a window");
-  assert.equal(rows(w, "recoveries")[0].status, "done");
+  assert.equal(rows(w, "recoveries")[0].status, "failed");
   assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
   assert.match(recoverLog(w), /gave up after 3 attempts/);
 });
@@ -509,7 +509,7 @@ test("a tmux that fails mid-handoff is a failed recovery, not an exception", asy
     rows(w, "attempts").map((a) => [a.account, a.outcome]),
     [["dirk", "exhausted"], ["gmail", "infra"]],
   );
-  assert.equal(rows(w, "recoveries")[0].status, "done", "terminal: nothing may retry onto a dead pane");
+  assert.equal(rows(w, "recoveries")[0].status, "failed", "terminal: nothing may retry onto a dead pane");
   assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "no worker is sent to respawn a pane that would not respawn");
 });
 
@@ -529,6 +529,11 @@ test("with every handoff slot taken the recovery stands down and re-dispatches i
   const dispatch = logLines(w).find((l) => l.includes("run-shell"));
   assert.match(dispatch ?? "", /run-shell -b -d 30 '.*ms' '_recover' 's1'/);
   assert.match(recoverLog(w), /too many handoffs in flight/);
+  // The delayed re-dispatch is armed, but nothing showed up on `ms status`
+  // or in reconciliation's due-wakeups scan unless the wake-up is recorded
+  // too — it must land at the same ~30s the timer itself was set for.
+  const wakeup = session(w).wakeupAt!;
+  assert.ok(Math.abs(wakeup - (nowSeconds() + 30)) < 5, `wakeup ${wakeup} is not ~30s out`);
 });
 
 test("ms _recover is a registered verb and needs a session id", async (t) => {
@@ -738,7 +743,7 @@ test("candidates used up by failures park the session; they do not wait for a wi
   assert.equal(s.wakeupAt, null, "no wake-up for a window that was never the problem");
   assert.ok(!logLines(w).some((l) => l.includes("run-shell")));
   assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
-  assert.equal(rows(w, "recoveries")[0].status, "done");
+  assert.equal(rows(w, "recoveries")[0].status, "failed");
   assert.match(recoverLog(w), /all candidates failed: gmail: no launch token/);
 });
 

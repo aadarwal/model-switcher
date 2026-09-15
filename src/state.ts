@@ -16,7 +16,7 @@ export type SessionRow = { id: string; provider: Provider; cliSessionId: string 
 export type LaunchRow = { id: string; sessionId: string; generation: number; account: string; command: string[]; env: Record<string, string>; createdAt: number };
 export type WallKind = "session" | "weekly" | "fable" | "unknown";
 export type RecoveryRow = { id: number; sessionId: string; generation: number; turnId: string | null; kind: WallKind;
-  status: "pending" | "owned" | "done" | "obsolete"; owner: string | null; attempts: number; nextAttemptAt: number | null; createdAt: number; updatedAt: number };
+  status: "pending" | "owned" | "done" | "obsolete" | "failed"; owner: string | null; attempts: number; nextAttemptAt: number | null; createdAt: number; updatedAt: number };
 export type AttemptOutcome = "ok" | "exhausted" | "auth" | "infra" | "resume-broken" | "forced";
 export type AttemptRow = { id: number; recoveryId: number; account: string; outcome: AttemptOutcome; note: string; createdAt: number };
 type RecoveryInput = Omit<RecoveryRow, "id" | "status" | "owner" | "attempts" | "nextAttemptAt" | "createdAt" | "updatedAt">;
@@ -117,7 +117,7 @@ export class State {
     const res = this.db.prepare("UPDATE recoveries SET status='owned', owner=?, updatedAt=? WHERE id=? AND status='pending'").run(owner, now(), id);
     return Number(res.changes) === 1;
   }
-  finishRecovery(id: number, status: "done" | "obsolete"): void { this.db.prepare("UPDATE recoveries SET status=?, updatedAt=? WHERE id=?").run(status, now(), id); }
+  finishRecovery(id: number, status: "done" | "obsolete" | "failed"): void { this.db.prepare("UPDATE recoveries SET status=?, updatedAt=? WHERE id=?").run(status, now(), id); }
   releaseRecovery(id: number): void { this.db.prepare("UPDATE recoveries SET status='pending', owner=NULL, updatedAt=? WHERE id=?").run(now(), id); }
   /**
    * Release a recovery ONLY if it is still the exact row the caller judged

@@ -12,18 +12,19 @@ export const p = {
   get state() { return sub("state.sqlite"); },
   get snapshot() { return sub("snapshot.json"); },
   get lastPick() { return sub("last-pick.json"); },
-  get locks() { return sub("locks"); },
   sessionDir: (id: string) => sub("sessions", id),
   eventsFile: (id: string) => sub("sessions", id, "events.jsonl"),
   recoverLog: (id: string) => sub("sessions", id, "recover.log"),
   launchToken: (name: string) => sub("launch", `${name}.token`),
   claudeConfigDir: (name: string) => sub("claude", name),
   codexHome: (name: string) => sub("codex", name),
-  lockDir: (name: string) => sub("locks", name),
   hooksDir: () => sub("hooks"),
 };
 export function ensureStore(): void {
-  for (const d of [msHome(), sub("claude"), sub("codex"), sub("launch"), sub("sessions"), sub("hooks"), sub("locks")]) {
+  // Locks live in one file, MS_HOME/locks.sqlite (src/lock.ts) — there is
+  // no locks/ subdirectory to create; the mkdir-lock design that once used
+  // one is gone.
+  for (const d of [msHome(), sub("claude"), sub("codex"), sub("launch"), sub("sessions"), sub("hooks")]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true, mode: 0o700 });
     chmodSync(d, 0o700);
   }

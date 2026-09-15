@@ -12,7 +12,7 @@ function setup() {
 case "$*" in
   *"#{pid}:#{start_time}"*) echo "4242:1789000000" ;;
   *"#{pane_pid}"*) echo "777	2.1.272	0	/tmp/work" ;;
-  *"show-options -p"*) printf '@ms_session s1\\n@ms_generation 3\\n@ms_note "has \\"quotes\\" inside"\\n@ms_path "/tmp/a b"\\n' ;;
+  *"show-options -p"*) printf '%s\\n' '@ms_session s1' '@ms_generation 3' '@ms_note "has \\"quotes\\" inside"' '@ms_path "/tmp/a b"' '@ms_bs "x\\\\"' ;;
   *capture-pane*) printf 'line one\\nline two\\n' ;;
   *"list-panes"*) echo "%5" ;;
 esac
@@ -52,6 +52,7 @@ test("paneInfo and paneOptions parse the stub's answers", async () => {
     "@ms_generation": "3",
     "@ms_note": 'has "quotes" inside',
     "@ms_path": "/tmp/a b",
+    "@ms_bs": "x\\",
   });
   assert.equal(t.capture("%5"), "line one\nline two\n");
 });

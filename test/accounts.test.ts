@@ -651,6 +651,55 @@ test("accounts verify will not adopt an unattributable keychain item", () => {
   assert.equal(existsSync(path.join(s.configDir("gmail"), "keychain-account")), false);
 });
 
+test("accounts verify refreshes the poll grant under the account's own credential lock", async () => {
+  const s = scene();
+  s.ms(["add", "gmail"]);
+  assert.equal(s.ms(["login", "gmail"]).code, 0);
+
+  // A spent access token, so `verify` has to refresh before it can read the
+  // profile — and the token endpoint ROTATES the refresh token, so doing that
+  // beside a poll (`ms status`, a launch warming grants) spends the same grant
+  // twice and the loser reads invalid_grant. src/snapshot.ts names
+  // `account-claude-<name>` as the lock that keeps them apart.
+  const credFile = path.join(s.configDir("gmail"), ".credentials.json");
+  writeFileSync(
+    credFile,
+    JSON.stringify({ claudeAiOauth: { accessToken: "at-1", refreshToken: "rt-1", expiresAt: Date.now() - 1_000 } }),
+    { mode: 0o600 },
+  );
+  const refreshStub = path.join(s.home, "refresh-stub.mjs");
+  writeFileSync(
+    refreshStub,
+    `const profile = ${JSON.stringify(JSON.stringify(PROFILE))};\n` +
+      `globalThis.fetch = async (url) => String(url).includes("/oauth/token")\n` +
+      `  ? new Response(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } })\n` +
+      `  : new Response(profile, { status: 200, headers: { "content-type": "application/json" } });\n`,
+  );
+  const withRefresh = { NODE_OPTIONS: `--import=${pathToFileURL(refreshStub).href}`, MS_LOCK_WAIT_MS: "300" };
+
+  // Held by "another process" — here, this one.
+  const { acquire } = await import("../src/lock.ts");
+  const savedHome = process.env.MS_HOME;
+  process.env.MS_HOME = s.msHome;
+  const release = acquire("account-claude-gmail");
+  assert.ok(release, "the test could not take the lock it means to hold");
+  try {
+    const blocked = s.ms(["verify", "gmail"], withRefresh);
+    assert.notEqual(blocked.code, 0);
+    assert.match(blocked.stderr, /account-claude-gmail/, "it refreshed without the lock, or failed for another reason");
+    assert.match(JSON.parse(readFileSync(credFile, "utf8")).claudeAiOauth.refreshToken, /^rt-1$/, "nothing was spent");
+  } finally {
+    release!();
+    if (savedHome === undefined) delete process.env.MS_HOME;
+    else process.env.MS_HOME = savedHome;
+  }
+
+  // With the lock free it takes it, refreshes, and writes the rotated token.
+  const ok = s.ms(["verify", "gmail"], withRefresh);
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.equal(JSON.parse(readFileSync(credFile, "utf8")).claudeAiOauth.refreshToken, "rt-2");
+});
+
 test("accounts verify fails when there is no launch token yet", () => {
   const s = scene();
   s.ms(["add", "gmail"]);

@@ -28,6 +28,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import path from "node:path";
+import { withLock } from "./lock.ts";
 import { ensureStore, p } from "./paths.ts";
 import { type Account, findAccount, loadRegistry, NAME_PATTERN, saveRegistry } from "./registry.ts";
 import { deleteLaunchToken, looksLikeSetupToken, readLaunchToken, saveLaunchToken } from "./launch-credentials.ts";
@@ -52,6 +53,12 @@ const AUTH_STATUS_TIMEOUT_MS = 15_000;
 const KEYCHAIN_TIMEOUT_MS = 3_000;
 /** The two HTTP reads (profile, and a refresh before it if needed). */
 const HTTP_TIMEOUT_MS = 20_000;
+/** A grant that would expire mid-flight is refreshed rather than 401'd —
+ *  src/snapshot.ts's REFRESH_SKEW_MS, and the same number. */
+const REFRESH_SKEW_MS = 60_000;
+/** How long to wait for whoever else holds this account's credential lock.
+ *  Test-tunable, like manual.ts's bounds; nothing else depends on the value. */
+const lockWaitMs = (): number => Number(process.env.MS_LOCK_WAIT_MS) || HTTP_TIMEOUT_MS;
 
 /** The keychain service Claude Code stores its OAuth credentials under. */
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
@@ -474,19 +481,48 @@ function hasPollGrant(name: string): boolean {
   return note !== null && keychainItemExists(note);
 }
 
+/**
+ * Refresh this account's poll grant under its own credential lock — the
+ * `account-<provider>-<name>` name src/snapshot.ts's `refreshGrant` takes, and
+ * for the same reason: the token endpoint ROTATES the refresh token, so an
+ * `ms accounts verify` running beside a poll (or beside another `ms`) would
+ * have the two spend each other's grant, and whoever lost would read
+ * `invalid_grant` — a live account that now looks dead and needs a re-login.
+ *
+ * Re-read inside the lock, as snapshot.ts does: whoever we waited for has just
+ * written a fresh credential where we found a stale one, so the common case
+ * costs no network call at all. `force` is the after-an-AuthError path, where
+ * the credential we hold was rejected and only a DIFFERENT one is any use.
+ *
+ * Bounded by the same budget as the calls around it; a lock we cannot get in
+ * that time throws `Locked`, which the verb reports, rather than waiting on.
+ */
+async function refreshUnderLock(name: string, c: PollCredentials, opts: { force?: boolean } = {}): Promise<PollCredentials> {
+  return await withLock(
+    `account-claude-${name}`,
+    async () => {
+      const latest = readPollCredentials(name) ?? c;
+      const someoneElseDidIt = opts.force ? latest.refreshToken !== c.refreshToken : latest.expiresAt >= Date.now() + REFRESH_SKEW_MS;
+      if (someoneElseDidIt) return latest;
+      return await refreshPollCredentials(name, latest, AbortSignal.timeout(HTTP_TIMEOUT_MS));
+    },
+    { waitMs: lockWaitMs() },
+  );
+}
+
 /** The organisation behind the poll grant. Refreshes when the access token is
  *  spent, and once more if the profile read says the credential is stale. */
 async function readProfile(name: string): Promise<Profile> {
   let c: PollCredentials | null = readPollCredentials(name);
   if (!c) throw new Error(`no poll grant for ${name} — run: ms accounts login ${name}`);
-  if (c.expiresAt && c.expiresAt <= Date.now() + 60_000) {
-    c = await refreshPollCredentials(name, c, AbortSignal.timeout(HTTP_TIMEOUT_MS));
+  if (c.expiresAt && c.expiresAt <= Date.now() + REFRESH_SKEW_MS) {
+    c = await refreshUnderLock(name, c);
   }
   try {
     return await fetchProfile(c, AbortSignal.timeout(HTTP_TIMEOUT_MS));
   } catch (e) {
     if (!(e instanceof AuthError)) throw e;
-    const fresh = await refreshPollCredentials(name, c, AbortSignal.timeout(HTTP_TIMEOUT_MS));
+    const fresh = await refreshUnderLock(name, c, { force: true });
     return await fetchProfile(fresh, AbortSignal.timeout(HTTP_TIMEOUT_MS));
   }
 }

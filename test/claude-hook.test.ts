@@ -1,0 +1,143 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { run, stubDir, tempHome } from "./helpers.ts";
+
+function setup() {
+  const { home, msHome } = tempHome(); const { dir, stub } = stubDir();
+  const tlog = path.join(home, "tmux.log");
+  stub("tmux", `printf '%s\\n' "$*" >> "${tlog}"; case "$*" in *capture-pane*) printf '❯ do it\\n  ⎿  You'"'"'ve reached your Fable limit. Run /usage-credits to continue or switch models with /model.\\n\\n❯ \\n' ;; esac; exit 0`);
+  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7" };
+  return { home, msHome, env, tlog };
+}
+
+/** Node's warnings fully enabled: neither the harness's `NODE_NO_WARNINGS` nor
+ * its `NODE_OPTIONS=--disable-warning=…` may be what keeps the hook quiet. A
+ * hook's stderr is rendered inside the human's Claude transcript. */
+const LOUD = { NODE_OPTIONS: "", NODE_NO_WARNINGS: "" };
+
+function events(msHome: string, session = "s1"): Record<string, unknown>[] {
+  return readFileSync(path.join(msHome, "sessions", session, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+}
+const eventsExist = (msHome: string, session = "s1") => existsSync(path.join(msHome, "sessions", session, "events.jsonl"));
+
+async function seedSession(env: Record<string, string>, patch: Record<string, unknown> = {}) {
+  process.env.HOME = env.HOME; process.env.MS_HOME = env.MS_HOME;
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  st.createSession({ id: "s1", provider: "claude", cliSessionId: "c-42", cwd: "/tmp", socket: env.MS_SOCKET, pane: "%7", serverStart: "1",
+    need: "fable", account: "dirk", generation: 2, state: "running", desired: "running", flags: [], ...patch } as Parameters<typeof st.createSession>[0]);
+  st.close();
+  return openState;
+}
+
+test("SessionStart with source resume appends a resumed event carrying the inherited generation", () => {
+  const { env, msHome } = setup();
+  const r = run(["_hook", "claude"], env, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "c-42" }));
+  assert.equal(r.code, 0); assert.equal(r.stdout, "");
+  const ev = events(msHome);
+  assert.deepEqual([ev[0].kind, ev[0].generation, ev[0].cliSessionId], ["resumed", 2, "c-42"]);
+});
+
+test("SessionStart maps every source, UserPromptSubmit is activity and SessionEnd is ended", () => {
+  for (const [source, kind] of [["startup", "started"], ["clear", "cleared"], ["compact", "compacted"], [undefined, "started"]] as const) {
+    const { env, msHome } = setup();
+    assert.equal(run(["_hook", "claude"], env, JSON.stringify({ hook_event_name: "SessionStart", source, session_id: "c-7" })).code, 0);
+    assert.equal(events(msHome)[0].kind, kind);
+  }
+  const a = setup();
+  assert.equal(run(["_hook", "claude"], a.env, JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "c-7" })).code, 0);
+  assert.deepEqual([events(a.msHome)[0].kind, events(a.msHome)[0].cliSessionId], ["activity", "c-7"]);
+  const b = setup();
+  assert.equal(run(["_hook", "claude"], b.env, JSON.stringify({ hook_event_name: "SessionEnd", reason: "clear", session_id: "c-7" })).code, 0);
+  assert.deepEqual([events(b.msHome)[0].kind, events(b.msHome)[0].kindDetail], ["ended", "clear"]);
+  const c = setup();
+  assert.equal(run(["_hook", "claude"], c.env, JSON.stringify({ hook_event_name: "SessionEnd", session_id: "c-7" })).code, 0);
+  assert.equal(events(c.msHome)[0].kind, "ended");
+  assert.ok(!("kindDetail" in events(c.msHome)[0]), "no reason means no kindDetail, not an empty one");
+});
+
+test("StopFailure rate_limit records the wall kind from the screen, opens a recovery and asks tmux to dispatch the worker", async () => {
+  const { env, msHome, tlog } = setup();
+  const openState = await seedSession(env);
+  const r = run(["_hook", "claude"], env, JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit", error_message: "x", session_id: "c-42" }));
+  assert.equal(r.code, 0); assert.equal(r.stdout, "");
+  const ev = events(msHome).pop()!;
+  assert.equal(ev.kind, "rate_limited"); assert.equal(ev.kindDetail, "fable");
+  const st2 = openState(); assert.equal(st2.pendingRecovery("s1")!.kind, "fable"); st2.close();
+  assert.match(readFileSync(tlog, "utf8"), /-S \/private\/tmp\/tmux-501\/default run-shell -b '.*ms' '_recover' 's1'/);
+});
+
+test("an unmanaged pane is left alone: the session is real, one MS_ variable is not", () => {
+  // MS_SESSION stays s1 on purpose — if the guard broke, events would land there.
+  const a = setup();
+  const { MS_PANE: _pane, ...noPane } = a.env;
+  assert.equal(run(["_hook", "claude"], noPane, JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit", session_id: "c-42" })).code, 0);
+  assert.equal(eventsExist(a.msHome), false, "no MS_PANE: not our pane");
+
+  const b = setup();
+  const { MS_SOCKET: _sock, ...noSocket } = b.env;
+  assert.equal(run(["_hook", "claude"], noSocket, JSON.stringify({ hook_event_name: "SessionStart", source: "startup" })).code, 0);
+  assert.equal(eventsExist(b.msHome), false, "no MS_SOCKET: not our pane");
+
+  // `Number("")` is 0, and 0 is finite — a blank generation is not a generation.
+  for (const gen of ["", " ", "0", "-1", "1.5", "nope"]) {
+    const c = setup();
+    assert.equal(run(["_hook", "claude"], { ...c.env, MS_GENERATION: gen }, JSON.stringify({ hook_event_name: "SessionStart", source: "startup" })).code, 0);
+    assert.equal(eventsExist(c.msHome), false, `MS_GENERATION=${JSON.stringify(gen)} is not a generation`);
+  }
+});
+
+test("a StopFailure that is not a rate limit does nothing", () => {
+  const { env, msHome } = setup();
+  assert.equal(run(["_hook", "claude"], env, JSON.stringify({ hook_event_name: "StopFailure", error: "overloaded" })).code, 0);
+  assert.equal(eventsExist(msHome), false);
+});
+
+test("an unknown event, empty stdin and unparseable stdin all exit 0 silently", () => {
+  const { env, msHome } = setup();
+  for (const input of [JSON.stringify({ hook_event_name: "PreToolUse" }), "", "not json", "[]", "null"]) {
+    const r = run(["_hook", "claude"], { ...env, ...LOUD }, input);
+    assert.equal(r.code, 0); assert.equal(r.stdout, ""); assert.equal(r.stderr, "");
+  }
+  assert.equal(eventsExist(msHome), false);
+});
+
+test("the hook prints nothing on stderr with Node's own warnings fully enabled", async () => {
+  // `state.ts` pulls in node:sqlite, whose ExperimentalWarning would land in the
+  // human's transcript. Both halves are under test: the unmanaged early return
+  // must not load it at all, and the rate-limit path must not leak it either.
+  const a = setup();
+  const { MS_PANE: _pane, ...unmanaged } = a.env;
+  const r1 = run(["_hook", "claude"], { ...unmanaged, ...LOUD }, JSON.stringify({ hook_event_name: "SessionStart", source: "startup" }));
+  assert.deepEqual([r1.code, r1.stdout, r1.stderr], [0, "", ""], "unmanaged pane: not one byte");
+
+  const b = setup();
+  await seedSession(b.env);
+  const r2 = run(["_hook", "claude"], { ...b.env, ...LOUD }, JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit", session_id: "c-42" }));
+  assert.deepEqual([r2.code, r2.stdout, r2.stderr], [0, "", ""], "rate_limited: not one byte");
+  assert.equal(events(b.msHome).pop()!.kindDetail, "fable", "and it still did the work");
+});
+
+test("a rate limit for a stale generation is recorded but never dispatched", async () => {
+  const { env, msHome, tlog } = setup();
+  const openState = await seedSession(env, { generation: 5 });
+  assert.equal(run(["_hook", "claude"], env, JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit", session_id: "c-42" })).code, 0);
+  assert.equal(events(msHome).pop()!.kind, "rate_limited");
+  const st2 = openState(); assert.equal(st2.pendingRecovery("s1"), null); st2.close();
+  assert.doesNotMatch(readFileSync(tlog, "utf8"), /run-shell/);
+});
+
+test("a rate limit for a session that is stopping, or one the store has never seen, is recorded but never dispatched", async () => {
+  const a = setup();
+  await seedSession(a.env, { desired: "stopped" });
+  assert.equal(run(["_hook", "claude"], a.env, JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit", session_id: "c-42" })).code, 0);
+  assert.equal(events(a.msHome).pop()!.kind, "rate_limited");
+  assert.doesNotMatch(readFileSync(a.tlog, "utf8"), /run-shell/);
+
+  const b = setup();
+  assert.equal(run(["_hook", "claude"], b.env, JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit", session_id: "c-42" })).code, 0);
+  assert.equal(events(b.msHome).pop()!.kind, "rate_limited");
+  assert.doesNotMatch(readFileSync(b.tlog, "utf8"), /run-shell/);
+});

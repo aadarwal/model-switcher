@@ -50,7 +50,10 @@ export async function claudeHook(): Promise<number> {
       const prev = await noteSessionStart(session, gen, kind, cliSessionId);
       appendEvent({ t, kind, session, generation: gen, cliSessionId, ...(prev !== undefined ? { prevCliSessionId: prev } : {}) });
     } else if (name === "UserPromptSubmit") {
+      // The event first: it is what makes an earlier failure obsolete, and the
+      // state move below is only bookkeeping on top of it.
       appendEvent({ t, kind: "activity", session, generation: gen, cliSessionId });
+      await noteActivity(session, gen);
     } else if (name === "SessionEnd") {
       const reason = typeof input.reason === "string" && input.reason ? input.reason : null;
       appendEvent({ t, kind: "ended", session, generation: gen, cliSessionId, ...(reason ? { kindDetail: reason } : {}) });
@@ -95,7 +98,7 @@ async function onRow<T>(session: string, gen: number, fn: (st: State, s: Session
 }
 
 /**
- * What a SessionStart means for the ROW (spec §8's table).
+ * What a SessionStart means for the ROW (spec §8's table, §7 step 5).
  *
  * The CLI's session id can change inside one process: a `/clear` starts a new
  * conversation, and an interactive `/resume` or a fork moves to another one.
@@ -105,8 +108,11 @@ async function onRow<T>(session: string, gen: number, fn: (st: State, s: Session
  * resume. The id we were told replaces the one we had, and the caller records
  * both on the event.
  *
- * A `compacted` report is not that: compaction keeps the conversation and its
- * id, so nothing moves.
+ * The other half is the state: a `startup` report for this generation is the
+ * launch itself answering, which is what `launching → running` means.
+ *
+ * A `compacted` report is neither: compaction keeps the conversation, its id
+ * and the state it was in, so nothing moves.
  *
  * Returns the id the row USED to carry when it changed, `undefined` when it
  * did not.
@@ -120,8 +126,24 @@ async function noteSessionStart(session: string, gen: number, kind: EventKind, c
       patch.cliSessionId = cliSessionId;
       prev = s.cliSessionId;
     }
+    // A launch is `running` only once the CLI reports itself under this
+    // generation (spec §7 step 5); until then it is `launching`.
+    if (kind === "started" && s.state === "launching") patch.state = "running";
     if (Object.keys(patch).length) st.updateSession(session, patch);
     return prev;
+  });
+}
+
+/**
+ * The first turn after a resume is what finishes a rotation (spec §9 step 7:
+ * "`continuing` → `running` on the first activity/turn event of the new
+ * generation"). `continuing` means the replacement CLI was handed the
+ * continuation and has not been seen acting on it yet; this is that. Any other
+ * state belongs to somebody else — the worker, a stop, reconciliation.
+ */
+async function noteActivity(session: string, gen: number): Promise<void> {
+  await onRow(session, gen, (st, s) => {
+    if (s.state === "continuing") st.updateSession(session, { state: "running" });
   });
 }
 

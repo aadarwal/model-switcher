@@ -104,6 +104,54 @@ test("a resume or startup under another id moves the row too, but never one for 
   assert.ok(!("prevCliSessionId" in events(stale.msHome).pop()!), "and the event claims no change it did not make");
 });
 
+test("a launch is running once the CLI reports itself, and a continuation once the human's next turn arrives", async () => {
+  // Spec §7 step 5 and §9 step 7. Nothing else writes either transition, so
+  // without these every healthy session reads `launching` for ever and every
+  // rotated one `continuing`.
+  const a = setup();
+  const openA = await seedSession(a.env, { state: "launching" });
+  assert.equal(run(["_hook", "claude"], a.env, JSON.stringify({ hook_event_name: "SessionStart", source: "startup", session_id: "c-42" })).code, 0);
+  const stA = openA();
+  try {
+    assert.equal(stA.getSession("s1")!.state, "running", "the launch answered for itself");
+  } finally {
+    stA.close();
+  }
+
+  const b = setup();
+  const openB = await seedSession(b.env, { state: "continuing" });
+  assert.equal(run(["_hook", "claude"], b.env, JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "c-42" })).code, 0);
+  const stB = openB();
+  try {
+    assert.equal(stB.getSession("s1")!.state, "running", "the resumed session is working again");
+  } finally {
+    stB.close();
+  }
+
+  // And neither transition invents one from a state that is not its own: a
+  // `resume` report is the worker's to act on (readiness), and a turn in a
+  // session being stopped does not un-stop it.
+  const c = setup();
+  const openC = await seedSession(c.env, { state: "launching" });
+  assert.equal(run(["_hook", "claude"], c.env, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "c-42" })).code, 0);
+  const stC = openC();
+  try {
+    assert.equal(stC.getSession("s1")!.state, "launching", "a resume report is the worker's to act on");
+  } finally {
+    stC.close();
+  }
+
+  const d = setup();
+  const openD = await seedSession(d.env, { state: "stopping", desired: "stopped" });
+  assert.equal(run(["_hook", "claude"], d.env, JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "c-42" })).code, 0);
+  const stD = openD();
+  try {
+    assert.equal(stD.getSession("s1")!.state, "stopping", "a turn does not un-stop a session on its way out");
+  } finally {
+    stD.close();
+  }
+});
+
 test("StopFailure rate_limit records the wall kind from the screen, opens a recovery and asks tmux to dispatch the worker", async () => {
   const { env, msHome, tlog } = setup();
   const openState = await seedSession(env);

@@ -123,7 +123,8 @@ const OPTION = /^\s*[❯›]\s*\d+\./;
 const CANCEL = /esc to cancel/i;
 const INTERRUPT = /esc to interrupt/i;
 
-function safeCapture(tmux: Tmux, pane: string): string {
+/** Exported for Task 16's manual verbs: one reading of a pane, one meaning. */
+export function safeCapture(tmux: Tmux, pane: string): string {
   try {
     return tmux.capture(pane, 200);
   } catch {
@@ -151,14 +152,20 @@ function isModal(screen: string): boolean {
   return lastTurn(screen).some((l) => OPTION.test(l) || CANCEL.test(l));
 }
 
-/** The CLI is mid-turn: its own spinner says how to interrupt it. */
-const isBusy = (screen: string): boolean => tail(screen, 6).some((l) => INTERRUPT.test(l));
+/** The CLI is mid-turn: its own spinner says how to interrupt it. Exported so
+ * Task 16's manual verbs refuse on exactly the reading this transaction uses. */
+export const isBusy = (screen: string): boolean => tail(screen, 6).some((l) => INTERRUPT.test(l));
 
 // --- Locks -------------------------------------------------------------
 
 /** A lock name is a restricted token (src/lock.ts); a session id that is not
  * a UUID must still produce a legal, stable one rather than throwing. */
 const lockToken = (id: string): string => id.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 48);
+
+/** The name of a session's mutation lock. Exported — and used by the
+ * transaction below — so a caller outside this module (Task 16's `ms stop`)
+ * cannot take a DIFFERENT lock and believe it has excluded a worker. */
+export const sessionLockName = (id: string): string => `session-${lockToken(id)}`;
 
 /**
  * One of four handoff slots, taken without waiting — `acquire` is `withLock`
@@ -350,7 +357,7 @@ async function candidatesFor(session: SessionRow, exclude: string[]): Promise<Ca
  */
 export async function recoverSession(id: string, opts: RecoverOptions = {}): Promise<RecoverCode> {
   try {
-    return await withLock(`session-${lockToken(id)}`, () => transaction(id, opts), { waitMs: SESSION_LOCK_WAIT_MS });
+    return await withLock(sessionLockName(id), () => transaction(id, opts), { waitMs: SESSION_LOCK_WAIT_MS });
   } catch (e) {
     if (e instanceof Locked || (e as Error)?.name === "Locked") return fail(id, 0, `another recovery holds ${id}`);
     // Anything else — a tmux call that failed, a store that would not write —

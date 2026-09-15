@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
 import { appendEvent } from "../src/events.ts";
@@ -41,6 +42,7 @@ const HOUR = 3_600_000;
 
 const TMUX_STUB = String.raw`printf '%s\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
+if [ -n "$MS_TMUX_FAIL" ] && [ "$1" = "$MS_TMUX_FAIL" ]; then exit 1; fi
 st="$MS_TMUX_STATE"
 get() { grep "^$1=" "$st" 2>/dev/null | tail -1 | cut -d= -f2-; }
 put() { printf '%s=%s\n' "$1" "$2" >> "$st"; }
@@ -73,6 +75,15 @@ exit 0`;
 const IDLE_SCREEN = ["❯ ship it", "", "  Done.", "", "❯ ", ""].join("\n");
 const WALLED_SCREEN = ["❯ ship it", "", "⎿  You've hit your usage limit. Your limit will reset at 9pm.", "", "❯ ", ""].join("\n");
 const BUSY_SCREEN = ["❯ ship it", "", "  Composing… (esc to interrupt)", ""].join("\n");
+/** A wall UNDER a spinner the TUI never cleared: the turn ended at the wall. */
+const WALLED_BUSY_SCREEN = [
+  "❯ ship it",
+  "",
+  "⎿  You've hit your usage limit. Your limit will reset at 9pm.",
+  "",
+  "  Composing… (esc to interrupt)",
+  "",
+].join("\n");
 
 type UsageRow = { session: number; weekly: number };
 type World = { home: string; msHome: string; log: string; state: string; screen: string; snap: string; pid: number; cwd: string };
@@ -138,6 +149,10 @@ type WorldOptions = {
   revivePid?: number;
   /** Park the session with a wake-up already scheduled. */
   wakeup?: boolean;
+  /** Make the stub tmux fail this subcommand, and only this one. */
+  failOn?: string;
+  /** Raw accounts.json content, for the unreadable-registry case. */
+  registry?: string;
 };
 
 async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
@@ -167,10 +182,11 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   );
   writeFileSync(
     path.join(msHome, "accounts.json"),
-    JSON.stringify({
-      version: 1,
-      accounts: ["dirk", "gmail", "work"].map((name) => ({ name, provider: "claude", label: name, shared: false })),
-    }),
+    opts.registry ??
+      JSON.stringify({
+        version: 1,
+        accounts: ["dirk", "gmail", "work"].map((name) => ({ name, provider: "claude", label: name, shared: false })),
+      }),
     { mode: 0o600 },
   );
 
@@ -182,8 +198,11 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   process.env.MS_TMUX_SCREEN = screen;
   process.env.MS_TMUX_SNAP = opts.snapshot ? snap : "";
   process.env.MS_TMUX_REVIVE = opts.revivePid ? String(opts.revivePid) : "";
+  process.env.MS_TMUX_FAIL = opts.failOn ?? "";
   process.env.MS_POLL_MS = "20";
   process.env.MS_READY_MS = "10000";
+  process.env.MS_SETTLE_MS = "";
+  process.env.MS_LOCK_WAIT_MS = "";
   process.env.SHELL = SHELL;
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
   // The verbs read both; a real tmux around the test runner must not answer
@@ -278,6 +297,15 @@ function reportOnRespawn(w: World, generation = 3): () => void {
   return () => clearInterval(timer);
 }
 
+/** Poll for something another async path is expected to do. */
+async function until(check: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 500; i++) {
+    if (check()) return;
+    await sleep(10);
+  }
+  assert.fail(what);
+}
+
 /** Everything the verbs print, so a success line can be asserted verbatim. */
 function stderr(t: TestContext): () => string {
   let out = "";
@@ -313,10 +341,13 @@ test("rotate hands a walled pane to the next account and continues the work", as
 
 test("rotate refuses a busy pane that shows no wall, and forces past it with --force", async (t) => {
   const w = await world(t, { screen: BUSY_SCREEN });
+  const say = stderr(t);
 
   assert.equal(await rotateVerb(["s1"]), 1);
+  assert.match(say(), /^ms rotate: s1 is mid-turn/m, "the verb refuses in its own name, before the transaction starts");
   assert.ok(!typedAnything(w), "a mid-turn pane is never typed into");
   assert.equal(session(w).account, "dirk");
+  assert.equal(rows(w, "recoveries").length, 0, "a refused rotate opens no recovery");
 
   const stop = reportOnRespawn(w);
   t.after(stop);
@@ -386,8 +417,7 @@ test("switch to the account the session is already on is refused", async (t) => 
 
   assert.equal(await switchVerb(["s1", "--to", "dirk"]), 1);
   assert.match(say(), /already on dirk/);
-  assert.ok(!typedAnything(w));
-  assert.ok(!respawnLine(w));
+  assert.deepEqual(logLines(w), [], "tmux was never even asked a question");
   assert.equal(session(w).state, "running");
 });
 
@@ -397,8 +427,35 @@ test("switch to an account nobody registered is refused before the pane is touch
 
   assert.equal(await switchVerb(["s1", "--to", "nobody"]), 1);
   assert.match(say(), /no such claude account 'nobody'/);
-  assert.ok(!typedAnything(w));
-  assert.ok(!respawnLine(w));
+  // Not "no keys were sent": no tmux command of any kind was run, which is the
+  // only version of "before the pane is touched" that cannot rot.
+  assert.deepEqual(logLines(w), [], "tmux was never even asked a question");
+});
+
+test("switch will not move a session on a registry it cannot read", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN, registry: "{ this is not json" });
+  const say = stderr(t);
+
+  assert.equal(await switchVerb(["s1", "--to", "gmail"]), 1);
+  assert.match(say(), /cannot read the registry/);
+  assert.deepEqual(logLines(w), [], "an unreadable registry is answered without asking tmux anything");
+  assert.equal(session(w).account, "dirk");
+});
+
+test("a wall on screen means the turn ended there, so neither verb calls the pane busy", async (t) => {
+  const w = await world(t, { screen: WALLED_BUSY_SCREEN });
+  const stop = reportOnRespawn(w);
+  t.after(stop);
+
+  // The spinner is still drawn above the wall; the turn is over all the same.
+  assert.equal(await switchVerb(["s1", "--to", "gmail"]), 0);
+  assert.equal(session(w).account, "gmail");
+  assert.equal(session(w).state, "continuing", "the unfinished work carries over");
+
+  const w2 = await world(t, { screen: WALLED_BUSY_SCREEN, wall: true, recovery: true });
+  const stop2 = reportOnRespawn(w2);
+  t.after(stop2);
+  assert.equal(await rotateVerb(["s1"]), 0, "rotate reads the same screen the same way");
 });
 
 // --- stop --------------------------------------------------------------
@@ -446,6 +503,101 @@ test("stop does not respawn a pane something else already brought back", async (
   // on: the verb must recognise it and finish, not sit out its whole budget.
   assert.match(say(), /^ms: s1 stopped$/m, "a revived pane is an ordinary ending, not a stubborn one");
   assert.ok(Date.now() - started < 5_000, "stop waited for a pane that had already come back");
+  assert.ok(
+    logLines(w).some((l) => l.includes("remain-on-exit off")),
+    "the pane stayed the tool's: exiting that shell would leave a dead pane and re-fire the pane-died hook",
+  );
+});
+
+test("a pane that will not die is not recorded as stopped", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN });
+  // The pane comes back alive under the SAME pid: the CLI outlived /exit,
+  // SIGTERM and SIGKILL, so there is nothing honest to call this but unfinished.
+  process.env.MS_TMUX_REVIVE = String(w.pid);
+  process.env.MS_SETTLE_MS = "200";
+  const say = stderr(t);
+
+  assert.equal(await stopVerb(["s1"]), 1);
+  assert.match(say(), /did not exit/);
+  const s = session(w);
+  assert.equal(s.desired, "stopped", "the human's intent stands");
+  assert.equal(s.state, "stopping", "…and the state says the stop never finished");
+  assert.ok(!respawnLine(w), "nothing was handed back over a live CLI");
+  assert.ok(!logLines(w).some((l) => l.includes("remain-on-exit off")), "the pane is still the tool's");
+});
+
+test("a second stop never types into the login shell the first one handed back", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN });
+  const say = stderr(t);
+
+  assert.equal(await stopVerb(["s1"]), 0);
+  assert.ok(respawnLine(w), "the first stop handed the pane back");
+  writeFileSync(w.log, ""); // everything from here on is the second stop's doing
+
+  assert.equal(await stopVerb(["s1"]), 0, "a stop that has nothing to do is not a failure");
+  assert.match(say(), /^ms: s1 already stopped$/m);
+  assert.deepEqual(logLines(w), [], "tmux was never asked to touch the human's shell");
+});
+
+test("stop stands down while a recovery holds the session, and leaves the intent written", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN, recovery: true, wakeup: true });
+  const say = stderr(t);
+  process.env.MS_LOCK_WAIT_MS = "300";
+  const { acquire } = await import("../src/lock.ts");
+  const { sessionLockName } = await import("../src/recover.ts");
+  const release = acquire(sessionLockName("s1"));
+  assert.ok(release, "the test could not take the lock it means to hold");
+  t.after(() => release?.());
+
+  assert.equal(await stopVerb(["s1"]), 1);
+  assert.match(say(), /a recovery is in progress; retry/);
+  assert.ok(!typedAnything(w), "nothing reaches a pane another worker is inside");
+  assert.ok(!respawnLine(w));
+
+  // The intent is what a worker rechecks, so it is written even though the
+  // destructive half never ran — and the session stays retryable.
+  const s = session(w);
+  assert.equal(s.desired, "stopped");
+  assert.equal(s.state, "stopping");
+  assert.equal(s.wakeupAt, null);
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+});
+
+test("stop ends the CLI that is in the pane NOW, not the one that was there when it asked", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN });
+  const { acquire } = await import("../src/lock.ts");
+  const { sessionLockName } = await import("../src/recover.ts");
+  const release = acquire(sessionLockName("s1"));
+  assert.ok(release, "the test could not take the lock it means to hold");
+
+  const done = stopVerb(["s1"]);
+  await until(() => session(w).state === "stopping", "the intent was never written while the lock was held");
+  assert.ok(!typedAnything(w), "the destructive half waits for the lock");
+
+  // While we hold it, the worker finishes a handoff: a new generation, in a
+  // different pane. A `stop` acting on its stale row would type into %7.
+  const st = openState();
+  try {
+    st.updateSession("s1", { pane: "%9", generation: 3, account: "gmail", state: "continuing" });
+  } finally {
+    st.close();
+  }
+  writeFileSync(w.state, `panes=%9\npane_pid=${w.pid}\ncommand=claude\npane_dead=0\ncwd=${w.cwd}\nidentity=${IDENTITY}\n`);
+  release!();
+
+  assert.equal(await done, 0);
+  assert.ok(logLines(w).some((l) => l.includes("send-keys -t %9 /exit Enter")), "the CLI asked to leave was the stale one");
+  assert.ok(!logLines(w).some((l) => l.includes("-t %7")), "a pane the session had already left was touched");
+  assert.equal(session(w).state, "stopped");
+});
+
+test("stop says so when tmux will not give the pane back, and still records the session stopped", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN, failOn: "respawn-pane" });
+  const say = stderr(t);
+
+  assert.equal(await stopVerb(["s1"]), 0, "the CLI left; only the courtesy shell failed");
+  assert.match(say(), /could not be given back to a shell/);
+  assert.equal(session(w).state, "stopped");
 });
 
 test("stop on a pane that is already gone touches nothing and still marks the session stopped", async (t) => {
@@ -491,6 +643,29 @@ test("a %pane on a different tmux server is refused by name", async (t) => {
   assert.equal(session(w).account, "dirk");
 });
 
+test("after a tmux restart no verb touches the pane the session remembers", async (t) => {
+  // tmux restarts its numbering at %0, so the session's %7 is now a stranger's
+  // pane — and `paneExists` says yes about it.
+  const w = await world(t, { screen: IDLE_SCREEN, identity: "9:9", wall: true, recovery: true });
+  const say = stderr(t);
+
+  assert.equal(await rotateVerb(["s1"]), 1);
+  assert.equal(await switchVerb(["s1", "--to", "gmail"]), 1);
+  assert.equal(await stopVerb(["s1"]), 1);
+
+  const lines = say().split("\n").filter((l) => l.startsWith("ms "));
+  assert.equal(lines.length, 3, `each verb said one thing: ${JSON.stringify(lines)}`);
+  for (const verb of ["rotate", "switch", "stop"]) {
+    assert.match(say(), new RegExp(`^ms ${verb}: tmux server restarted; the pane id is stale \\(ms status shows it gone\\)$`, "m"));
+  }
+  assert.ok(!typedAnything(w), "a stranger's pane is never typed into");
+  assert.ok(!respawnLine(w));
+  const s = session(w);
+  assert.equal(s.account, "dirk");
+  assert.equal(s.state, "running", "stop did not even record an intent against a pane that is not ours");
+  assert.equal(s.desired, "running");
+});
+
 test("inside tmux, no argument means the caller's own pane", async (t) => {
   const w = await world(t, { screen: IDLE_SCREEN });
   const say = stderr(t);
@@ -523,6 +698,7 @@ test("usage errors exit 2", async (t) => {
 
   assert.equal(await switchVerb(["s1"]), 2, "switch without --to");
   assert.equal(await switchVerb(["s1", "--to"]), 2, "--to without an account");
+  assert.equal(await switchVerb(["s1", "--to", "--force"]), 2, "a forgotten account name, not an account called --force");
   assert.equal(await rotateVerb(["s1", "--frobnicate"]), 2, "an option nobody defined");
   assert.equal(await rotateVerb(["s1", "--to", "gmail"]), 2, "rotate does not choose the account");
   assert.equal(await stopVerb(["s1", "--force"]), 2, "stop takes no options");

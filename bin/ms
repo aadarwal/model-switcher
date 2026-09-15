@@ -1,0 +1,11 @@
+#!/usr/bin/env node
+// Built install: dist/ms.js exists. Dev: fall back to the TypeScript sources via tsx
+// (tests run this file with `node --import tsx`).
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+const here = path.dirname(fileURLToPath(import.meta.url));
+const dist = path.join(here, "..", "dist", "ms.js");
+const entry = existsSync(dist) ? dist : path.join(here, "..", "src", "cli.ts");
+const { main } = await import(entry);
+process.exitCode = await main(process.argv.slice(2));

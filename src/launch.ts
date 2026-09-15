@@ -200,7 +200,12 @@ export const launchClaude: Verb = async (argv) => {
   if ("error" in parsed) { say(parsed.error); return EXIT_USAGE_ERROR; }
   const need = parsed.need ?? autoNeed(parsed.args);
 
-  const { registry } = loadRegistry();
+  // An unreadable accounts.json is "could not look", never "nothing is
+  // there": reporting it as an empty pool would send the human hunting for a
+  // missing account instead of a broken file. It is checked once, before
+  // either branch, so `--as` cannot report it as "no such account" either.
+  const { registry, parseError } = loadRegistry();
+  if (parseError) { say(`cannot read the registry: ${parseError}`); return EXIT_ACCOUNT; }
   let account: string;
   // A pick is only worth remembering once it has actually been launched: a
   // fallback the tool never managed to run is a trap for the next launch.
@@ -215,10 +220,17 @@ export const launchClaude: Verb = async (argv) => {
     // Not "the pool is full" — there is no pool. A configuration answer.
     if (!mine.size) { say("no claude account is registered (run: ms accounts add <name>)"); return EXIT_ACCOUNT; }
     const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
+    // The registry can break between our read and the snapshot's own.
+    if (snapshot.registryError) { say(`cannot read the registry: ${snapshot.registryError}`); return EXIT_ACCOUNT; }
     // Only this provider's accounts: a codex row has no poller yet, and
     // letting it into the set would make "every account transient" unsayable.
-    const rows = snapshot.accounts.filter((a) => mine.has(a.name));
-    const inputs = toPickInputs({ takenAt: snapshot.takenAt, accounts: rows });
+    // Identity is (provider, name), so the provider is part of the match — a
+    // codex account sharing a name is a different account, not this one.
+    const rows = snapshot.accounts.filter((a) => a.provider === "claude" && mine.has(a.name));
+    // The whole snapshot travels, only its rows narrowed: `toPickInputs` reads
+    // more than `accounts` (an unreadable registry yields no inputs at all),
+    // and a hand-built partial would silently drop whatever it learns next.
+    const inputs = toPickInputs({ ...snapshot, accounts: rows });
     const { picks, out } = pickAccounts(inputs, need);
     const reasons = out.map((o) => `${o.name}: ${o.why}`);
     const first = picks[0];

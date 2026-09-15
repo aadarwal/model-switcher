@@ -517,3 +517,26 @@ test("the settings read follows CLAUDE_CONFIG_DIR when it is set", async () => {
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stderr, /\(fable\)/);
 });
+
+// --- the registry itself ------------------------------------------------
+
+test("an unreadable registry names the problem; it is never an empty pool", async () => {
+  const w = await world();
+  writeFileSync(path.join(w.msHome, "accounts.json"), "{ this is not json", { mode: 0o600 });
+
+  const r = run(["claude"], w.env());
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, /accounts\.json/);
+  // "could not look" must never be reported as "nothing has room" or as an
+  // empty registry — both would send the human looking in the wrong place.
+  assert.equal(/no account has room/.test(r.stderr), false, r.stderr);
+  assert.equal(/no claude account is registered/.test(r.stderr), false, r.stderr);
+
+  // nor may --as turn it into "no such account"
+  const as = run(["claude", "--as", "work"], w.env());
+  assert.equal(as.code, 1, as.stderr);
+  assert.match(as.stderr, /accounts\.json/);
+  assert.equal(/no such account/.test(as.stderr), false, as.stderr);
+
+  assert.equal((await readState(w)).sessions.length, 0);
+});

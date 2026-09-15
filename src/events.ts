@@ -2,7 +2,11 @@ import { appendFileSync, existsSync, readFileSync, openSync, closeSync, fstatSyn
 import { ensureSessionDir, p } from "./paths.ts";
 
 export type EventKind = "started" | "resumed" | "cleared" | "compacted" | "activity" | "rate_limited" | "ended" | "died" | "recovery" | "note";
-export type Event = { t: number; kind: EventKind; session: string; generation: number; cliSessionId?: string | null; turnId?: string | null; kindDetail?: string; text?: string };
+/** `cliSessionId` is the CLI's own id as the hook reported it. When a
+ * SessionStart moves the session onto a NEW id — a `/clear`, an interactive
+ * `/resume`, a fork — `prevCliSessionId` carries the one it left, so the
+ * audit log records the change itself and not merely its result. */
+export type Event = { t: number; kind: EventKind; session: string; generation: number; cliSessionId?: string | null; prevCliSessionId?: string | null; turnId?: string | null; kindDetail?: string; text?: string };
 
 /** True if the file is non-empty and its last byte is not '\n' — a torn
  * fragment left by a crash mid-write. Bounded: opens the file, checks its

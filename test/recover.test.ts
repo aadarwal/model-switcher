@@ -325,6 +325,31 @@ test("the happy path: dirk hands off to gmail and the resumed session continues"
   assert.match(recoverLog(w), /s1: dirk → gmail \(session wall, generation 3\)/);
 });
 
+test("a wall after a /clear resumes the conversation the human is actually in", async (t) => {
+  // End to end, with Claude Code's own SessionStart hook in the middle: the
+  // human cleared the conversation (a new CLI session id, one process), went on
+  // working, and then hit a wall. Resuming the PRE-clear id would hand the model
+  // a conversation the human had deliberately left — and the readiness check,
+  // comparing against that same stale id, would call it a good resume.
+  const w = await world(t);
+  const { run } = await import("./helpers.ts");
+  const hook = run(
+    ["_hook", "claude"],
+    { HOME: w.home, MS_HOME: w.msHome, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: SOCKET, MS_PANE: PANE },
+    JSON.stringify({ hook_event_name: "SessionStart", source: "clear", session_id: "c-2" }),
+  );
+  assert.equal(hook.code, 0);
+  assert.equal(session(w).cliSessionId, "c-2");
+
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-2" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.deepEqual(launch.command, ["claude", "--resume", "c-2", CONTINUATION, "--model", "sonnet"]);
+  assert.equal(session(w).state, "continuing", "and the resume was accepted, not read as a new conversation");
+});
+
 test("activity newer than the wall makes the recovery obsolete, and nothing is typed", async (t) => {
   const w = await world(t);
   appendEvent({ t: nowSeconds(), kind: "activity", session: "s1", generation: 2, cliSessionId: "c-1" });

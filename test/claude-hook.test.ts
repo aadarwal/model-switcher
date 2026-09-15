@@ -58,6 +58,52 @@ test("SessionStart maps every source, UserPromptSubmit is activity and SessionEn
   assert.ok(!("kindDetail" in events(c.msHome)[0]), "no reason means no kindDetail, not an empty one");
 });
 
+test("a /clear moves the row onto the new CLI session id, and the event records both", async () => {
+  // `/clear` starts a new conversation inside one process. The row's id is what
+  // a rotation resumes, so a row left on the pre-clear id would bring back the
+  // conversation the human had just cleared.
+  const { env, msHome } = setup();
+  const openState = await seedSession(env); // the row is on c-42
+  const r = run(["_hook", "claude"], env, JSON.stringify({ hook_event_name: "SessionStart", source: "clear", session_id: "c-99" }));
+  assert.equal(r.code, 0);
+  assert.equal(r.stdout, "");
+  const ev = events(msHome).pop()!;
+  assert.deepEqual([ev.kind, ev.cliSessionId, ev.prevCliSessionId], ["cleared", "c-99", "c-42"]);
+  const st = openState();
+  try {
+    assert.equal(st.getSession("s1")!.cliSessionId, "c-99", "the row follows the conversation the human is in");
+  } finally {
+    st.close();
+  }
+});
+
+test("a resume or startup under another id moves the row too, but never one for a generation the session has left", async () => {
+  for (const source of ["resume", "startup"]) {
+    const { env, msHome } = setup();
+    const openState = await seedSession(env);
+    assert.equal(run(["_hook", "claude"], env, JSON.stringify({ hook_event_name: "SessionStart", source, session_id: "c-7" })).code, 0);
+    const st = openState();
+    try {
+      assert.equal(st.getSession("s1")!.cliSessionId, "c-7", source);
+    } finally {
+      st.close();
+    }
+    assert.equal(events(msHome).pop()!.prevCliSessionId, "c-42", source);
+  }
+  // A late report from a replaced generation is attributable to the process
+  // that sent it and to nothing else: the row belongs to its replacement.
+  const stale = setup();
+  const openState = await seedSession(stale.env, { generation: 5 });
+  assert.equal(run(["_hook", "claude"], stale.env, JSON.stringify({ hook_event_name: "SessionStart", source: "clear", session_id: "c-99" })).code, 0);
+  const st = openState();
+  try {
+    assert.equal(st.getSession("s1")!.cliSessionId, "c-42", "generation 2's report may not move generation 5's row");
+  } finally {
+    st.close();
+  }
+  assert.ok(!("prevCliSessionId" in events(stale.msHome).pop()!), "and the event claims no change it did not make");
+});
+
 test("StopFailure rate_limit records the wall kind from the screen, opens a recovery and asks tmux to dispatch the worker", async () => {
   const { env, msHome, tlog } = setup();
   const openState = await seedSession(env);

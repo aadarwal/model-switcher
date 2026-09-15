@@ -644,6 +644,44 @@ function claimManual(st: State, session: SessionRow, tmux: Tmux, opts: RecoverOp
   return rec ? { rec } : { why: `recovery ${recId} vanished` };
 }
 
+/**
+ * The launch's pass-through arguments, minus anything the CLI would read as a
+ * prompt (spec §9 step 6: the resumed command line is
+ * `claude --resume <id> "<continuation>"` plus what the launch was given).
+ *
+ * `ms claude -- "fix the tests"` records that prompt in `session.flags`, and a
+ * resume re-applies the flags verbatim — so the command line carried TWO
+ * positionals, the continuation and the original prompt, and the CLI rejects
+ * that outright. Even with no continuation (a manual switch of a finished
+ * conversation) the old prompt has no business being submitted again.
+ *
+ * What counts as a positional is decided the way any argv reader without the
+ * CLI's own flag table must decide it: a word that neither starts with `-` nor
+ * follows a bare `-x`/`--x` that may be taking it as a value (`--model
+ * sonnet`), and everything after a `--`. The remaining ambiguity —
+ * `--boolean-flag word` — keeps the word, which is exactly the old behaviour
+ * and never drops something the human asked for.
+ */
+export function flagsForResume(flags: string[]): string[] {
+  const out: string[] = [];
+  let mayBeAValue = false;
+  for (const a of flags) {
+    if (a === "--") break; // everything past it is positional by definition
+    if (a.length > 1 && a.startsWith("-")) {
+      out.push(a);
+      mayBeAValue = !a.includes("=");
+      continue;
+    }
+    if (mayBeAValue) {
+      out.push(a);
+      mayBeAValue = false;
+      continue;
+    }
+    // A prompt. The continuation is the only one this command line may carry.
+  }
+  return out;
+}
+
 /** Steps 3–8: pick, leave, respawn, and wait to be told it worked. */
 async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: Tmux, opts: RecoverOptions): Promise<RecoverCode> {
   const id = session.id;
@@ -777,7 +815,7 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // 7. The new generation, written down before it is started.
   const next = g + 1;
   const continuing = !manual || manual.continueAfter;
-  const command = ["claude", "--resume", session.cliSessionId!, ...(continuing ? [CONTINUATION] : []), ...session.flags];
+  const command = ["claude", "--resume", session.cliSessionId!, ...(continuing ? [CONTINUATION] : []), ...flagsForResume(session.flags)];
   const launchId = randomUUID();
   st.createLaunch({ id: launchId, sessionId: id, generation: next, account: to, command, env: {}, createdAt: nowSeconds() });
   // The attempt records the account we LEFT — that is what was consumed, and

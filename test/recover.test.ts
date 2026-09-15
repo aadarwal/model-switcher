@@ -596,6 +596,29 @@ test("a manual move to a named account on an idle pane resumes without a continu
   assert.equal(rows(w, "attempts")[0].outcome, "ok", "a manual move is not an exhaustion");
 });
 
+test("a pass-through prompt is never re-submitted beside the continuation", async (t) => {
+  // `ms claude -- --model sonnet "finish the docs"` records all three as the
+  // session's flags, and a resume re-applies them: two positionals on one
+  // command line, which the CLI rejects outright.
+  const w = await world(t, { session: { flags: ["--model", "sonnet", "finish the docs"] } });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.deepEqual(launch.command, ["claude", "--resume", "c-1", CONTINUATION, "--model", "sonnet"]);
+});
+
+test("flagsForResume keeps flags and their values, and drops what the CLI would read as a prompt", async () => {
+  const { flagsForResume } = await import("../src/recover.ts");
+  assert.deepEqual(flagsForResume(["--model", "sonnet", "do it"]), ["--model", "sonnet"]);
+  assert.deepEqual(flagsForResume(["do it"]), []);
+  assert.deepEqual(flagsForResume(["--model=sonnet", "do it"]), ["--model=sonnet"]);
+  assert.deepEqual(flagsForResume(["--dangerously-skip-permissions"]), ["--dangerously-skip-permissions"]);
+  assert.deepEqual(flagsForResume(["--", "not a flag"]), [], "everything after a -- is positional");
+  assert.deepEqual(flagsForResume([]), []);
+});
+
 test("a modal choice on screen is never typed into; the pane is signalled instead", async (t) => {
   const w = await world(t, { screen: MODAL_SCREEN });
   const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });

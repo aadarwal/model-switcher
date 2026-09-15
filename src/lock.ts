@@ -1,4 +1,4 @@
-import { chmodSync } from "node:fs";
+import { chmodSync, closeSync, openSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
@@ -36,13 +36,25 @@ import { ensureStore, msHome } from "./paths.ts";
  *      `DELETE ... WHERE name = ? AND pid = ?` — so a row whose pid is no longer
  *      ours is not matched, and cannot be deleted.
  *
+ * **A busy database is not a failure.** Every transaction here lasts
+ * microseconds, so `busy_timeout` is short (250 ms) and a `BEGIN IMMEDIATE`
+ * that still comes back SQLITE_BUSY means only that another `ms` process was
+ * mid-transaction: nothing of ours was read, let alone written. `acquire`
+ * reports it as `Locked` rather than letting `database is locked` escape as a
+ * bare Error, and `withLock` treats it as a reason to retry inside its own
+ * deadline — so a waiter's total wait stays the one its caller asked for
+ * instead of becoming `waitMs` plus a hidden multiple of the busy timeout.
+ *
  * `since` is unix SECONDS, the store's convention.
  */
 
 /** Idempotent; deletes this process's lock row, and only its own. */
 export type Release = () => void;
 
-/** `withLock` gave up waiting: another process holds the name. */
+/**
+ * Either another process holds the name, or the lock database was too busy to
+ * find out. Both mean the same thing to a caller: you did not get the lock.
+ */
 export class Locked extends Error {
   constructor(message: string) {
     super(message);
@@ -63,7 +75,8 @@ export type WithLockOptions = AcquireOptions & { waitMs?: number; intervalMs?: n
 export const DEFAULT_STALE_MS = 600_000;
 const DEFAULT_WAIT_MS = 5_000;
 const DEFAULT_INTERVAL_MS = 100;
-const BUSY_TIMEOUT_MS = 5_000;
+/** Short on purpose: see "A busy database is not a failure" above. */
+const BUSY_TIMEOUT_MS = 250;
 
 const SCHEMA = "CREATE TABLE IF NOT EXISTS locks (name TEXT PRIMARY KEY, pid INTEGER NOT NULL, since INTEGER NOT NULL)";
 
@@ -80,6 +93,17 @@ function lockDbFile(): string {
   return path.join(msHome(), "locks.sqlite");
 }
 
+/** SQLITE_BUSY (5) or SQLITE_LOCKED (6): someone else holds the write lock. */
+function isBusy(e: unknown): boolean {
+  const err = e as { errcode?: unknown; message?: unknown } | null | undefined;
+  if (typeof err?.errcode === "number") return err.errcode === 5 || err.errcode === 6;
+  return typeof err?.message === "string" && /database (is locked|table is locked)/i.test(err.message);
+}
+
+function busy(name: string): Locked {
+  return new Locked(`the lock database is busy; '${name}' was not taken`);
+}
+
 /**
  * Open the lock database, run `fn`, and always close. `ms` processes are short
  * lived and these calls are rare (the slowest path polls once per 100 ms), so a
@@ -88,15 +112,14 @@ function lockDbFile(): string {
 function withDb<T>(fn: (db: DatabaseSync) => T): T {
   ensureStore();
   const file = lockDbFile();
+  // Create the file ourselves, at 0600. Letting SQLite create it would make it
+  // 0644 first and leave it world-readable until the chmod below lands.
+  closeSync(openSync(file, "a", 0o600));
   const db = new DatabaseSync(file);
   try {
     db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     db.exec(SCHEMA);
-    try {
-      chmodSync(file, 0o600);
-    } catch {
-      /* another process may be mid-create; the next call re-applies it */
-    }
+    chmodSync(file, 0o600); // also repairs a file created before the line above
     return fn(db);
   } finally {
     db.close();
@@ -133,9 +156,10 @@ export function lockedBy(name: string): Holder | null {
 }
 
 /**
- * Take the lock `name`, or return null if another process holds it. Never
- * blocks on the lock itself (only on SQLite's write lock, bounded by
- * `busy_timeout`); `withLock` is the waiting form.
+ * Take the lock `name`, or return null if another process holds it. Throws
+ * `Locked` if the database itself was too busy to decide — also "not acquired",
+ * but worth telling apart from a lock that is genuinely held. Never blocks on
+ * the lock itself; `withLock` is the waiting form.
  */
 export function acquire(name: string, opts: AcquireOptions = {}): Release | null {
   checkName(name);
@@ -143,7 +167,13 @@ export function acquire(name: string, opts: AcquireOptions = {}): Release | null
   const pid = process.pid;
 
   const taken = withDb((db) => {
-    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.exec("BEGIN IMMEDIATE");
+    } catch (e) {
+      // Nothing was read and nothing written: there is no transaction to undo.
+      if (isBusy(e)) throw busy(name);
+      throw e;
+    }
     try {
       const row = readRow(db, name);
       if (row && !abandoned(row, staleAfterMs)) {
@@ -161,6 +191,7 @@ export function acquire(name: string, opts: AcquireOptions = {}): Release | null
       } catch {
         /* the transaction is already finished */
       }
+      if (isBusy(e)) throw busy(name);
       throw e;
     }
   });
@@ -169,8 +200,14 @@ export function acquire(name: string, opts: AcquireOptions = {}): Release | null
   let released = false;
   return () => {
     if (released) return;
-    released = true;
-    withDb((db) => db.prepare("DELETE FROM locks WHERE name = ? AND pid = ?").run(name, pid));
+    try {
+      withDb((db) => db.prepare("DELETE FROM locks WHERE name = ? AND pid = ?").run(name, pid));
+      released = true;
+    } catch (e) {
+      // Never mask the caller's own error from a `finally`. A row we could not
+      // delete is left to the stale rule, and a later release() may still win.
+      if (!isBusy(e)) throw e;
+    }
   };
 }
 
@@ -190,7 +227,14 @@ export async function withLock<T>(name: string, fn: () => T | Promise<T>, opts: 
     // extend or collapse one. `waitMs: 0` therefore makes no attempt at all —
     // a caller that wants one try and no waiting wants `acquire`.
     if (performance.now() >= deadline) throw locked(name);
-    const release = acquire(name, opts);
+
+    let release: Release | null = null;
+    try {
+      release = acquire(name, opts);
+    } catch (e) {
+      // A busy database is a reason to retry, not to fail the caller.
+      if (!(e instanceof Locked)) throw e;
+    }
     if (release) {
       try {
         return await fn();
@@ -198,14 +242,23 @@ export async function withLock<T>(name: string, fn: () => T | Promise<T>, opts: 
         release();
       }
     }
+
     const left = deadline - performance.now();
     if (left <= 0) throw locked(name);
-    await sleep(Math.min(intervalMs, left));
+    // Round the last sleep up. `left` is fractional, and a truncated timer would
+    // wake a fraction of a millisecond early, only for the check above to reject
+    // the attempt it just paid for — or, worse, to let one through.
+    await sleep(Math.ceil(Math.min(intervalMs, left)));
   }
 }
 
 function locked(name: string): Locked {
-  const by = lockedBy(name);
+  let by: Holder | null = null;
+  try {
+    by = lockedBy(name);
+  } catch {
+    /* a busy or unreadable database names nobody */
+  }
   const who = by ? ` (pid ${by.pid}, since ${new Date(by.since * 1000).toISOString()})` : "";
   return new Locked(`another process holds the '${name}' lock${who}`);
 }

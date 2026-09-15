@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
@@ -98,6 +98,17 @@ test("release then acquire succeeds, and lockedBy goes quiet", () => {
   const again = acquire("snapshot");
   assert.ok(again, "the name is free again");
   assert.equal(lockedBy("snapshot")?.pid, process.pid);
+});
+
+test("a lock db left with loose permissions is repaired on open", () => {
+  // The file is pre-created at 0600 so SQLite never makes it 0644 first, but a
+  // file from before that line (or from another tool) must still be tightened.
+  const { msHome } = useTempHome();
+  const file = dbFile(msHome);
+  closeSync(openSync(file, "a", 0o644));
+  chmodSync(file, 0o644);
+  assert.ok(acquire("repair"));
+  assert.equal(statSync(file).mode & 0o777, 0o600);
 });
 
 test("release is idempotent", () => {
@@ -202,20 +213,25 @@ test("withLock never enters after its wait has expired", async () => {
 test("withLock makes no attempt once the deadline has passed", async () => {
   // The test above passes either way: with waitMs 40 the lock is still held at
   // every attempt, so checking the deadline after the attempt reaches the same
-  // verdict. This one separates them. waitMs is an exact multiple of intervalMs,
-  // so attempts land at ~0 and ~500 and the last sleep ends exactly on the
-  // 1000 ms deadline; the holder releases at 750, squarely in the gap, leaving
-  // 250 ms of slack on either side for timer jitter. An implementation that
-  // attempts before checking would take the now-free lock at ~1000 and enter fn
-  // after its wait had expired.
+  // verdict. This one separates them.
+  //
+  // waitMs is NOT a multiple of intervalMs, so the last attempt (~900) is a
+  // clean interval short of the deadline and the final wake-up exists only to
+  // make the deadline check. Attempts land at ~0/300/600/900; the holder
+  // releases at 960, after the last attempt and before the ~1000 check. A
+  // correct withLock never attempts again, so it never sees the lock go free;
+  // one that attempts before checking takes it at ~1000 and enters fn after its
+  // wait expired. (The final sleep is rounded up in the implementation, so it
+  // cannot end a fraction of a millisecond early and turn this into a
+  // coin toss — the flake the first version of this test hit.)
   useTempHome();
   const held = acquire("busy");
   assert.ok(held);
-  const timer = setTimeout(() => held(), 750);
+  const timer = setTimeout(() => held(), 960);
   let entered = false;
   try {
     await assert.rejects(
-      withLock("busy", () => { entered = true; }, { waitMs: 1_000, intervalMs: 500 }),
+      withLock("busy", () => { entered = true; }, { waitMs: 1_000, intervalMs: 300 }),
       (e: unknown) => e instanceof Locked,
     );
     assert.equal(entered, false, "the deadline was checked before the attempt, not after");
@@ -223,6 +239,31 @@ test("withLock makes no attempt once the deadline has passed", async () => {
     clearTimeout(timer);
     held();
   }
+});
+
+test("a busy lock database reads as not-acquired, never as a bare Error", async () => {
+  // Another process holds SQLite's write lock (an open BEGIN IMMEDIATE) for
+  // ~600 ms — longer than the 250 ms busy_timeout, so every attempt inside the
+  // 300 ms wait comes back SQLITE_BUSY. That must surface as Locked and be
+  // retried inside withLock's own deadline, not escape as `database is locked`
+  // and not stretch the wait to waitMs plus a multiple of the busy timeout.
+  const { home, msHome } = useTempHome();
+  const sync = path.join(home, "busydb");
+  const holder = startChild("lock-busy-child.ts", [sync, "600"], { HOME: home, MS_HOME: msHome });
+
+  await bounded([holder], 20_000, async () => {
+    assert.ok(await waitForFile(path.join(sync, "holding"), 15_000), "the other process holds the write lock");
+    let entered = false;
+    const t0 = performance.now();
+    await assert.rejects(
+      withLock("contended", () => { entered = true; }, { waitMs: 300, intervalMs: 100 }),
+      (e: unknown) => e instanceof Locked && e.name === "Locked",
+    );
+    const elapsed = performance.now() - t0;
+    assert.equal(entered, false);
+    assert.ok(elapsed < 1_500, `gave up on its own deadline, not the busy timeout's (${Math.round(elapsed)} ms)`);
+    assert.equal(await holder.exit, 0, `the holder finished cleanly: ${holder.stderr()}`);
+  });
 });
 
 test("withLock runs fn while holding the name, and releases after", async () => {

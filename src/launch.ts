@@ -13,8 +13,10 @@
 //   * inside tmux — the caller's OWN pane is respawned. tmux kills this very
 //     process to do it, so everything the human should see is already on
 //     stderr before the respawn is issued.
-//   * outside tmux — a tool-owned server (`<store>/tmux.sock`), session `ms`,
-//     then an interactive attach.
+//   * outside tmux — a tool-owned server (`<store>/tmux.sock`), session `ms`.
+//     The pane is born holding a placeholder and the SAME respawn puts the CLI
+//     in it, so both shapes start the CLI exactly one way: into a pane that is
+//     already recorded, already `remain-on-exit`, already hooked. Then attach.
 
 import { randomUUID } from "node:crypto";
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -39,6 +41,11 @@ const EXIT_UNREACHABLE = 4; // usage is down and there is no recent pick
 /** The tool's own tmux server, for a launch with no tmux of its own. */
 const TOOL_SOCKET = () => path.join(msHome(), "tmux.sock");
 const TOOL_SESSION = "ms";
+/** What a brand-new pane holds until the CLI is respawned into it. It must be
+ *  unable to exit on its own (a shell would, and would source rc files too),
+ *  because a pane that dies before the pane-died hook is set is a pane nothing
+ *  ever reports. */
+const PLACEHOLDER = ["sleep", "2147483647"];
 
 /** How long a remembered pick stands in for a reading we cannot take. */
 export const LAST_PICK_MAX_AGE_MS = 600_000;
@@ -99,13 +106,17 @@ function modelFromArgs(args: string[]): string | null {
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a === "--model") return args[i + 1] ?? null;
-    if (a.startsWith("--model=")) return a.slice("--model=".length);
+    if (a.startsWith("--model=")) return a.slice("--model=".length) || null;
   }
   return null;
 }
 
 function modelFromSettings(): string | null {
-  const f = path.join(process.env.HOME || homedir(), ".claude", "settings.json");
+  // Claude Code's own config dir, wherever the human put it — this tool runs
+  // accounts out of private CLAUDE_CONFIG_DIRs itself (spec §12), so reading a
+  // hardcoded `~/.claude` would answer for the wrong install.
+  const dir = process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || homedir(), ".claude");
+  const f = path.join(dir, "settings.json");
   try {
     const j = JSON.parse(readFileSync(f, "utf8")) as { model?: unknown };
     return typeof j?.model === "string" ? j.model : null;
@@ -189,8 +200,16 @@ export const launchClaude: Verb = async (argv) => {
   if ("error" in parsed) { say(parsed.error); return EXIT_USAGE_ERROR; }
   const need = parsed.need ?? autoNeed(parsed.args);
 
-  const { registry } = loadRegistry();
+  // An unreadable accounts.json is "could not look", never "nothing is
+  // there": reporting it as an empty pool would send the human hunting for a
+  // missing account instead of a broken file. It is checked once, before
+  // either branch, so `--as` cannot report it as "no such account" either.
+  const { registry, parseError } = loadRegistry();
+  if (parseError) { say(`cannot read the registry: ${parseError}`); return EXIT_ACCOUNT; }
   let account: string;
+  // A pick is only worth remembering once it has actually been launched: a
+  // fallback the tool never managed to run is a trap for the next launch.
+  let remember: (() => void) | null = null;
 
   if (parsed.as) {
     const named = findAccount(registry, parsed.as, "claude");
@@ -198,18 +217,26 @@ export const launchClaude: Verb = async (argv) => {
     account = named.name;
   } else {
     const mine = new Set(registry.accounts.filter((a) => a.provider === "claude").map((a) => a.name));
-    if (!mine.size) { say("no account has room", ["no claude accounts are registered"]); return EXIT_NO_ROOM; }
+    // Not "the pool is full" — there is no pool. A configuration answer.
+    if (!mine.size) { say("no claude account is registered (run: ms accounts add <name>)"); return EXIT_ACCOUNT; }
     const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
+    // The registry can break between our read and the snapshot's own.
+    if (snapshot.registryError) { say(`cannot read the registry: ${snapshot.registryError}`); return EXIT_ACCOUNT; }
     // Only this provider's accounts: a codex row has no poller yet, and
     // letting it into the set would make "every account transient" unsayable.
-    const rows = snapshot.accounts.filter((a) => mine.has(a.name));
-    const inputs = toPickInputs({ takenAt: snapshot.takenAt, accounts: rows });
+    // Identity is (provider, name), so the provider is part of the match — a
+    // codex account sharing a name is a different account, not this one.
+    const rows = snapshot.accounts.filter((a) => a.provider === "claude" && mine.has(a.name));
+    // The whole snapshot travels, only its rows narrowed: `toPickInputs` reads
+    // more than `accounts` (an unreadable registry yields no inputs at all),
+    // and a hand-built partial would silently drop whatever it learns next.
+    const inputs = toPickInputs({ ...snapshot, accounts: rows });
     const { picks, out } = pickAccounts(inputs, need);
     const reasons = out.map((o) => `${o.name}: ${o.why}`);
     const first = picks[0];
     if (first) {
       account = first.name;
-      writeLastPick(need, account);
+      remember = () => writeLastPick(need, first.name);
     } else if (usageUnreachable(rows, inputs)) {
       const last = readLastPick(need);
       if (!last) { say("usage unreachable", reasons); return EXIT_UNREACHABLE; }
@@ -259,37 +286,48 @@ export const launchClaude: Verb = async (argv) => {
       tmux.setPaneOption(pane, "@ms_session", sessionId);
       tmux.setPaneDiedHook(pane, [msBin, "_pane_died", sessionId]);
       // The respawn below replaces the shell this process is running in, so
-      // tmux kills us the moment it is issued: say it first or never.
+      // tmux kills us the moment it is issued: everything else happens first.
+      remember?.();
       process.stderr.write(`ms: ${account} (${need}) → pane ${pane}\n`);
       tmux.respawn(pane, cwd, [msBin, "_exec", launchId]);
       return EXIT_OK;
     }
 
-    // Outside tmux the pane does not exist yet, so the row is written without
-    // one and completed the moment tmux names it. The new pane is already
-    // running `ms _exec` by then; it reads the launch row (complete) and the
-    // session's socket (correct from the start), and only `MS_PANE` could
-    // briefly be empty — a few milliseconds against node's own startup.
+    // Outside tmux the pane has to be made before it can be described, so it
+    // is born holding a placeholder — `sleep` forever, which cannot exit on
+    // its own and sources no rc files — and the CLI is respawned into it only
+    // once the pane is fully accounted for. That ordering is the point:
+    //   * the session row is written with a REAL pane and server identity
+    //     before anything can read it, so `_exec` never carries an empty
+    //     MS_PANE for the life of the CLI (src/exec.ts copies it once);
+    //   * `remain-on-exit` and the pane-died hook are in place before the CLI
+    //     starts, so an `_exec` that fails immediately leaves a dead pane the
+    //     hook can report, rather than a vanished pane and an orphaned row.
+    const pane = tmux.hasSession(TOOL_SESSION)
+      ? tmux.newWindow(TOOL_SESSION, cwd, PLACEHOLDER)
+      : tmux.newSession(TOOL_SESSION, cwd, PLACEHOLDER);
+    const serverStart = tmux.serverIdentity();
     st.createSession({
-      id: sessionId, provider: "claude", cliSessionId, cwd, socket, pane: "", serverStart: "",
+      id: sessionId, provider: "claude", cliSessionId, cwd, socket, pane, serverStart,
       need, account, generation: 1, state: "launching", desired: "running", flags: parsed.args,
     });
     st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
 
-    const exec = [msBin, "_exec", launchId];
-    const pane = tmux.hasSession(TOOL_SESSION)
-      ? tmux.newWindow(TOOL_SESSION, cwd, exec)
-      : tmux.newSession(TOOL_SESSION, cwd, exec);
-    st.updateSession(sessionId, { pane, serverStart: tmux.serverIdentity() });
-
     tmux.remainOnExit(pane, true);
     tmux.setPaneOption(pane, "@ms_session", sessionId);
     tmux.setPaneDiedHook(pane, [msBin, "_pane_died", sessionId]);
+    tmux.respawn(pane, cwd, [msBin, "_exec", launchId]);
+    remember?.();
     process.stderr.write(`ms: ${account} (${need}) → pane ${pane}\n`);
     st.close(); // the attach below lasts as long as the session does
-    // The launch has already happened; this exit code is the attach's own
-    // (a terminal-less caller cannot attach, and the pane runs regardless).
-    return tmux.attach(TOOL_SESSION);
+
+    // The launch has already happened. An attach that fails — no terminal, a
+    // caller that is a script — is not a failed launch, so it must not become
+    // one of the 1/2/3/4 answers; it is a line telling the human the way back.
+    if (tmux.attach(TOOL_SESSION) !== 0) {
+      process.stderr.write(`ms: launched in the ms tmux server; attach with: tmux -S ${socket} attach -t ms\n`);
+    }
+    return EXIT_OK;
   } finally {
     st.close(); // idempotent
   }

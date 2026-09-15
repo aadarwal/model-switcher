@@ -28,6 +28,7 @@ import { readLaunchToken } from "./launch-credentials.ts";
 import { openState, type SessionRow } from "./state.ts";
 import { Tmux } from "./tmux.ts";
 import { resolveOnPath } from "./exec.ts";
+import { reconcile } from "./reconcile.ts";
 
 export type Result = { ok: boolean; what: string; why?: string; fixed?: boolean };
 
@@ -358,18 +359,10 @@ export async function checkOrphaned(fix: boolean): Promise<Result[]> {
   if (orphaned.length === 0) return [{ ok: true, what: "orphaned session state" }];
 
   if (fix) {
-    // TODO(T18 merge): static import — Task 18 (src/reconcile.ts) has not
-    // landed in this worktree yet. Once it does, the controller replaces
-    // this with a plain `import { reconcile } from "./reconcile.ts"` at the
-    // top of the file. Until then this dynamic import — its specifier built
-    // at runtime, not a string literal at the call site, so `tsc` never
-    // tries to resolve a module that does not exist yet — is guarded by the
-    // try/catch below so this branch degrades gracefully (still reports the
-    // orphans, unfixed) rather than crashing `ms doctor --fix`.
+    // Reconciliation is the repair; a throw inside it must still leave the
+    // orphans reported (unfixed) rather than crash `ms doctor --fix`.
     try {
-      const reconcileModule: string = [".", "reconcile.ts"].join("/");
-      const mod = (await import(reconcileModule)) as { reconcile: () => string[] };
-      mod.reconcile();
+      reconcile();
       const st2 = openState();
       try {
         sessions = st2.listSessions();
@@ -379,8 +372,8 @@ export async function checkOrphaned(fix: boolean): Promise<Result[]> {
       orphaned = findOrphaned(sessions, new Map());
       if (orphaned.length === 0) return [{ ok: true, what: "orphaned session state", fixed: true }];
     } catch {
-      // reconcile.ts not available yet, or it threw — fall through and
-      // report whatever is still orphaned, unfixed.
+      // reconcile threw — fall through and report whatever is still
+      // orphaned, unfixed.
     }
   }
 

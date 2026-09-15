@@ -173,7 +173,17 @@ function isInvalidGrant(body: string): boolean {
   }
 }
 
-function transientFromFetchError(err: unknown, what: string): TransientError {
+/** Classifies a thrown `fetch`. Deadline reached ⇒ TransientError; a network
+ *  fault ⇒ TransientError; but a caller-initiated abort is **cancellation**,
+ *  not a transient failure, so its own reason is rethrown here (returning a
+ *  TransientError would tell the caller "try again" about a call it cancelled
+ *  itself, and would hide its reason). */
+function transientFromFetchError(err: unknown, what: string, signal: AbortSignal): TransientError {
+  if (signal.aborted) {
+    const reason: unknown = signal.reason;
+    const reasonName = reason instanceof Error ? reason.name : "";
+    if (reasonName !== "TimeoutError") throw reason ?? err;
+  }
   const name = err instanceof Error ? err.name : "";
   if (name === "TimeoutError" || name === "AbortError") return new TransientError(`${what} timed out`);
   return new TransientError(`${what} could not be reached`);
@@ -202,7 +212,7 @@ export async function refreshPollCredentials(
       }),
     });
   } catch (err) {
-    throw transientFromFetchError(err, "the token endpoint");
+    throw transientFromFetchError(err, "the token endpoint", signal);
   }
 
   if (!res.ok) {
@@ -257,7 +267,7 @@ async function authed(url: string, c: PollCredentials, signal: AbortSignal): Pro
     if (url === CLAUDE_USAGE_URL) headers["Content-Type"] = "application/json";
     res = await fetch(url, { signal, headers });
   } catch (err) {
-    throw transientFromFetchError(err, where);
+    throw transientFromFetchError(err, where, signal);
   }
   if (res.status === 400 || res.status === 401 || res.status === 403) {
     throw new AuthError(`${res.status} from ${where}`);
@@ -286,8 +296,12 @@ type RawLimit = {
   resets_at?: string | null;
 };
 
-const limitPercent = (l: RawLimit): number => Number(l.used_percent ?? l.percent ?? NaN);
-const limitDisplayName = (l: RawLimit): string => l.display_name ?? l.scope?.model?.display_name ?? "";
+// The attested names come first: `percent` and `scope.model.display_name` are
+// what the author's working poller reads off the live endpoint today.
+// `used_percent`/`display_name` are unattested aliases (the brief's flatter
+// form) and are only consulted when the attested field is absent.
+const limitPercent = (l: RawLimit): number => Number(l.percent ?? l.used_percent ?? NaN);
+const limitDisplayName = (l: RawLimit): string => l.scope?.model?.display_name ?? l.display_name ?? "";
 
 /** The three windows the chooser needs, raw: `usedPercent` is never rounded
  *  (99.6 is not 100 — src/pick.ts gates on exactly 100). A window the account
@@ -295,7 +309,10 @@ const limitDisplayName = (l: RawLimit): string => l.display_name ?? l.scope?.mod
 export async function fetchUsage(c: PollCredentials, signal: AbortSignal): Promise<Usage> {
   const j = (await authed(CLAUDE_USAGE_URL, c, signal)) as { limits?: RawLimit[] };
   const u: Usage = { session: null, weeklyAll: null, weeklyFable: null };
-  for (const l of j?.limits ?? []) {
+  // A `limits` that is not an array (an older or unexpected shape) is "no
+  // windows", never a crash: pick.ts already has reasons for a missing window.
+  const limits = Array.isArray(j?.limits) ? j.limits : [];
+  for (const l of limits) {
     const w: Window = { usedPercent: limitPercent(l), resetsAt: l.resets_at ?? null };
     if (l.kind === "session") u.session = w;
     else if (l.kind === "weekly_all") u.weeklyAll = w;

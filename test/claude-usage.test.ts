@@ -9,15 +9,36 @@
 // module never guesses an account form: the file is tried first, and the
 // keychain only when that recorded file exists. These tests stub `security` on
 // PATH and `globalThis.fetch`; they never touch the real keychain, `~/.claude`,
-// or the network.
+// or the network. Every test restores fetch, PATH, HOME and MS_HOME in its own
+// teardown, so nothing leaks into the next test or out of the file.
 
-import { test } from "node:test";
+import { test, after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { stubDir, tempHome } from "./helpers.ts";
 
-function env() {
+type Saved = { fetch: typeof globalThis.fetch; HOME?: string; MS_HOME?: string; PATH?: string };
+const save = (): Saved => ({
+  fetch: globalThis.fetch,
+  HOME: process.env.HOME,
+  MS_HOME: process.env.MS_HOME,
+  PATH: process.env.PATH,
+});
+function restore(s: Saved): void {
+  globalThis.fetch = s.fetch;
+  for (const k of ["HOME", "MS_HOME", "PATH"] as const) {
+    const v = s[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+}
+const pristine = save();
+after(() => restore(pristine));
+
+function env(t: TestContext) {
+  const before = save();
+  t.after(() => restore(before));
   const { home, msHome } = tempHome();
   process.env.HOME = home;
   process.env.MS_HOME = msHome;
@@ -29,16 +50,16 @@ const cred = {
   claudeAiOauth: { accessToken: "at-1", refreshToken: "rt-1", expiresAt: Date.now() + 3_600_000 },
 };
 
-test("readPollCredentials prefers the credentials file", async () => {
-  const { dir } = env();
+test("readPollCredentials prefers the credentials file", async (t) => {
+  const { dir } = env(t);
   writeFileSync(path.join(dir, ".credentials.json"), JSON.stringify(cred));
   const { readPollCredentials } = await import("../src/providers/claude-usage.ts");
   assert.equal(readPollCredentials("gmail")!.source, "file");
   assert.equal(readPollCredentials("gmail")!.accessToken, "at-1");
 });
 
-test("readPollCredentials falls back to the keychain account recorded at login", async () => {
-  const { dir } = env();
+test("readPollCredentials falls back to the keychain account recorded at login", async (t) => {
+  const { dir } = env(t);
   writeFileSync(path.join(dir, "keychain-account"), "aadarwal-abc123\n");
   const { stub, dir: bin } = stubDir();
   process.env.PATH = `${bin}:${process.env.PATH}`;
@@ -49,14 +70,14 @@ test("readPollCredentials falls back to the keychain account recorded at login",
   assert.equal(readPollCredentials("gmail")!.accessToken, "at-1");
 });
 
-test("readPollCredentials is null with neither a file nor a recorded keychain account", async () => {
-  env();
+test("readPollCredentials is null with neither a file nor a recorded keychain account", async (t) => {
+  env(t);
   const { readPollCredentials } = await import("../src/providers/claude-usage.ts");
   assert.equal(readPollCredentials("gmail"), null);
 });
 
-test("fetchUsage maps the three windows raw and classifies errors", async () => {
-  env();
+test("fetchUsage maps the three windows raw and classifies errors", async (t) => {
+  env(t);
   const { fetchUsage, AuthError } = await import("../src/providers/claude-usage.ts");
   const c = { accessToken: "at", refreshToken: "rt", expiresAt: 0, source: "file" as const };
   globalThis.fetch = (async () => new Response(JSON.stringify({ limits: [
@@ -70,13 +91,14 @@ test("fetchUsage maps the three windows raw and classifies errors", async () => 
   await assert.rejects(fetchUsage(c, AbortSignal.timeout(1000)), AuthError);
 });
 
-// The live endpoint (as the author's working dashboard provider reads it)
-// names the same fields `percent` and `scope.model.display_name`; the fixture
-// above is the brief's. Reading only one of the two shapes would report every
-// window as 0 % against the real API, which the chooser would read as "plenty
-// of room" — so both are accepted.
-test("fetchUsage also reads the live shape: percent and scope.model.display_name", async () => {
-  env();
+// The attested shape: the live endpoint, as the author's working dashboard
+// provider reads it, names these fields `percent` and `scope.model.display_name`
+// and they take precedence. The brief's flatter `used_percent`/`display_name`
+// (the test above) are unattested aliases, read only when the attested field is
+// absent — reading neither form would report every window as 0 %, which the
+// chooser takes for "plenty of room".
+test("fetchUsage reads the attested shape: percent and scope.model.display_name", async (t) => {
+  env(t);
   const { fetchUsage } = await import("../src/providers/claude-usage.ts");
   const c = { accessToken: "at", refreshToken: "rt", expiresAt: 0, source: "file" as const };
   globalThis.fetch = (async () => new Response(JSON.stringify({ limits: [
@@ -92,8 +114,19 @@ test("fetchUsage also reads the live shape: percent and scope.model.display_name
   assert.equal(u.weeklyFable!.resetsAt, null);
 });
 
-test("fetchProfile reads the account email and the organisation", async () => {
-  env();
+test("fetchUsage survives a missing or non-array limits field", async (t) => {
+  env(t);
+  const { fetchUsage } = await import("../src/providers/claude-usage.ts");
+  const c = { accessToken: "at", refreshToken: "rt", expiresAt: 0, source: "file" as const };
+  const empty = { session: null, weeklyAll: null, weeklyFable: null };
+  for (const body of ["{}", JSON.stringify({ limits: null }), JSON.stringify({ limits: "soon" })]) {
+    globalThis.fetch = (async () => new Response(body, { status: 200 })) as typeof fetch;
+    assert.deepEqual(await fetchUsage(c, AbortSignal.timeout(1000)), empty);
+  }
+});
+
+test("fetchProfile reads the account email and the organisation", async (t) => {
+  env(t);
   const { fetchProfile } = await import("../src/providers/claude-usage.ts");
   const c = { accessToken: "at", refreshToken: "rt", expiresAt: 0, source: "file" as const };
   globalThis.fetch = (async () => new Response(JSON.stringify({
@@ -107,8 +140,8 @@ test("fetchProfile reads the account email and the organisation", async () => {
   });
 });
 
-test("429, 5xx, a non-JSON body and a network failure are transient; 403 is auth", async () => {
-  env();
+test("429, 5xx, a non-JSON body and a network failure are transient; 403 is auth", async (t) => {
+  env(t);
   const { fetchUsage, AuthError, TransientError } = await import("../src/providers/claude-usage.ts");
   const c = { accessToken: "at", refreshToken: "rt", expiresAt: 0, source: "file" as const };
   const sig = () => AbortSignal.timeout(1000);
@@ -130,8 +163,32 @@ test("429, 5xx, a non-JSON body and a network failure are transient; 403 is auth
     e instanceof Error && !(e instanceof AuthError) && !(e instanceof TransientError));
 });
 
-test("refreshPollCredentials writes the rotated refresh token back to the file", async () => {
-  const { dir } = env();
+test("a caller's abort propagates; a deadline is transient", async (t) => {
+  env(t);
+  const { fetchUsage, refreshPollCredentials, TransientError } = await import("../src/providers/claude-usage.ts");
+  const c = { accessToken: "at", refreshToken: "rt", expiresAt: 0, source: "file" as const };
+
+  // Cancellation is the caller's own doing: its reason must survive, not be
+  // relabelled "try again later".
+  const cancelled = new Error("caller cancelled");
+  cancelled.name = "AbortError";
+  const ac = new AbortController();
+  ac.abort(cancelled);
+  globalThis.fetch = (async () => { throw cancelled; }) as unknown as typeof fetch;
+  await assert.rejects(fetchUsage(c, ac.signal), (e: unknown) => e === cancelled);
+  await assert.rejects(refreshPollCredentials("gmail", c, ac.signal), (e: unknown) => e === cancelled);
+
+  // A deadline reached is a transient condition.
+  const timedOut = new DOMException("timed out", "TimeoutError");
+  const to = new AbortController();
+  to.abort(timedOut);
+  globalThis.fetch = (async () => { throw timedOut; }) as unknown as typeof fetch;
+  await assert.rejects(fetchUsage(c, to.signal), TransientError);
+  await assert.rejects(refreshPollCredentials("gmail", c, to.signal), TransientError);
+});
+
+test("refreshPollCredentials writes the rotated refresh token back to the file", async (t) => {
+  const { dir } = env(t);
   writeFileSync(path.join(dir, ".credentials.json"), JSON.stringify(cred));
   const { readPollCredentials, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
   globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 3600 }), { status: 200 })) as typeof fetch;
@@ -140,8 +197,8 @@ test("refreshPollCredentials writes the rotated refresh token back to the file",
   assert.equal(JSON.parse(readFileSync(path.join(dir, ".credentials.json"), "utf8")).claudeAiOauth.refreshToken, "rt-2");
 });
 
-test("refreshPollCredentials keeps unrelated keys in the credentials file", async () => {
-  const { dir } = env();
+test("refreshPollCredentials keeps unrelated keys in the credentials file", async (t) => {
+  const { dir } = env(t);
   const file = path.join(dir, ".credentials.json");
   writeFileSync(file, JSON.stringify({ ...cred, otherThing: { keep: true } }));
   const { readPollCredentials, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
@@ -155,8 +212,8 @@ test("refreshPollCredentials keeps unrelated keys in the credentials file", asyn
   assert.ok(written.claudeAiOauth.expiresAt > Date.now());
 });
 
-test("refreshPollCredentials never writes back a keychain-sourced credential", async () => {
-  const { dir } = env();
+test("refreshPollCredentials never writes back a keychain-sourced credential", async (t) => {
+  const { dir } = env(t);
   const { readPollCredentials, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
   writeFileSync(path.join(dir, "keychain-account"), "aadarwal-abc123\n");
   const { stub, dir: bin } = stubDir();
@@ -172,8 +229,8 @@ test("refreshPollCredentials never writes back a keychain-sourced credential", a
   assert.equal(readPollCredentials("gmail")!.source, "keychain");
 });
 
-test("refresh rejections: invalid_grant and 400/401 are auth, 5xx is transient", async () => {
-  env();
+test("refresh rejections: invalid_grant and 400/401 are auth, 5xx is transient", async (t) => {
+  env(t);
   const { refreshPollCredentials, AuthError, TransientError } = await import("../src/providers/claude-usage.ts");
   const c = { accessToken: "at", refreshToken: "rt", expiresAt: 0, source: "file" as const };
   const sig = () => AbortSignal.timeout(1000);
@@ -191,8 +248,8 @@ test("refresh rejections: invalid_grant and 400/401 are auth, 5xx is transient",
   await assert.rejects(refreshPollCredentials("gmail", c, sig()), TransientError);
 });
 
-test("no token or credential value ever appears in an error message", async () => {
-  env();
+test("no token or credential value ever appears in an error message", async (t) => {
+  env(t);
   const { fetchUsage, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
   const secret = "SEKRET-TOKEN-VALUE";
   const c = { accessToken: secret, refreshToken: `${secret}-refresh`, expiresAt: 0, source: "file" as const };
@@ -214,20 +271,66 @@ test("the proven endpoints, token URL and client id are the dashboard's", async 
   assert.equal(m.CLAUDE_CLIENT_ID, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
 });
 
-test("the usage and profile calls carry Claude Code's proven header set", async () => {
-  env();
+/** Records the one request the stubbed fetch saw. */
+function recorder(body: string, status = 200) {
+  const seen: { url: string; init: RequestInit }[] = [];
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    seen.push({ url: String(url), init: init ?? {} });
+    return new Response(body, { status });
+  }) as unknown as typeof fetch;
+  return () => {
+    assert.equal(seen.length, 1);
+    const { url, init } = seen[0]!;
+    return { url, init, headers: new Headers(init.headers) };
+  };
+}
+
+test("the usage call carries Claude Code's proven header set", async (t) => {
+  env(t);
   const { fetchUsage, CLAUDE_USAGE_URL } = await import("../src/providers/claude-usage.ts");
   const c = { accessToken: "at-9", refreshToken: "rt", expiresAt: 0, source: "file" as const };
-  let seen: { url: string; headers: Headers } | null = null;
-  globalThis.fetch = (async (url: string, init: RequestInit) => {
-    seen = { url: String(url), headers: new Headers(init.headers) };
-    return new Response(JSON.stringify({ limits: [] }), { status: 200 });
-  }) as unknown as typeof fetch;
+  const seen = recorder(JSON.stringify({ limits: [] }));
   await fetchUsage(c, AbortSignal.timeout(1000));
-  const got = seen as unknown as { url: string; headers: Headers };
-  assert.equal(got.url, CLAUDE_USAGE_URL);
-  assert.equal(got.headers.get("authorization"), "Bearer at-9");
-  assert.equal(got.headers.get("anthropic-beta"), "oauth-2025-04-20");
+  const { url, headers } = seen();
+  assert.equal(url, CLAUDE_USAGE_URL);
+  assert.equal(headers.get("authorization"), "Bearer at-9");
+  assert.equal(headers.get("anthropic-beta"), "oauth-2025-04-20");
   // Other UAs land in an aggressively rate-limited bucket (see the provider).
-  assert.match(got.headers.get("user-agent") ?? "", /^claude-code\//);
+  assert.match(headers.get("user-agent") ?? "", /^claude-code\//);
+  assert.equal(headers.get("content-type"), "application/json");
+});
+
+test("the profile call carries the same headers and no content-type", async (t) => {
+  env(t);
+  const { fetchProfile, CLAUDE_PROFILE_URL } = await import("../src/providers/claude-usage.ts");
+  const c = { accessToken: "at-9", refreshToken: "rt", expiresAt: 0, source: "file" as const };
+  const seen = recorder("{}");
+  await fetchProfile(c, AbortSignal.timeout(1000));
+  const { url, headers } = seen();
+  assert.equal(url, CLAUDE_PROFILE_URL);
+  assert.equal(headers.get("authorization"), "Bearer at-9");
+  assert.equal(headers.get("anthropic-beta"), "oauth-2025-04-20");
+  assert.match(headers.get("user-agent") ?? "", /^claude-code\//);
+  // The dashboard's profile call sends no Content-Type; neither does this one.
+  assert.equal(headers.get("content-type"), null);
+});
+
+test("the refresh posts the proven grant, client id and headers to the token URL", async (t) => {
+  env(t);
+  const { refreshPollCredentials, CLAUDE_TOKEN_URL, CLAUDE_CLIENT_ID } =
+    await import("../src/providers/claude-usage.ts");
+  const c = { accessToken: "at-9", refreshToken: "rt-9", expiresAt: 0, source: "file" as const };
+  const seen = recorder(JSON.stringify({ access_token: "at-10", expires_in: 3600 }));
+  await refreshPollCredentials("gmail", c, AbortSignal.timeout(1000));
+  const { url, init, headers } = seen();
+  assert.equal(url, CLAUDE_TOKEN_URL);
+  assert.equal(init.method, "POST");
+  assert.equal(headers.get("content-type"), "application/json");
+  assert.equal(headers.get("anthropic-beta"), "oauth-2025-04-20");
+  const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+  assert.equal(body.grant_type, "refresh_token");
+  assert.equal(body.client_id, CLAUDE_CLIENT_ID);
+  assert.equal(body.refresh_token, "rt-9");
+  // The refresh sends no bearer: the grant IS the refresh token.
+  assert.equal(headers.get("authorization"), null);
 });

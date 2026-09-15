@@ -290,7 +290,7 @@ export async function checkClaudeAccount(a: Account, fix: boolean): Promise<Resu
 
   const cred = readPollCredentials(a.name);
   if (!cred) {
-    out.push({ ok: false, what: `${tag}: poll grant readable`, why: "no credentials file or keychain entry (npm run add-claude on the serving host)" });
+    out.push({ ok: false, what: `${tag}: poll grant readable`, why: `no credentials file or keychain entry (ms accounts login ${a.name})` });
   } else {
     out.push({ ok: true, what: `${tag}: poll grant readable` });
     const due = cred.expiresAt - Date.now() <= REFRESH_DUE_MS;
@@ -317,7 +317,7 @@ export async function checkClaudeAccount(a: Account, fix: boolean): Promise<Resu
   out.push(
     readLaunchToken(a.name)
       ? { ok: true, what: `${tag}: launch token present` }
-      : { ok: false, what: `${tag}: launch token present`, why: "no launch token (anu account add)" },
+      : { ok: false, what: `${tag}: launch token present`, why: `no launch token (ms accounts login ${a.name})` },
   );
 
   out.push(

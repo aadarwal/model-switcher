@@ -161,12 +161,6 @@ export const isBusy = (screen: string): boolean => tail(screen, 6).some((l) => I
 /** A lock name is a restricted token (src/lock.ts); a session id that is not
  * a UUID must still produce a legal, stable one rather than throwing. */
 const lockToken = (id: string): string => id.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 48);
-
-/** The name of a session's mutation lock. Exported — and used by the
- * transaction below — so a caller outside this module (Task 16's `ms stop`)
- * cannot take a DIFFERENT lock and believe it has excluded a worker. */
-export const sessionLockName = (id: string): string => `session-${lockToken(id)}`;
-
 /**
  * The lock this worker holds for the whole transaction. Exported because it is
  * a shared name, not an implementation detail: Tasks 16 and 18 serialise

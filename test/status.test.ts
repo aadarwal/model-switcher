@@ -507,6 +507,75 @@ test("ms status --json prints { accounts, sessions, takenAt } and parses", async
   assert.ok(Number.isFinite(parsed.takenAt) && parsed.takenAt > 0);
 });
 
+// --- Review round 1 (P4-T2), finding 1: LABEL/PENDING/WALLED? additive ----
+//
+// `ms status --json` used to hand back the raw AccountUsage/SessionRow the
+// snapshot and the store keep, with none of the derived words the TABLE
+// renders (LABEL, STATE, PENDING, WALLED?) — a consumer of the JSON (the
+// dashboard page) had no choice but to re-derive them, badly (finding 2:
+// its copy never checked `hasToken`, so a token-less account read "ok").
+// These fields are additive — the existing keys above are untouched — and
+// computed by the exact same helpers the table itself calls, so the two
+// views can never drift.
+
+test("ms status --json: each account row also carries LABEL and STATE — the exact words the table prints, not the raw snapshot row", async () => {
+  const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
+  await seedSessions(w);
+
+  const r = run(["status", "--json"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout) as { accounts: { name: string; label: string; state: string }[] };
+
+  const dirk = parsed.accounts.find((a) => a.name === "dirk")!;
+  assert.equal(dirk.label, "Dirk");
+  assert.equal(dirk.state, "ok"); // matches the table's own "dirk" row above
+
+  const gmail = parsed.accounts.find((a) => a.name === "gmail")!;
+  assert.equal(gmail.label, "Gmail");
+  assert.equal(gmail.state, "no-grant"); // matches the table's own "gmail" row above
+});
+
+test("ms status --json: each session row also carries PENDING and WALLED? — null/\"\" where the table prints \"—\", not just the raw store row", async () => {
+  const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
+  await seedSessions(w);
+
+  const r = run(["status", "--json"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout) as { sessions: { id: string; pending: string | null; walled: string }[] };
+
+  // sess-1: an open recovery → "pending" / "reported" (matches the table's
+  // own sess-1 row above, where an open recovery wins even though the
+  // stubbed screen also reads a wall).
+  const s1 = parsed.sessions.find((s) => s.id === "sess-1")!;
+  assert.equal(s1.pending, "pending");
+  assert.equal(s1.walled, "reported");
+
+  // sess-2: no recovery, no matching rate_limited event, but its screen
+  // reads a wall → null pending, "unreported" (matches the table's own
+  // sess-2 row above).
+  const s2 = parsed.sessions.find((s) => s.id === "sess-2")!;
+  assert.equal(s2.pending, null);
+  assert.equal(s2.walled, "unreported");
+});
+
+test("ms status --json: finding 2 — a Claude account with no launch token reads STATE no-token, never ok", async () => {
+  const { home, msHome } = tempHome();
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ name: "notoken", provider: "claude", label: "NoToken", shared: false }] }),
+    { mode: 0o600 },
+  );
+  // Deliberately no saveLaunchToken() call and no poll-grant credentials
+  // dir — exactly the state of an account `ms accounts add` registered but
+  // neither `ms accounts login` nor `anu account add` has ever touched.
+
+  const r = run(["status", "--json"], { HOME: home, MS_HOME: msHome });
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout) as { accounts: { name: string; state: string }[] };
+  const acct = parsed.accounts.find((a) => a.name === "notoken")!;
+  assert.equal(acct.state, "no-token");
+});
+
 test("ms status --watch clears the screen and redraws exactly once when bounded", async () => {
   const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
   await seedSessions(w);

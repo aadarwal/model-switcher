@@ -205,12 +205,33 @@ test("GET /api/state returns both tables, a numeric takenAt, and no token-shaped
   const res = await handle({ method: "GET", path: "/api/state" });
 
   assert.equal(res.status, 200);
-  const json = res.json as { accounts: unknown[]; sessions: { id: string; account: string }[]; takenAt: number };
+  const json = res.json as {
+    accounts: { name: string; label: string; state: string }[];
+    sessions: { id: string; account: string; pending: string | null; walled: string }[];
+    takenAt: number;
+  };
   assert.equal(json.accounts.length, 2);
   assert.equal(json.sessions.length, 2);
   assert.ok(json.sessions.some((s) => s.id === "s1" && s.account === "dirk"));
   assert.ok(json.sessions.some((s) => s.id === "s2" && s.account === "gmail"));
   assert.ok(Number.isFinite(json.takenAt) && json.takenAt > 0);
+
+  // Review round 1 (P4-T2), finding 1: LABEL/STATE/PENDING/WALLED? travel
+  // through the dashboard API too, not just `ms status --json` directly —
+  // this route is `statusJson()` end to end, so a regression here would be
+  // `handle()` itself dropping a key, not the underlying computation.
+  const dirk = json.accounts.find((a) => a.name === "dirk")!;
+  assert.equal(dirk.label, "Dirk");
+  assert.equal(dirk.state, "ok");
+  const gmail = json.accounts.find((a) => a.name === "gmail")!;
+  assert.equal(gmail.label, "Gmail");
+  assert.equal(gmail.state, "ok");
+  const s1 = json.sessions.find((s) => s.id === "s1")!;
+  assert.equal(s1.pending, null);
+  assert.equal(s1.walled, ""); // running, idle screen: no wall, no open recovery
+  const s2 = json.sessions.find((s) => s.id === "s2")!;
+  assert.equal(s2.pending, null);
+  assert.equal(s2.walled, ""); // pane %9 isn't in the tmux stub's pane list at all
 
   const serialized = JSON.stringify(res);
   assert.ok(!serialized.includes(FIXTURE_TOKEN), `token leaked into the API response: ${serialized}`);

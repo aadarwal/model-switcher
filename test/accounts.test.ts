@@ -154,7 +154,7 @@ if [ "$1" = "-p" ]; then
   logcfg probe
   [ "$CLAUDE_CODE_OAUTH_TOKEN" = "$MS_TEST_TOKEN" ] || { echo "probe ran without the token env" >&2; exit 9; }
   printf '%s\\n' "$MS_TEST_PROBE_OUT"
-  exit 0
+  exit "${MS_TEST_PROBE_EXIT:-0}"
 fi
 exit 3
 `;
@@ -198,6 +198,7 @@ type Opts = {
   pollStatusOk?: boolean;
   authStatus?: string;
   probeOut?: string;
+  probeExit?: number;
   tokenStream?: "stdout" | "stderr";
   tokenInline?: boolean;
   tokenSplit?: "prefix" | "partial";
@@ -245,6 +246,7 @@ function scene(opts: Opts = {}) {
     MS_TEST_POLL_STATUS_OK: opts.pollStatusOk ? "1" : "0",
     MS_TEST_AUTH_STATUS: opts.authStatus ?? '{"loggedIn":true,"orgId":"org-1","email":"work@example.com","orgName":"Work"}', // the real top-level shape; one test below keeps the nested fallback
     MS_TEST_PROBE_OUT: opts.probeOut ?? "ok",
+    MS_TEST_PROBE_EXIT: String(opts.probeExit ?? 0),
   };
   return {
     home,
@@ -846,4 +848,15 @@ test("a row the registry skips is named once per command, not once per read", ()
   const warnings = r.stderr.split("\n").filter((l) => l.includes("accounts.json"));
   assert.equal(warnings.length, 1, `expected one warning, got: ${JSON.stringify(warnings)}`);
   assert.match(warnings[0], /unknown provider/);
+});
+
+test("a launch token that answers the probe with a usage wall is proven, not broken (seen live)", () => {
+  // dirk on 2026-09-15: `claude -p` exited 1 printing
+  // "You've hit your session limit · resets 10:10pm" — an authenticated answer.
+  const s = scene({ probeOut: "You've hit your session limit · resets 10:10pm (America/New_York)", probeExit: 1 });
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(s.row("gmail").identityVerified, true);
+  assert.doesNotMatch(r.stderr, /headless check/);
 });

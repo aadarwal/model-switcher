@@ -46,6 +46,7 @@ import {
   refreshPollCredentials,
   writeKeychainNote,
 } from "./providers/claude-usage.ts";
+import { wallKindFromText } from "./wall.ts";
 
 // --- Bounds ------------------------------------------------------------
 /** A browser login and a token mint both wait on the human. */
@@ -309,6 +310,10 @@ function probeLaunchToken(token: string, scratch: string): { ok: boolean; detail
     timeout: PROBE_TIMEOUT_MS,
   });
   if (r.error) return { ok: false, detail: r.error.message };
+  // A usage wall is an AUTHENTICATED answer: the account is merely out of
+  // room right now (seen live: "You've hit your session limit · resets …").
+  const wall = wallKindFromText(`${r.stdout ?? ""}\n${r.stderr ?? ""}`);
+  if (r.status !== 0 && wall) return { ok: true, detail: `walled (${wall})` };
   if (r.status !== 0) return { ok: false, detail: `claude -p exited ${r.status ?? "on a signal"}` };
   if (!/\bok\b/i.test(r.stdout ?? "")) return { ok: false, detail: "the headless turn did not answer ok" };
   return { ok: true, detail: "" };

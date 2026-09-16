@@ -33,6 +33,9 @@ function stubHealthyBinaries(): { dir: string } {
   const { dir, stub } = stubDir();
   stub("tmux", HEALTHY_TMUX);
   stub("claude", HEALTHY_CLAUDE);
+  // Every doctor test that reaches the poll-grant check must never touch the
+  // real keychain: absent (exit 44) unless a test stubs its own answer.
+  stub("security", "exit 44");
   process.env.PATH = `${dir}:${process.env.PATH}`;
   return { dir };
 }
@@ -110,8 +113,10 @@ test("nodeVersionAtLeast: a real MAJOR.MINOR.PATCH comparison, not vacuous", asy
 
 // --- tmux --------------------------------------------------------------
 
-test("checkTmux: ok at 3.3+, fails below 3.3, fails when tmux is missing", async () => {
+test("checkTmux: ok at 3.3+, fails below 3.3, fails when tmux is missing", async (t) => {
   base();
+  const savedPath = process.env.PATH;
+  t.after(() => { process.env.PATH = savedPath; });
   const { checkTmux } = await import("../src/doctor.ts");
 
   let d = stubDir();
@@ -132,8 +137,10 @@ test("checkTmux: ok at 3.3+, fails below 3.3, fails when tmux is missing", async
 
 // --- claude ------------------------------------------------------------
 
-test("checkClaudeBinary: ok when present, fails when missing", async () => {
+test("checkClaudeBinary: ok when present, fails when missing", async (t) => {
   base();
+  const savedPath = process.env.PATH;
+  t.after(() => { process.env.PATH = savedPath; });
   const { checkClaudeBinary } = await import("../src/doctor.ts");
   const { dir, stub } = stubDir();
   stub("claude", 'echo "1.0.0 (Claude Code)"');
@@ -333,6 +340,7 @@ test("checkClaudeAccount: a fully healthy account reports four ✓ lines", async
 
 test("checkClaudeAccount: a grant-less account fails readable, launch token, and identity", async () => {
   base();
+  stubHealthyBinaries(); // stubs security too: the real keychain is never consulted
   const { checkClaudeAccount } = await import("../src/doctor.ts");
   const rs = await checkClaudeAccount(account({ name: "orphan-acct", identityVerified: false }), false);
   // No refreshable line at all when the grant cannot even be read.

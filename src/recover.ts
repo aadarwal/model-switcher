@@ -318,6 +318,29 @@ function obsoleteReason(session: SessionRow, rec: RecoveryRow, tmux: Tmux): stri
 }
 
 /**
+ * Has the conversation the session is in NOW ever been given a turn?
+ *
+ * Claude Code writes a transcript only once a prompt has been submitted, so a
+ * CLI session id with no `activity` event behind it — a launch nobody has typed
+ * into yet, or the conversation a `/clear` has just started — has no file on
+ * disk to resume. And `--resume` on such an id does NOT quietly start a fresh
+ * conversation: verified live against 2.1.273, it prints "No conversation found
+ * with session ID: <id>" and exits 1, which is how a rotation of an untouched
+ * pane came back a corpse within a second.
+ *
+ * `--session-id <id>` is the relaunch that works there: a new conversation
+ * carrying the id the store already records, so the row, the hook's reports and
+ * the readiness check all still agree about which conversation this is.
+ *
+ * The id is compared, not merely the kind: after a `/clear` the row moves onto
+ * a new id (src/hooks/claude-hook.ts), and the turns of the conversation the
+ * human LEFT say nothing about whether the one they are in has a transcript.
+ */
+function hasTranscript(id: string, cliSessionId: string): boolean {
+  return readEvents(id).some((e) => e.kind === "activity" && e.cliSessionId === cliSessionId);
+}
+
+/**
  * The session went on working after the wall, or null — re-read from the event
  * log every time it is asked (spec §9: "User starts a new turn during polling:
  * the failure is obsolete, nothing is killed").
@@ -816,8 +839,16 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
 
   // 7. The new generation, written down before it is started.
   const next = g + 1;
-  const continuing = !manual || manual.continueAfter;
-  const command = ["claude", "--resume", session.cliSessionId!, ...(continuing ? [CONTINUATION] : []), ...flagsForResume(session.flags)];
+  // A conversation with no transcript cannot be resumed, and has no unfinished
+  // work to continue: it is relaunched under its own id instead.
+  const resumable = hasTranscript(id, session.cliSessionId!);
+  const continuing = resumable && (!manual || manual.continueAfter);
+  const command = resumable
+    ? ["claude", "--resume", session.cliSessionId!, ...(continuing ? [CONTINUATION] : []), ...flagsForResume(session.flags)]
+    : ["claude", "--session-id", session.cliSessionId!, ...flagsForResume(session.flags)];
+  if (!resumable) {
+    logLine(id, next, `${session.cliSessionId} has no transcript yet (no turn was ever submitted); starting it under the same id rather than resuming`);
+  }
   const launchId = randomUUID();
   st.createLaunch({ id: launchId, sessionId: id, generation: next, account: to, command, env: {}, createdAt: nowSeconds() });
   // The attempt records the account we LEFT — that is what was consumed, and

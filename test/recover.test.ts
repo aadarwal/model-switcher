@@ -127,6 +127,10 @@ type WorldOptions = {
   session?: Partial<SessionRow>;
   recovery?: boolean;
   wall?: boolean;
+  /** Has the conversation ever had a turn? Default yes — a session that walled
+   * got there by submitting one, and a transcript is what makes `--resume` the
+   * right relaunch. `false` is the pane nobody has typed into yet. */
+  activity?: boolean;
   panes?: string;
   /** Make the stub tmux fail this subcommand, and only this one. */
   failOn?: string;
@@ -200,6 +204,9 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
       flags: ["--model", "sonnet"],
       ...opts.session,
     });
+    // Before the wall, so the recovery is never obsolete by it: the turn that
+    // walled is what wrote this, and it is also the transcript on disk.
+    if (opts.activity !== false) appendEvent({ t: nowSeconds() - 20, kind: "activity", session: "s1", generation: 2, cliSessionId: "c-1" });
     if (opts.wall !== false) appendEvent({ t: nowSeconds() - 10, kind: "rate_limited", session: "s1", generation: 2, cliSessionId: "c-1", kindDetail: "session" });
     if (opts.recovery !== false) st.addRecovery({ sessionId: "s1", generation: 2, turnId: null, kind: "session" });
   } finally {
@@ -339,7 +346,10 @@ test("a wall after a /clear resumes the conversation the human is actually in", 
   // working, and then hit a wall. Resuming the PRE-clear id would hand the model
   // a conversation the human had deliberately left — and the readiness check,
   // comparing against that same stale id, would call it a good resume.
-  const w = await world(t);
+  // The wall is appended after the clear here, in the order the events really
+  // happened: a turn on the old conversation, the clear, the turn that made a
+  // transcript for the NEW one, and then the wall it ended at.
+  const w = await world(t, { wall: false, recovery: false });
   const { run } = await import("./helpers.ts");
   const hook = run(
     ["_hook", "claude"],
@@ -348,6 +358,14 @@ test("a wall after a /clear resumes the conversation the human is actually in", 
   );
   assert.equal(hook.code, 0);
   assert.equal(session(w).cliSessionId, "c-2");
+  appendEvent({ t: nowSeconds() - 20, kind: "activity", session: "s1", generation: 2, cliSessionId: "c-2" });
+  appendEvent({ t: nowSeconds() - 10, kind: "rate_limited", session: "s1", generation: 2, cliSessionId: "c-2", kindDetail: "session" });
+  const st = openState();
+  try {
+    st.addRecovery({ sessionId: "s1", generation: 2, turnId: null, kind: "session" });
+  } finally {
+    st.close();
+  }
 
   const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-2" });
   t.after(stop);
@@ -356,6 +374,49 @@ test("a wall after a /clear resumes the conversation the human is actually in", 
   const launch = launchOf(w, respawnLaunchId(w))!;
   assert.deepEqual(launch.command, ["claude", "--resume", "c-2", CONTINUATION, "--model", "sonnet"]);
   assert.equal(session(w).state, "continuing", "and the resume was accepted, not read as a new conversation");
+});
+
+test("a conversation that has never had a turn is started under its own id, not resumed", async (t) => {
+  // Live matrix case 3: `ms rotate` on a pane nobody had typed into yet. There
+  // is no transcript for that id, and Claude Code 2.1.273 does not quietly
+  // start a fresh conversation for `--resume` — it prints "No conversation
+  // found with session ID" and exits 1, so the respawned pane died at +1 s.
+  const w = await world(t, { activity: false });
+  // `--session-id` is a NEW conversation, so the CLI reports a `startup`.
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1", kind: "started" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.deepEqual(launch.command, ["claude", "--session-id", "c-1", "--model", "sonnet"]);
+  assert.ok(!launch.command.includes(CONTINUATION), "a conversation with no turns has no unfinished work to continue");
+  const s = session(w);
+  assert.equal(s.account, "gmail", "the handoff still happened");
+  assert.equal(s.generation, 3);
+  assert.equal(s.state, "running", "no continuation means the session is merely running");
+  assert.match(recoverLog(w), /c-1 has no transcript yet/);
+});
+
+test("a turn on the current conversation is what makes it resumable", async (t) => {
+  // The other branch, told apart by the ID and not merely by the kind: the
+  // activity on the record belongs to the conversation the human LEFT, so the
+  // one they are in now still has nothing on disk.
+  const w = await world(t, { activity: false, session: { cliSessionId: "c-2" }, wall: false, recovery: false });
+  appendEvent({ t: nowSeconds() - 30, kind: "activity", session: "s1", generation: 2, cliSessionId: "c-1" });
+  appendEvent({ t: nowSeconds() - 20, kind: "cleared", session: "s1", generation: 2, cliSessionId: "c-2", prevCliSessionId: "c-1" });
+  appendEvent({ t: nowSeconds() - 10, kind: "rate_limited", session: "s1", generation: 2, cliSessionId: "c-2", kindDetail: "session" });
+  const st = openState();
+  try {
+    st.addRecovery({ sessionId: "s1", generation: 2, turnId: null, kind: "session" });
+  } finally {
+    st.close();
+  }
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-2", kind: "started" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["claude", "--session-id", "c-2", "--model", "sonnet"]);
 });
 
 test("activity newer than the wall makes the recovery obsolete, and nothing is typed", async (t) => {

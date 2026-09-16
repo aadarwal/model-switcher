@@ -393,7 +393,12 @@ function stuck(st: State, s: SessionRow): string[] {
   const events = readEvents(s.id).filter((e) => e.generation === s.generation);
   const minutes = STUCK_SECONDS / 60;
   if (resuming) {
-    if (events.some((e) => e.kind === "resumed")) return [];
+    // `started` counts as well as `resumed`: a handoff of a conversation with
+    // no transcript relaunches it with `--session-id` (src/recover.ts), and
+    // Claude Code reports that as a SessionStart `startup`. The CLI did come
+    // back — parking it for saying so in the other word would be a repair that
+    // is itself the damage.
+    if (events.some((e) => e.kind === "resumed" || e.kind === "started")) return [];
     return [park(st, s, `${s.state} for over ${minutes} minutes with no resumed event`)];
   }
   if (events.some((e) => e.kind === "started")) return [];

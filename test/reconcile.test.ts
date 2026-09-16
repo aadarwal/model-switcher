@@ -492,9 +492,15 @@ test("(e) resuming or continuing for over five minutes with no resumed event is 
     st.createSession({ id: "s-stuck-resuming", ...base, state: "resuming", generation: 2 });
     st.createSession({ id: "s-stuck-continuing", ...base, state: "continuing", generation: 2 });
     st.createSession({ id: "s-resumed", ...base, state: "continuing", generation: 2 });
+    st.createSession({ id: "s-restarted-id", ...base, state: "resuming", generation: 2 });
     st.createSession({ id: "s-recent", ...base, state: "resuming", generation: 2 });
   });
   appendEvent({ t: nowSec() - 400, kind: "resumed", session: "s-resumed", generation: 2, cliSessionId: "c1" });
+  // A handoff of a conversation with no transcript relaunches it with
+  // `--session-id`, and Claude Code reports that as a `startup`. The CLI is
+  // back; parking it for reporting in the other word is a repair that is the
+  // damage.
+  appendEvent({ t: nowSec() - 400, kind: "started", session: "s-restarted-id", generation: 2, cliSessionId: "c1" });
   // A `resumed` from the generation BEFORE this one is not this handoff's.
   appendEvent({ t: nowSec() - 900, kind: "resumed", session: "s-stuck-continuing", generation: 1, cliSessionId: "c1" });
   planted(w.msHome, "UPDATE sessions SET updatedAt=? WHERE id<>'s-recent'", nowSec() - 400);
@@ -504,6 +510,7 @@ test("(e) resuming or continuing for over five minutes with no resumed event is 
   assert.equal(stateOf("s-stuck-resuming"), "parked");
   assert.equal(stateOf("s-stuck-continuing"), "parked", "continuing is a handoff state too, and this one never landed");
   assert.equal(stateOf("s-resumed"), "continuing", "it did resume; it is just still working");
+  assert.equal(stateOf("s-restarted-id"), "resuming", "a `started` for this generation is a CLI that came back");
   assert.equal(stateOf("s-recent"), "resuming", "five minutes have not passed");
   for (const id of ["s-stuck-resuming", "s-stuck-continuing"]) {
     assert.ok(repaired.some((l) => l.includes(id)), repaired.join("\n"));

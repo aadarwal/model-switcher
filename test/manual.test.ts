@@ -148,6 +148,9 @@ type WorldOptions = {
   recovery?: boolean;
   /** Append a `rate_limited` event for the current generation (default: no). */
   wall?: boolean;
+  /** Has the conversation ever had a turn? Default yes: a pane the human has
+   * worked in has a transcript, which is what `--resume` needs to exist. */
+  activity?: boolean;
   panes?: string;
   /** What the stub server answers `serverIdentity` with. */
   identity?: string;
@@ -240,6 +243,7 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
       flags: ["--model", "sonnet"],
       ...opts.session,
     });
+    if (opts.activity !== false) appendEvent({ t: nowSeconds() - 20, kind: "activity", session: "s1", generation: 2, cliSessionId: "c-1" });
     if (opts.wall) appendEvent({ t: nowSeconds() - 10, kind: "rate_limited", session: "s1", generation: 2, cliSessionId: "c-1", kindDetail: "session" });
     if (opts.recovery) st.addRecovery({ sessionId: "s1", generation: 2, turnId: null, kind: "session" });
     if (opts.wakeup) st.setWakeup("s1", nowSeconds() + 3600);
@@ -296,11 +300,11 @@ const respawnLaunchId = (w: World): string => {
 
 /** Stand in for Claude Code's SessionStart hook: report the resume the
  *  recovery waits for, as soon as the pane has been respawned. */
-function reportOnRespawn(w: World, generation = 3): () => void {
+function reportOnRespawn(w: World, generation = 3, kind: "resumed" | "started" = "resumed"): () => void {
   const timer = setInterval(() => {
     if (!respawnLine(w)) return;
     clearInterval(timer);
-    appendEvent({ t: nowSeconds(), kind: "resumed", session: "s1", generation, cliSessionId: "c-1" });
+    appendEvent({ t: nowSeconds(), kind, session: "s1", generation, cliSessionId: "c-1" });
   }, 10);
   return () => clearInterval(timer);
 }
@@ -424,6 +428,23 @@ test("switch --to on an idle pane relaunches on that account without a continuat
   assert.deepEqual(launch.command, ["claude", "--resume", "c-1", "--model", "sonnet"]);
   assert.ok(!launch.command.includes(CONTINUATION), "a finished conversation is not told to continue");
   assert.match(say(), /^ms: s1 switched → gmail$/m);
+});
+
+test("switch on a pane that has never had a turn starts it under the same id", async (t) => {
+  // The pane the human opened and did not type into. `--resume` on an id with
+  // no transcript exits 1 ("No conversation found with session ID"), so the
+  // switch would have handed them a dead pane on the new account.
+  const w = await world(t, { screen: IDLE_SCREEN, activity: false });
+  const stop = reportOnRespawn(w, 3, "started");
+  t.after(stop);
+
+  assert.equal(await switchVerb(["s1", "--to", "gmail", "--continue"]), 0);
+
+  const launch = launchOf(respawnLaunchId(w))!;
+  assert.deepEqual(launch.command, ["claude", "--session-id", "c-1", "--model", "sonnet"]);
+  assert.ok(!launch.command.includes(CONTINUATION), "--continue has nothing to continue in a conversation with no turns");
+  assert.equal(session(w).account, "gmail");
+  assert.equal(session(w).state, "running");
 });
 
 test("switch --continue asks the resumed session to carry on", async (t) => {

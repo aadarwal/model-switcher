@@ -238,6 +238,28 @@ function readKeychainBlob(item: KeychainItem): string | null {
   return r.stdout.trim();
 }
 
+/**
+ * A fingerprint of the scoped item's VALUE — enough to tell whether something
+ * replaced it, and nothing else.
+ *
+ * `ms accounts login` has to answer "did the browser login I just ran write
+ * this item?", and existence cannot answer it: on macOS a login overwrites the
+ * item in place, so an item that was there before and an item the login just
+ * replaced look identical to a probe. A refusal that deletes on existence
+ * alone therefore destroys a pre-existing grant whenever the login wrote
+ * nothing — which is a documented live path.
+ *
+ * The blob never leaves this function: it is read, hashed, and dropped. The
+ * digest is a fact ABOUT a credential, so it is never logged, never printed
+ * and never put in an error message either — it is only ever compared. `null`
+ * means "nothing readable there", which is not the same answer as a hash and
+ * must never be treated as one.
+ */
+export function stampKeychainItem(name: string): string | null {
+  const blob = readKeychainBlob(keychainItemFor(name));
+  return blob === null ? null : createHash("sha256").update(blob).digest("hex").slice(0, 16);
+}
+
 /** Delete the scoped item — `ms accounts remove`'s last piece of cleanup.
  *  Best-effort: an item that was not there is not a failure to report. And it
  *  can only ever be this account's own item, never the human's login. */
@@ -349,15 +371,43 @@ export function stampCredFile(name: string): CredFileStamp {
  */
 export function discardStaleCredFile(name: string, before: CredFileStamp): boolean {
   if (before === null) return false;
-  const now = stampCredFile(name);
-  if (now === null) return false;
-  if (now.ino !== before.ino || now.mtimeMs !== before.mtimeMs || now.size !== before.size) return false;
+  if (!sameStamp(stampCredFile(name), before)) return false;
+  return unlinkCredFile(name);
+}
+
+/** Is this the very same file, untouched? Two nulls are not: "there is no
+ *  file" is not an identity anything can be compared by. */
+function sameStamp(a: CredFileStamp, b: CredFileStamp): boolean {
+  return a !== null && b !== null && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.size === b.size;
+}
+
+/** Best effort, and nothing here is a secret: a file that would not unlink is
+ *  not a login to fail over. */
+function unlinkCredFile(name: string): boolean {
   try {
     unlinkSync(credFile(name));
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Drop a credentials file that THIS run's login wrote — the mirror of
+ * `discardStaleCredFile`, for the opposite moment.
+ *
+ * That one keeps what the login wrote and drops what it did not, because a
+ * fresh login's grant wins. This one is for a login that was REFUSED (`ms
+ * accounts login`'s identity check turned the sign-in away), so what the login
+ * wrote goes and whatever was already there stays. A file whose stamp is
+ * exactly the one taken before the login is a file the login never touched,
+ * and it is not this run's to delete.
+ */
+export function discardFreshCredFile(name: string, before: CredFileStamp): boolean {
+  const now = stampCredFile(name);
+  if (now === null) return false;
+  if (sameStamp(now, before)) return false;
+  return unlinkCredFile(name);
 }
 
 // --- Refresh, with write-back -----------------------------------------
@@ -464,6 +514,25 @@ function writeCredFile(name: string, c: PollCredentials): boolean {
     );
     return false;
   }
+}
+
+/**
+ * Put a poll grant back in the credentials file — where `readPollGrant` looks
+ * first.
+ *
+ * `ms accounts login --relogin` deliberately replaces a working grant, and on
+ * macOS `claude auth login` overwrites the keychain item in place: once it has
+ * run, the credential it replaced exists only in the copy read before it. So a
+ * refused re-login restores that copy HERE rather than to the item it came
+ * from — there is no safe way to write a ~600-byte secret through `security`
+ * (see `runSecurity`), and the file is not a second-best copy but the place
+ * every reader prefers, exactly as the refresh write-back already treats it.
+ *
+ * Best effort, never throws; the caller has nothing different to do about a
+ * restore that would not write than about one that did.
+ */
+export function restorePollGrantFile(name: string, c: PollCredentials): boolean {
+  return writeCredFile(name, c);
 }
 
 /** The token endpoint's success body, as far as this file uses it. */

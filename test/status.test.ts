@@ -309,7 +309,7 @@ async function seedSessions(w: World): Promise<{ sess1: string; sess2: string; w
  *  separator is exactly two, and padding only ever adds more). */
 const cells = (line: string): string[] => line.trim().split(/\s{2,}/);
 
-test("ms status: accounts table (NAME LABEL 5H WEEK FABLE RESETS STATE) and sessions table, with the unreported flag", async () => {
+test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE) and sessions table, with the unreported flag", async () => {
   const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
   await seedSessions(w);
   const { localTimeCli } = await import("../src/status.ts");
@@ -320,21 +320,22 @@ test("ms status: accounts table (NAME LABEL 5H WEEK FABLE RESETS STATE) and sess
   const lines = r.stdout.split("\n");
   const accHeaderIdx = lines.findIndex((l) => l.startsWith("NAME"));
   assert.ok(accHeaderIdx >= 0, r.stdout);
-  assert.deepEqual(cells(lines[accHeaderIdx]!), ["NAME", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"]);
+  assert.deepEqual(cells(lines[accHeaderIdx]!), ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"]);
 
   const dirkLine = lines.find((l) => l.startsWith("dirk"))!;
   assert.ok(dirkLine, r.stdout);
   assert.deepEqual(cells(dirkLine), [
-    "dirk", "Dirk", "42.5%", "10%", "33.3%", localTimeCli(Date.parse("2026-09-18T12:30:00Z")), "ok",
+    "dirk", "claude", "Dirk", "42.5%", "10%", "33.3%", localTimeCli(Date.parse("2026-09-18T12:30:00Z")), "ok",
   ]);
 
   const gmailLine = lines.find((l) => l.startsWith("gmail"))!;
   assert.ok(gmailLine, r.stdout);
   const gmailCells = cells(gmailLine);
   assert.equal(gmailCells[0], "gmail");
-  assert.equal(gmailCells[1], "Gmail");
-  assert.equal(gmailCells[2], "—"); // no poll grant → no reading
-  assert.equal(gmailCells[6], "no-grant");
+  assert.equal(gmailCells[1], "claude");
+  assert.equal(gmailCells[2], "Gmail");
+  assert.equal(gmailCells[3], "—"); // no poll grant → no reading
+  assert.equal(gmailCells[7], "no-grant");
 
   const sessHeaderIdx = lines.findIndex((l) => l.startsWith("SESSION"));
   assert.ok(sessHeaderIdx >= 0, r.stdout);
@@ -441,10 +442,11 @@ test("ms status: a Codex account row renders — for FABLE and a missing 5H wind
   assert.ok(codexLine, r.stdout);
   const cCells = cells(codexLine);
   assert.equal(cCells[0], "codexacct");
-  assert.equal(cCells[1], "CodexAcct");
-  assert.equal(cCells[2], "—"); // 5H: no primary_window on this plan
-  assert.equal(cCells[4], "—"); // FABLE: codex has no fable-scoped window at all
-  assert.equal(cCells[6], "ok"); // a healthy read — never no-token, never no-grant
+  assert.equal(cCells[1], "codex");
+  assert.equal(cCells[2], "CodexAcct");
+  assert.equal(cCells[3], "—"); // 5H: no primary_window on this plan
+  assert.equal(cCells[5], "—"); // FABLE: codex has no fable-scoped window at all
+  assert.equal(cCells[7], "ok"); // a healthy read — never no-token, never no-grant
 
   const sess3 = lines.find((l) => l.startsWith("sess-3"))!;
   assert.ok(sess3, r.stdout);
@@ -488,7 +490,8 @@ test("ms status: a Codex account with no auth.json reads STATE no-grant through 
   assert.ok(codexLine, r.stdout);
   const cCells = cells(codexLine);
   assert.equal(cCells[0], "codexnogrant");
-  assert.equal(cCells[6], "no-grant");
+  assert.equal(cCells[1], "codex");
+  assert.equal(cCells[7], "no-grant");
 });
 
 test("ms status --json prints { accounts, sessions, takenAt } and parses", async () => {
@@ -606,7 +609,7 @@ test("ms status --watch actually loops: MS_WATCH_ITERATIONS=2 redraws twice, not
   // newline between them), so "starts with NAME" per split("\n") line only
   // matches the SECOND redraw onward — count occurrences in the raw text
   // instead.
-  const headerCount = (r.stdout.match(/NAME\s+LABEL\s+5H\s+WEEK\s+FABLE\s+RESETS\s+STATE/g) ?? []).length;
+  const headerCount = (r.stdout.match(/NAME\s+PROVIDER\s+LABEL\s+5H\s+WEEK\s+FABLE\s+RESETS\s+STATE/g) ?? []).length;
   assert.equal(headerCount, 2, r.stdout);
   const sessionHeaderCount = (r.stdout.match(/SESSION\s+PANE\s+PROVIDER\s+ACCOUNT\s+NEED\s+STATE\s+GEN\s+PENDING\s+WAKEUP\s+WALLED\?/g) ?? []).length;
   assert.equal(sessionHeaderCount, 2, r.stdout);
@@ -614,10 +617,12 @@ test("ms status --watch actually loops: MS_WATCH_ITERATIONS=2 redraws twice, not
 
 test("ms status: a session whose pane no longer exists shows STATE gone, with no WALLED? flag", async () => {
   // %2 is deliberately left out of `list-panes` — sess-2's pane is gone.
+  // Finding F6: a gone row is hidden by default, so this reads it with
+  // --all — the word itself, not the default-hide rule, is the point here.
   const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": "" } });
   await seedSessions(w);
 
-  const r = run(["status"], env());
+  const r = run(["status", "--all"], env());
   assert.equal(r.code, 0, r.stderr);
 
   const lines = r.stdout.split("\n");
@@ -641,11 +646,12 @@ test("ms status --json: a gone pane's JSON state is the same word the text table
   // (seedSessions), so a fix that only patches the text table's own
   // `sessionRow` — and not `statusJson`'s `computeSession` application —
   // would print "gone" in one place and "running" in the other for the
-  // same closed pane.
+  // same closed pane. Finding F6: a gone row is hidden by default, so this
+  // reads it with --all.
   const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": "" } });
   await seedSessions(w);
 
-  const r = run(["status", "--json"], env());
+  const r = run(["status", "--json", "--all"], env());
   assert.equal(r.code, 0, r.stderr);
   const parsed = JSON.parse(r.stdout) as { sessions: { id: string; state: string }[] };
   const s2 = parsed.sessions.find((s) => s.id === "sess-2")!;
@@ -655,6 +661,75 @@ test("ms status --json: a gone pane's JSON state is the same word the text table
   // sess-1's pane is still there and unaffected.
   const s1 = parsed.sessions.find((s) => s.id === "sess-1")!;
   assert.equal(s1.state, "walled");
+});
+
+// --- Finding F6: gone/stopped sessions hidden by default -------------------
+//
+// `/api/state` and `ms status` used to list every session the store had ever
+// recorded — 17 `gone` rows before one run, 20 after. `ms status` now hides
+// `gone` and `stopped` rows by default and shows them with `--all`;
+// `/api/state` itself is UNCHANGED (see test/dashboard-api.test.ts's own GET
+// /api/state test — statusJson() is not touched here at all), because the
+// dashboard page filters client-side over that same, still-complete json
+// (test/dashboard-client.test.ts's isFinishedSession/visibleSessions tests).
+
+test("ms status: gone and stopped sessions are hidden by default, and --all shows them", async () => {
+  // %2 is left out of list-panes (the same fixture shape as the "gone" tests
+  // above), so sess-2 reads STATE gone; sess-3 is created directly in state
+  // "stopped" — the other word --all is the escape hatch for.
+  const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": WALL_SCREEN } });
+  await seedSessions(w);
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    st.createSession({
+      id: "sess-3", provider: "claude", cliSessionId: "cli-3", cwd: "/tmp/work3",
+      socket: TMUX_SOCKET, pane: "", serverStart: "srv1",
+      need: "any", account: "dirk", generation: 1, state: "stopped", desired: "stopped", flags: [],
+    });
+  } finally {
+    st.close();
+  }
+
+  const r = run(["status"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const lines = r.stdout.split("\n");
+  assert.ok(lines.some((l) => l.startsWith("sess-1")), r.stdout);
+  assert.ok(!lines.some((l) => l.startsWith("sess-2")), `a gone session shown by default: ${r.stdout}`);
+  assert.ok(!lines.some((l) => l.startsWith("sess-3")), `a stopped session shown by default: ${r.stdout}`);
+
+  const rAll = run(["status", "--all"], env());
+  assert.equal(rAll.code, 0, rAll.stderr);
+  const allLines = rAll.stdout.split("\n");
+  assert.ok(allLines.some((l) => l.startsWith("sess-1")), rAll.stdout);
+  assert.ok(allLines.some((l) => l.startsWith("sess-2")), `--all did not show the gone session: ${rAll.stdout}`);
+  assert.ok(allLines.some((l) => l.startsWith("sess-3")), `--all did not show the stopped session: ${rAll.stdout}`);
+});
+
+test("ms status --json: gone/stopped are hidden by default and included with --all, the same two words the text table uses", async () => {
+  const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": WALL_SCREEN } });
+  await seedSessions(w);
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    st.createSession({
+      id: "sess-3", provider: "claude", cliSessionId: "cli-3", cwd: "/tmp/work3",
+      socket: TMUX_SOCKET, pane: "", serverStart: "srv1",
+      need: "any", account: "dirk", generation: 1, state: "stopped", desired: "stopped", flags: [],
+    });
+  } finally {
+    st.close();
+  }
+
+  const r = run(["status", "--json"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout) as { sessions: { id: string; state: string }[] };
+  assert.deepEqual(parsed.sessions.map((s) => s.id).sort(), ["sess-1"]);
+
+  const rAll = run(["status", "--json", "--all"], env());
+  assert.equal(rAll.code, 0, rAll.stderr);
+  const parsedAll = JSON.parse(rAll.stdout) as { sessions: { id: string; state: string }[] };
+  assert.deepEqual(parsedAll.sessions.map((s) => s.id).sort(), ["sess-1", "sess-2", "sess-3"]);
 });
 
 test("ms status: an unreadable registry prints its parse error as the first line", async () => {

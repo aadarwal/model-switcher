@@ -23,8 +23,15 @@ import type { Verb } from "./cli.ts";
 import { claudeSettingsPath, msBinary, msHome, p } from "./paths.ts";
 import { claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
 import { codexConfigPath, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
-import { loadRegistry, type Account } from "./registry.ts";
-import { AuthError, TransientError, readPollGrant, refreshPollCredentials } from "./providers/claude-usage.ts";
+import { loadRegistry, organisationClaimedBy, sameOrganisationAs, type Account } from "./registry.ts";
+import {
+  AuthError,
+  fetchProfile,
+  type PollCredentials,
+  TransientError,
+  readPollGrant,
+  refreshPollCredentials,
+} from "./providers/claude-usage.ts";
 import { fetchCodexUsage, readCodexCredentials } from "./providers/codex-usage.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { codexAutorotateEnabled, codexAutorotateLine } from "./autorotate.ts";
@@ -50,6 +57,9 @@ const CODEX_TESTED_MINOR = "0.153";
  *  the access token already on disk, exactly as it never refreshes a Claude
  *  poll grant outside `--fix` (see `checkClaudeAccount` below). */
 const CODEX_USAGE_TIMEOUT_MS = 10_000;
+/** The profile read behind the identity line, on the same terms as the Codex
+ *  usage probe beside it: bounded, and never a refresh. */
+const IDENTITY_TIMEOUT_MS = 10_000;
 
 export function renderLine(r: Result): string {
   if (r.ok) return r.fixed ? `✓ ${r.what} → fixed` : `✓ ${r.what}`;
@@ -407,7 +417,60 @@ function checkRegistry(parseError: string | null, problems: string[]): Result[] 
 
 // --- Claude accounts ---------------------------------------------------
 
-export async function checkClaudeAccount(a: Account, fix: boolean): Promise<Result[]> {
+/**
+ * The identity line — and the organisation check `ms accounts verify` runs.
+ *
+ * Live on 2026-09-16: a refused `ms accounts login dirk` left the WRONG
+ * organisation's grant in dirk's keychain item. `ms accounts verify dirk`
+ * failed with "resolves to the same organisation as kratuvak", while this line
+ * read the registry's `identityVerified: true` — a verdict earned by an
+ * earlier, different credential — and printed ✓. A book and a doctor must
+ * never disagree about one credential, so the question is asked of the GRANT,
+ * through the same `organisationClaimedBy` the refusal uses and in the same
+ * words (`sameOrganisationAs`).
+ *
+ * The read is only made when it could change the answer. An organisation
+ * collides only with ANOTHER registered account's, so a book with no other
+ * claimed organisation costs no network call at all — exactly what `verify`
+ * would conclude, for free. A grant whose access token is due is not refreshed
+ * (`ms doctor` without `--fix` is read-only, and the line above already says
+ * it is due), and a read that fails says nothing: "could not tell" is not a
+ * collision. There is no `--fix` branch here, and there should not be: an
+ * identity is repaired by a human at a browser tab.
+ */
+async function checkClaudeIdentity(a: Account, book: Account[], cred: PollCredentials | null): Promise<Result> {
+  const tag = `claude account ${a.name}`;
+  const rivals = book.filter((x) => x.provider === "claude" && x.name !== a.name && x.orgId);
+  let checked = false;
+  if (cred && rivals.length > 0 && cred.expiresAt - Date.now() > REFRESH_DUE_MS) {
+    try {
+      const profile = await fetchProfile(cred, AbortSignal.timeout(IDENTITY_TIMEOUT_MS));
+      checked = true;
+      const other = profile.orgId ? organisationClaimedBy(rivals, a.name, profile.orgId) : null;
+      if (other) {
+        return {
+          ok: false,
+          what: `${tag}: identity`,
+          why: `${sameOrganisationAs(other)}; run ms accounts login ${a.name} --relogin`,
+        };
+      }
+    } catch {
+      /* could not tell — never a collision, and never a ✓ this run did not earn */
+    }
+  }
+  // A line says what was actually CHECKED. When the grant was read, "identity
+  // verified" is this run's own finding. When it was not — nothing to collide
+  // with, an access token inside the refresh window, a read that failed — the
+  // only thing true is the verdict `login`/`verify` recorded, and the line
+  // must not borrow the authority of a check that never ran. That overclaim is
+  // how the live dirk case read ✓ beside a `verify` that was failing.
+  const what = `${tag}: identity ${checked ? "verified" : "verified at login (not re-checked)"}`;
+  return a.identityVerified
+    ? { ok: true, what }
+    : { ok: false, what, why: "identityVerified is false in the registry" };
+}
+
+export async function checkClaudeAccount(a: Account, fix: boolean, book: Account[] = []): Promise<Result[]> {
   const tag = `claude account ${a.name}`;
   const out: Result[] = [];
 
@@ -469,11 +532,7 @@ export async function checkClaudeAccount(a: Account, fix: boolean): Promise<Resu
         },
   );
 
-  out.push(
-    a.identityVerified
-      ? { ok: true, what: `${tag}: identity verified` }
-      : { ok: false, what: `${tag}: identity verified`, why: "identityVerified is false in the registry" },
-  );
+  out.push(await checkClaudeIdentity(a, book, grant.state === "ok" ? grant.cred : null));
 
   return out;
 }
@@ -751,7 +810,7 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
 
   results.push(...checkRegistry(parseError, problems));
   for (const a of claudeAccounts) {
-    results.push(...(await checkClaudeAccount(a, fix)));
+    results.push(...(await checkClaudeAccount(a, fix, claudeAccounts)));
   }
 
   results.push(...(await checkOrphaned(fix)));

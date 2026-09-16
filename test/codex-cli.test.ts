@@ -6,7 +6,10 @@ import path from "node:path";
 
 const { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand, ensureCodexTrust } = await import("../src/providers/codex-cli.ts");
 
-const tempDir = (prefix: string) => mkdtempSync(path.join(tmpdir(), prefix));
+// Resolved: `os.tmpdir()` is `/tmp` on macOS, itself a symlink to `/private/tmp`,
+// and `src/paths.ts`'s `msHome()` now resolves `MS_HOME` the same way — so an
+// unresolved temp dir here would diverge from what the tool derives internally.
+const tempDir = (prefix: string) => realpathSync(mkdtempSync(path.join(tmpdir(), prefix)));
 const configOf = (home: string) => path.join(home, "config.toml");
 const read = (home: string) => readFileSync(configOf(home), "utf8");
 /** How many times a pattern occurs — the test for "one table, one key". */

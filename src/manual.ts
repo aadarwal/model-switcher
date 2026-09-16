@@ -42,7 +42,7 @@ import type { Verb } from "./cli.ts";
 import { handBackShell, releasePane } from "./handback.ts";
 import { Locked, withLock } from "./lock.ts";
 import { HANDOFF_SLOTS, isBusy, recoverSession, safeCapture, sessionLockName, stopPane, takeFailReason } from "./recover.ts";
-import { findAccount, loadRegistry } from "./registry.ts";
+import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
 import { wallKindFromText } from "./wall.ts";
@@ -67,7 +67,7 @@ const USAGE: Record<string, string> = {
   rotate: "usage: ms rotate [<session|pane>] [--force]",
   switch: [
     "usage: ms switch [<session|pane>] --to <account> [--continue] [--force]",
-    "       ms switch --all --to <account> [--continue] [--force] [--timeout <seconds>]",
+    "       ms switch --all --to <account> [--provider claude|codex] [--continue] [--force] [--timeout <seconds>]",
   ].join("\n"),
   stop: "usage: ms stop [<session|pane>]",
 };
@@ -85,8 +85,16 @@ function usage(verb: string, why: string): 2 {
 
 // --- The command line --------------------------------------------------
 
-type Options = { target: string | null; to: string | null; force: boolean; continueAfter: boolean; all: boolean; timeoutSeconds: number | null };
-type Allowed = { to?: boolean; continueAfter?: boolean; force?: boolean; all?: boolean; timeout?: boolean };
+type Options = {
+  target: string | null;
+  to: string | null;
+  force: boolean;
+  continueAfter: boolean;
+  all: boolean;
+  timeoutSeconds: number | null;
+  provider: Provider | null;
+};
+type Allowed = { to?: boolean; continueAfter?: boolean; force?: boolean; all?: boolean; timeout?: boolean; provider?: boolean };
 
 /**
  * One positional (a session id or a `%N` pane) plus whichever flags the verb
@@ -95,7 +103,7 @@ type Allowed = { to?: boolean; continueAfter?: boolean; force?: boolean; all?: b
  * move the session to an account nobody chose.
  */
 export function parseManualArgs(argv: string[], allowed: Allowed): Options | { error: string } {
-  const out: Options = { target: null, to: null, force: false, continueAfter: false, all: false, timeoutSeconds: null };
+  const out: Options = { target: null, to: null, force: false, continueAfter: false, all: false, timeoutSeconds: null, provider: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (allowed.to && (a === "--to" || a.startsWith("--to="))) {
@@ -119,6 +127,17 @@ export function parseManualArgs(argv: string[], allowed: Allowed): Options | { e
       const n = Number(v);
       if (!Number.isFinite(n) || n < 0) return { error: `--timeout needs a number of seconds, not ${JSON.stringify(v)}` };
       out.timeoutSeconds = n;
+      continue;
+    }
+    if (allowed.provider && (a === "--provider" || a.startsWith("--provider="))) {
+      const joined = a.startsWith("--provider=");
+      const v = joined ? a.slice("--provider=".length) : argv[i + 1];
+      if (!v || (!joined && v.startsWith("-"))) return { error: "--provider needs claude or codex" };
+      if (!joined) i++;
+      // The exact wording `ms accounts`' own `--provider` uses (`asProvider`,
+      // src/accounts.ts) — one escape hatch, one phrasing for a typo in it.
+      if (v !== "claude" && v !== "codex") return { error: `--provider takes claude|codex, not '${v}'` };
+      out.provider = v;
       continue;
     }
     if (allowed.all && a === "--all") { out.all = true; continue; }
@@ -364,10 +383,24 @@ export async function switchOne(
  * `results` is in candidate order — the store's own order — however the moves
  * finished; `onResult` is the other half of that, called as each one lands, so
  * a caller can print a line per session while the rest are still running.
+ *
+ * `opts.provider` is the same escape hatch `ms accounts`' own `--provider`
+ * gives a target verb (`resolveTarget`, src/accounts.ts): needed only when
+ * `to` is a name BOTH providers hold, where guessing would move a whole
+ * claude fleet on a codex typo. Omitted, the ambiguity refusal below is
+ * unchanged; given, it narrows which account `to` names before that check
+ * ever runs, so a genuinely ambiguous name resolves to one fleet instead of
+ * refusing.
  */
 export async function switchAll(
   to: string,
-  opts: { force: boolean; continueAfter: boolean | "auto"; timeoutMs: number; onResult?: (r: SwitchResult) => void },
+  opts: {
+    force: boolean;
+    continueAfter: boolean | "auto";
+    timeoutMs: number;
+    provider?: Provider;
+    onResult?: (r: SwitchResult) => void;
+  },
 ): Promise<{ results: SwitchResult[]; code: number; message: string | null }> {
   // Which fleet `to` names, and the three ways that question has no answer.
   // They live HERE rather than in the verb because the verb is not the only
@@ -379,8 +412,14 @@ export async function switchAll(
   // started, so there is nothing to summarise under it.
   const { registry, parseError } = loadRegistry();
   if (parseError) return { results: [], code: EXIT_REFUSED, message: `cannot read the registry: ${parseError}` };
-  const named = registry.accounts.filter((a) => a.name === to);
-  if (!named.length) return { results: [], code: EXIT_REFUSED, message: `no such account '${to}'` };
+  const named = registry.accounts.filter((a) => a.name === to && (!opts.provider || a.provider === opts.provider));
+  if (!named.length) {
+    return {
+      results: [],
+      code: EXIT_REFUSED,
+      message: opts.provider ? `no such ${opts.provider} account '${to}'` : `no such account '${to}'`,
+    };
+  }
   if (named.length > 1) {
     const which = named.map((a) => `a ${a.provider}`).join(" and ");
     return { results: [], code: EXIT_REFUSED, message: `'${to}' names ${which} account; --all cannot tell which fleet you mean` };
@@ -454,6 +493,7 @@ async function switchAllVerb(parsed: Options): Promise<number> {
     force: parsed.force,
     continueAfter: parsed.continueAfter || "auto",
     timeoutMs: (parsed.timeoutSeconds ?? ALL_TIMEOUT_SECONDS) * 1000,
+    provider: parsed.provider ?? undefined,
     onResult: (r) =>
       process.stderr.write(r.code === EXIT_OK ? `ms: ${r.session} moved → ${to}\n` : `ms: ${r.session} refused: ${r.message}\n`),
   });
@@ -467,12 +507,15 @@ async function switchAllVerb(parsed: Options): Promise<number> {
 }
 
 export const switchVerb: Verb = async (argv) => {
-  const parsed = parseManualArgs(argv, { to: true, force: true, continueAfter: true, all: true, timeout: true });
+  const parsed = parseManualArgs(argv, { to: true, force: true, continueAfter: true, all: true, timeout: true, provider: true });
   if ("error" in parsed) return usage("switch", parsed.error);
   if (parsed.all) return switchAllVerb(parsed);
   // One session waits exactly as long as its own handoff takes; there is
-  // nothing for a budget to stop starting.
+  // nothing for a budget to stop starting. A single session's own row already
+  // says which provider it is — `--provider` disambiguates a NAME two
+  // providers hold, which only matters when `--all` is picking a fleet by it.
   if (parsed.timeoutSeconds !== null) return usage("switch", "--timeout bounds --all");
+  if (parsed.provider) return usage("switch", "--provider bounds --all");
   if (!parsed.to) return usage("switch", "--to <account> is required");
   const found = withSession(parsed.target);
   if ("error" in found) return found.code === EXIT_USAGE ? usage("switch", found.error) : refuse("switch", found.error);

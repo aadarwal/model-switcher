@@ -40,8 +40,8 @@ export function buildStopBody(session: string): { session: string } {
   return { session: session };
 }
 
-export function buildSwitchAllBody(to: string, force: boolean): { to: string; force: boolean } {
-  return { to: to, force: force };
+export function buildSwitchAllBody(to: string, force: boolean, provider: string): { to: string; force: boolean; provider: string } {
+  return { to: to, force: force, provider: provider };
 }
 
 // --- Poll retry/backoff state machine (finding 6) --------------------------
@@ -173,6 +173,7 @@ export function accountRowHtml(a: AccountRowView, dash: string): string {
   return (
     "<tr>" +
     "<td>" + esc(a.name) + "</td>" +
+    "<td>" + esc(a.provider || dash) + "</td>" +
     "<td>" + esc(a.label) + "</td>" +
     "<td>" + fmtPercent(u.session, dash) + "</td>" +
     "<td>" + fmtPercent(u.weeklyAll, dash) + "</td>" +
@@ -284,4 +285,43 @@ export function fleetCandidateIds(sessions: SessionRowView[], provider: string, 
     if (s.provider === provider && s.account !== to) out.push(s.id);
   }
   return out;
+}
+
+// --- Finished sessions: hidden by default (finding F6) ---------------------
+//
+// `/api/state` always carries every session the store has ever recorded —
+// `gone` (the pane is dead) and `stopped` (ended, by a human or a handoff)
+// included, which is how the sessions table only ever grew. That route stays
+// exactly as it is (`src/status.ts`'s `statusJson()` is the dashboard's own
+// data source too, and other pages may want the full history) — the page
+// filters client-side over the SAME json instead, on the same two words `ms
+// status`'s own `--all` toggles, so the CLI table and this page can never
+// disagree about what "finished" means.
+
+export function isFinishedSession(s: SessionRowView): boolean {
+  var FINISHED_STATES: { [k: string]: number } = { gone: 1, stopped: 1 };
+  return !!FINISHED_STATES[s.state];
+}
+
+/** The rows the sessions table actually renders: every row once the human
+ *  has asked to see finished ones, otherwise every row that isn't finished. */
+export function visibleSessions(sessions: SessionRowView[], showFinished: boolean): SessionRowView[] {
+  if (showFinished) return sessions;
+  var out: SessionRowView[] = [];
+  for (var i = 0; i < sessions.length; i++) {
+    if (!isFinishedSession(sessions[i]!)) out.push(sessions[i]!);
+  }
+  return out;
+}
+
+/** The toggle's own label: blank — which the page reads as "hide the
+ *  control" — when nothing is finished, otherwise how many are hidden (or,
+ *  once shown, how many a second click would hide again). */
+export function finishedToggleText(sessions: SessionRowView[], showFinished: boolean): string {
+  var n = 0;
+  for (var i = 0; i < sessions.length; i++) {
+    if (isFinishedSession(sessions[i]!)) n++;
+  }
+  if (!n) return "";
+  return (showFinished ? "hide " : "show ") + n + " finished";
 }

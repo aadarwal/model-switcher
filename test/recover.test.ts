@@ -2003,9 +2003,22 @@ test("a codex session that needs fable is refused: there is no such window to wa
   assert.equal(s.account, "work");
   assert.equal(s.state, "walled");
   assert.equal(s.wakeupAt, null);
+  // A-M7. The refusal is TERMINAL, so the row that asked for it is closed.
+  // Left pending and unowned, `reconcile`'s `redispatchOrphan` sends a worker
+  // at it every 45 s for ever, and every one of them lands here and says the
+  // same thing. `failed`, not `done`: a reader can tell "rotated fine" from
+  // "needs a human", and a real wall on a later generation can still open a
+  // fresh recovery over it.
   const rec = rows(w, "recoveries")[0];
-  assert.equal(rec.status, "pending");
+  assert.equal(rec.status, "failed");
   assert.equal(rec.owner, null, "nothing was claimed");
+
+  // A second dispatch changes nothing further, and finds nothing to re-open.
+  assert.equal(await recoverSession("s1"), 2);
+  assert.equal(rows(w, "recoveries").length, 1);
+  assert.equal(rows(w, "recoveries")[0].status, "failed");
+  assert.equal(session(w).state, "walled", "the session itself is untouched");
+  assert.equal(session(w).account, "work");
 });
 
 test("no codex credential ever reaches a tmux command line", async (t) => {

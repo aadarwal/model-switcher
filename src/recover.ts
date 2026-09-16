@@ -35,7 +35,6 @@
 
 import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readdirSync, statSync } from "node:fs";
-
 import { hostname } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -940,9 +939,23 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
     // Only the automatic path. A human's `ms rotate`/`switch --as` is not
     // asking the chooser to satisfy a need — it names the account, or accepts
     // whatever has room — and refusing them here would leave a hand-edited row
-    // with no way out at all. Nothing is claimed and nothing is touched.
+    // with no way out at all. Nothing is claimed, and the only thing written
+    // is the closing of the row below.
     if (!opts.manual && session.provider === "codex" && session.need === "fable") {
       const why = `codex has no fable window; ${id} cannot be recovered while it needs fable`;
+      // A TERMINAL refusal, so the row that asked for it is closed. Left
+      // pending and unowned, `reconcile`'s `redispatchOrphan` sends a worker
+      // at it every 45 s for ever, and every one of them lands here and says
+      // the same thing. `failed` (not `done`) is what `park` uses for the same
+      // reason: a reader can tell "rotated fine" from "needs a human", and
+      // `one_open_recovery` already treats anything outside pending/owned as
+      // closed, so a real wall on a later generation can still open one.
+      //
+      // The SESSION is not touched. It is not parked, it keeps its state and
+      // its account, and the human's own `ms rotate`/`switch --as` — which
+      // never comes through here — still moves it.
+      const rec = st.pendingRecovery(id);
+      if (rec) st.finishRecovery(rec.id, "failed");
       logLine(id, g, why);
       process.stderr.write(`ms _recover: ${why}\n`);
       return 2;

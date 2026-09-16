@@ -514,3 +514,117 @@ test("a line longer than the read cap is stepped over rather than stalling the s
   }
   assert.match(heard.join(""), /s1: skipped \d+ rollout bytes with no line break/);
 });
+
+test("an end event from a generation the session has left does not mask the new turn", async () => {
+  // A-M1. A pass that listed the row before a `--force` rotate can append a
+  // stale-generation `rate_limited` AFTER the new generation's `activity`.
+  // Counting any generation's end as this turn's end hid the live turn until
+  // the human's next prompt — and with the gate on, that is a wall nobody
+  // notices.
+  const w = await world({
+    rows: [{ id: "s1", generation: 3 }],
+    events: {
+      s1: [
+        { t: NOW() - 3, kind: "activity", session: "s1", generation: 3, turnId: "t-new" },
+        { t: NOW() - 2, kind: "rate_limited", session: "s1", generation: 2, turnId: "t-old", kindDetail: "session" },
+      ],
+    },
+    rollouts: { s1: [noise(1)] },
+  });
+
+  assert.equal(await watch(), 0);
+  assert.equal(rearms(w.tlog), 1, "the live turn is still watched");
+
+  // ...and the turn it watches is the NEW one: its own task_complete settles it.
+  appendFileSync(w.rollout("s1"), taskComplete("t-new", "usage_limit_exceeded") + "\n");
+  const st0 = w.openState();
+  try { st0.delKv("codexWatchArmedUntil"); } finally { st0.close(); }
+  assert.equal(await watch(), 0);
+  const ev = events(w.msHome).pop()!;
+  assert.deepEqual([ev.kind, ev.turnId, ev.generation], ["rate_limited", "t-new", 3]);
+});
+
+test("a /new mid-pass keeps its fresh offset: the old file's offset is never stamped on the new path", async () => {
+  // A-M2. The row is read at the start of a pass and the offset stamped at the
+  // end of it. In between, a `/new` fires a SessionStart whose hook points the
+  // row at a fresh rollout and resets the offset to 0 \u2014 and that hook does not
+  // hold the watch's lock. Stamping the old file's offset onto the new path
+  // would make the watch skip the first N bytes of a conversation nothing has
+  // read (it self-heals only while the new file happens to be shorter).
+  const w = await world({ rollouts: { s1: [noise(1), noise(2), noise(3)] } });
+  const fresh = path.join(w.home, "rollout-fresh.jsonl");
+  writeFileSync(fresh, noise(9) + "\n");
+
+  const st = w.openState();
+  try {
+    const old = String((st.getSession("s1") as Record<string, unknown>).transcriptPath);
+    // The hook, mid-pass: a new conversation and an offset of zero.
+    st.updateSession("s1", { transcriptPath: fresh, rolloutOffset: 0 });
+    // The watch, finishing its pass over the OLD file.
+    st.advanceRolloutOffset("s1", old, 4096);
+    const after = st.getSession("s1") as Record<string, unknown>;
+    assert.equal(after.transcriptPath, fresh);
+    assert.equal(after.rolloutOffset, 0, "the stale stamp missed: the row no longer names that file");
+    // ...and a stamp that DOES name the current file still lands.
+    st.advanceRolloutOffset("s1", fresh, 17);
+    assert.equal((st.getSession("s1") as Record<string, unknown>).rolloutOffset, 17);
+  } finally {
+    st.close();
+  }
+});
+
+test("a turn that began DURING the pass is picked up before the watch stands down", async () => {
+  // A-M3. A `UserPromptSubmit` that loses the 2 s lock wait appends its
+  // `activity` and arms nothing \u2014 the watch holds the lock. The end-of-pass
+  // check re-read only the timer claim, not the events, so with a single busy
+  // session that turn went unwatched for good and its wall would never be
+  // noticed.
+  //
+  // The concurrent write is real, not simulated: the tmux stub that the wall's
+  // own `_recover` dispatch runs appends the late `activity` while this pass is
+  // still inside its lock.
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  const tlog = path.join(home, "tmux.log");
+  const evFile = path.join(msHome, "sessions", "s1", "events.jsonl");
+  stub(
+    "tmux",
+    `printf '%s\\n' "$*" >> "${tlog}"\n` +
+      `case "$*" in *_recover*) printf '%s\\n' '{"t":'"$(date +%s)"',"kind":"activity","session":"s1","generation":2,"turnId":"t-2"}' >> "${evFile}";; esac\n` +
+      `exit 0`,
+  );
+
+  process.env.HOME = home;
+  process.env.MS_HOME = msHome;
+  process.env.MS_BIN = MS_BIN;
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  process.env.MS_CODEX_AUTOROTATE = "1";
+
+  const rollout = path.join(home, "rollout-s1.jsonl");
+  writeFileSync(rollout, [noise(1), taskComplete("t-1", "usage_limit_exceeded")].join("\n") + "\n");
+
+  const { openState } = await import("../src/state.ts");
+  const st0 = openState();
+  st0.createSession({ id: "s1", provider: "codex", cliSessionId: "cx-s1", cwd: "/tmp", socket: SOCKET, pane: "%7", serverStart: "1",
+    need: "any", account: "dirk", generation: 2, state: "running", desired: "running", flags: [] });
+  st0.updateSession("s1", { transcriptPath: rollout });
+  st0.close();
+
+  const { appendEvent } = await import("../src/events.ts");
+  appendEvent({ t: NOW() - 5, kind: "activity", session: "s1", generation: 2, turnId: "t-1" });
+
+  assert.equal(await watch(), 0);
+
+  // The pass settled t-1 (the wall), which is why `inFlight` was null \u2014 and
+  // t-2 arrived while it was doing so.
+  const kinds = events(msHome).map((e) => `${e.kind}:${e.turnId}`);
+  assert.deepEqual(kinds, ["activity:t-1", "rate_limited:t-1", "activity:t-2"]);
+  assert.equal(rearms(tlog), 1, "the late turn re-armed the watch instead of standing down");
+  const st = openState();
+  try {
+    assert.ok(Number(st.getKv("codexWatchArmedUntil")) > NOW(), "and the claim was renewed, not cleared");
+  } finally {
+    st.close();
+  }
+  delete process.env.MS_CODEX_AUTOROTATE;
+});

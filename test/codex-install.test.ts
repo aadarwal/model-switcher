@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tempHome } from "./helpers.ts";
-import { codexHookTables, codexHooksInstalled, codexTrustedHash, installCodexHooks } from "../src/hooks/codex-install.ts";
+import { codexHookTables, codexHooksInstalled, codexTrustedHash, ensureCodexHooks, installCodexHooks } from "../src/hooks/codex-install.ts";
 
 const MS = "/opt/homebrew/bin/ms";
 const CMD = `${MS} _hook codex`;
@@ -372,4 +372,39 @@ test("a first install into a config that already carries a webhooks project is a
   assert.equal(codexHooksInstalled(d, MS), true);
   // The project table is NOT counted as a matcher: our trust keys stay at index 0.
   assert.ok(read(d).includes(`[hooks.state."${config(d)}:session_start:0:0"]`));
+});
+
+test("a backup is 0600 even when the config it copied was not", () => {
+  // A-M4. `copyFileSync` gives the copy the SOURCE's mode (libuv fchmods to
+  // `st_mode`), and Codex's own writes — the modal trust prompt, `/settings`
+  // → t — are 0644. A backup is a full copy of a file naming every project
+  // this account is trusted in, so it is 0600 like the file this tool writes.
+  const d = home();
+  writeFileSync(config(d), 'model = "gpt-5-codex"\n', { mode: 0o644 });
+  chmodSync(config(d), 0o644); // writeFileSync's mode is subject to umask
+  assert.equal(statSync(config(d)).mode & 0o777, 0o644, "the fixture really is world-readable");
+
+  const r = installCodexHooks(d, MS);
+  assert.equal(r.changed, true);
+  assert.ok(r.backup, "a backup was taken");
+  assert.equal(statSync(r.backup!).mode & 0o777, 0o600, "the backup is not world-readable");
+  assert.equal(statSync(config(d)).mode & 0o777, 0o600, "and neither is the file it replaced");
+  assert.equal(readFileSync(r.backup!, "utf8"), 'model = "gpt-5-codex"\n', "with the original bytes");
+});
+
+test("ensureCodexHooks is the one idempotent call: installs once, then does nothing, and reports a refusal", () => {
+  const d = home();
+  const first = ensureCodexHooks(d, MS);
+  assert.equal(first.problem, undefined);
+  assert.equal(first.changed, true);
+  assert.equal(codexHooksInstalled(d, MS), true);
+
+  const second = ensureCodexHooks(d, MS);
+  assert.deepEqual([second.changed, second.backup, second.problem], [false, null, undefined], "nothing to do, nothing written");
+
+  const bad = home();
+  writeFileSync(config(bad), "[hooks]\nSessionStart = []\n", { mode: 0o600 });
+  const refused = ensureCodexHooks(bad, MS);
+  assert.match(refused.problem!, /cannot read/);
+  assert.equal(refused.changed, false);
 });

@@ -331,6 +331,12 @@ export function installCodexHooks(homeDir: string, msBin: string): InstallResult
   if (existed) {
     backup = `${file}.bak-ms-${Math.floor(Date.now() / 1000)}`;
     copyFileSync(file, backup);
+    // `copyFileSync` gives the copy the SOURCE's mode (libuv fchmods to
+    // `st_mode`), and Codex's own writes — the modal trust prompt,
+    // `/settings` → t — are 0644. A backup is a full copy of a file that
+    // names every project this account is trusted in, so it is 0600 like the
+    // original this tool writes, not like the one it found.
+    chmodSync(backup, 0o600);
   } else {
     mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   }

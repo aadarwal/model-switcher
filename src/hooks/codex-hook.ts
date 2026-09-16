@@ -422,9 +422,22 @@ export async function codexWatch(): Promise<number> {
           const seconds = await watchSeconds();
           new Tmux(inFlight.socket).runShell([msBinary(), "_codex_watch"], { delaySeconds: seconds });
           claimTimer(st, seconds);
-        } else {
-          st.delKv(ARMED_UNTIL);
+          return;
         }
+        // Nothing was still flying when this pass read it — but the pass took
+        // time, and a `UserPromptSubmit` that lost the 2 s lock wait appended
+        // its `activity` and armed nothing. Standing down on the pre-pass
+        // answer would leave that turn unwatched for good: with a single busy
+        // session, its wall would never be noticed. So look again, cheaply,
+        // before the claim is cleared.
+        const late = firstInFlight(st);
+        if (late) {
+          const seconds = await watchSeconds();
+          new Tmux(late.socket).runShell([msBinary(), "_codex_watch"], { delaySeconds: seconds });
+          claimTimer(st, seconds);
+          return;
+        }
+        st.delKv(ARMED_UNTIL);
       } finally {
         st.close();
       }
@@ -448,14 +461,31 @@ function inFlightTurn(s: SessionRow): { turnId: string; activityIndex: number } 
   let act = -1;
   let end = -1;
   for (let i = 0; i < events.length; i++) {
-    const k = events[i].kind;
-    if (k === "activity") act = i;
-    else if (k === "stop" || k === "rate_limited" || k === "ended") end = i;
+    const e = events[i];
+    // BOTH halves are filtered by generation, not just the activity. An end
+    // from a generation the session has left belongs to a process that is
+    // gone: a pass that listed the row before a `--force` rotate and appended
+    // a stale-generation `rate_limited` after the new `activity` would
+    // otherwise mask the new turn until its next prompt.
+    if (e.generation !== s.generation) continue;
+    if (e.kind === "activity") act = i;
+    else if (e.kind === "stop" || e.kind === "rate_limited" || e.kind === "ended") end = i;
   }
   if (act < 0 || end > act) return null;
   const a = events[act];
-  if (a.generation !== s.generation || !a.turnId) return null;
+  if (!a.turnId) return null;
   return { turnId: a.turnId, activityIndex: act };
+}
+
+/** The first Codex session with a turn in flight, or null. A pure read of the
+ * rows and their event logs — no rollout is tailed and nothing is written. */
+function firstInFlight(st: State): SessionRow | null {
+  for (const s of st.listSessions()) {
+    if (s.provider !== "codex") continue;
+    if (s.state !== "running" && s.state !== "continuing") continue;
+    if (inFlightTurn(s)) return s;
+  }
+  return null;
 }
 
 /**
@@ -501,7 +531,7 @@ async function readRollout(st: State, s: SessionRow, turn: { turnId: string }): 
     // never seeing the turn end. Step over it. Nothing is lost that this tool
     // could have read: a `task_complete` record is a few hundred bytes.
     if (buf.length >= ROLLOUT_CHUNK_MAX) {
-      st.updateSession(s.id, { rolloutOffset: from + buf.length });
+      st.advanceRolloutOffset(s.id, s.transcriptPath, from + buf.length);
       note(`${s.id}: skipped ${buf.length} rollout bytes with no line break`);
     }
     return false;
@@ -538,7 +568,11 @@ async function readRollout(st: State, s: SessionRow, turn: { turnId: string }): 
   // that carried nothing for this turn is fully consumed however it went; a
   // chunk whose record we could not write down is re-read next pass, which is
   // the entire reason the append comes first.
-  if (!lost) st.updateSession(s.id, { rolloutOffset: from + lastNewline + 1 });
+  // ...and onto THIS file only. A `/new` mid-pass has already pointed the row
+  // at a fresh rollout and reset the offset to 0, without holding this lock;
+  // stamping the old file's offset onto the new path would skip the first N
+  // bytes of a conversation nothing has read.
+  if (!lost) st.advanceRolloutOffset(s.id, s.transcriptPath, from + lastNewline + 1);
   return settled;
 }
 

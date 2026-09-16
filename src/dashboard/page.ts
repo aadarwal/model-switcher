@@ -43,6 +43,9 @@ import {
   sessionRowHtml,
   formatSwitchAll,
   fleetCandidateIds,
+  isFinishedSession,
+  visibleSessions,
+  finishedToggleText,
   MAX_POLL_FAILURES,
 } from "./client-logic.ts";
 
@@ -82,6 +85,7 @@ td.actions { display: flex; align-items: center; gap: 6px; white-space: nowrap; 
    flex control it would have been one squashed run of text. */
 #moveall-msg { display: block; white-space: pre-line; line-height: 1.5; margin: 0 0 10px; }
 .empty { color: #bab8b0; font-style: italic; }
+.finished-toggle { font-size: 11px; font-weight: 400; padding: 2px 8px; margin-left: 8px; vertical-align: middle; color: #bab8b0; }
 `;
 
 // Every function in this list is imported from ./client-logic.ts, so its
@@ -106,6 +110,9 @@ const EMBEDDED = [
   sessionRowHtml,
   formatSwitchAll,
   fleetCandidateIds,
+  isFinishedSession,
+  visibleSessions,
+  finishedToggleText,
 ];
 
 /** The names the page's own script depends on being present, verbatim, in
@@ -153,6 +160,9 @@ ${EMBEDDED_FUNCTIONS}
   var lastTakenAt = null;
   var currentAccounts = [];
   var currentSessions = [];
+  // Finding F6: gone/stopped sessions are hidden by default, over the SAME
+  // /api/state json — the toggle just flips what renderSessions() draws.
+  var showFinished = false;
   var pollState = { failures: 0, stopped: false };
   var pollTimer = null;
 
@@ -175,16 +185,32 @@ ${EMBEDDED_FUNCTIONS}
   // PENDING and WALLED? are statusJson()'s own computed words too
   // (src/status.ts's computeSession()) — "pending" is null exactly where
   // the text table prints "—".
+  //
+  // Finding F6: "sessions" here is still the FULL list from /api/state —
+  // gone/stopped rows included — so the toggle's own count is always right;
+  // only the rows the table actually draws are narrowed by showFinished.
   function renderSessions(sessions, accounts) {
+    var visible = visibleSessions(sessions, showFinished);
     var tbody = document.querySelector("#sessions-table tbody");
-    if (!sessions.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty">no sessions</td></tr>'; return; }
-    tbody.innerHTML = sessions.map(function (s) {
-      var m = rowMessages[s.id];
-      var msg = (m && m.expiresAt > Date.now()) ? { text: m.text, error: m.error } : null;
-      var others = otherAccounts(accounts, s.provider, s.account);
-      return sessionRowHtml(s, others, rowChoice[s.id] || "", msg, DASH);
-    }).join("");
+    if (!visible.length) {
+      tbody.innerHTML = '<tr><td colspan="11" class="empty">' + (sessions.length ? "no sessions to show" : "no sessions") + "</td></tr>";
+    } else {
+      tbody.innerHTML = visible.map(function (s) {
+        var m = rowMessages[s.id];
+        var msg = (m && m.expiresAt > Date.now()) ? { text: m.text, error: m.error } : null;
+        var others = otherAccounts(accounts, s.provider, s.account);
+        return sessionRowHtml(s, others, rowChoice[s.id] || "", msg, DASH);
+      }).join("");
+    }
+    renderFinishedToggle(sessions);
     applyBusy();
+  }
+
+  function renderFinishedToggle(sessions) {
+    var btn = el("finished-toggle");
+    var text = finishedToggleText(sessions, showFinished);
+    btn.textContent = text;
+    btn.style.display = text ? "" : "none";
   }
 
   // One place decides what a row's controls may do, so a re-render mid-verb
@@ -318,6 +344,11 @@ ${EMBEDDED_FUNCTIONS}
     });
   });
 
+  el("finished-toggle").addEventListener("click", function () {
+    showFinished = !showFinished;
+    renderSessions(currentSessions, currentAccounts);
+  });
+
   el("moveall-provider").addEventListener("change", refreshMoveAllAccounts);
   el("moveall-go").addEventListener("click", function () {
     var to = el("moveall-account").value;
@@ -328,7 +359,7 @@ ${EMBEDDED_FUNCTIONS}
     // from the moment the request goes out — not just the "Go" button.
     moveBusyIds = fleetCandidateIds(currentSessions, provider, to);
     applyBusy();
-    post("/api/switch-all", buildSwitchAllBody(to, forceChecked())).then(function (r) {
+    post("/api/switch-all", buildSwitchAllBody(to, forceChecked(), provider)).then(function (r) {
       moveBusy = false;
       moveBusyIds = [];
       applyBusy();
@@ -411,7 +442,7 @@ export function renderDashboardPage(): string {
   </section>
 
   <section>
-    <h2>Sessions</h2>
+    <h2>Sessions <button id="finished-toggle" class="finished-toggle" style="display:none"></button></h2>
     <div class="moveall">
       <span>Move every</span>
       <select id="moveall-provider"></select>

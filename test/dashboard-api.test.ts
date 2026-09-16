@@ -300,6 +300,9 @@ test("a malformed body is refused with 400, per route", async (t) => {
     { method: "POST", path: "/api/switch-all", body: { to: "home", force: "yes" } }, // wrong type
     { method: "POST", path: "/api/switch-all", body: { to: "home", timeoutMs: -1 } }, // not positive
     { method: "POST", path: "/api/switch-all", body: { to: "home", timeoutMs: "600000" } }, // wrong type
+    { method: "POST", path: "/api/switch-all", body: { to: "home", provider: "gemini" } }, // not claude|codex
+    { method: "POST", path: "/api/switch-all", body: { to: "home", provider: "" } }, // empty string
+    { method: "POST", path: "/api/switch-all", body: { to: "home", provider: 1 } }, // wrong type
   ];
 
   for (const req of cases) {
@@ -558,6 +561,62 @@ test("POST /api/switch-all to an account nobody registered moves nothing", async
   assert.match(json.message ?? "", /no such/);
   assert.deepEqual(json.results, []);
   assert.ok(!readFileSync(w.log, "utf8").includes("send-keys"), "a pane was touched for a destination that does not exist");
+});
+
+// --- Finding F1: /api/switch-all's own --provider ---------------------------
+
+test("POST /api/switch-all: a name two providers hold is refused as ambiguous without provider, and provider resolves it", async (t) => {
+  const w = await fleetWorld(t);
+  // "home" is claude's already (fleetWorld's own registry); add a codex
+  // "home" too, so the name is genuinely ambiguous — the same fixture shape
+  // test/manual.test.ts's CLI-level test uses.
+  writeFileSync(
+    path.join(w.msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: [
+        { name: "home", provider: "claude", label: "Home", shared: false },
+        { name: "away", provider: "claude", label: "Away", shared: false },
+        { name: "home", provider: "codex", label: "Home", shared: false },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+
+  const ambiguous = await handle({ method: "POST", path: "/api/switch-all", body: { to: "home" } });
+  assert.equal(ambiguous.status, 200);
+  const ambiguousJson = ambiguous.json as { code: number; message: string | null; results: unknown[] };
+  assert.equal(ambiguousJson.code, 1);
+  assert.match(ambiguousJson.message ?? "", /cannot tell which fleet you mean/);
+  assert.deepEqual(ambiguousJson.results, []);
+  assert.ok(!readFileSync(w.log, "utf8").includes("send-keys"), "a pane was touched before the ambiguity was resolved");
+
+  // --provider narrows "home" to the codex account before the ambiguity
+  // check ever runs — no codex session exists in this fleet, so the move
+  // starts and finishes having touched nothing, never refuses as ambiguous.
+  const resolved = await handle({ method: "POST", path: "/api/switch-all", body: { to: "home", provider: "codex" } });
+  assert.equal(resolved.status, 200);
+  const resolvedJson = resolved.json as { code: number; message: string | null; results: unknown[] };
+  assert.equal(resolvedJson.code, 0, JSON.stringify(resolvedJson));
+  assert.equal(resolvedJson.message, null);
+  assert.deepEqual(resolvedJson.results, []);
+});
+
+test("POST /api/switch-all: --provider for a fleet's own provider still refuses a claude session by name, no ambiguity in sight", async (t) => {
+  const w = await fleetWorld(t);
+  const stop = reportFleet(w);
+  t.after(stop);
+
+  const res = await handle({ method: "POST", path: "/api/switch-all", body: { to: "home", provider: "claude" } });
+
+  assert.equal(res.status, 200);
+  const json = res.json as { code: number; message: string | null; results: { session: string; code: number }[] };
+  assert.equal(json.code, 0, JSON.stringify(json));
+  assert.equal(json.results.length, 2);
+  for (const s of w.sessions) {
+    const r = json.results.find((x) => x.session === s.id);
+    assert.ok(r && r.code === 0, `${s.id}: ${JSON.stringify(r)}`);
+  }
 });
 
 // --- captureVerb ----------------------------------------------------------

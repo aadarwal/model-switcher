@@ -12,6 +12,10 @@
   grant exists; the old grant is replaced only after the new one passes the check
 - `ms doctor` runs `verify`'s organisation check on the grant itself, and says
   `identity verified at login (not re-checked)` when it could not run
+- ms switch --all --provider, and the page's provider select reaches the
+  fleet move
+- ms status and the page hide finished sessions by default (ms status
+  --all)
 
 ## 0.2.1
 

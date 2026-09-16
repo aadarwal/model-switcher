@@ -25,6 +25,9 @@ import {
   sessionRowHtml,
   formatSwitchAll,
   fleetCandidateIds,
+  isFinishedSession,
+  visibleSessions,
+  finishedToggleText,
   MAX_POLL_FAILURES,
   type PollState,
   type SessionRowView,
@@ -74,9 +77,9 @@ test("buildStopBody: exactly { session }", () => {
   assert.deepStrictEqual(Object.keys(body), ["session"]);
 });
 
-test("buildSwitchAllBody: the ONLY builder that carries force, both ways", () => {
-  assert.deepStrictEqual(buildSwitchAllBody("gmail", true), { to: "gmail", force: true });
-  assert.deepStrictEqual(buildSwitchAllBody("gmail", false), { to: "gmail", force: false });
+test("buildSwitchAllBody: the ONLY builder that carries force, both ways, plus the provider the page has selected", () => {
+  assert.deepStrictEqual(buildSwitchAllBody("gmail", true, "claude"), { to: "gmail", force: true, provider: "claude" });
+  assert.deepStrictEqual(buildSwitchAllBody("gmail", false, "codex"), { to: "gmail", force: false, provider: "codex" });
 });
 
 // --- Poll state machine (finding 6) -----------------------------------------
@@ -374,6 +377,7 @@ function fakeDom(state: unknown): { context: Record<string, unknown>; el: (key: 
         className: "",
         value: "",
         disabled: false,
+        style: {},
         addEventListener: () => undefined,
         querySelector: () => null,
         querySelectorAll: () => [],
@@ -473,4 +477,90 @@ test("the served page's own script survives an empty store without throwing", as
 
   assert.match(el("#accounts-table tbody").innerHTML, /no accounts/);
   assert.match(el("#sessions-table tbody").innerHTML, /no sessions/);
+});
+
+// --- Finding F6: gone/stopped sessions hidden by default --------------------
+//
+// /api/state always carries every session the store has ever recorded — the
+// route is unchanged. The page filters client-side, over the SAME rows, on
+// the same two words ms status's own --all toggles (gone, stopped).
+
+const FINISHED_ROWS: SessionRowView[] = [
+  { id: "s1", pane: "%1", provider: "claude", account: "home", need: "any", state: "running", generation: 1, pending: null, wakeupAt: null, walled: "" },
+  { id: "s2", pane: "", provider: "claude", account: "home", need: "any", state: "gone", generation: 1, pending: null, wakeupAt: null, walled: "" },
+  { id: "s3", pane: "%3", provider: "codex", account: "cdx", need: "any", state: "stopped", generation: 1, pending: null, wakeupAt: null, walled: "" },
+  { id: "s4", pane: "%4", provider: "claude", account: "home", need: "any", state: "walled", generation: 2, pending: null, wakeupAt: null, walled: "unreported" },
+];
+
+test("isFinishedSession: gone and stopped are finished, every other state is not", () => {
+  assert.equal(isFinishedSession({ ...FINISHED_ROWS[0]!, state: "gone" }), true);
+  assert.equal(isFinishedSession({ ...FINISHED_ROWS[0]!, state: "stopped" }), true);
+  for (const state of ["running", "walled", "launching", "resuming", "continuing", "parked", "waiting", "stopping"]) {
+    assert.equal(isFinishedSession({ ...FINISHED_ROWS[0]!, state }), false, state);
+  }
+});
+
+test("visibleSessions: hides gone/stopped by default, shows everything when showFinished is true", () => {
+  assert.deepStrictEqual(
+    visibleSessions(FINISHED_ROWS, false).map((s) => s.id),
+    ["s1", "s4"],
+  );
+  assert.deepStrictEqual(
+    visibleSessions(FINISHED_ROWS, true).map((s) => s.id),
+    ["s1", "s2", "s3", "s4"],
+  );
+});
+
+test("visibleSessions: no finished rows at all is a no-op either way", () => {
+  const rows = [FINISHED_ROWS[0]!, FINISHED_ROWS[3]!];
+  assert.deepStrictEqual(visibleSessions(rows, false), rows);
+  assert.deepStrictEqual(visibleSessions(rows, true), rows);
+});
+
+test("finishedToggleText: counts the finished rows, says show/hide depending on the current toggle state", () => {
+  assert.equal(finishedToggleText(FINISHED_ROWS, false), "show 2 finished");
+  assert.equal(finishedToggleText(FINISHED_ROWS, true), "hide 2 finished");
+});
+
+test("finishedToggleText: blank — which the page reads as 'hide the control' — when nothing is finished", () => {
+  const rows = [FINISHED_ROWS[0]!, FINISHED_ROWS[3]!];
+  assert.equal(finishedToggleText(rows, false), "");
+  assert.equal(finishedToggleText(rows, true), "");
+  assert.equal(finishedToggleText([], false), "");
+});
+
+test("the served page's own script hides gone/stopped sessions by default and shows the toggle's own count", async () => {
+  const { renderDashboardPage } = await import("../src/dashboard/page.ts");
+  const vm = await import("node:vm");
+  const script = renderDashboardPage().match(/<script>([\s\S]*?)<\/script>/)![1]!;
+
+  const state = { takenAt: Date.now(), accounts: [], sessions: FINISHED_ROWS };
+  const { context, el } = fakeDom(state);
+  vm.runInNewContext(script, context);
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+
+  const sessions = el("#sessions-table tbody").innerHTML;
+  assert.ok(sessions.includes('data-session="s1"'), sessions);
+  assert.ok(sessions.includes('data-session="s4"'), sessions);
+  assert.ok(!sessions.includes('data-session="s2"'), `a gone session rendered by default: ${sessions}`);
+  assert.ok(!sessions.includes('data-session="s3"'), `a stopped session rendered by default: ${sessions}`);
+
+  const toggle = el("#finished-toggle");
+  assert.equal(toggle.textContent, "show 2 finished");
+  assert.notEqual((toggle as unknown as { style: { display: string } }).style.display, "none", "two finished rows exist; the toggle must not be hidden");
+});
+
+test("the served page's own script hides the toggle entirely when nothing is finished", async () => {
+  const { renderDashboardPage } = await import("../src/dashboard/page.ts");
+  const vm = await import("node:vm");
+  const script = renderDashboardPage().match(/<script>([\s\S]*?)<\/script>/)![1]!;
+
+  const state = { takenAt: Date.now(), accounts: [], sessions: [FINISHED_ROWS[0]!, FINISHED_ROWS[3]!] };
+  const { context, el } = fakeDom(state);
+  vm.runInNewContext(script, context);
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+
+  const toggle = el("#finished-toggle");
+  assert.equal(toggle.textContent, "");
+  assert.equal((toggle as unknown as { style: { display: string } }).style.display, "none");
 });

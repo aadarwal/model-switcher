@@ -197,8 +197,7 @@ function computeSession(s: SessionRow, st: State): SessionComputed {
   return { state, pending: rec ? rec.status : null, walled };
 }
 
-function sessionRow(s: SessionRow, st: State): string[] {
-  const c = computeSession(s, st);
+function sessionRow(s: SessionRow, c: SessionComputed): string[] {
   return [
     s.id,
     s.pane || DASH,
@@ -212,6 +211,19 @@ function sessionRow(s: SessionRow, st: State): string[] {
     c.walled,
   ];
 }
+
+/** Finding F6: `ms status` used to list every session the store had ever
+ *  recorded — `gone` (the pane is dead) and `stopped` (the human, or a
+ *  handoff, already ended it) included, which is how the table only ever
+ *  grew. Neither is "running" in any sense a human watching the fleet cares
+ *  about, so both are hidden by default and shown only with `--all` — the
+ *  same word for both the text table and `--json`, since a human scripting
+ *  against the JSON is asking the identical question. `/api/state`
+ *  (`statusJson()` itself) is UNCHANGED: it always carries every session, so
+ *  the dashboard page can filter client-side over the same data instead of
+ *  costing a second shape of this route. */
+const FINISHED_STATES = new Set(["gone", "stopped"]);
+export const isFinishedState = (state: string): boolean => FINISHED_STATES.has(state);
 
 // --- Rendering -------------------------------------------------------------
 
@@ -262,14 +274,19 @@ export async function statusJson(): Promise<StatusJson> {
   }
 }
 
-async function render(json: boolean): Promise<string> {
-  if (json) return JSON.stringify(await statusJson()) + "\n";
+async function render(json: boolean, all: boolean): Promise<string> {
+  if (json) {
+    const data = await statusJson();
+    const sessions = all ? data.sessions : data.sessions.filter((s) => !isFinishedState(s.state));
+    return JSON.stringify({ ...data, sessions }) + "\n";
+  }
 
   const { registry, parseError } = loadRegistry();
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
   const st = openState();
   try {
-    const sessions = st.listSessions();
+    const sessions = st.listSessions().map((s) => ({ session: s, computed: computeSession(s, st) }));
+    const visible = all ? sessions : sessions.filter((r) => !isFinishedState(r.computed.state));
     const lines: string[] = [];
     // A registry the loader could not read is not silently a pool of zero
     // accounts — say so, first, before either table (which may still show
@@ -290,7 +307,7 @@ async function render(json: boolean): Promise<string> {
       // providers, never within one — so a session's own credential is
       // named by both cells together, not ACCOUNT alone.
       ["SESSION", "PANE", "PROVIDER", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?"],
-      sessions.map((s) => sessionRow(s, st)),
+      visible.map((r) => sessionRow(r.session, r.computed)),
     ));
     return lines.join("\n") + "\n";
   } finally {
@@ -301,7 +318,7 @@ async function render(json: boolean): Promise<string> {
 /** `--watch`: clear + reprint every `MS_WATCH_MS` (default 5 s) until
  *  SIGINT. `MS_WATCH_ITERATIONS`, set, bounds the loop so a test can exercise
  *  exactly one redraw without waiting on a signal. */
-async function watchLoop(json: boolean): Promise<number> {
+async function watchLoop(json: boolean, all: boolean): Promise<number> {
   const intervalMs = Number(process.env.MS_WATCH_MS) || 5_000;
   const raw = process.env.MS_WATCH_ITERATIONS;
   const maxIterations = raw ? Number(raw) : Infinity;
@@ -311,7 +328,7 @@ async function watchLoop(json: boolean): Promise<number> {
   try {
     let i = 0;
     while (i < maxIterations && !ac.signal.aborted) {
-      const out = await render(json);
+      const out = await render(json, all);
       process.stdout.write(CLEAR_SCREEN + out);
       i++;
       if (ac.signal.aborted || i >= maxIterations) break;
@@ -330,7 +347,8 @@ async function watchLoop(json: boolean): Promise<number> {
 export const status: Verb = async (argv) => {
   const watch = argv.includes("--watch");
   const json = argv.includes("--json");
-  if (watch) return watchLoop(json);
-  process.stdout.write(await render(json));
+  const all = argv.includes("--all");
+  if (watch) return watchLoop(json, all);
+  process.stdout.write(await render(json, all));
   return 0;
 };

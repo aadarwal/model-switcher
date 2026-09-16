@@ -55,7 +55,7 @@ const AUTH_JSON = JSON.stringify({
 });
 
 const CLAUDE_STUB = `
-printf '%s\\t%s\\t%s\\n' "$*" "$CLAUDE_CONFIG_DIR" "$(pwd -P)" >> "$MS_TEST_CLAUDE_LOG"
+printf '%s\\t%s\\t%s\\t%s\\n' "$*" "$CLAUDE_CONFIG_DIR" "$(pwd -P)" "$ANTHROPIC_API_KEY$CLAUDE_CODE_USE_BEDROCK" >> "$MS_TEST_CLAUDE_LOG"
 fire() {
   [ "$MS_TEST_NO_HOOK" = "1" ] && return 0
   # Where Claude Code itself reads its settings: the config dir when one is
@@ -97,7 +97,7 @@ exit 3
 `;
 
 const CODEX_STUB = `
-printf '%s\\t%s\\n' "$*" "$CODEX_HOME" >> "$MS_TEST_CODEX_LOG"
+printf '%s\\t%s\\t%s\\n' "$*" "$CODEX_HOME" "$OPENAI_API_KEY" >> "$MS_TEST_CODEX_LOG"
 if [ "$1" = "--version" ]; then echo "codex-cli 0.153.4"; exit 0; fi
 if [ "$1" = "login" ]; then
   [ -n "$CODEX_HOME" ] || { echo "no CODEX_HOME" >&2; exit 9; }
@@ -109,7 +109,7 @@ if [ "$1" = "exec" ]; then
   # What the trust table said the moment the turn started — Codex's trust
   # dialog is a modal, so a turn in an untrusted directory would never return.
   c=$(grep -c 'trust_level = "trusted"' "$CODEX_HOME/config.toml" 2>/dev/null)
-  printf '%s\\t%s\\n' "$(pwd -P)" "\${c:-0}" >> "$MS_TEST_TRUST_LOG"
+  printf '%s\\t%s\\t%s\\n' "$(pwd -P)" "\${c:-0}" "$OPENAI_API_KEY" >> "$MS_TEST_TRUST_LOG"
   if [ "$MS_TEST_NO_HOOK" != "1" ] && grep -q '_hook codex' "$CODEX_HOME/config.toml" 2>/dev/null; then
     printf '%s' '{"hook_event_name":"SessionStart","source":"startup","session_id":"probe-cli-2"}' \\
       | "$MS_BIN" _hook codex >/dev/null 2>&1
@@ -164,19 +164,25 @@ try {
 type Opts = {
   /** Leave `codex` off PATH entirely (the Claude-only machine). */
   noCodex?: boolean;
+  /** Leave `claude` off PATH entirely (the ChatGPT-only machine). */
+  noClaude?: boolean;
   /** `claude setup-token` refuses, so every Claude login fails. */
   mintFail?: boolean;
   /** The CLIs never call the hook, so the wizard's probe finds no event. */
   noHook?: boolean;
   /** A different `ms` earlier on PATH than the one `MS_BIN` names. */
   shadowMs?: boolean;
+  /** Put an API key (and an alternative backend) in the wizard's own
+   *  environment, the way a human who also uses the API has in their shell.
+   *  Every real turn the wizard takes must be scrubbed of them. */
+  apiKeys?: boolean;
 };
 
 function scene(opts: Opts = {}) {
   const repo = process.cwd();
   const { home, msHome } = tempHome();
   const { dir: bin, stub } = stubDir();
-  stub("claude", CLAUDE_STUB);
+  if (!opts.noClaude) stub("claude", CLAUDE_STUB);
   if (!opts.noCodex) stub("codex", CODEX_STUB);
   stub("tmux", TMUX_STUB);
   stub("security", "exit 44");
@@ -232,6 +238,11 @@ function scene(opts: Opts = {}) {
     MS_TEST_MINT_FAIL: opts.mintFail ? "1" : "0",
     MS_TEST_NO_HOOK: opts.noHook ? "1" : "0",
   };
+  if (opts.apiKeys) {
+    env.ANTHROPIC_API_KEY = "sk-ant-api03-SHOULD-NEVER-REACH-A-TURN";
+    env.CLAUDE_CODE_USE_BEDROCK = "1";
+    env.OPENAI_API_KEY = "sk-proj-SHOULD-NEVER-REACH-A-TURN";
+  }
 
   return {
     home,
@@ -253,8 +264,12 @@ function scene(opts: Opts = {}) {
       return a;
     },
     asked: (): string[] => JSON.parse(readFileSync(asked, "utf8")),
-    /** Every `claude` invocation, as [argv, CLAUDE_CONFIG_DIR, cwd]. */
+    /** Every `claude` invocation, as [argv, CLAUDE_CONFIG_DIR, cwd, the
+     *  Anthropic API key + backend flag it saw (empty when scrubbed)]. */
     claudeCalls: (): string[][] => readFileSync(claudeLog, "utf8").split("\n").filter(Boolean).map((l) => l.split("\t")),
+    /** Every `codex` invocation, as [argv, CODEX_HOME, the OpenAI API key it
+     *  saw (empty when scrubbed)]. */
+    codexCalls: (): string[][] => readFileSync(codexLog, "utf8").split("\n").filter(Boolean).map((l) => l.split("\t")),
     /** Every `codex exec`, as [cwd, how many trusted projects config.toml
      *  held at the moment the turn started]. */
     trustCalls: (): string[][] => readFileSync(trustLog, "utf8").split("\n").filter(Boolean).map((l) => l.split("\t")),
@@ -262,7 +277,7 @@ function scene(opts: Opts = {}) {
       const d = path.join(msHome, "sessions");
       return existsSync(d) ? readdirSync(d) : [];
     },
-    run(answers: string[], setupOpts: Partial<{ resume: boolean; reset: boolean; yes: boolean }> = {}) {
+    run(answers: string[], setupOpts: Partial<{ resume: boolean; reset: boolean; yes: boolean; repair: boolean; remove: string[] }> = {}) {
       const r = spawnSync(process.execPath, ["--import", "tsx", driver], {
         cwd: repo,
         encoding: "utf8",
@@ -327,10 +342,16 @@ test("a full run with one Claude and one Codex account finishes every step, veri
   assert.equal(trust.length, 1, JSON.stringify(trust));
   assert.ok(Number(trust[0][1]) >= 1, `codex exec started in an untrusted directory: ${JSON.stringify(trust)}`);
   assert.match(trust[0][0], /ms-setup-probe-/, "the Codex probe did not run in a throwaway cwd");
-  assert.ok(
-    readFileSync(s.codexConfig("codex-1"), "utf8").includes(`[projects."${trust[0][0]}"]`),
-    `config.toml does not trust the probe's own cwd: ${readFileSync(s.codexConfig("codex-1"), "utf8")}`,
-  );
+  // ...and the row it needed is gone AFTERWARDS (fix wave B-M8). A probe
+  // that leaves `[projects."/tmp/ms-setup-probe-…"]` behind is one stale
+  // trust row per attempt, for ever, naming a directory deleted seconds
+  // later. The hook block and its trust hashes stay, which is the whole
+  // point of the step.
+  const configAfter = readFileSync(s.codexConfig("codex-1"), "utf8");
+  assert.ok(!configAfter.includes(`[projects."${trust[0][0]}"]`), `the probe's trust row survived the probe:\n${configAfter}`);
+  assert.ok(!/ms-setup-probe-/.test(configAfter), `something still names a probe directory:\n${configAfter}`);
+  assert.ok(configAfter.includes("[[hooks.SessionStart]]"), configAfter);
+  assert.ok(/trusted_hash = "sha256:/.test(configAfter), "the hook trust hashes must survive the cleanup");
 
   // The one line that guards the two-browser-flow login is really printed.
   assert.match(r.stdout, /Sign in as the SAME account in both browser tabs\./);
@@ -456,7 +477,10 @@ test("a prerequisite the machine does not have stops the run before anything is 
   // One ChatGPT account declared, but this machine has no `codex` at all:
   // the count is what makes the missing binary a fault rather than a shrug.
   const s = scene({ noCodex: true });
-  const r = s.run(["1"]);
+  // Both counts are asked before any check runs now (fix wave B-M9): a
+  // missing `claude` is only a fault when the Claude count is not zero
+  // either, and the wizard cannot know that until the human says so.
+  const r = s.run(["1", "1"]);
   assert.equal(r.code, 1, r.all);
   assert.match(r.stdout, /✗ codex --version/);
   assert.match(r.stderr, /run ms setup again/);
@@ -555,4 +579,156 @@ test("the verb rejects an option it does not have", () => {
   });
   assert.equal(r.status, 2, r.stderr);
   assert.match(r.stderr ?? "", /unknown option --force/);
+});
+
+// --- B-M7: no API key ever reaches a probe turn ---------------------------
+
+test("the wizard's own ANTHROPIC_API_KEY / OPENAI_API_KEY never reach a probe turn", () => {
+  const s = scene({ apiKeys: true });
+  const r = s.run(FULL);
+  assert.equal(r.code, 0, r.all);
+
+  // The hook probe is the turn with no CLAUDE_CONFIG_DIR (it must read the
+  // human's own settings file). It is a REAL model call under a REAL
+  // subscription token: an API key left in the environment would bill that
+  // key instead, and prove the hooks of an account nobody chose.
+  const hookTurn = s.claudeCalls().filter((c) => c[0].startsWith("-p ") && c[1] === "");
+  assert.equal(hookTurn.length, 1, JSON.stringify(s.claudeCalls()));
+  assert.equal(hookTurn[0][3], "", `the Claude probe saw a key/backend: ${JSON.stringify(hookTurn[0])}`);
+
+  const codexProbe = s.codexCalls().filter((c) => c[0].startsWith("exec "));
+  assert.equal(codexProbe.length, 1, JSON.stringify(s.codexCalls()));
+  assert.equal(codexProbe[0][2], "", `the Codex probe saw OPENAI_API_KEY: ${JSON.stringify(codexProbe[0])}`);
+
+  // And nothing token-shaped leaked either way.
+  assert.ok(!r.all.includes("SHOULD-NEVER-REACH-A-TURN"), "a key was printed");
+});
+
+// --- B-M9: a ChatGPT-only machine is not stopped for a `claude` it will never run
+
+test("zero Claude accounts: a missing claude is not a fault, and settings.json is left alone", () => {
+  const s = scene({ noClaude: true });
+  // codex count 1, claude count 0, codex name default, no device code, no opt-ins.
+  const r = s.run(["1", "0", "n", "", "n", "n"]);
+  assert.equal(r.code, 0, r.all);
+  assert.deepEqual(s.setupState().done, ALL_STEPS);
+  assert.ok(!/✗ claude --version/.test(r.stdout), r.stdout);
+  assert.match(r.stdout, /claude --version — not needed \(no claude accounts\)/);
+  assert.ok(!existsSync(s.settingsFile), "the wizard wrote Claude hooks for a human with no Claude accounts");
+  assert.match(r.stdout, /is left alone/);
+  assert.match(r.stdout, /hooks verified \(codex\)/);
+});
+
+// --- B-I6: --repair -------------------------------------------------------
+
+test("--repair re-installs the hooks for the registered accounts, without a single login", () => {
+  const s = scene();
+  assert.equal(s.run(FULL).code, 0);
+
+  // What a CLI upgrade, a dotfiles restore or a hand edit does: the ms hook
+  // entries go from settings.json, and the whole ms block from config.toml.
+  const settings = s.settings();
+  for (const ev of Object.keys(settings.hooks)) {
+    settings.hooks[ev] = (settings.hooks[ev] as { hooks: { command: string }[] }[]).filter(
+      (e) => !e.hooks.some((h) => / _hook claude$/.test(h.command)),
+    );
+  }
+  writeFileSync(s.settingsFile, JSON.stringify(settings, null, 2));
+  const codexConfig = s.codexConfig("codex-1");
+  writeFileSync(codexConfig, readFileSync(codexConfig, "utf8").replace(/# ms-hooks-begin[\s\S]*# ms-hooks-end\n?/, ""));
+  assert.ok(!/_hook codex/.test(readFileSync(codexConfig, "utf8")));
+
+  const loginsBefore = s.claudeCalls().filter((c) => /^(auth login|setup-token)/.test(c[0])).length;
+  const codexLoginsBefore = s.codexCalls().filter((c) => c[0].startsWith("login")).length;
+  assert.ok(loginsBefore > 0 && codexLoginsBefore > 0, "the first run should have logged in");
+
+  // `--resume` cannot do this: every step is already in `done`. `--reset`
+  // would re-run a full browser login for every account.
+  const r = s.run([], { repair: true });
+  assert.equal(r.code, 0, r.all);
+  assert.deepEqual(s.asked(), [], "--repair asked the human nothing");
+
+  const live = `'${s.msBin}' _hook claude`;
+  const after = s.settings();
+  for (const ev of ["SessionStart", "UserPromptSubmit", "StopFailure", "SessionEnd"]) {
+    const cmds = (after.hooks[ev] as { hooks: { command: string }[] }[]).flatMap((e) => e.hooks.map((h) => h.command));
+    assert.deepEqual(cmds.filter((c) => / _hook claude$/.test(c)), [live], `${ev} was not repaired`);
+  }
+  assert.match(readFileSync(codexConfig, "utf8"), /_hook codex/);
+  assert.match(readFileSync(codexConfig, "utf8"), /trusted_hash = "sha256:/);
+
+  assert.equal(s.claudeCalls().filter((c) => /^(auth login|setup-token)/.test(c[0])).length, loginsBefore, "--repair logged in again");
+  assert.equal(s.codexCalls().filter((c) => c[0].startsWith("login")).length, codexLoginsBefore, "--repair logged in to Codex again");
+
+  // Repair is not progress through the wizard: the resume point is untouched.
+  assert.deepEqual(s.setupState().done, ALL_STEPS);
+});
+
+test("--repair with nothing registered says so and does not pretend to have repaired anything", () => {
+  const s = scene({ noCodex: true });
+  const r = s.run([], { repair: true });
+  assert.equal(r.code, 1, r.all);
+  assert.match(r.stdout, /No accounts are registered yet/);
+  assert.ok(!existsSync(s.settingsFile), "it wrote hooks for nobody");
+});
+
+// --- B-I5: --remove -------------------------------------------------------
+
+function msSetup(s: ReturnType<typeof scene>, args: string[]) {
+  const r = spawnSync(process.execPath, ["--import", "tsx", path.join(process.cwd(), "bin/ms"), "setup", ...args], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    timeout: 60_000,
+    env: {
+      ...process.env,
+      HOME: s.home,
+      MS_HOME: s.msHome,
+      MS_BIN: s.msBin,
+      SHELL: "/bin/zsh",
+      NODE_OPTIONS: "--disable-warning=ExperimentalWarning",
+    },
+  });
+  return { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "", all: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+}
+
+test("--remove statusline and --remove alias undo both opt-ins, naming the backup", () => {
+  const s = scene({ noCodex: true });
+  assert.equal(s.run(["0", "1", "", "y", "y"]).code, 0);
+  assert.deepEqual(s.setupState().optIns, { statusline: true, alias: true });
+  const rcBefore = readFileSync(s.rcFile, "utf8");
+  assert.match(rcBefore, /# ms-alias-begin/);
+
+  const r = msSetup(s, ["--remove", "statusline", "--remove", "alias"]);
+  assert.equal(r.code, 0, r.all);
+
+  assert.equal(s.settings().statusLine, undefined, "the statusline block is gone");
+  assert.ok(!/# ms-alias-begin/.test(readFileSync(s.rcFile, "utf8")), "the alias block is gone");
+  assert.match(r.stdout, new RegExp(`no longer in Claude Code's statusline`));
+  assert.match(r.stdout, /aliases are gone from/);
+  // Each removal names the backup it left, which is the whole point of an
+  // undo a human can trust.
+  assert.equal(r.stdout.match(/kept as /g)?.length, 2, r.stdout);
+  for (const m of r.stdout.matchAll(/kept as (\S+)\./g)) assert.ok(existsSync(m[1]), `${m[1]} does not exist`);
+
+  // The wizard no longer believes an opt-in is installed.
+  assert.deepEqual(s.setupState().optIns, { statusline: false, alias: false });
+});
+
+test("--remove refuses a hand-edited alias block, exits 1, and leaves the file alone", () => {
+  const s = scene({ noCodex: true });
+  assert.equal(s.run(["0", "1", "", "n", "y"]).code, 0);
+  const handEdited = readFileSync(s.rcFile, "utf8").replace("# ms-alias-end", "alias foo='bar'\n# ms-alias-end");
+  writeFileSync(s.rcFile, handEdited);
+
+  const r = msSetup(s, ["--remove", "alias"]);
+  assert.equal(r.code, 1, r.all);
+  assert.match(r.stdout, /hand-edited/);
+  assert.equal(readFileSync(s.rcFile, "utf8"), handEdited, "untouched");
+});
+
+test("--remove rejects a name it does not have", () => {
+  const s = scene({ noCodex: true });
+  assert.equal(msSetup(s, ["--remove", "hooks"]).code, 2);
+  assert.match(msSetup(s, ["--remove"]).stderr, /statusline. or .alias/);
+  assert.equal(msSetup(s, ["--remove", "alias", "--reset"]).code, 2);
 });

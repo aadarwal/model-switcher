@@ -40,6 +40,20 @@ const STRIP_ENV_KEYS: Record<Provider, readonly string[]> = {
   ],
 };
 
+/**
+ * Strip every variable that would make `provider`'s CLI answer as somebody
+ * other than the account this tool just chose.
+ *
+ * Exported because a launch is not the only place a real turn happens under a
+ * real credential: `ms setup`'s hook probes run one too, and an
+ * `ANTHROPIC_API_KEY` left in the wizard's own environment would bill that
+ * key rather than prove the subscription's hooks. One function, so the two
+ * can never disagree about what has to go.
+ */
+export function scrubProviderEnv(env: NodeJS.ProcessEnv, provider: Provider): void {
+  for (const key of STRIP_ENV_KEYS[provider]) delete env[key];
+}
+
 /** `execve` takes a path, not a bare name, so we walk PATH ourselves the
  * way a shell would (first executable regular file named `name` wins).
  * Exported for `src/doctor.ts`'s "ms on PATH" check — the one other module
@@ -105,7 +119,7 @@ export const execLaunch: Verb = async (args) => {
   } else {
     const home = p.codexHome(launch.account);
     applyCredential = (env) => {
-      for (const key of STRIP_ENV_KEYS.codex) delete env[key];
+      scrubProviderEnv(env, "codex");
       env.CODEX_HOME = home;
     };
   }
@@ -123,7 +137,7 @@ export const execLaunch: Verb = async (args) => {
   // variables below — never after, so a launch.env entry (whatever wrote
   // it) can never shadow the real credential or MS_* identity.
   const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of STRIP_ENV_KEYS[provider]) delete env[key];
+  scrubProviderEnv(env, provider);
   for (const [k, v] of Object.entries(launch.env)) env[k] = v;
   // The codex arm re-runs its own strip in here, for the same reason the
   // token is set here: a launch.env entry must never be able to put back what

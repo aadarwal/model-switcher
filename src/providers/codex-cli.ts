@@ -282,6 +282,59 @@ export type TrustResult = { changed: boolean; problem?: string };
  *
  * Every other byte of the file is left exactly as it was found.
  */
+/**
+ * The inverse of `ensureCodexTrust`, for a directory that only ever existed
+ * to be probed in.
+ *
+ * `ms setup`'s hook check takes one real turn in a throwaway `mkdtemp`
+ * directory, and Codex's trust dialog is a modal — so the directory has to be
+ * trusted first, which leaves a `[projects."/tmp/ms-setup-probe-…"]` row in
+ * the account's `config.toml` naming a path that is deleted seconds later.
+ * One per probe attempt, for ever.
+ *
+ * It removes ONLY a table whose entire body is the one `trust_level =
+ * "trusted"` line this tool writes. A table the human has added anything else
+ * to is theirs, whatever the path says, and is left exactly as found —
+ * `changed: false`, no problem, because there is nothing here for a human to
+ * act on.
+ */
+export function removeCodexTrust(home: string, cwd: string): TrustResult {
+  let resolved: string;
+  try {
+    resolved = realpathSync(cwd);
+  } catch {
+    resolved = path.resolve(cwd);
+  }
+  const file = path.join(home, "config.toml");
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return { changed: false };
+  }
+
+  const lines = text.split("\n");
+  let start = -1;
+  let end = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripComment(lines[i]!);
+    if (!opensTable(line)) continue;
+    if (start >= 0) { end = i; break; }
+    if (classifyHeader(line, resolved) === "ours") start = i;
+  }
+  if (start < 0) return { changed: false };
+
+  const body = lines.slice(start + 1, end).map((l) => stripComment(l).trim()).filter((l) => l !== "");
+  if (body.length !== 1 || body[0] !== TRUSTED) return { changed: false };
+
+  const kept = [...lines.slice(0, start), ...lines.slice(end)].join("\n");
+  // The removed table took its own blank-line separator with it; collapse
+  // the run that leaves behind so the file keeps the one-blank-line shape
+  // every other writer here produces, and ends in exactly one newline.
+  writeConfig(file, kept.replace(/\n{3,}/g, "\n\n").replace(/\n*$/, "\n"));
+  return { changed: true };
+}
+
 export function ensureCodexTrust(home: string, cwd: string): TrustResult {
   let resolved: string;
   try {

@@ -92,9 +92,12 @@ test("claudeHooksInstalled is false for a missing file, a partial install, or an
   installClaudeHooks(file, MS);
   assert.equal(claudeHooksInstalled(file, MS), true);
   assert.equal(claudeHooksInstalled(file, "/usr/local/bin/ms"), false, "a different binary is a different install");
-  // installing the other binary adds its own entries without touching the first
+  // Fix wave B-I4: installing the other binary REPLACES the first tool's
+  // entries rather than adding a second set beside them. Two live ms hooks
+  // per event is not "both installed", it is a duplicate `started` event on
+  // every session — or a dead hook, once the first binary is gone.
   assert.equal(installClaudeHooks(file, "/usr/local/bin/ms").changed, true);
-  assert.equal(claudeHooksInstalled(file, MS), true);
+  assert.equal(claudeHooksInstalled(file, MS), false, "the old binary's entries are gone, not shadowed");
   assert.equal(claudeHooksInstalled(file, "/usr/local/bin/ms"), true);
 });
 
@@ -106,4 +109,100 @@ test("a settings.json that cannot be parsed is refused, never overwritten", () =
   assert.equal(readFileSync(file, "utf8"), "{ not json,");
   assert.equal(existsSync(file + ".bak"), false);
   assert.equal(claudeHooksInstalled(file, MS), false);
+});
+
+// --- B-I4: a re-point REPLACES our entries, never stacks another ------------
+
+const OLD = "/Users/someone/src/model-switcher/bin/ms";
+const NEW = "/opt/homebrew/opt/model-switcher/bin/ms";
+const cmdFor = (bin: string) => `'${bin}' _hook claude`;
+const msEntries = (settings: Record<string, any>, event: string): string[] =>
+  commands(settings, event).filter((c) => / _hook claude$/.test(c));
+
+test("two moves leave exactly one ms entry per event, and other tools' hooks untouched", () => {
+  const { home } = tempHome();
+  const file = path.join(home, "settings.json");
+  writeFileSync(
+    file,
+    JSON.stringify(
+      {
+        permissions: { allow: ["Bash(npm test)"] },
+        hooks: {
+          SessionStart: [{ matcher: "", hooks: [{ type: "command", command: "anu-session-start" }] }],
+          Notification: [{ matcher: "", hooks: [{ type: "command", command: "say hi" }] }],
+        },
+      },
+      null,
+      2,
+    ),
+  );
+
+  // A checkout install, then a move to brew, then a second move (an upgrade
+  // that changed the path). Every one of these used to APPEND four entries.
+  installClaudeHooks(file, OLD);
+  installClaudeHooks(file, "/opt/homebrew/Cellar/model-switcher/0.2.0/bin/ms");
+  const last = installClaudeHooks(file, NEW);
+  assert.equal(last.changed, true);
+
+  const after = JSON.parse(readFileSync(file, "utf8"));
+  for (const ev of EVENTS) {
+    assert.deepEqual(msEntries(after, ev), [cmdFor(NEW)], `${ev} carries exactly one ms entry, the current one`);
+  }
+  assert.ok(commands(after, "SessionStart").includes("anu-session-start"), "another tool's hook survives every move");
+  assert.deepEqual(after.hooks.Notification, [{ matcher: "", hooks: [{ type: "command", command: "say hi" }] }]);
+  assert.deepEqual(after.permissions, { allow: ["Bash(npm test)"] });
+
+  assert.equal(claudeHooksInstalled(file, NEW), true);
+  assert.equal(claudeHooksInstalled(file, OLD), false);
+});
+
+test("a stale ms entry beside the current one is not 'installed' — the doctor must see it", () => {
+  const { home } = tempHome();
+  const file = path.join(home, "settings.json");
+  installClaudeHooks(file, NEW);
+  const settings = JSON.parse(readFileSync(file, "utf8"));
+  settings.hooks.SessionStart.push({ matcher: "", hooks: [{ type: "command", command: cmdFor(OLD) }] });
+  writeFileSync(file, JSON.stringify(settings, null, 2));
+
+  assert.equal(claudeHooksInstalled(file, NEW), false, "a dead ms hook is a problem, not a detail");
+  const r = installClaudeHooks(file, NEW);
+  assert.equal(r.changed, true);
+  assert.deepEqual(msEntries(JSON.parse(readFileSync(file, "utf8")), "SessionStart"), [cmdFor(NEW)]);
+  assert.equal(claudeHooksInstalled(file, NEW), true);
+});
+
+test("an ms command sharing an entry with another tool's loses only its own line", () => {
+  const { home } = tempHome();
+  const file = path.join(home, "settings.json");
+  writeFileSync(
+    file,
+    JSON.stringify(
+      {
+        hooks: {
+          SessionStart: [
+            { matcher: "", hooks: [{ type: "command", command: cmdFor(OLD) }, { type: "command", command: "anu-session-start" }] },
+          ],
+        },
+      },
+      null,
+      2,
+    ),
+  );
+  installClaudeHooks(file, NEW);
+  const after = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(msEntries(after, "SessionStart"), [cmdFor(NEW)]);
+  assert.ok(commands(after, "SessionStart").includes("anu-session-start"));
+});
+
+test("an ms entry under an event this tool no longer subscribes to is pruned", () => {
+  const { home } = tempHome();
+  const file = path.join(home, "settings.json");
+  writeFileSync(
+    file,
+    JSON.stringify({ hooks: { PreToolUse: [{ matcher: "", hooks: [{ type: "command", command: cmdFor(OLD) }] }] } }, null, 2),
+  );
+  installClaudeHooks(file, NEW);
+  const after = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(after.hooks.PreToolUse, [], "ours, and nothing else, is removed from an event we do not use");
+  assert.equal(claudeHooksInstalled(file, NEW), true);
 });

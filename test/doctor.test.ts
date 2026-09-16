@@ -272,6 +272,67 @@ test("checkHooks: not installed → ✗; --fix installs and reports fixed", asyn
   assert.equal(again.fixed, undefined);
 });
 
+test("checkHooks: a stale ms entry from an ms that MOVED is a ✗, and --fix prunes it", async () => {
+  const { home } = base();
+  const { checkHooks } = await import("../src/doctor.ts");
+  const { claudeHookCommand, installClaudeHooks } = await import("../src/hooks/install.ts");
+  const { msBinary } = await import("../src/paths.ts");
+  const settingsPath = path.join(home, ".claude", "settings.json");
+
+  // What a brew upgrade (or an abandoned checkout) leaves behind: our own
+  // four for the CURRENT binary, plus four more naming one that is gone.
+  installClaudeHooks(settingsPath, msBinary());
+  const dead = claudeHookCommand("/opt/homebrew/Cellar/model-switcher/0.1.0/bin/ms");
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  for (const ev of ["SessionStart", "UserPromptSubmit", "StopFailure", "SessionEnd"]) {
+    settings.hooks[ev].push({ matcher: "", hooks: [{ type: "command", command: dead }] });
+  }
+  settings.hooks.SessionStart.push({ matcher: "", hooks: [{ type: "command", command: "anu-session-start" }] });
+  writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+
+  const before = checkHooks(false);
+  assert.equal(before.ok, false, "a dead hook on every SessionStart is a fault, not a detail");
+  assert.match(before.why ?? "", /stale/);
+
+  const fixed = checkHooks(true);
+  assert.equal(fixed.ok, true);
+  assert.equal(fixed.fixed, true);
+
+  const after = JSON.parse(readFileSync(settingsPath, "utf8"));
+  const live = claudeHookCommand(msBinary());
+  for (const ev of ["SessionStart", "UserPromptSubmit", "StopFailure", "SessionEnd"]) {
+    const ms = (after.hooks[ev] as { hooks: { command: string }[] }[])
+      .flatMap((e) => e.hooks.map((h) => h.command))
+      .filter((c) => / _hook claude$/.test(c));
+    assert.deepEqual(ms, [live], `${ev}: exactly one ms entry, the live one`);
+  }
+  const start = (after.hooks.SessionStart as { hooks: { command: string }[] }[]).flatMap((e) => e.hooks.map((h) => h.command));
+  assert.ok(start.includes("anu-session-start"), "another tool's hook is never pruned");
+});
+
+test("checkClaudeBinary / checkHooks: not needed when the registry names no Claude account", async () => {
+  const { msHome } = base();
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ name: "codex-1", provider: "codex", label: "codex-1", orgId: null, shared: false, identityVerified: true }] }),
+    { mode: 0o600 },
+  );
+  const { dir, stub } = stubDir();
+  stub("tmux", HEALTHY_TMUX);
+  stub("codex", HEALTHY_CODEX);
+  stub("security", "exit 44");
+  process.env.PATH = `${dir}:${process.env.PATH}`; // deliberately NO `claude`
+
+  const { runDoctor } = await import("../src/doctor.ts");
+  const { results } = await runDoctor(false);
+  const claudeLine = results.find((r) => r.what.startsWith("claude --version"));
+  assert.ok(claudeLine?.ok, JSON.stringify(claudeLine));
+  assert.match(claudeLine!.what, /not needed \(no claude accounts\)/);
+  const hooksLine = results.find((r) => r.what.startsWith("Claude hooks installed"));
+  assert.ok(hooksLine?.ok, JSON.stringify(hooksLine));
+  assert.match(hooksLine!.what, /not needed \(no claude accounts\)/);
+});
+
 // --- store permissions ---------------------------------------------------
 
 test("checkStorePermissions: a 0644 ms-owned file (accounts.json) is ✗; --fix chmods it to ✓", async () => {
@@ -1053,6 +1114,36 @@ test("checkPathBinary: ✓ when PATH resolves to the same file as msBinary()", a
 
   const { checkPathBinary } = await import("../src/doctor.ts");
   assert.equal(checkPathBinary().ok, true);
+  delete process.env.MS_BIN;
+});
+
+test("B-C2: with MS_BIN set the way the brew shim sets it, ms on PATH resolves to msBinary()", async () => {
+  const { home } = base();
+  // The keg, exactly as Homebrew lays it out: a VERSIONED prefix, the
+  // stable `opt/<formula>` link at it, and `<brew>/bin/ms` linked into the
+  // keg. `opt_bin` is the path the shim must export — `#{bin}` during
+  // `def install` is the versioned one, which the next `brew upgrade`
+  // deletes, taking every hook command and alias with it.
+  const brew = path.join(home, "homebrew");
+  const keg = path.join(brew, "Cellar", "model-switcher", "0.2.0");
+  mkdirSync(path.join(keg, "bin"), { recursive: true });
+  mkdirSync(path.join(brew, "bin"), { recursive: true });
+  mkdirSync(path.join(brew, "opt"), { recursive: true });
+  const kegBin = path.join(keg, "bin", "ms");
+  writeFileSync(kegBin, "#!/bin/bash\n");
+  chmodSync(kegBin, 0o755);
+  symlinkSync(keg, path.join(brew, "opt", "model-switcher"));
+  symlinkSync(kegBin, path.join(brew, "bin", "ms"));
+
+  const optBin = path.join(brew, "opt", "model-switcher", "bin", "ms");
+  process.env.MS_BIN = optBin;
+  process.env.PATH = `${path.join(brew, "bin")}:${process.env.PATH}`;
+
+  const { msBinary } = await import("../src/paths.ts");
+  const { checkPathBinary } = await import("../src/doctor.ts");
+  assert.equal(msBinary(), optBin, "every hook/alias/wrapper is written with this exact string");
+  const r = checkPathBinary();
+  assert.equal(r.ok, true, JSON.stringify(r));
   delete process.env.MS_BIN;
 });
 

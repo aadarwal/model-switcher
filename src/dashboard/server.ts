@@ -93,6 +93,20 @@ function readBody(req: IncomingMessage): Promise<Buffer | "too-large"> {
 }
 
 /**
+ * Every hostname a browser can mean by "this machine" — the bind address we
+ * actually listen on (`127.0.0.1`), the name most humans type instead
+ * (`localhost`), and its IPv6 spelling. `URL#hostname` keeps an IPv6 host's
+ * bracket syntax (`new URL("http://[::1]:1").hostname === "[::1]"`, not
+ * `"::1"`), so the bracketed form is the one this set carries. A loopback
+ * bind is not ONE origin (fix-R, fix-C-report.md item 4's flagged
+ * deviation): a human who reaches the dashboard at `http://localhost:<port>`
+ * instead of the `http://127.0.0.1:<port>` the tool prints and opens was
+ * refused on every action, though a page served from `localhost:<ourport>`
+ * IS our page.
+ */
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
  * Whole-branch review, area C, finding C4: why a loopback bind is not, by
  * itself, an access control.
  *
@@ -111,16 +125,30 @@ function readBody(req: IncomingMessage): Promise<Buffer | "too-large"> {
  *     with a plain 404 and no CORS headers, so the real request is never
  *     sent. A POST that arrives without it is refused 415 before the body is
  *     even parsed.
- *   * An `Origin` header that is present and is not this server's own origin
- *     is somebody else's page, and `Sec-Fetch-Site` saying so is the same
- *     answer from the other direction. Browsers attach both to a POST
- *     themselves, and neither can be set by the page's own JavaScript.
+ *   * An `Origin` header that is present and does not name THIS SERVER —
+ *     scheme `http`, a loopback hostname (`LOOPBACK_HOSTNAMES` above), and
+ *     the exact port we bound — is somebody else's page, and `Sec-Fetch-Site`
+ *     saying so is the same answer from the other direction. Browsers attach
+ *     both to a POST themselves, and neither can be set by the page's own
+ *     JavaScript. The PORT is still what makes an origin ours: any loopback
+ *     hostname at a DIFFERENT port is exactly the scan this guard exists to
+ *     refuse.
  *
  * GET is deliberately untouched: the page's own poll must not be made to
  * carry headers a plain browser navigation would not, and no route here ever
  * sends a CORS header, so a cross-origin READ still cannot see the answer.
  */
-function refuseUnsafePost(req: IncomingMessage, selfOrigin: string): { status: number; error: string } | null {
+function isSelfOrigin(origin: string, selfPort: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(origin);
+  } catch {
+    return false;
+  }
+  return u.protocol === "http:" && u.port === selfPort && LOOPBACK_HOSTNAMES.has(u.hostname);
+}
+
+function refuseUnsafePost(req: IncomingMessage, selfPort: string): { status: number; error: string } | null {
   const method = req.method ?? "GET";
   if (method === "GET" || method === "HEAD") return null;
 
@@ -133,7 +161,7 @@ function refuseUnsafePost(req: IncomingMessage, selfOrigin: string): { status: n
   }
 
   const origin = req.headers.origin;
-  if (typeof origin === "string" && origin !== selfOrigin) {
+  if (typeof origin === "string" && !isSelfOrigin(origin, selfPort)) {
     return { status: 403, error: "refused: this request came from another origin" };
   }
 
@@ -161,9 +189,9 @@ function sendJson(res: ServerResponse, status: number, json: unknown): void {
  * never invents a 400 of its own for bad JSON, it just gives `handle()`
  * nothing to work with.
  */
-async function handleApi(req: IncomingMessage, res: ServerResponse, path: string, selfOrigin: string): Promise<void> {
+async function handleApi(req: IncomingMessage, res: ServerResponse, path: string, selfPort: string): Promise<void> {
   const method = req.method ?? "GET";
-  const unsafe = refuseUnsafePost(req, selfOrigin);
+  const unsafe = refuseUnsafePost(req, selfPort);
   if (unsafe) {
     // Drain rather than destroy: the same reasoning as the 413 above — a
     // socket torn down mid-request races the answer, and the client sees a
@@ -219,10 +247,11 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
   };
   // Filled in below, the moment the OS tells us which port we got — nothing
   // can reach `handleApi` before `listen()` resolves, so there is no window in
-  // which a POST is judged against an empty origin. It starts as a string no
-  // header can equal rather than "": an `Origin: ` header is impossible, but a
-  // guard whose default matched something would be the wrong kind of default.
-  let selfOrigin = "\u0000unbound";
+  // which a POST is judged against an empty port. It starts as a string no
+  // `URL#port` can equal rather than "": an origin with no explicit port
+  // parses to "" (the scheme's default), and a guard whose default matched
+  // THAT would be the wrong kind of default.
+  let selfPort = "\u0000unbound";
 
   const server = createServer((req, res) => {
     touch();
@@ -252,7 +281,7 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
           return;
         }
         if (pathName.startsWith("/api/")) {
-          await handleApi(req, res, pathName, selfOrigin);
+          await handleApi(req, res, pathName, selfPort);
           return;
         }
         sendJson(res, 404, { error: `no such route: ${req.method} ${pathName}` });
@@ -282,9 +311,10 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
     throw new Error(`dashboard: refused to report a URL for a non-loopback bind (${address.address})`);
   }
   const url = `http://127.0.0.1:${address.port}`;
-  // The exact string a browser puts in `Origin` for a page served from this
-  // URL — scheme, host and port, no path, no trailing slash.
-  selfOrigin = url;
+  // The PORT alone — `isSelfOrigin` above accepts any loopback hostname, so
+  // this is the one part of the bound address that still has to match
+  // exactly (`URL#port`'s own string form, e.g. "52288", never "0").
+  selfPort = String(address.port);
 
   if (open) openInBrowser(url);
 

@@ -165,9 +165,32 @@ function logLine(id: string, generation: number, msg: string): void {
   }
 }
 
+/**
+ * The last reason `fail()` gave for a session, so a `{code, message}` caller
+ * (Task 16's manual verbs, src/manual.ts) can say what the transaction itself
+ * said instead of a generic pointer at stderr — which points at nothing once
+ * the dashboard's `captured()` has swallowed that write (fix-C-report.md item
+ * 2). Keyed by session id and overwritten on every `fail()`; reading it is
+ * safe without a lock because at most one `recoverSession(id)` runs at a time
+ * for a given id (the per-session lock in `transaction()`), so a `fail()` for
+ * `id` recorded here can only ever be THIS call's own.
+ */
+const lastFailReason = new Map<string, string>();
+
+/** The reason `fail()` last recorded for `id`, consumed once. A caller asks
+ *  right after its own `recoverSession(id)` call returned non-zero, so a
+ *  stale leftover from an unrelated earlier failure is never what comes
+ *  back. */
+export function takeFailReason(id: string): string | null {
+  const why = lastFailReason.get(id) ?? null;
+  lastFailReason.delete(id);
+  return why;
+}
+
 /** The one shape of failure: say why on stderr AND in the log, and exit 1. */
 function fail(id: string, generation: number, why: string): 1 {
   logLine(id, generation, why);
+  lastFailReason.set(id, why);
   process.stderr.write(`ms _recover: ${why}\n`);
   return 1;
 }

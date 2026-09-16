@@ -635,6 +635,28 @@ test("ms status: a session whose pane no longer exists shows STATE gone, with no
   assert.equal(cells(s1)[5], "walled");
 });
 
+test("ms status --json: a gone pane's JSON state is the same word the text table prints (fix-C-report.md item 1)", async () => {
+  // %2 is deliberately left out of `list-panes` — sess-2's pane is gone,
+  // exactly as in the text-table test above. Its store STATE is "running"
+  // (seedSessions), so a fix that only patches the text table's own
+  // `sessionRow` — and not `statusJson`'s `computeSession` application —
+  // would print "gone" in one place and "running" in the other for the
+  // same closed pane.
+  const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": "" } });
+  await seedSessions(w);
+
+  const r = run(["status", "--json"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout) as { sessions: { id: string; state: string }[] };
+  const s2 = parsed.sessions.find((s) => s.id === "sess-2")!;
+  assert.ok(s2, r.stdout);
+  assert.equal(s2.state, "gone");
+
+  // sess-1's pane is still there and unaffected.
+  const s1 = parsed.sessions.find((s) => s.id === "sess-1")!;
+  assert.equal(s1.state, "walled");
+});
+
 test("ms status: an unreadable registry prints its parse error as the first line", async () => {
   const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
   await seedSessions(w);

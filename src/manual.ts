@@ -41,7 +41,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { handBackShell, releasePane } from "./handback.ts";
 import { Locked, withLock } from "./lock.ts";
-import { HANDOFF_SLOTS, isBusy, recoverSession, safeCapture, sessionLockName, stopPane } from "./recover.ts";
+import { HANDOFF_SLOTS, isBusy, recoverSession, safeCapture, sessionLockName, stopPane, takeFailReason } from "./recover.ts";
 import { findAccount, loadRegistry } from "./registry.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
@@ -265,13 +265,11 @@ export type SwitchOneOptions = {
 };
 
 /**
- * The message a refusal carries when the TRANSACTION is what refused.
- *
- * `recoverSession` has already written its reason to stderr and to the
- * session's own recover log by the time it returns non-zero, so a caller that
- * prints one line per refusal prints this instead of repeating a reason it
- * would have to invent a shorter version of. `switchVerb` prints nothing at
- * all for it, which is exactly what the single-session verb has always done.
+ * The fallback message a transaction refusal carries when, somehow,
+ * `recover.ts`'s own `takeFailReason` has nothing recorded for this session
+ * — every `RecoverCode` a manual (`opts.manual.toAccount`-carrying) call can
+ * return other than 0 is produced by `fail()`, which always records one
+ * first, so this is defensive rather than a path either verb takes today.
  */
 export const HANDOFF_REPORTED = "the handoff did not happen (the reason is above, and in ms status)";
 
@@ -291,8 +289,22 @@ const budgetSaid = (ms: number): string => (ms >= 1000 ? `${Math.round(ms / 1000
  * them differently — `ms switch` in its own name (`ms switch: <why>`), `ms
  * switch --all` under the session's (`ms: s3 refused: <why>`) — and a body that
  * printed would say it twice or in the wrong voice.
+ *
+ * A TRANSACTION refusal (recoverSession returned non-zero) sets
+ * `fromTransaction: true` and a `message` that is the transaction's OWN
+ * reason (`recover.ts`'s `takeFailReason`, fix-C-report.md item 2) — the
+ * exact words `recoverSession` already wrote to stderr and to the session's
+ * recover log. `switchVerb` uses the flag, not the message text, to print
+ * nothing for it (recoverSession said it once already); `switchAllVerb`
+ * prints it under the session's own name either way, so the fleet line now
+ * carries the real reason instead of a pointer at stderr the dashboard's
+ * `captured()` may already have discarded.
  */
-export async function switchOne(sessionId: string, to: string, opts: SwitchOneOptions): Promise<{ code: number; message: string }> {
+export async function switchOne(
+  sessionId: string,
+  to: string,
+  opts: SwitchOneOptions,
+): Promise<{ code: number; message: string; fromTransaction?: true }> {
   const found = withSession(sessionId);
   // `resolveSession` speaks the CLI's exit codes, and 2 there means "the
   // command line is wrong" — which is never what a named session is. A library
@@ -321,7 +333,9 @@ export async function switchOne(sessionId: string, to: string, opts: SwitchOneOp
   // so the work carries over whether or not the human thought to ask.
   const continueAfter = opts.continueAfter === "auto" ? wallOnScreen(screen) !== null : opts.continueAfter;
   const code = await recoverSession(session.id, { manual: { toAccount: to, continueAfter }, force: opts.force });
-  if (code !== EXIT_OK) return { code: EXIT_REFUSED, message: HANDOFF_REPORTED };
+  if (code !== EXIT_OK) {
+    return { code: EXIT_REFUSED, message: takeFailReason(session.id) ?? HANDOFF_REPORTED, fromTransaction: true };
+  }
   return { code: EXIT_OK, message: `switched → ${to}` };
 }
 
@@ -462,7 +476,7 @@ export const switchVerb: Verb = async (argv) => {
     continueAfter: parsed.continueAfter || "auto",
     force: parsed.force,
   });
-  if (r.code !== EXIT_OK) return r.message === HANDOFF_REPORTED ? EXIT_REFUSED : refuse("switch", r.message);
+  if (r.code !== EXIT_OK) return r.fromTransaction ? EXIT_REFUSED : refuse("switch", r.message);
   process.stderr.write(`ms: ${found.session.id} ${r.message}\n`);
   return EXIT_OK;
 };

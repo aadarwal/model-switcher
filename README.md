@@ -68,7 +68,7 @@ pane.
 
 ```
 ms accounts add <name> [--provider claude|codex] [--label L] [--shared]
-ms accounts login <name> [--provider P] [--device-auth]
+ms accounts login <name> [--provider P] [--device-auth] [--relogin]
 ms accounts verify <name> [--provider P]
 ms accounts remove <name> [--provider P]
 ms accounts token <name>
@@ -81,6 +81,21 @@ code instead of a browser redirect back to localhost, which is what you want
 over SSH. `--provider` is needed only when one name is held by both providers
 — names are unique per provider, so a Claude `work` and a Codex `work` are two
 different accounts.
+
+`login` skips the browser when the account already holds a usable poll grant.
+`--relogin` (Claude only) signs in again anyway — the flag to reach for when
+the grant that is there is usable but WRONG, because the wrong account
+answered the browser tab. The grant it replaces is only let go once the new
+one has passed the identity check: a re-login that is refused puts the old one
+back, and leaves the launch token alone.
+
+A sign-in that is refused is discarded. If the identity check turns the
+browser login away — most often because the account you signed in as belongs
+to the same organisation as one already registered — the grant that login just
+wrote is removed (the keychain item, the credentials file, or both) and the
+account is left exactly as it was, rather than polling an organisation it does
+not own. A credential that was already there and was not replaced is never
+touched.
 
 ### Setup and health
 
@@ -99,8 +114,12 @@ ms doctor [--fix]
 
 `ms doctor` checks the runtime, tmux, the CLIs, the hooks, file permissions,
 the registry, every account's credentials, orphaned session state and the `ms`
-on your PATH. `--fix` repairs what is safe to repair — including re-pointing
-hooks that name an `ms` that has moved. A dead credential, a malformed
+on your PATH. Its identity line runs the same organisation check `ms accounts
+verify` runs — asked of the grant on disk, not of the flag beside it — so the
+two can never disagree about one credential; a grant that resolves to another
+registered account's organisation is reported with the `--relogin` that fixes
+it. `--fix` repairs what is safe to repair — including re-pointing hooks that
+name an `ms` that has moved. A dead credential, an identity, a malformed
 registry and a stray `ms` shadowing this one are reported, never auto-fixed.
 
 ## The two credentials a Claude account needs

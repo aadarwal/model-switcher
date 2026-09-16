@@ -174,17 +174,42 @@ test("a resume report adopts a session whose worker never came back to it", asyn
     stA.close();
   }
 
+  // The other way a handoff comes back. A conversation with no transcript is
+  // relaunched with `--session-id`, which reports a `startup` and carries no
+  // continuation — so `running`, exactly what the worker writes for a handoff
+  // with none. Matching only `resumed` left this shape in `resuming` limbo:
+  // `noteActivity` rescues `continuing` and nothing else, and reconciliation's
+  // stuck rule reads that `started` as "it came back" and leaves it alone.
+  const fresh = setup();
+  const openFresh = await seedSession(fresh.env, { state: "resuming" });
+  const wasFresh = openFresh();
+  wasFresh.setWakeup("s1", Math.floor(Date.now() / 1000) + 600);
+  wasFresh.close();
+
+  assert.equal(run(["_hook", "claude"], fresh.env, JSON.stringify({ hook_event_name: "SessionStart", source: "startup", session_id: "c-42" })).code, 0);
+
+  const stFresh = openFresh();
+  try {
+    const s = stFresh.getSession("s1")!;
+    assert.equal(s.state, "running", "a relaunch with no continuation is running, not continuing");
+    assert.equal(s.wakeupAt, null);
+  } finally {
+    stFresh.close();
+  }
+
   // Only from `resuming`. Every other state belongs to somebody else — a stop,
   // a park, the worker itself — and a late report may not overwrite it.
   for (const state of ["running", "stopping", "parked"] as const) {
-    const b = setup();
-    const openB = await seedSession(b.env, { state });
-    assert.equal(run(["_hook", "claude"], b.env, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "c-42" })).code, 0);
-    const stB = openB();
-    try {
-      assert.equal(stB.getSession("s1")!.state, state, state);
-    } finally {
-      stB.close();
+    for (const source of ["resume", "startup"] as const) {
+      const b = setup();
+      const openB = await seedSession(b.env, { state });
+      assert.equal(run(["_hook", "claude"], b.env, JSON.stringify({ hook_event_name: "SessionStart", source, session_id: "c-42" })).code, 0);
+      const stB = openB();
+      try {
+        assert.equal(stB.getSession("s1")!.state, state, `${state} / ${source}`);
+      } finally {
+        stB.close();
+      }
     }
   }
 

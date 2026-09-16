@@ -143,8 +143,18 @@ async function noteSessionStart(session: string, gen: number, kind: EventKind, c
     if (kind === "started" && s.state === "launching") patch.state = "running";
     // A handoff's replacement, reporting in. Adopt it now rather than leaving
     // the row to reconciliation's stuck-state threshold.
-    if (kind === "resumed" && s.state === "resuming") {
-      patch.state = "continuing";
+    //
+    // Either word counts, because the worker has two ways to bring a session
+    // back: `--resume` (a `resume` report, and a continuation, so `continuing`)
+    // and `--session-id` for a conversation with no transcript (a `startup`
+    // report, and NO continuation, so `running` — the same state the worker
+    // itself writes for a handoff that carries none). Matching only `resumed`
+    // left the second kind in `resuming` limbo whenever its worker died:
+    // `noteActivity` rescues `continuing` and nothing else, and
+    // reconciliation's stuck rule reads that `started` as "it came back" and
+    // leaves the row alone for ever.
+    if (s.state === "resuming" && (kind === "resumed" || kind === "started")) {
+      patch.state = kind === "resumed" ? "continuing" : "running";
       patch.wakeupAt = null;
     }
     if (Object.keys(patch).length) st.updateSession(session, patch);

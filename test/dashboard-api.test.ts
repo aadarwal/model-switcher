@@ -275,7 +275,9 @@ test("POST /api/switch with an unregistered account is refused before tmux is to
   // manual.ts's switchVerb names the unregistered account this way — not
   // "not registered" — so this is what the API actually relays.
   assert.match(json.message, /no such claude account 'nobody'/);
-  assert.deepEqual(logLines(w), [], "tmux was never even asked a question");
+  // A POST reconciles first now, and reconciliation READS tmux — so the log
+  // is not empty. What matters is unchanged: nothing was done to a pane.
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys") || l.includes("respawn-pane")), "a pane was touched");
 });
 
 // --- Malformed bodies → 400 -------------------------------------------
@@ -367,6 +369,30 @@ const FLEET_SESSIONS: FleetSession[] = [
   { id: "f2", pane: "%2", cliSessionId: "c-f2", generation: 1 },
 ];
 
+/** The fleet's own two accounts, `away` walled and `home` wide open. */
+function writeFleetSnapshot(msHome: string): void {
+  const now = Date.now();
+  const row = (name: string, session: number, weekly: number) => ({
+    name,
+    provider: "claude" as const,
+    shared: false,
+    usage: {
+      session: { usedPercent: session, resetsAt: new Date(now + HOUR).toISOString() },
+      weeklyAll: { usedPercent: weekly, resetsAt: new Date(now + 6 * HOUR).toISOString() },
+      weeklyFable: null,
+    },
+    error: null,
+    errorKind: null,
+    observedAt: now,
+    stale: false,
+  });
+  writeFileSync(
+    path.join(msHome, "snapshot.json"),
+    JSON.stringify({ takenAt: now, accounts: [row("home", 4, 8), row("away", 100, 60)], backoff: {} }),
+    { mode: 0o600 },
+  );
+}
+
 async function fleetWorld(t: TestContext): Promise<FleetWorld> {
   const { home, msHome } = tempHome();
   const { dir, stub } = stubDir();
@@ -424,6 +450,11 @@ async function fleetWorld(t: TestContext): Promise<FleetWorld> {
 
   saveLaunchToken("home", "sk-ant-oat01-home0123456789abcdefghijklmn");
   saveLaunchToken("away", "sk-ant-oat01-away0123456789abcdefghijklmn");
+  // A fresh snapshot covering BOTH fleet accounts, so a `rotate` — which has
+  // no named destination and must ask the chooser — reads it from the cache
+  // instead of polling. `away` is at the wall and `home` is empty, so the
+  // chooser's answer is the one the assertions name.
+  writeFleetSnapshot(msHome);
 
   const st = openState();
   try {
@@ -526,7 +557,7 @@ test("POST /api/switch-all to an account nobody registered moves nothing", async
   assert.equal(json.code, 1);
   assert.match(json.message ?? "", /no such/);
   assert.deepEqual(json.results, []);
-  assert.deepEqual(readFileSync(w.log, "utf8").split("\n").filter((l) => l.trim()), [], "tmux was never even asked a question");
+  assert.ok(!readFileSync(w.log, "utf8").includes("send-keys"), "a pane was touched for a destination that does not exist");
 });
 
 // --- captureVerb ----------------------------------------------------------
@@ -551,4 +582,185 @@ test("captureVerb restores process.stderr.write even when the verb throws", asyn
   };
   assert.deepEqual(await captureVerb(ok, []), { code: 0, message: "ms: fine" });
   assert.equal(process.stderr.write, original, "the second call also restored stderr.write");
+});
+
+// --- Whole-branch review, area C ------------------------------------------
+
+/**
+ * C2: `/api/switch-all` used to run OUTSIDE `captureVerb`'s chain, so every
+ * `ms _recover: …` line the fleet move wrote went to whatever
+ * `process.stderr.write` happened to be at that instant — the `ms dashboard`
+ * terminal (which promised exactly one line), or, worse, another session's
+ * in-flight capture, which then returned a refusal about a session the human
+ * had not touched.
+ *
+ * The provocation is the handoff pool: with all four slots held, every move
+ * in this test refuses through `fail()`, which writes to stderr. The sentinel
+ * below IS the process's real stderr for the duration, so a single escaped
+ * line fails the test.
+ */
+test("POST /api/switch-all is captured like every other verb: no refusal reaches the process's stderr, or another verb's response", async (t) => {
+  const w = await fleetWorld(t);
+  const { acquire } = await import("../src/lock.ts");
+  const held = [0, 1, 2, 3].map((k) => acquire(`handoff-${k}`));
+  assert.ok(held.every(Boolean), "the test could not fill the handoff slots");
+  t.after(() => held.forEach((r) => r?.()));
+
+  const leaked: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    leaked.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+    return true;
+  }) as typeof process.stderr.write;
+  let all: Awaited<ReturnType<typeof handle>>;
+  let rot: Awaited<ReturnType<typeof handle>>;
+  try {
+    [all, rot] = await Promise.all([
+      handle({ method: "POST", path: "/api/switch-all", body: { to: "home" } }),
+      handle({ method: "POST", path: "/api/rotate", body: { session: "f2" } }),
+    ]);
+  } finally {
+    process.stderr.write = original;
+  }
+
+  assert.deepEqual(leaked, [], `the fleet move's own refusals reached the dashboard's terminal: ${leaked.join("")}`);
+
+  // Nothing is lost by capturing it: every refusal is in `results`.
+  const json = all.json as { code: number; message: string | null; results: { session: string; code: number; message: string }[] };
+  assert.equal(json.code, 1);
+  assert.equal(json.results.length, 2);
+  for (const r of json.results) assert.equal(r.code, 1, `${r.session} should have been refused: ${r.message}`);
+
+  // And the concurrent rotate answers for ITSELF: one line, its own.
+  const rotJson = rot.json as { code: number; message: string };
+  assert.equal(rotJson.code, 1);
+  assert.equal(
+    rotJson.message.split("\n").length,
+    1,
+    `the rotate's response absorbed another session's stderr: ${JSON.stringify(rotJson.message)}`,
+  );
+  assert.match(rotJson.message, /handoff slots are busy/);
+});
+
+/**
+ * C6: a second click on Rotate was a second handoff — `captureVerb`'s chain
+ * queues rather than dedupes, so the two ran back to back and the session
+ * ended two accounts and two `/exit`+resume cycles later. The per-session
+ * in-flight set refuses the second one outright, before it can queue.
+ */
+test("a verb for a session already in flight is refused at once, and the generation advances exactly once", async (t) => {
+  const w = await fleetWorld(t);
+  const stop = reportFleet(w);
+  t.after(stop);
+
+  const [first, second] = await Promise.all([
+    handle({ method: "POST", path: "/api/rotate", body: { session: "f1" } }),
+    handle({ method: "POST", path: "/api/rotate", body: { session: "f1" } }),
+  ]);
+
+  assert.equal(second.status, 200);
+  assert.deepEqual(second.json, { code: 1, message: "a move is already in progress for f1" });
+  const firstJson = first.json as { code: number; message: string };
+  assert.equal(firstJson.code, 0, `the first rotate should have run: ${firstJson.message}`);
+
+  const st = openState();
+  try {
+    const s = st.getSession("f1")!;
+    assert.equal(s.generation, 2, "two clicks must not be two handoffs");
+    assert.equal(s.account, "home");
+  } finally {
+    st.close();
+  }
+  const exits = readFileSync(w.log, "utf8")
+    .split("\n")
+    .filter((l) => l.includes("send-keys -t %1") && l.includes("/exit"));
+  assert.equal(exits.length, 1, `the pane was asked to exit ${exits.length} times`);
+
+  // The set is cleared in a `finally`, so the session is movable again.
+  const again = await handle({ method: "POST", path: "/api/switch", body: { session: "f1", to: "away" } });
+  const againJson = again.json as { code: number; message: string };
+  assert.notEqual(againJson.message, "a move is already in progress for f1");
+});
+
+/**
+ * Minor (report-C): `timeoutMs` must accept 0 — the CLI's own `--timeout 0`
+ * means "start nothing" (src/manual.ts's `parseManualArgs`), and the API
+ * 400'd the identical request.
+ */
+test("timeoutMs accepts 0: 'start nothing', exactly as the CLI's --timeout 0 does", async (t) => {
+  const w = await fleetWorld(t);
+
+  const res = await handle({ method: "POST", path: "/api/switch-all", body: { to: "home", timeoutMs: 0 } });
+
+  assert.equal(res.status, 200, JSON.stringify(res.json));
+  const json = res.json as { code: number; message: string | null; results: { session: string; code: number; message: string }[] };
+  assert.equal(json.code, 1);
+  assert.equal(json.results.length, 2);
+  for (const r of json.results) assert.match(r.message, /not started: the 0ms budget ran out/);
+  assert.ok(
+    !readFileSync(w.log, "utf8").includes("send-keys"),
+    "a zero budget started a handoff anyway",
+  );
+});
+
+/**
+ * Minor (report-C): the CLI reconciles once per process, so a `ms switch
+ * --all` typed into a terminal repairs a closed pane's row first. A dashboard
+ * left open for hours never did, so the same fleet move from the page refused
+ * every gone session ("obsolete: the pane is gone") and came back exit 1.
+ * GETs still never write: `ms status` reports, it does not repair.
+ */
+test("a POST verb reconciles first (a GET never does): a closed pane's row is repaired, not refused", async (t) => {
+  const w = await fleetWorld(t);
+  const seed = openState();
+  try {
+    seed.createSession({
+      id: "f3",
+      provider: "claude",
+      cliSessionId: "c-f3",
+      cwd: w.home,
+      socket: FLEET_SOCKET,
+      pane: "%3", // never in the stub's pane list: this pane is gone
+      serverStart: IDENTITY,
+      need: "any",
+      account: "away",
+      generation: 1,
+      state: "running",
+      desired: "running",
+      flags: [],
+    });
+  } finally {
+    seed.close();
+  }
+
+  // A read never repairs. (What it REPORTS for a closed pane is a separate
+  // matter: `statusJson()` spreads the raw row, so its `state` is the store's
+  // own word, not `computeSession`'s "gone" override — see fix-C-report.md.)
+  const state = await handle({ method: "GET", path: "/api/state" });
+  const stateJson = state.json as { sessions: { id: string }[] };
+  assert.ok(stateJson.sessions.some((s) => s.id === "f3"));
+  const afterGet = openState();
+  try {
+    assert.equal(afterGet.getSession("f3")!.state, "running", "a GET must not repair anything");
+  } finally {
+    afterGet.close();
+  }
+
+  const stop = reportFleet(w);
+  t.after(stop);
+  const res = await handle({ method: "POST", path: "/api/switch-all", body: { to: "home" } });
+
+  const json = res.json as { code: number; message: string | null; results: { session: string; code: number; message: string }[] };
+  assert.deepEqual(
+    json.results.map((r) => r.session).sort(),
+    ["f1", "f2"],
+    "the gone session was still dragged into the fleet move",
+  );
+  assert.equal(json.code, 0, JSON.stringify(json.results));
+  const afterPost = openState();
+  try {
+    assert.equal(afterPost.getSession("f3")!.state, "stopped", "the POST never reconciled");
+  } finally {
+    afterPost.close();
+  }
 });

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { execLaunch } from "./exec.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
+import { codexHook, codexWatch } from "./hooks/codex-hook.ts";
 import { attachVerb, launchClaude, launchCodex } from "./launch.ts";
 import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { paneDied, reconcile } from "./reconcile.ts";
@@ -16,7 +17,10 @@ const verbs = new Map<string, Verb>();
 export function registerVerb(name: string, fn: Verb): void { verbs.set(name, fn); }
 
 registerVerb("_exec", execLaunch);
-registerVerb("_hook", async ([which]) => (which === "claude" ? claudeHook() : 0));
+registerVerb("_hook", async ([which]) => (which === "claude" ? claudeHook() : which === "codex" ? codexHook() : 2));
+// The Codex fleet watchdog: ONE timer per tmux server, dispatched by tmux, so
+// it inherits no MS_* identity and reads every Codex session from the store.
+registerVerb("_codex_watch", codexWatch);
 registerVerb("_pane_died", paneDied);
 registerVerb("claude", launchClaude);
 registerVerb("codex", launchCodex);
@@ -31,7 +35,7 @@ registerVerb("stop", stopVerb);
 
 const USAGE = `usage: ms <verb> [args]
   setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach
-  (internal: _exec _hook _recover _pane_died)`;
+  (internal: _exec _hook _codex_watch _recover _pane_died)`;
 
 function version(): string {
   const pkg = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");

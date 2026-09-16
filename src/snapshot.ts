@@ -181,6 +181,23 @@ function readCache(): CacheFile | null {
   return { takenAt: o.takenAt, accounts, backoff };
 }
 
+/**
+ * The last reading on disk, and nothing else: no lock, no registry read, no
+ * poll, no network. Returns `[]` when the cache is absent, unreadable or torn.
+ *
+ * This exists for callers that want to know how close to a wall the fleet was
+ * the last time anybody looked, but must not cause a look. `getSnapshot` is
+ * not that: even `maxAgeMs: Infinity` polls when the file does not cover an
+ * account the registry has since gained, and it takes the snapshot lock to
+ * find out. The Codex watchdog uses this to choose how often to wake up, on a
+ * hook's clock and inside the tmux server — neither of which may block on the
+ * network. It is deliberately NOT how anything DECIDES: `toPickInputs` and its
+ * ten-minute age rule are still the only way a reading becomes a choice.
+ */
+export function cachedAccounts(): AccountUsage[] {
+  return readCache()?.accounts ?? [];
+}
+
 function writeCache(file: CacheFile): void {
   ensureStore();
   const tmp = `${p.snapshot}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;

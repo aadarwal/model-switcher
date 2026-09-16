@@ -135,7 +135,7 @@ function unescapeBasic(s: string): string {
  * path and is left alone, which is why this walks the line instead of
  * splitting it.
  */
-function stripComment(line: string): string {
+export function stripComment(line: string): string {
   let basic = false;
   let literal = false;
   for (let i = 0; i < line.length; i++) {

@@ -1,11 +1,22 @@
 import { appendFileSync, existsSync, readFileSync, openSync, closeSync, fstatSync, readSync, statSync, chmodSync } from "node:fs";
 import { ensureSessionDir, p } from "./paths.ts";
 
-export type EventKind = "started" | "resumed" | "cleared" | "compacted" | "activity" | "rate_limited" | "ended" | "died" | "recovery" | "note";
+/** `stop` is Codex's: it records that ONE turn finished, from either of the
+ * two places that can say so — the Stop hook, which fires only on success,
+ * and `ms _codex_watch` reading the turn's `task_complete` out of the
+ * rollout. The fleet watchdog reads its presence for a turn id as "that turn
+ * is settled, stop watching it". Claude Code has no equivalent, because its
+ * wall arrives as a StopFailure: recording the END of a turn is only
+ * load-bearing where the SIGNAL is a turn that never ended. */
+export type EventKind = "started" | "resumed" | "cleared" | "compacted" | "activity" | "stop" | "rate_limited" | "ended" | "died" | "recovery" | "note";
 /** `cliSessionId` is the CLI's own id as the hook reported it. When a
  * SessionStart moves the session onto a NEW id — a `/clear`, an interactive
  * `/resume`, a fork — `prevCliSessionId` carries the one it left, so the
- * audit log records the change itself and not merely its result. */
+ * audit log records the change itself and not merely its result.
+ *
+ * `turnId` is the CLI's own id for ONE turn (Codex reports it on
+ * UserPromptSubmit and again on Stop). It is what lets a watchdog armed for
+ * a turn recognise that very turn's ending, rather than any later one. */
 export type Event = { t: number; kind: EventKind; session: string; generation: number; cliSessionId?: string | null; prevCliSessionId?: string | null; turnId?: string | null; kindDetail?: string; text?: string };
 
 /** True if the file is non-empty and its last byte is not '\n' — a torn

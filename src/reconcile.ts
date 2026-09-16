@@ -181,21 +181,30 @@ function presenceOf(s: SessionRow, look: Look): Presence {
   return look.panes.has(s.pane) ? "present" : "absent";
 }
 
-/** True only when tmux SAID this pane is dead; `null` (could not ask) is not a
- * death. Says nothing about whether the pane is OURS — `presenceOf` is that
- * question, and both answers are needed before anything respawns. */
-function paneIsDead(servers: Servers, s: SessionRow): boolean {
-  return servers.tmux(s.socket).paneDead(s.pane) === true;
+/**
+ * Is this pane a corpse, and what did the thing in it exit with — from ONE
+ * read (`Tmux.paneInfo`, src/tmux.ts).
+ *
+ * One read because the two facts are only meaningful together. Asked as two
+ * `display-message` round-trips they come from two moments, and a pane
+ * respawned in between answers dead-with-no-status: the caller then reads a
+ * crash as "no evidence" and falls back on the event log, which is exactly the
+ * reading `#{pane_dead_status}` exists to correct.
+ *
+ * `dead` is true only when tmux SAID so — a query that failed is not a death.
+ * `status` is null when there is no number to read, never defaulted to zero,
+ * because zero is itself a claim (it exited cleanly). Neither says whether the
+ * pane is OURS; `presenceOf` is that question, and both answers are needed
+ * before anything respawns.
+ */
+function deadLook(servers: Servers, s: SessionRow): { dead: boolean; status: number | null } {
+  const info = servers.tmux(s.socket).paneInfo(s.pane);
+  return { dead: info?.dead === true, status: info?.deadStatus ?? null };
 }
 
-/**
- * The exit status of whatever left this pane a corpse, when tmux gave one —
- * `#{pane_dead_status}` (src/tmux.ts). Null is "no number to read": a tmux we
- * could not ask, or a field that is empty. Never inferred, never defaulted to
- * zero, because zero is itself a claim (it exited cleanly).
- */
-function deadStatus(servers: Servers, s: SessionRow): number | null {
-  return servers.tmux(s.socket).paneDeadStatus(s.pane);
+/** Dead-ness alone, for the callers that have no use for the status. */
+function paneIsDead(servers: Servers, s: SessionRow): boolean {
+  return deadLook(servers, s).dead;
 }
 
 /** One durable line in the session's own log, for repairs the human will want
@@ -319,13 +328,21 @@ function abandonedStopping(st: State, servers: Servers, s: SessionRow, presence:
  * `died` event, nothing left saying anything had gone wrong. A non-zero
  * `#{pane_dead_status}` is a death whatever the log says.
  */
-function settleDeadPane(st: State, servers: Servers, s: SessionRow, presence: Presence): string[] {
+function settleDeadPane(st: State, servers: Servers, s: SessionRow, presence: Presence, status: number | null): string[] {
   if (s.state === "stopping") return abandonedStopping(st, servers, s, presence);
+  // The status comes from the caller's own dead-check, not from a second read:
+  // one look at the pane answers both questions, and the `desired: stopped`
+  // branch below never needs the second one at all.
+  if (s.desired === "stopped") {
+    closeOut(st, s);
+    respawnShell(servers, s);
+    log(s.id, s.generation, "pane ended; the login shell is back and the session is stopped");
+    return [`session ${s.id}: pane ended, login shell restored, marked stopped`];
+  }
   const events = readEvents(s.id).filter((e) => e.generation === s.generation);
   const normalEnd = events[events.length - 1]?.kind === "ended";
-  const status = deadStatus(servers, s);
   const crashed = status !== null && status !== 0;
-  if (s.desired === "stopped" || (normalEnd && !crashed)) {
+  if (normalEnd && !crashed) {
     // Close the row out BEFORE the respawn: a pending recovery would otherwise
     // find a live pane (the shell we are about to put there) and respawn claude
     // over the human's prompt.
@@ -551,8 +568,12 @@ export function reconcile(): string[] {
         const rec = st.pendingRecovery(s.id);
         // (h) A corpse nobody handled. `_pane_died` is the fast path for this
         // and tmux delivers it once; when it declined, this is the only net.
-        if (presence === "present" && !workerOnIt(rec) && paneIsDead(servers, s)) {
-          out.push(...settleDeadPane(st, servers, s, presence));
+        // Looked at only when everything cheaper says it is worth a tmux call,
+        // and then exactly once: the dead-check and the exit status are the
+        // same read.
+        const corpse = presence === "present" && !workerOnIt(rec) ? deadLook(servers, s) : null;
+        if (corpse?.dead) {
+          out.push(...settleDeadPane(st, servers, s, presence, corpse.status));
           continue;
         }
         out.push(...reclaimRecovery(st, servers, s, rec)); // (b)
@@ -626,9 +647,10 @@ export function paneDiedSession(id: string): number {
       // and reconciliation's rule (c) is what closes that session out.
       // "unknown" is a question we could not ask — never a licence to act.
       if (presence !== "present") return 0;
-      if (!paneIsDead(servers, s)) return 0; // something is running in it: not this death
+      const corpse = deadLook(servers, s);
+      if (!corpse.dead) return 0; // something is running in it: not this death
 
-      settleDeadPane(st, servers, s, presence);
+      settleDeadPane(st, servers, s, presence, corpse.status);
       return 0;
     } finally {
       st.close();

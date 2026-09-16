@@ -18,11 +18,19 @@ export class Tmux {
   }
   serverIdentity(): string { return this.must(["display-message", "-p", "#{pid}:#{start_time}"]).trim(); }
   paneExists(pane: string): boolean { return this.run(["list-panes", "-a", "-F", "#{pane_id}"]).stdout.split("\n").includes(pane); }
-  paneInfo(pane: string): { pid: number; command: string; dead: boolean; cwd: string } | null {
-    const r = this.run(["display-message", "-p", "-t", pane, "#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{pane_current_path}"]);
+  /**
+   * One pane, one read. `deadStatus` rides along with `dead` on purpose: asked
+   * separately, the two answers can come from two different moments, and a pane
+   * that was respawned between them reports dead-with-no-status — which a
+   * caller then has to read as "no evidence" and fall back on something weaker.
+   * A live pane's status field is empty, which parses to null.
+   */
+  paneInfo(pane: string): { pid: number; command: string; dead: boolean; cwd: string; deadStatus: number | null } | null {
+    const r = this.run(["display-message", "-p", "-t", pane, "#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{pane_current_path}\t#{pane_dead_status}"]);
     if (r.code !== 0 || !r.stdout.trim()) return null;
-    const [pid, command, dead, cwd] = r.stdout.trim().split("\t");
-    return { pid: Number(pid), command, dead: dead === "1", cwd };
+    const [pid, command, dead, cwd, status] = r.stdout.trim().split("\t");
+    const n = Number(status);
+    return { pid: Number(pid), command, dead: dead === "1", cwd, deadStatus: status && Number.isInteger(n) ? n : null };
   }
   /**
    * `#{pane_dead}` for one pane: true when the pane's command has exited and

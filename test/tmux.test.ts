@@ -11,7 +11,7 @@ function setup() {
   stub("tmux", `printf '%s\\n' "$*" >> "${log}"
 case "$*" in
   *"#{pid}:#{start_time}"*) echo "4242:1789000000" ;;
-  *"#{pane_pid}"*) echo "777	2.1.272	0	/tmp/work" ;;
+  *"#{pane_pid}"*) echo "777	2.1.272	0	/tmp/work	$MS_TMUX_DEAD_STATUS" ;;
   *"#{pane_dead_status}"*) printf '%s\\n' "$MS_TMUX_DEAD_STATUS" ;;
   *"#{pane_dead}"*) printf '%s\\n' "$MS_TMUX_DEAD" ;;
   *"show-options -p"*) printf '%s\\n' '@ms_session s1' '@ms_generation 3' '@ms_note "has \\"quotes\\" inside"' '@ms_path "/tmp/a b"' '@ms_bs "x\\\\"' ;;
@@ -48,7 +48,13 @@ test("paneInfo and paneOptions parse the stub's answers", async () => {
   setup();
   const { Tmux } = await import("../src/tmux.ts");
   const t = new Tmux(null);
-  assert.deepEqual(t.paneInfo("%5"), { pid: 777, command: "2.1.272", dead: false, cwd: "/tmp/work" });
+  // A LIVE pane's `#{pane_dead_status}` is empty, and it rides along with the
+  // rest rather than costing a second round-trip.
+  delete process.env.MS_TMUX_DEAD_STATUS;
+  assert.deepEqual(t.paneInfo("%5"), { pid: 777, command: "2.1.272", dead: false, cwd: "/tmp/work", deadStatus: null });
+  process.env.MS_TMUX_DEAD_STATUS = "1";
+  assert.equal(t.paneInfo("%5")!.deadStatus, 1, "one read answers both questions");
+  delete process.env.MS_TMUX_DEAD_STATUS;
   assert.deepEqual(t.paneOptions("%5"), {
     "@ms_session": "s1",
     "@ms_generation": "3",

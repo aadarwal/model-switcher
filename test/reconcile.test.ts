@@ -45,10 +45,11 @@ deadfile="\${MS_TMUX_STATE}/dead\${pane}"
 case "$verb" in
   display-message)
     if [ "\${MS_TMUX_NO_SERVER:-0}" = "1" ]; then echo "no server running" >&2; exit 1; fi
+    if [ -f "$deadfile" ]; then d=$(cat "$deadfile"); else d="\${MS_TMUX_PANE_DEAD:-0}"; fi
     case "$*" in
-      *"#{pane_dead_status}"*) echo "\${MS_TMUX_DEAD_STATUS:-0}" ;;
-      *"#{pane_dead}"*)
-        if [ -f "$deadfile" ]; then cat "$deadfile"; else echo "\${MS_TMUX_PANE_DEAD:-0}"; fi ;;
+      *"#{pane_pid}"*) printf '%s\\t%s\\t%s\\t%s\\t%s\\n' 4242 claude "$d" /tmp/work "\${MS_TMUX_DEAD_STATUS:-0}" ;;
+      *"#{pane_dead_status}"*) if [ "\${MS_TMUX_STATUS_SPLIT:-0}" = "1" ]; then echo ""; else echo "\${MS_TMUX_DEAD_STATUS:-0}"; fi ;;
+      *"#{pane_dead}"*) echo "$d" ;;
       *) echo "\${MS_TMUX_IDENTITY}" ;;
     esac ;;
   list-panes)
@@ -81,6 +82,7 @@ function world(): World {
   delete process.env.MS_TMUX_LIST_FAILS;
   delete process.env.MS_TMUX_PANE_DEAD;
   delete process.env.MS_TMUX_DEAD_STATUS;
+  delete process.env.MS_TMUX_STATUS_SPLIT;
   delete process.env.MS_TMUX_ON_RUNSHELL;
   delete process.env.MS_VERBOSE;
   return { home, msHome, log };
@@ -757,6 +759,29 @@ test("_pane_died: a launch that exited non-zero is a death, whatever its own hoo
   assert.equal(last.generation, 2);
   assert.equal(last.kindDetail, "exit 1", "the status is on the record, not just in the decision");
   assert.match(readFileSync(path.join(w.msHome, "sessions", "s-crashed", "recover.log"), "utf8"), /exit status 1/);
+});
+
+test("_pane_died: the exit status comes from the same read as the dead-check", async (t) => {
+  // Asked as a second `display-message`, the status can come from a later
+  // moment than the dead-check — and a pane respawned in between answers with
+  // nothing, which would put B3 back on the event log it exists to correct.
+  // `MS_TMUX_STATUS_SPLIT` makes the standalone query answer exactly that way;
+  // the crash must still be read as a crash, because the status rode along.
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  process.env.MS_TMUX_DEAD_STATUS = "1";
+  process.env.MS_TMUX_STATUS_SPLIT = "1";
+  t.after(() => {
+    delete process.env.MS_TMUX_STATUS_SPLIT;
+  });
+  withState((st) => st.createSession({ id: "s-split", ...base, state: "resuming", generation: 2 }));
+  appendEvent({ t: nowSec() - 2, kind: "ended", session: "s-split", generation: 2, cliSessionId: "c1", kindDetail: "other" });
+
+  assert.equal(await paneDied(["s-split"]), 0);
+
+  assert.equal(stateOf("s-split"), "parked");
+  assert.deepEqual(respawns(w), [], "the pane is left as evidence, not handed back");
+  assert.equal(readEvents("s-split").at(-1)!.kindDetail, "exit 1");
 });
 
 test("_pane_died: the stop the human asked for outranks a non-zero exit", async () => {

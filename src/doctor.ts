@@ -704,9 +704,19 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
   const { registry, parseError, problems } = loadRegistry();
   const codexAccounts = registry.accounts.filter((a) => a.provider === "codex");
   const claudeAccounts = registry.accounts.filter((a) => a.provider === "claude");
+  // A parse error empties `registry.accounts` the same way a truly empty
+  // registry would (loadRegistry's documented behaviour), so
+  // `claudeAccounts.length > 0` alone cannot tell "no claude accounts" apart
+  // from "no idea — the file did not parse". Only the FORMER earns a "not
+  // needed" — the latter must run the real check rather than print two
+  // green lines (`claude --version`, `Claude hooks installed`) that assert
+  // something this doctor run never actually knew. `checkRegistry` below
+  // still reports the parse error itself as its own ✗, so nothing goes
+  // silent either way.
+  const hasClaudeAccounts = claudeAccounts.length > 0 || parseError !== null;
 
-  results.push(checkClaudeBinary(claudeAccounts.length > 0));
-  results.push(checkHooks(fix, claudeAccounts.length > 0));
+  results.push(checkClaudeBinary(hasClaudeAccounts));
+  results.push(checkHooks(fix, hasClaudeAccounts));
   results.push(checkCodexBinary(codexAccounts.length > 0));
   // The Codex auto-recovery gate, stated rather than left to be guessed at:
   // it ships off, it is a stored setting (src/autorotate.ts) because the

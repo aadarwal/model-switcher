@@ -243,7 +243,7 @@ function scene(opts: Opts = {}) {
     MS_TEST_KEYCHAIN_OK: (opts.keychainOk ?? []).join("\n"),
     MS_TEST_KEYCHAIN_AFTER: (opts.keychainAfter ?? []).join("\n"),
     MS_TEST_POLL_STATUS_OK: opts.pollStatusOk ? "1" : "0",
-    MS_TEST_AUTH_STATUS: opts.authStatus ?? '{"organization":{"uuid":"org-1"}}',
+    MS_TEST_AUTH_STATUS: opts.authStatus ?? '{"loggedIn":true,"orgId":"org-1","email":"work@example.com","orgName":"Work"}', // the real top-level shape; one test below keeps the nested fallback
     MS_TEST_PROBE_OUT: opts.probeOut ?? "ok",
   };
   return {

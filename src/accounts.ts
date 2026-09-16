@@ -74,6 +74,7 @@ const TOKEN_PREFIX = "sk-ant-oat01-";
 /** Where `claude auth status --json` may name the organisation. Also a single
  *  edit point: the CLI's JSON shape is not a contract we control. */
 const ORG_ID_PATHS: string[][] = [
+  ["orgId"], // the real shape (Claude Code 2.1.273, verified live): top-level orgId/email/orgName
   ["organization", "uuid"],
   ["organization", "id"],
   ["org", "uuid"],

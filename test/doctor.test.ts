@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync, realpathSync, existsSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
+import { userInfo } from "node:os";
 import { stubDir, tempHome, run } from "./helpers.ts";
 import type { Account } from "../src/registry.ts";
 
@@ -721,6 +723,47 @@ test("checkClaudeAccount: a launch token that is there but unreadable asks for a
   assert.equal(token.ok, false);
   assert.match(token.why!, /^unreadable \(chmod 600 .*gmail\.token\)$/);
   assert.doesNotMatch(token.why!, /accounts login/, "a permission is not a login to redo");
+});
+
+test("checkClaudeAccount: a truncated keychain grant reads `unreadable`, and --fix never refreshes it", async () => {
+  // ms 0.2.0's write-back put the refreshed blob through `security`'s
+  // interactive prompt, which keeps 128 bytes of ~600. What it left behind is
+  // an item that is THERE and holds no parseable credential — a different
+  // repair from an account that was never logged in, and a refresh token
+  // there is nothing left to send. --fix must not spend a call on it.
+  const { msHome } = base();
+  const configDir = path.join(msHome, "claude", "gmail");
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  const service = `Claude Code-credentials-${createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
+  const whole = JSON.stringify({
+    claudeAiOauth: { accessToken: `at-${"A".repeat(260)}`, refreshToken: `rt-${"R".repeat(260)}`, expiresAt: Date.now() },
+  });
+  const truncated = whole.slice(0, 128);
+  const { dir, stub } = stubDir();
+  stub("security", `case "$*" in *"-s ${service} -a ${userInfo().username}"*) printf '%s' '${truncated}' ;; *) exit 44 ;; esac\nexit 0`);
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error("--fix must never attempt a refresh on an unreadable grant");
+  }) as unknown as typeof fetch;
+  try {
+    const { checkClaudeAccount, renderLine } = await import("../src/doctor.ts");
+    const rs = await checkClaudeAccount(account({ name: "gmail" }), true);
+    const grant = rs.find((r) => r.what === "claude account gmail: poll grant");
+    assert.ok(grant, JSON.stringify(rs));
+    assert.equal(grant!.ok, false);
+    assert.equal(
+      renderLine(grant!),
+      "✗ claude account gmail: poll grant — unreadable (a truncated keychain write from ms 0.2.0); run ms accounts login gmail",
+    );
+    // Distinct from the genuinely missing case, which is the OTHER line.
+    assert.equal(rs.some((r) => /poll grant readable/.test(r.what)), false, JSON.stringify(rs));
+    assert.equal(rs.some((r) => r.fixed), false, "nothing was repaired");
+    for (const r of rs) assert.equal((r.why ?? "").includes("RRRR"), false, `a credential leaked: ${r.why}`);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
 });
 
 test("checkClaudeAccount: a due grant WITHOUT --fix is reported, never refreshed (no network call)", async () => {

@@ -18,7 +18,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -193,6 +193,8 @@ type Opts = {
   profile?: unknown;
   token?: string;
   noCredFile?: boolean;
+  /** What the keychain stub serves for this account's item. */
+  cred?: string;
   keychainOk?: string[];
   keychainAfter?: string[];
   pollStatusOk?: boolean;
@@ -239,7 +241,7 @@ function scene(opts: Opts = {}) {
     MS_TEST_TOKEN_SPLIT: opts.tokenSplit ?? "",
     MS_TEST_PROMPT_HOLD: opts.promptHold ?? "",
     MS_TEST_TOKEN_ONLINE: opts.tokenOnline ?? "",
-    MS_TEST_CRED: CRED,
+    MS_TEST_CRED: opts.cred ?? CRED,
     MS_TEST_NO_CRED_FILE: opts.noCredFile ? "1" : "0",
     MS_TEST_KEYCHAIN_OK: (opts.keychainOk ?? []).join("\n"),
     MS_TEST_KEYCHAIN_AFTER: (opts.keychainAfter ?? []).join("\n"),
@@ -557,6 +559,79 @@ test("accounts login records the scoped keychain item its login wrote", () => {
   assert.equal(s.securityLog().split("\n")[0].includes("-w"), false);
 });
 
+test("accounts login discards a credentials file it did not write, so the fresh grant wins", () => {
+  // A refresh's write-back moves a keychain-held grant into
+  // `.credentials.json`, and `readPollGrant` prefers that file. On macOS the
+  // next `claude auth login` mints into the KEYCHAIN, so without this the
+  // account would keep polling with the credential the human just replaced —
+  // for ever, because nothing else ever removes that file.
+  const s = scene({ noCredFile: true });
+  const scoped = s.scopedService("gmail");
+  const stale = path.join(s.configDir("gmail"), ".credentials.json");
+  mkdirSync(s.configDir("gmail"), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    stale,
+    JSON.stringify({ claudeAiOauth: { accessToken: "at-stale", refreshToken: "rt-stale", expiresAt: Date.now() + 3_600_000 } }),
+    { mode: 0o600 },
+  );
+  s.ms(["add", "gmail"]);
+
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: scoped });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(existsSync(stale), false, "the file the login did not write did not survive it");
+  // And the grant the login DID write is the one the account is now pointed
+  // at: a note is only ever recorded when the keychain item is what answered.
+  assert.deepEqual(JSON.parse(readFileSync(s.noteFile("gmail"), "utf8")), { service: scoped, account: BARE });
+
+  const ls = s.ms(["ls"], { MS_TEST_KEYCHAIN_OK: scoped });
+  assert.equal(ls.code, 0, ls.stderr);
+  assert.match(ls.stdout, /gmail\s+claude\s+gmail\s+org-1\s+yes\s+yes\s+yes/);
+  assert.equal(ls.stdout.includes("stale"), false, "the account book never prints a credential");
+});
+
+test("accounts login KEEPS the credentials file when the login minted nothing it can locate", () => {
+  // The discard is only ever a SUPERSEDE: it drops a migrated file because the
+  // login put a better grant somewhere else. A `claude auth login` that exits
+  // 0 and leaves nothing behind — a CLI that no-ops, a flow the human
+  // abandoned into a zero exit — has superseded nothing, and unlinking here
+  // would take the account's only working credential and drop it out of the
+  // pool. Note that `pollGrantUsable` says "not usable" for reasons that are
+  // not the grant's fault (no `claude` on PATH, an `auth status` that errors),
+  // so this path is reachable with a perfectly good file sitting there.
+  const s = scene({ noCredFile: true });
+  const stale = path.join(s.configDir("gmail"), ".credentials.json");
+  const healthy = JSON.stringify({
+    claudeAiOauth: { accessToken: "at-migrated", refreshToken: "rt-migrated", expiresAt: Date.now() + 3_600_000 },
+  });
+  mkdirSync(s.configDir("gmail"), { recursive: true, mode: 0o700 });
+  writeFileSync(stale, healthy, { mode: 0o600 });
+  s.ms(["add", "gmail"]);
+
+  // No keychainOk and no keychainAfter: the login writes no file and mints no
+  // item, so there is nothing for it to have superseded.
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(existsSync(stale), "the login minted nothing, so it superseded nothing");
+  assert.equal(readFileSync(stale, "utf8"), healthy, "and the file was not rewritten either");
+
+  const ls = s.ms(["ls"]);
+  assert.equal(ls.code, 0, ls.stderr);
+  assert.match(ls.stdout, /gmail\s+claude\s+gmail\s+org-1\s+yes\s+yes/);
+  assert.equal(ls.stdout.includes("migrated"), false, "the account book never prints a credential");
+});
+
+test("accounts login KEEPS the credentials file when the login itself wrote it", () => {
+  // The other half: on Linux (and under the stub here) `claude auth login`
+  // writes that file itself, and it IS the fresh grant. Only a file the login
+  // left untouched is stale.
+  const s = scene();
+  const cred = path.join(s.configDir("gmail"), ".credentials.json");
+  s.ms(["add", "gmail"]);
+  assert.equal(s.ms(["login", "gmail"]).code, 0);
+  assert.ok(existsSync(cred), "the login's own credential was deleted out from under it");
+  assert.deepEqual(JSON.parse(readFileSync(cred, "utf8")), JSON.parse(CRED));
+});
+
 test("accounts login fails loudly, naming the service it expected, when nothing answers", () => {
   const s = scene({ noCredFile: true });
   s.ms(["add", "gmail"]);
@@ -786,7 +861,11 @@ test("accounts ls calls a token it cannot read `unreadable`, not `yes`", { skip:
   assert.equal(r.stdout.includes(TOKEN), false, "the account book never prints a credential");
 });
 
-test("accounts ls fills the POLL column without reading any secret", () => {
+test("accounts ls answers POLL from the grant it can actually READ, and prints none of it", () => {
+  // The column used to be existence alone, which was cheap and wrong: ms
+  // 0.2.0 left items that exist and hold nothing parseable (see the truncated
+  // case below). Telling those apart costs one read of the value, which `ls`
+  // holds just long enough to parse and never prints.
   const s = scene({ noCredFile: true });
   const scoped = s.scopedService("gmail");
   s.ms(["add", "gmail"]);
@@ -797,7 +876,28 @@ test("accounts ls fills the POLL column without reading any secret", () => {
   assert.match(r.stdout, /gmail\s+claude\s+gmail\s+org-1\s+yes\s+yes\s+yes/);
   const probes = s.securityLog().split("\n").filter(Boolean);
   assert.ok(probes.length > 0, "ls did check the keychain");
-  for (const line of probes) assert.equal(line.includes("-w"), false, `ls asked for a secret: ${line}`);
+  assert.equal(r.stdout.includes("rt-1"), false, "the account book never prints a credential");
+  assert.equal(r.stdout.includes("at-1"), false, "the account book never prints a credential");
+  // Whatever it asked for, it never asked for the human's own login.
+  for (const line of probes) assert.doesNotMatch(line, /-s Claude Code-credentials(?=\s|$)/, line);
+});
+
+test("accounts ls calls a truncated keychain grant POLL `no`, not `yes`", () => {
+  // The item ms 0.2.0 leaves behind: 128 bytes of a ~600-byte credentials
+  // blob, written through `security`'s interactive prompt. `ls` said `yes`
+  // about a grant nothing can read, which is the one thing the book must not
+  // do — the doctor calls the same grant unreadable.
+  const whole = JSON.stringify({
+    claudeAiOauth: { accessToken: `at-${"A".repeat(260)}`, refreshToken: `rt-${"R".repeat(260)}`, expiresAt: Date.now() + 3_600_000 },
+  });
+  const truncated = whole.slice(0, 128);
+  const s = scene({ noCredFile: true, cred: truncated });
+  const scoped = s.scopedService("gmail");
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["ls"], { MS_TEST_KEYCHAIN_OK: scoped });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /gmail\s+claude\s+gmail\s+-\s+no\s+no\s+no/);
+  assert.equal(r.stdout.includes("AAAA"), false, "the account book never prints a credential");
 });
 
 test("accounts remove deletes the row, the token file and the config dir", () => {

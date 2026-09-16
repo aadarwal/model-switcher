@@ -24,7 +24,7 @@ import { claudeSettingsPath, msBinary, msHome, p } from "./paths.ts";
 import { claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
 import { codexConfigPath, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
 import { loadRegistry, type Account } from "./registry.ts";
-import { AuthError, TransientError, readPollCredentials, refreshPollCredentials } from "./providers/claude-usage.ts";
+import { AuthError, TransientError, readPollGrant, refreshPollCredentials } from "./providers/claude-usage.ts";
 import { fetchCodexUsage, readCodexCredentials } from "./providers/codex-usage.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { codexAutorotateEnabled, codexAutorotateLine } from "./autorotate.ts";
@@ -411,10 +411,26 @@ export async function checkClaudeAccount(a: Account, fix: boolean): Promise<Resu
   const tag = `claude account ${a.name}`;
   const out: Result[] = [];
 
-  const cred = readPollCredentials(a.name);
-  if (!cred) {
+  // Three answers, not two. A grant that is THERE and holds nothing parseable
+  // is a different report from one that was never minted — and ms 0.2.0 made
+  // the first one common, by writing every refreshed grant back through
+  // `security`'s 128-byte prompt (src/providers/claude-usage.ts). There is no
+  // refresh to attempt on it either: whatever is in it is not a refresh token,
+  // so --fix would spend a call to be told `invalid_grant`.
+  const grant = readPollGrant(a.name);
+  if (grant.state === "unreadable") {
+    out.push({
+      ok: false,
+      what: `${tag}: poll grant`,
+      why:
+        grant.where === "keychain"
+          ? `unreadable (a truncated keychain write from ms 0.2.0); run ms accounts login ${a.name}`
+          : `unreadable (${path.join(p.claudeConfigDir(a.name), ".credentials.json")} is not the credentials JSON); run ms accounts login ${a.name}`,
+    });
+  } else if (grant.state === "absent") {
     out.push({ ok: false, what: `${tag}: poll grant readable`, why: `no credentials file or keychain entry (ms accounts login ${a.name})` });
   } else {
+    const cred = grant.cred;
     out.push({ ok: true, what: `${tag}: poll grant readable` });
     const due = cred.expiresAt - Date.now() <= REFRESH_DUE_MS;
     if (!due) {

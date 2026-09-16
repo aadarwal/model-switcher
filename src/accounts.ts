@@ -45,13 +45,16 @@ import { deleteLaunchToken, looksLikeSetupToken, readLaunchToken, saveLaunchToke
 import {
   AuthError,
   deleteKeychainItem,
+  discardStaleCredFile,
   fetchProfile,
   keychainItemExists,
   keychainItemFor,
   type PollCredentials,
   type Profile,
   readPollCredentials,
+  readPollGrant,
   refreshPollCredentials,
+  stampCredFile,
   writeKeychainNote,
 } from "./providers/claude-usage.ts";
 import { wallKindFromText } from "./wall.ts";
@@ -410,8 +413,10 @@ function locatePollCredential(name: string, dir: string): void {
   );
 }
 
-/** Is there a poll grant on disk for this account? Existence only — `ls` has
- *  no business pulling a secret out of the keychain to fill in a column. */
+/** Is there a poll grant on disk for this account? Existence only — this is
+ *  `cmdLogin`'s pre-flight, which asks `claude auth status` next and has no
+ *  need to pull a secret out of the keychain to decide whether to. (The `ls`
+ *  column is the one that needs more than existence: see `pollCell`.) */
 function hasPollGrant(name: string): boolean {
   const dir = p.claudeConfigDir(name);
   try {
@@ -420,6 +425,20 @@ function hasPollGrant(name: string): boolean {
     /* no file; the scoped keychain item is the other place it can be */
   }
   return keychainItemExists(keychainItemFor(name));
+}
+
+/** The POLL cell for a Claude row.
+ *
+ *  Existence used to be the whole answer, and ms 0.2.0 made it a lie: its
+ *  refresh write-back truncated grants at `security`'s 128-byte prompt
+ *  (src/providers/claude-usage.ts), leaving items that are THERE and hold
+ *  nothing parseable. This column called those `yes` while `ms doctor` called
+ *  the same grant unreadable — and a book and a doctor must never disagree
+ *  about one credential, which is exactly the reason the TOKEN column stopped
+ *  trusting `existsSync` (see `tokenCell`). So the value is read, held for as
+ *  long as the parse takes, and printed nowhere. */
+function pollCell(name: string): string {
+  return readPollGrant(name).state === "ok" ? "yes" : "no";
 }
 
 /** Does this account ALREADY hold a usable poll grant? `claude auth status`
@@ -596,7 +615,23 @@ export async function cmdLogin(name: string): Promise<number> {
     if (pollGrantUsable(name, dir)) {
       out(`${name}: a usable poll grant is already in place — skipping claude auth login\n`);
     } else {
+      // A `.credentials.json` left by an earlier refresh's write-back outranks
+      // the keychain (`readPollGrant` prefers the file), so on macOS — where
+      // this login mints into the keychain — it would shadow the grant the
+      // human is standing here minting. A file this login does not itself
+      // write does not survive it; one it does write IS the new grant.
+      //
+      // And only when the login actually MINTED something to supersede it
+      // with. A `claude auth login` that exits 0 and leaves nothing ms can
+      // locate has superseded nothing, and unlinking here would take the
+      // account's only working credential — `locatePollCredential` would then
+      // fail, and the account would drop out of the pool over a file that was
+      // fine. `pollGrantUsable` says "not usable" for reasons that are not the
+      // grant's fault (no `claude` on PATH, an `auth status` that errors), so
+      // this is a live path, not a theoretical one.
+      const before = stampCredFile(name);
       runAuthLogin(name, dir);
+      if (keychainItemExists(keychainItemFor(name))) discardStaleCredFile(name, before);
     }
     locatePollCredential(name, dir);
     // Identity (and the duplicate refusal) before a token is ever minted: a
@@ -753,7 +788,7 @@ async function cmdLs(): Promise<number> {
     a.provider === "codex"
       ? await codexCells(a)
       : {
-          poll: hasPollGrant(a.name) ? "yes" : "no",
+          poll: pollCell(a.name),
           token: tokenCell(a.name),
           verified: a.identityVerified ? "yes" : "no",
         },

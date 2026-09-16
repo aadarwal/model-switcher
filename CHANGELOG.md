@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- MS_HOME is canonicalised at startup, so a symlinked store keeps its hooks
+  and trust
+
 ## 0.2.1
 
 - a refreshed Claude poll grant is written to the credentials file; ms 0.2.0's

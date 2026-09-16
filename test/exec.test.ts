@@ -15,16 +15,23 @@ const SESSION_BASE = {
  * returns the env `run()` needs to see the same store and stub PATH. */
 async function seedLaunch(opts: {
   home: string; msHome: string; account?: string; generation?: number; env?: Record<string, string>;
-  skipSession?: boolean;
+  skipSession?: boolean; provider?: "claude" | "codex"; command?: string[];
 }) {
   const account = opts.account ?? "gmail";
+  const provider = opts.provider ?? "claude";
   process.env.HOME = opts.home; process.env.MS_HOME = opts.msHome;
   const { openState } = await import("../src/state.ts");
   const st = openState();
-  if (!opts.skipSession) st.createSession({ id: "s1", ...SESSION_BASE, account, generation: opts.generation ?? 2 });
+  if (!opts.skipSession) {
+    st.createSession({
+      id: "s1", ...SESSION_BASE, provider, account, generation: opts.generation ?? 2,
+      // Codex has no `--session-id`; the row carries none until its hook speaks.
+      cliSessionId: provider === "codex" ? null : SESSION_BASE.cliSessionId,
+    });
+  }
   st.createLaunch({
     id: "L1", sessionId: "s1", generation: opts.generation ?? 2, account,
-    command: ["claude", "--resume", "c-1", "hello"], env: opts.env ?? {}, createdAt: Math.floor(Date.now() / 1000),
+    command: opts.command ?? ["claude", "--resume", "c-1", "hello"], env: opts.env ?? {}, createdAt: Math.floor(Date.now() / 1000),
   });
   st.close();
 }
@@ -151,4 +158,80 @@ test("without process.execve, _exec exits 1 and never touches state or the CLI",
   } finally {
     if (original) process.execve = original;
   }
+});
+
+// --- a codex launch ------------------------------------------------------
+//
+// A Codex account's ONE credential is the `auth.json` inside its own
+// CODEX_HOME, so `_exec` hands the child a DIRECTORY, not a token: nothing
+// secret is put in the environment at all, and the two variables that could
+// make the CLI answer as somebody else are removed.
+
+const CODEX_STUB = `echo "ARGS=$*"
+echo "CODEX_HOME=$CODEX_HOME"
+echo "CLAUDE_TOKEN=\${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"
+echo "OPENAI_API_KEY=\${OPENAI_API_KEY-<unset>}"
+echo "MS_SESSION=$MS_SESSION"
+echo "MS_ACCOUNT=$MS_ACCOUNT"
+echo "FOO=$FOO"`;
+
+const envOf = (stdout: string) =>
+  Object.fromEntries(stdout.trim().split("\n").map((l) => { const i = l.indexOf("="); return [l.slice(0, i), l.slice(i + 1)]; }));
+
+test("_exec for a codex launch points the CLI at the account's home, with no token", async () => {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  await seedLaunch({ home, msHome, account: "work", provider: "codex", command: ["codex", "--model", "gpt-5"], env: { FOO: "bar" } });
+  stub("codex", CODEX_STUB);
+
+  const r = run(["_exec", "L1"], {
+    HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`,
+    // Both would otherwise be inherited straight into the CLI: one would make
+    // codex bill an API key instead of the subscription this tool is choosing
+    // between, the other is another provider's credential entirely.
+    OPENAI_API_KEY: "sk-openai-should-not-survive",
+    CLAUDE_CODE_OAUTH_TOKEN: SAMPLE_TOKEN,
+  });
+
+  assert.equal(r.code, 0, r.stderr);
+  const lines = envOf(r.stdout);
+  assert.equal(lines.CODEX_HOME, `${msHome}/codex/work`);
+  assert.equal(lines.OPENAI_API_KEY, "<unset>");
+  assert.equal(lines.CLAUDE_TOKEN, "<unset>");
+  assert.equal(lines.ARGS, "--model gpt-5");
+  assert.equal(lines.MS_SESSION, "s1");
+  assert.equal(lines.MS_ACCOUNT, "work");
+  assert.equal(lines.FOO, "bar");
+  assert.equal(r.stdout.includes(SAMPLE_TOKEN), false);
+});
+
+test("a codex launch needs no launch token: the absence of one is not an error", async () => {
+  // The claude path exits 3 here. A codex account never has one to read.
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  await seedLaunch({ home, msHome, account: "work", provider: "codex", command: ["codex"] });
+  stub("codex", CODEX_STUB);
+
+  const r = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(envOf(r.stdout).CODEX_HOME, `${msHome}/codex/work`);
+});
+
+test("a codex launch.env cannot shadow CODEX_HOME or the MS_* identity", async () => {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  await seedLaunch({
+    home, msHome, account: "work", provider: "codex", command: ["codex"],
+    env: { CODEX_HOME: "/tmp/evil", OPENAI_API_KEY: "sk-evil", MS_ACCOUNT: "evil" },
+  });
+  stub("codex", CODEX_STUB);
+
+  const r = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+
+  assert.equal(r.code, 0, r.stderr);
+  const lines = envOf(r.stdout);
+  assert.equal(lines.CODEX_HOME, `${msHome}/codex/work`);
+  assert.equal(lines.OPENAI_API_KEY, "<unset>");
+  assert.equal(lines.MS_ACCOUNT, "work");
 });

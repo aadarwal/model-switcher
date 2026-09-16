@@ -4,7 +4,7 @@ import path from "node:path";
 import { execLaunch } from "./exec.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
 import { codexHook, codexWatch } from "./hooks/codex-hook.ts";
-import { attachVerb, launchClaude } from "./launch.ts";
+import { attachVerb, launchClaude, launchCodex } from "./launch.ts";
 import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { paneDied, reconcile } from "./reconcile.ts";
 import { recoverVerb } from "./recover.ts";
@@ -23,6 +23,7 @@ registerVerb("_hook", async ([which]) => (which === "claude" ? claudeHook() : wh
 registerVerb("_codex_watch", codexWatch);
 registerVerb("_pane_died", paneDied);
 registerVerb("claude", launchClaude);
+registerVerb("codex", launchCodex);
 registerVerb("attach", attachVerb);
 registerVerb("_recover", recoverVerb);
 registerVerb("status", status);

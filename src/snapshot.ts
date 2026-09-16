@@ -43,6 +43,7 @@ import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { ensureStore, p } from "./paths.ts";
 import { Locked, withLock } from "./lock.ts";
 import { loadRegistry, type Account, type Provider } from "./registry.ts";
+import { openState } from "./state.ts";
 import type { PickInput } from "./pick.ts";
 import {
   AuthError,
@@ -53,6 +54,7 @@ import {
   type PollCredentials,
   type Usage,
 } from "./providers/claude-usage.ts";
+import { fetchCodexUsage, readCodexCredentials, refreshCodexCredentials, type CodexAuth } from "./providers/codex-usage.ts";
 
 export type ErrorKind = "auth" | "transient" | "other";
 
@@ -117,7 +119,6 @@ export const MAX_READING_AGE_MS = 600_000;
 /** Long enough to outlast the holder's own poll, so waiting beats stampeding. */
 const LOCK_WAIT_MS = POLL_TIMEOUT_MS + 5_000;
 const LOCK = "snapshot";
-const NO_POLLER = "no poller yet";
 
 /** The identity of an account, everywhere: provider first, then name. */
 const keyOf = (a: { provider: Provider; name: string }): string => `${a.provider}:${a.name}`;
@@ -289,6 +290,77 @@ async function refreshGrant(a: Account, c: PollCredentials, signal: AbortSignal)
   );
 }
 
+async function pollClaudeUsage(a: Account, signal: AbortSignal): Promise<Usage> {
+  let c = readPollCredentials(a.name);
+  if (!c) {
+    // Launchable-but-unpollable is the two-credential model's normal state
+    // (spec §6), and the fix is a login, not a retry — so: auth, no backoff.
+    throw new AuthError(`no poll grant (run: ms accounts login ${a.name})`);
+  }
+  if (c.expiresAt < Date.now() + REFRESH_SKEW_MS) c = await refreshGrant(a, c, signal);
+  return await fetchUsage(c, signal);
+}
+
+// --- Polling one Codex account ------------------------------------------
+
+/** The G2 spike (whether a running `codex` process tolerates its on-disk
+ *  grant rotating under it) has not run yet. Conservative rule until it does:
+ *  a credential is due for refresh only when nothing managed is using it.
+ *  This is the one function G2's verdict changes — PASS deletes the session
+ *  check entirely and refreshes on the age test alone (or a 401) instead. */
+export const CODEX_REFRESH_AGE_MS = 55 * 60_000;
+
+function codexRefreshDue(auth: CodexAuth): boolean {
+  const t = auth.last_refresh ? Date.parse(auth.last_refresh) : NaN;
+  return !Number.isFinite(t) || Date.now() - t > CODEX_REFRESH_AGE_MS;
+}
+
+/** True when no managed Codex session for this account is still using its
+ *  grant. A state read that fails (locked db, anything) answers false — the
+ *  conservative side, since spending the one-shot refresh token on a guess is
+ *  worse than polling one round on a slightly stale access token. */
+function codexRefreshAllowed(name: string): boolean {
+  try {
+    const state = openState();
+    try {
+      return !state.listSessions().some((s) => s.provider === "codex" && s.account === name && s.state !== "stopped");
+    } finally {
+      state.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function pollCodexUsage(a: Account, signal: AbortSignal): Promise<Usage> {
+  const dir = p.codexHome(a.name);
+  let auth = readCodexCredentials(dir);
+  if (!auth) throw new AuthError(`no credentials (ms accounts login ${a.name})`);
+  if (codexRefreshDue(auth) && codexRefreshAllowed(a.name)) {
+    auth = await withLock(
+      lockOf(a),
+      async () => {
+        // Re-read inside the lock: whoever we waited for may have just
+        // rotated it, in which case there is nothing left to refresh. And
+        // re-check the session guard too — the outside check above runs
+        // BEFORE the lock is even requested, so a session can start in the
+        // gap between that check and actually holding the lock. That check
+        // was only ever a cheap pre-filter to skip taking the lock when
+        // refreshing is obviously unnecessary; this is the one that must
+        // not miss a session that started while we waited.
+        const latest = readCodexCredentials(dir) ?? auth!;
+        if (!codexRefreshDue(latest) || !codexRefreshAllowed(a.name)) return latest;
+        return await refreshCodexCredentials(dir, latest, signal);
+      },
+      { waitMs: POLL_TIMEOUT_MS },
+    );
+  }
+  // Refresh skipped (fresh enough, or a live session owns the grant): poll
+  // with the stored access token and let a dead one classify as `auth` on
+  // its own, via fetchCodexUsage's 401/403 handling.
+  return await fetchCodexUsage(auth, signal);
+}
+
 type Polled = { entry: AccountUsage; backoffUntil: number | null };
 
 /** Never throws: every outcome is an entry, because one account's failure must
@@ -300,17 +372,6 @@ async function pollOne(a: Account, prev: AccountUsage | null, backoffUntil: numb
     ...who,
     ...over,
   });
-
-  if (a.provider !== "claude") {
-    // Plan 2 adds the codex poller. Until then this is a named absence, not a
-    // silent null: `ms status` should say why, and the chooser should skip it.
-    // `observedAt` is null because nothing has ever been read, and `stale` is
-    // false because this IS current — there is simply nothing to be current.
-    return {
-      entry: keep({ usage: null, error: NO_POLLER, errorKind: "other", observedAt: null, stale: false }),
-      backoffUntil: null,
-    };
-  }
 
   if (backoffUntil > Date.now()) {
     const until = new Date(backoffUntil).toISOString();
@@ -326,21 +387,7 @@ async function pollOne(a: Account, prev: AccountUsage | null, backoffUntil: numb
 
   const signal = AbortSignal.timeout(POLL_TIMEOUT_MS);
   try {
-    let c = readPollCredentials(a.name);
-    if (!c) {
-      // Launchable-but-unpollable is the two-credential model's normal state
-      // (spec §6), and the fix is a login, not a retry — so: auth, no backoff.
-      return {
-        entry: keep({
-          error: `no poll grant (run: ms accounts login ${a.name})`,
-          errorKind: "auth",
-          stale: true,
-        }),
-        backoffUntil: null,
-      };
-    }
-    if (c.expiresAt < Date.now() + REFRESH_SKEW_MS) c = await refreshGrant(a, c, signal);
-    const usage = await fetchUsage(c, signal);
+    const usage = a.provider === "codex" ? await pollCodexUsage(a, signal) : await pollClaudeUsage(a, signal);
     return {
       entry: { ...who, usage, error: null, errorKind: null, observedAt: Date.now(), stale: false },
       backoffUntil: null,

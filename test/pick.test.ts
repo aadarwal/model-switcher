@@ -69,6 +69,30 @@ test("a non-finite usedPercent is malformed, not eligible", () => {
   assert.equal(pickAccounts([fableBad], "any").picks.length, 1);
 });
 
+// A Codex row's `weeklyFable` is always null (Codex has no Fable-scoped
+// window): out for need=fable, in for need=any — never gated by a window
+// that provider simply does not have.
+test("a null weeklyFable is out for need=fable and in for need=any", () => {
+  const a = [acct("cdx", { provider: "codex", weeklyFable: null })];
+  const fable = pickAccounts(a, "fable");
+  assert.deepEqual(fable.out, [{ name: "cdx", why: "no fable window" }]);
+  const any = pickAccounts(a, "any");
+  assert.equal(any.picks.length, 1);
+  assert.equal(any.picks[0]?.name, "cdx");
+});
+
 test("parseNeed", () => {
   assert.equal(parseNeed(undefined), "any"); assert.equal(parseNeed("fable"), "fable"); assert.equal(parseNeed("fabel"), null);
+});
+
+test("a Codex account with no session window (Pro plans) is eligible on its weekly window; Claude still needs both", () => {
+  const weekly = { usedPercent: 30, resetsAt: "2026-09-21T11:00:00Z" };
+  const r = pickAccounts([
+    { name: "pro", provider: "codex", shared: false, session: null, weeklyAll: weekly, weeklyFable: null, error: null },
+    { name: "cl", provider: "claude", shared: false, session: null, weeklyAll: weekly, weeklyFable: weekly, error: null },
+  ], "any");
+  assert.deepEqual(r.picks.map((p) => p.name), ["pro"]);
+  assert.deepEqual(r.out, [{ name: "cl", why: "no session window" }]);
+  const walled = pickAccounts([{ name: "pro", provider: "codex", shared: false, session: null, weeklyAll: { usedPercent: 100, resetsAt: null }, weeklyFable: null, error: null }], "any");
+  assert.deepEqual(walled.out, [{ name: "pro", why: "weekly window at 100" }]);
 });

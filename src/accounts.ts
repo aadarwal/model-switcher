@@ -39,12 +39,23 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { withLock } from "./lock.ts";
 import { ensureStore, p } from "./paths.ts";
-import { type Account, findAccount, loadRegistry, NAME_PATTERN, type Provider, saveRegistry } from "./registry.ts";
+import {
+  type Account,
+  findAccount,
+  loadRegistry,
+  NAME_PATTERN,
+  organisationClaimedBy,
+  type Provider,
+  sameOrganisationAs,
+  saveRegistry,
+} from "./registry.ts";
 import { addCodex, CODEX_RESERVED_NAMES, codexCells, loginCodex, removeCodex, verifyCodex } from "./accounts-codex.ts";
 import { deleteLaunchToken, looksLikeSetupToken, readLaunchToken, saveLaunchToken } from "./launch-credentials.ts";
 import {
   AuthError,
+  type CredFileStamp,
   deleteKeychainItem,
+  discardFreshCredFile,
   discardStaleCredFile,
   fetchProfile,
   keychainItemExists,
@@ -54,6 +65,7 @@ import {
   readPollCredentials,
   readPollGrant,
   refreshPollCredentials,
+  restorePollGrantFile,
   stampCredFile,
   writeKeychainNote,
 } from "./providers/claude-usage.ts";
@@ -99,7 +111,7 @@ const PROVIDERS: Provider[] = ["claude", "codex"];
 const USAGE = `usage: ms accounts <command>
   add <name> [--provider claude|codex] [--label L] [--shared]
                                       register an account (no credentials yet)
-  login <name> [--provider P] [--device-auth]
+  login <name> [--provider P] [--device-auth] [--relogin]
                                       mint the credentials and record the identity
   verify <name> [--provider P]        re-check an account's credentials and identity
   remove <name> [--provider P]        delete the row and everything it names
@@ -107,7 +119,9 @@ const USAGE = `usage: ms accounts <command>
   ls                                  list the accounts
 
 --provider is needed only when one name is held by BOTH providers; names are
-unique per provider, so a claude "work" and a codex "work" are two accounts.`;
+unique per provider, so a claude "work" and a codex "work" are two accounts.
+--relogin (claude) signs in again even when a usable poll grant is already in
+place; the grant it replaces is given back if the new one is refused.`;
 
 const out = (s: string) => process.stdout.write(s);
 const warn = (s: string) => process.stderr.write(`ms accounts: ${s}\n`);
@@ -195,16 +209,6 @@ function update(name: string, patch: Partial<Account>): void {
   if (!a) throw new UsageError(`no such Claude account: ${name}`);
   Object.assign(a, patch);
   saveRegistry(r.registry, r);
-}
-
-/** The other account already claiming this organisation, if any. Identity is
- *  the org id (spec §6), so this is what makes two nicknames for one
- *  subscription an error rather than a silently doubled pool entry. */
-function organisationClaimedBy(name: string, orgId: string): string | null {
-  const other = load().registry.accounts.find(
-    (a) => a.provider === "claude" && a.name !== name && a.orgId === orgId,
-  );
-  return other ? other.name : null;
 }
 
 // --- The `claude` CLI --------------------------------------------------
@@ -504,8 +508,10 @@ async function readProfile(name: string): Promise<Profile> {
   }
 }
 
-/** Two rows resolving to one organisation. Its own type because `login`
- *  answers it by undoing the credential it just minted — and nothing else. */
+/** Two rows resolving to one organisation: the commonest way a human answers
+ *  the browser as the wrong account, and worth its own name in a stack trace.
+ *  `login` undoes the credential it just minted for it — and for every other
+ *  refusal in the same stretch; see `discardSignIn`. */
 class DuplicateOrganisation extends Error {
   override name = "DuplicateOrganisation";
 }
@@ -515,9 +521,89 @@ class DuplicateOrganisation extends Error {
 async function identifyOrRefuse(name: string): Promise<Profile> {
   const profile = await readProfile(name);
   if (!profile.orgId) throw new Error(`the poll grant for ${name} reported no organisation`);
-  const other = organisationClaimedBy(name, profile.orgId);
-  if (other) throw new DuplicateOrganisation(`${name} resolves to the same organisation as ${other}`);
+  const other = organisationClaimedBy(load().registry.accounts, name, profile.orgId);
+  if (other) throw new DuplicateOrganisation(`${name} ${sameOrganisationAs(other)}`);
   return profile;
+}
+
+/**
+ * Everything a refused sign-in has to put back the way it found it, stamped
+ * before this run touches anything — because "did THIS run produce it?" is
+ * the only question that makes a discard safe.
+ */
+type SignIn = {
+  /** Did this run open a browser login? Only then is the poll grant on disk
+   *  this run's to discard at all. */
+  ran: boolean;
+  /** The credentials file as it stood before that login. */
+  cred: CredFileStamp;
+  /** Was there a scoped keychain item before it? */
+  keychain: boolean;
+  /** Did this run create the config dir? */
+  dirCreated: boolean;
+  /** The working grant a `--relogin` is deliberately replacing, read before
+   *  the login so a refusal can give it back. Null on every other path. */
+  held: PollCredentials | null;
+};
+
+/** What a refused sign-in leaves the human with. The way back is one command,
+ *  and the account is where it started rather than polling an organisation it
+ *  does not own. */
+function discardedNote(name: string): string {
+  return `the sign-in was discarded; run ms accounts login ${name} --provider claude and sign in as the ${name} account`;
+}
+
+/**
+ * Undo the poll grant this run just minted, after a refusal.
+ *
+ * The defect this exists for, live on 2026-09-16: the browser tab for
+ * `ms accounts login dirk` was answered with an account from kratuvak's
+ * organisation. `ms` refused it — correctly — but `claude auth login` had
+ * already written that grant into dirk's own keychain item, so the account was
+ * left POLLING an organisation it does not own, the next `login` found a
+ * "usable" grant and skipped the browser, and the only way out was `remove` +
+ * `add` (which costs the launch token too).
+ *
+ * Only what this run produced goes:
+ *
+ *   * the credentials file, when the login wrote or replaced it — a file
+ *     whose stamp has not moved is one the login never touched;
+ *   * the keychain item, when the login minted it, or replaced one that was
+ *     already there. "Replaced" is exactly the case where the grant just
+ *     refused came OUT of the keychain: the service is derived from this
+ *     account's own config dir (src/providers/claude-usage.ts), so the item
+ *     can only ever be this account's — never the other account's, and never
+ *     the operator's own unscoped login;
+ *   * the config dir, when this run created it.
+ *
+ * And a grant a `--relogin` deliberately replaced is put back, so a refused
+ * re-login leaves the account exactly as usable as it was before it.
+ */
+function discardSignIn(name: string, dir: string, before: SignIn): boolean {
+  if (!before.ran) return false; // nothing this run minted; nothing to undo
+  const read = readPollGrant(name);
+  const fromKeychain = read.state === "ok" && read.cred.source === "keychain";
+  let discarded = false;
+  if (discardFreshCredFile(name, before.cred)) discarded = true;
+  const item = keychainItemFor(name);
+  if ((!before.keychain || fromKeychain) && keychainItemExists(item) && deleteKeychainItem(item)) discarded = true;
+  if (before.dirCreated) rmSync(dir, { recursive: true, force: true });
+  if (before.held) restorePollGrantFile(name, before.held);
+  return discarded;
+}
+
+/** The refusal, with the discard said out loud — but only when there was
+ *  something to discard, because a message must never claim a cleanup that did
+ *  not happen. The error keeps its own class, so a `DuplicateOrganisation` is
+ *  still one on the way out. */
+function refuseSignIn(name: string, dir: string, before: SignIn, e: unknown): unknown {
+  if (!discardSignIn(name, dir, before)) return e;
+  const note = discardedNote(name);
+  if (e instanceof Error) {
+    e.message = `${e.message} — ${note}`;
+    return e;
+  }
+  return new Error(`${String(e)} — ${note}`);
 }
 
 /** Runs the launch token headlessly (the probe) — the one thing that proves
@@ -603,18 +689,35 @@ export function cmdAdd(args: string[]): number {
   return 0;
 }
 
-export async function cmdLogin(name: string): Promise<number> {
+export async function cmdLogin(name: string, opts: { relogin?: boolean } = {}): Promise<number> {
   mustFind(name);
   const { dir, created } = claudeConfigDir(name);
+  const before: SignIn = { ran: false, cred: null, keychain: false, dirCreated: created, held: null };
   let profile: Profile;
   try {
     // A poll grant already in this dir is the login: sending the human back
     // through a browser flow they completed this morning is repeating work,
     // not confirming it. `login` is still the verb that mints the LAUNCH
     // token, so the rest of it runs either way.
-    if (pollGrantUsable(name, dir)) {
-      out(`${name}: a usable poll grant is already in place — skipping claude auth login\n`);
+    //
+    // `--relogin` is the way past it, and the skip names it: a grant can be
+    // perfectly usable and still be the WRONG one (the wrong account answered
+    // the browser tab), and before this flag the only way to sign in again was
+    // `remove` + `add`, which throws the launch token away with it.
+    if (!opts.relogin && pollGrantUsable(name, dir)) {
+      out(
+        `${name}: a usable poll grant is already in place — skipping claude auth login ` +
+          `(ms accounts login ${name} --relogin signs in again)\n`,
+      );
     } else {
+      // A `--relogin` is REPLACING something that works. Read it first, so a
+      // refusal can give it back rather than leave the account with nothing:
+      // on macOS `claude auth login` overwrites the keychain item in place,
+      // and after that this copy is the only one there is.
+      if (opts.relogin) {
+        const held = readPollGrant(name);
+        if (held.state === "ok") before.held = held.cred;
+      }
       // A `.credentials.json` left by an earlier refresh's write-back outranks
       // the keychain (`readPollGrant` prefers the file), so on macOS — where
       // this login mints into the keychain — it would shadow the grant the
@@ -629,23 +732,24 @@ export async function cmdLogin(name: string): Promise<number> {
       // fine. `pollGrantUsable` says "not usable" for reasons that are not the
       // grant's fault (no `claude` on PATH, an `auth status` that errors), so
       // this is a live path, not a theoretical one.
-      const before = stampCredFile(name);
+      before.cred = stampCredFile(name);
+      before.keychain = keychainItemExists(keychainItemFor(name));
+      before.ran = true;
       runAuthLogin(name, dir);
-      if (keychainItemExists(keychainItemFor(name))) discardStaleCredFile(name, before);
+      if (keychainItemExists(keychainItemFor(name))) discardStaleCredFile(name, before.cred);
     }
     locatePollCredential(name, dir);
     // Identity (and the duplicate refusal) before a token is ever minted: a
     // refused account must leave nothing behind.
     profile = await identifyOrRefuse(name);
   } catch (e) {
-    // A refusal undoes this run's own work: without this, the credential the
-    // browser login just wrote would keep answering, and `ms accounts ls`
-    // would report a poll grant for an account that was turned away. Only a
-    // dir this run created is ours to delete. (A keychain-held credential
-    // survives: deleting the item could revoke the very grant the OTHER
-    // account polls with — the dir, and the note in it, go.)
-    if (e instanceof DuplicateOrganisation && created) rmSync(dir, { recursive: true, force: true });
-    throw e;
+    // A refusal undoes this run's own work. Without it the credential the
+    // browser login just wrote keeps answering — for the wrong organisation,
+    // with `ms accounts ls` reporting a poll grant for an account that was
+    // turned away, and the next `login` skipping the browser because that
+    // grant is "usable". What this run did not produce is left exactly where
+    // it was; see `discardSignIn`.
+    throw refuseSignIn(name, dir, before, e);
   }
   // The organisation is a fact about the grant now on disk: record it before
   // the mint, and never leave a stale verdict standing beside a fresh org.
@@ -655,16 +759,30 @@ export async function cmdLogin(name: string): Promise<number> {
   // no way to check the human used the same account for both — the probe only
   // proves the launch token can run the CLI, never whose account it is.
   out(`${name}: sign in as the SAME account in the next browser tab\n`);
+  // What the mint is about to overwrite. A token this run replaces is the only
+  // copy of itself, and a sign-in that turns out to be for another account is
+  // no reason to take the working one away with it.
+  const heldToken = readLaunchToken(name);
   const token = await mintLaunchToken(name, dir);
   saveLaunchToken(name, token);
   const { verified, probe, mismatchOrg } = checkLaunchToken(name, token, profile);
   update(name, { identityVerified: verified, identityMethod: verified ? "both-usable" : undefined });
   if (!probe.ok) {
+    // The token is KEPT: a probe that did not answer says the credential does
+    // not work, not that it belongs to someone else, and `ls` should report
+    // what is on disk. The row already says unverified.
     throw new Error(`the launch token for ${name} did not answer the headless check (${probe.detail})`);
   }
   if (mismatchOrg) {
+    // This one IS an identity refusal: the token names another organisation
+    // than the grant beside it, so it was minted for an account that is not
+    // this one and is discarded exactly as a refused poll grant is. The poll
+    // grant itself is untouched — it is not what was refused.
+    deleteLaunchToken(name);
+    if (heldToken) saveLaunchToken(name, heldToken);
     throw new Error(
-      `${name}: the launch token belongs to a different organisation (it reports ${mismatchOrg}, but the poll grant reports ${profile.orgId})`,
+      `${name}: the launch token belongs to a different organisation (it reports ${mismatchOrg}, but the poll grant reports ${profile.orgId})` +
+        ` — ${discardedNote(name)}${heldToken ? "; the launch token it replaced is back" : ""}`,
     );
   }
   report(name, profile, verified);
@@ -805,21 +923,26 @@ async function cmdLs(): Promise<number> {
 const TARGET_VERBS = ["login", "verify", "remove", "token"];
 
 /** A target verb's arguments: the name, plus its flags. */
-function parseTarget(verb: string, args: string[]): { name: string; provider: Provider | null; deviceAuth: boolean } {
+function parseTarget(
+  verb: string,
+  args: string[],
+): { name: string; provider: Provider | null; deviceAuth: boolean; relogin: boolean } {
   let name: string | null = null;
   let provider: Provider | null = null;
   let deviceAuth = false;
+  let relogin = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--provider") provider = asProvider(verb, args[++i]);
     else if (a.startsWith("--provider=")) provider = asProvider(verb, a.slice("--provider=".length));
     else if (a === "--device-auth" && verb === "login") deviceAuth = true;
+    else if (a === "--relogin" && verb === "login") relogin = true;
     else if (a.startsWith("-")) throw new UsageError(`${verb}: unknown option ${a}`, true);
     else if (name === null) name = a;
     else throw new UsageError(`${verb}: unexpected argument ${a}`, true);
   }
   if (!name) throw new UsageError(`${verb} needs an account name`, true);
-  return { name, provider, deviceAuth };
+  return { name, provider, deviceAuth, relogin };
 }
 
 /**
@@ -858,7 +981,12 @@ export async function accountsVerb(args: string[]): Promise<number> {
       const row = resolveTarget(t.name, t.provider);
       const codex = row.provider === "codex";
       if (t.deviceAuth && !codex) throw new UsageError("login: --device-auth is a codex option", true);
-      if (sub === "login") return codex ? await loginCodex(row.name, { deviceAuth: t.deviceAuth }) : await cmdLogin(row.name);
+      // `codex login` has no skip to force past: it always runs the flow, so
+      // the flag would name a behaviour that provider does not have.
+      if (t.relogin && codex) throw new UsageError("login: --relogin is a claude option", true);
+      if (sub === "login") {
+        return codex ? await loginCodex(row.name, { deviceAuth: t.deviceAuth }) : await cmdLogin(row.name, { relogin: t.relogin });
+      }
       if (sub === "verify") return codex ? await verifyCodex(row.name) : await cmdVerify(row.name);
       if (sub === "remove") return codex ? removeCodex(row.name) : cmdRemove(row.name);
       // `token` is the launch grant, and only Claude has a second credential to

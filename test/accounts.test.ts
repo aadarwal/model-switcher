@@ -214,10 +214,13 @@ function scene(opts: Opts = {}) {
   stub("claude", CLAUDE_STUB);
   stub("security", SECURITY_STUB);
   const fetchStub = path.join(home, "fetch-stub.mjs");
+  // MS_TEST_PROFILE lets ONE `ms` invocation in a scene answer with a
+  // different organisation than the rest — which is what a human signing in
+  // as the wrong account looks like from in here.
   writeFileSync(
     fetchStub,
     `const body = ${JSON.stringify(JSON.stringify(opts.profile ?? PROFILE))};\n` +
-      `globalThis.fetch = async () => new Response(body, { status: 200, headers: { "content-type": "application/json" } });\n`,
+      `globalThis.fetch = async () => new Response(process.env.MS_TEST_PROFILE || body, { status: 200, headers: { "content-type": "application/json" } });\n`,
   );
   const argv = path.join(home, "claude-argv.log");
   const securityArgv = path.join(home, "security-argv.log");
@@ -247,6 +250,7 @@ function scene(opts: Opts = {}) {
     MS_TEST_KEYCHAIN_AFTER: (opts.keychainAfter ?? []).join("\n"),
     MS_TEST_POLL_STATUS_OK: opts.pollStatusOk ? "1" : "0",
     MS_TEST_AUTH_STATUS: opts.authStatus ?? '{"loggedIn":true,"orgId":"org-1","email":"work@example.com","orgName":"Work"}', // the real top-level shape; one test below keeps the nested fallback
+    MS_TEST_PROFILE: "", // per-invocation override; empty means "the scene's own profile"
     MS_TEST_PROBE_OUT: opts.probeOut ?? "ok",
     MS_TEST_PROBE_EXIT: String(opts.probeExit ?? 0),
   };
@@ -360,6 +364,10 @@ test("accounts login refuses a second account resolving to the same organisation
   const r = s.ms(["login", "gmail"]);
   assert.equal(r.code, 1);
   assert.match(r.stderr, /gmail resolves to the same organisation as work/);
+  assert.match(
+    r.stderr,
+    /the sign-in was discarded; run ms accounts login gmail --provider claude and sign in as the gmail account/,
+  );
   assert.equal(s.row("gmail").orgId, null);
   assert.equal(s.row("gmail").identityVerified, false);
   assert.equal(existsSync(s.tokenFile("gmail")), false);
@@ -400,8 +408,13 @@ test("accounts login refuses when the launch token reports a different organisat
   assert.match(r.stderr, /the launch token belongs to a different organisation/);
   assert.equal(s.row("gmail").identityVerified, false);
   assert.equal(s.row("gmail").identityMethod, undefined);
-  // the mint itself succeeded — a refused identity is not a failed mint
-  assert.ok(existsSync(s.tokenFile("gmail")));
+  // The token is minted, and then refused: it belongs to another account, so
+  // it is no more this account's to keep than the poll grant a refused
+  // sign-in writes. There was none here before, so nothing comes back.
+  assert.equal(existsSync(s.tokenFile("gmail")), false, "a token minted for a refused identity is discarded");
+  // The poll grant, by contrast, is untouched: it is not what was refused.
+  assert.equal(s.row("gmail").orgId, "org-1");
+  assert.ok(existsSync(path.join(s.configDir("gmail"), ".credentials.json")));
 });
 
 test("accounts login fails when setup-token prints nothing token-shaped", () => {
@@ -673,6 +686,186 @@ test("an unusable credential in the dir still opens the browser", () => {
   const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_OK: service });
   assert.equal(r.code, 0, r.stderr);
   assert.match(s.argvLog(), /^auth login$/m);
+});
+
+// --- a refused sign-in is discarded ------------------------------------
+//
+// Live, 2026-09-16: `ms accounts login dirk --provider claude` was answered in
+// the browser with an account belonging to kratuvak's organisation. `ms`
+// refused it — correctly — but `claude auth login` had already written that
+// grant into dirk's own keychain item, so the account was left POLLING an
+// organisation it does not own, and the next `login` found a "usable" grant,
+// skipped the browser, and refused again with no way back but `remove` + `add`
+// (which costs the launch token too). A refusal now undoes what this run
+// minted, and only what this run minted.
+
+const OLD_CRED = JSON.stringify({
+  claudeAiOauth: { accessToken: "at-already-here", refreshToken: "rt-already-here", expiresAt: Date.now() + 3_600_000 },
+});
+const OLD_TOKEN = "sk-ant-oat01-OLDtoken0987654321_-qrstuvwxyzabcdef";
+const ORG_9 = JSON.stringify({
+  account: { email: "someone-else@example.com" },
+  organization: { uuid: "org-9", name: "Another Org", rate_limit_tier: "default_claude_max_20x" },
+});
+
+test("a refused sign-in discards the credentials file that login wrote, config dir or no config dir", () => {
+  // The old code only ever removed a config dir this run CREATED, so a second
+  // login into an existing dir left the refused grant sitting there.
+  const s = scene();
+  s.ms(["add", "work"]);
+  assert.equal(s.ms(["login", "work"]).code, 0);
+  s.ms(["add", "gmail"]);
+  mkdirSync(s.configDir("gmail"), { recursive: true, mode: 0o700 }); // not this run's to remove
+  const cred = path.join(s.configDir("gmail"), ".credentials.json");
+
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /gmail resolves to the same organisation as work/);
+  assert.match(r.stderr, /the sign-in was discarded/);
+  assert.equal(existsSync(cred), false, "the grant the refused login wrote is gone");
+  assert.equal(s.row("gmail").orgId, null);
+  // and the account it collided with keeps everything it had
+  assert.ok(existsSync(path.join(s.configDir("work"), ".credentials.json")));
+  assert.equal(s.row("work").orgId, "org-1");
+  assert.equal(s.row("work").identityVerified, true);
+});
+
+test("a refused sign-in discards the keychain item that login wrote, and never another account's", () => {
+  // The macOS shape, and the one that actually bit: the grant is a generic
+  // password under a service derived from THIS account's config dir, so
+  // removing the dir leaves it answering for ever.
+  const s = scene({ noCredFile: true });
+  const workSvc = s.scopedService("work");
+  const gmailSvc = s.scopedService("gmail");
+  s.ms(["add", "work"]);
+  assert.equal(s.ms(["login", "work"], { MS_TEST_KEYCHAIN_AFTER: workSvc }).code, 0);
+  s.ms(["add", "gmail"]);
+  s.truncateSecurity();
+
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_OK: workSvc, MS_TEST_KEYCHAIN_AFTER: gmailSvc });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /gmail resolves to the same organisation as work/);
+  assert.match(
+    r.stderr,
+    /the sign-in was discarded; run ms accounts login gmail --provider claude and sign in as the gmail account/,
+  );
+  const sec = s.securityLog();
+  assert.ok(
+    sec.split("\n").includes(`delete-generic-password -s ${gmailSvc} -a ${BARE}`),
+    `the refused item was never deleted:\n${sec}`,
+  );
+  assert.equal(
+    sec.includes(`delete-generic-password -s ${workSvc}`),
+    false,
+    "another account's grant is never this run's to delete",
+  );
+});
+
+test("a refusal never discards a grant this run did not mint", () => {
+  // The skip path: the grant was already there and this login never opened a
+  // browser, so there is nothing of this run's to undo — and the refusal must
+  // not take a credential it did not write.
+  const s = scene({ noCredFile: true, pollStatusOk: true });
+  const workSvc = s.scopedService("work");
+  const gmailSvc = s.scopedService("gmail");
+  const both = { MS_TEST_KEYCHAIN_OK: [workSvc, gmailSvc].join("\n") };
+  s.ms(["add", "work"]);
+  assert.equal(s.ms(["login", "work"], both).code, 0);
+  s.ms(["add", "gmail"]);
+  s.truncateSecurity();
+
+  const r = s.ms(["login", "gmail"], both);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /gmail resolves to the same organisation as work/);
+  assert.equal(/the sign-in was discarded/.test(r.stderr), false, r.stderr);
+  assert.equal(s.securityLog().includes("delete-generic-password"), false, "a grant this run did not mint stayed put");
+  // and the skip says how to sign in again, which is the whole way out of it
+  assert.match(r.stdout, /skipping claude auth login/);
+  assert.match(r.stdout, /--relogin/);
+});
+
+// --- --relogin ----------------------------------------------------------
+
+test("--relogin signs in again past a usable grant, and what it writes is the grant", () => {
+  const s = scene({ pollStatusOk: true });
+  s.ms(["add", "gmail"]);
+  mkdirSync(s.configDir("gmail"), { recursive: true, mode: 0o700 });
+  const cred = path.join(s.configDir("gmail"), ".credentials.json");
+  writeFileSync(cred, OLD_CRED, { mode: 0o600 });
+
+  // Without the flag the browser is skipped and the grant that is there stands.
+  assert.equal(s.ms(["login", "gmail"]).code, 0);
+  assert.equal(/^auth login$/m.test(s.argvLog()), false, s.argvLog());
+  assert.deepEqual(JSON.parse(readFileSync(cred, "utf8")), JSON.parse(OLD_CRED));
+
+  s.truncateArgv();
+  const r = s.ms(["login", "gmail", "--relogin"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(s.argvLog(), /^auth login$/m);
+  assert.equal(/skipping claude auth login/.test(r.stdout), false, r.stdout);
+  assert.deepEqual(JSON.parse(readFileSync(cred, "utf8")), JSON.parse(CRED), "the fresh sign-in is now the grant");
+});
+
+test("a refused --relogin gives back the grant it was replacing", () => {
+  // The promise that makes --relogin safe to reach for: the old, working
+  // credential is only let go once the new one has passed the identity check.
+  const s = scene({ pollStatusOk: true });
+  s.ms(["add", "work"]);
+  assert.equal(s.ms(["login", "work"]).code, 0); // work claims org-1
+  s.ms(["add", "gmail"]);
+  // gmail's own good login: another organisation, its own credential and token
+  // (the launch token's `auth status` has to name that organisation too, or
+  // the two credentials disagree and the mint is refused on its own account).
+  const asOrg9 = {
+    MS_TEST_PROFILE: ORG_9,
+    MS_TEST_AUTH_STATUS: '{"loggedIn":true,"orgId":"org-9"}',
+    MS_TEST_CRED: OLD_CRED,
+    MS_TEST_TOKEN: OLD_TOKEN,
+  };
+  const good = s.ms(["login", "gmail"], asOrg9);
+  assert.equal(good.code, 0, good.stderr);
+  assert.equal(s.row("gmail").orgId, "org-9");
+  const cred = path.join(s.configDir("gmail"), ".credentials.json");
+  assert.deepEqual(JSON.parse(readFileSync(cred, "utf8")), JSON.parse(OLD_CRED));
+
+  // Now a re-login in which the human answers the browser as work's account.
+  const r = s.ms(["login", "gmail", "--relogin"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /gmail resolves to the same organisation as work/);
+  assert.deepEqual(JSON.parse(readFileSync(cred, "utf8")), JSON.parse(OLD_CRED), "the grant it was replacing is back");
+  assert.equal(s.row("gmail").orgId, "org-9", "and the identity beside it was never rewritten");
+  assert.equal(s.row("gmail").identityVerified, true);
+  assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), OLD_TOKEN);
+});
+
+test("a launch token minted for a refused identity is discarded, and the one it replaced comes back", () => {
+  const s = scene({ pollStatusOk: true });
+  s.ms(["add", "gmail"]);
+  assert.equal(s.ms(["login", "gmail"], { MS_TEST_TOKEN: OLD_TOKEN }).code, 0);
+  assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), OLD_TOKEN);
+
+  // The second run mints a token whose own `auth status` names another
+  // organisation than the poll grant — the one signal worth refusing on.
+  const r = s.ms(["login", "gmail"], { MS_TEST_AUTH_STATUS: '{"organization":{"uuid":"org-9"}}' });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /the launch token belongs to a different organisation/);
+  assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), OLD_TOKEN, "the token it replaced is back");
+  // the poll grant is not what was refused, and is left alone
+  assert.ok(existsSync(path.join(s.configDir("gmail"), ".credentials.json")));
+  assert.equal(s.row("gmail").orgId, "org-1");
+});
+
+test("the usage text names --relogin, and it is a claude option", () => {
+  const s = scene();
+  const r = s.ms(["frobnicate"]);
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /login <name> \[--provider P\] \[--device-auth\] \[--relogin\]/);
+  assert.match(r.stderr, /--relogin/);
+
+  s.ms(["add", "codexacct", "--provider", "codex"]);
+  const codex = s.ms(["login", "codexacct", "--provider", "codex", "--relogin"]);
+  assert.equal(codex.code, 2);
+  assert.match(codex.stderr, /--relogin is a claude option/);
 });
 
 test("no command ever queries the operator's own unscoped keychain item", () => {

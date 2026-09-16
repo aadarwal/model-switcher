@@ -162,7 +162,7 @@ ${EMBEDDED_FUNCTIONS}
   // computeAccount()) — rendered as given, never re-derived here.
   function renderAccounts(accounts) {
     var tbody = document.querySelector("#accounts-table tbody");
-    if (!accounts.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty">no accounts</td></tr>'; return; }
+    if (!accounts.length) { tbody.innerHTML = '<tr><td colspan="8" class="empty">no accounts</td></tr>'; return; }
     tbody.innerHTML = accounts.map(function (a) { return accountRowHtml(a, DASH); }).join("");
   }
 
@@ -405,7 +405,7 @@ export function renderDashboardPage(): string {
   <section>
     <h2>Accounts</h2>
     <table id="accounts-table">
-      <thead><tr><th>NAME</th><th>LABEL</th><th>5H</th><th>WEEK</th><th>FABLE</th><th>RESETS</th><th>STATE</th></tr></thead>
+      <thead><tr><th>NAME</th><th>PROVIDER</th><th>LABEL</th><th>5H</th><th>WEEK</th><th>FABLE</th><th>RESETS</th><th>STATE</th></tr></thead>
       <tbody></tbody>
     </table>
   </section>

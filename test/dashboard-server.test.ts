@@ -218,7 +218,7 @@ test("startDashboard binds 127.0.0.1 and GET / returns HTML with both table head
   const html = await res.text();
 
   // The accounts table's own header row.
-  for (const h of ["NAME", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"]) {
+  for (const h of ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"]) {
     assert.ok(html.includes(`>${h}<`), `accounts header missing: ${h}`);
   }
   // The sessions table's own header row (mirrors src/status.ts's columns).

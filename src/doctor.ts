@@ -16,7 +16,7 @@
 // a ✗ once fixes (if requested) have been applied.
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, readdirSync, realpathSync, symlinkSync, type Stats } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, symlinkSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
@@ -110,9 +110,16 @@ export function checkClaudeBinary(): Result {
  *  than the tested `0.153.x` family is worth a note in the ✓ line — this
  *  tool's Codex support (hook TOML shape, wall text, rollout record fields)
  *  was verified against that range, not proven broken on another one, so a
- *  ✗ here would be a guess this tool has no business making. */
-export function checkCodexBinary(): Result {
+ *  ✗ here would be a guess this tool has no business making.
+ *
+ *  `hasCodexAccounts` gates whether this even SPAWNS `codex`. A Claude-only
+ *  machine has no reason to have the Codex CLI installed at all — the tool
+ *  runs no Codex account without one, so a missing binary there is not a
+ *  fault to report, let alone one that fails `ms doctor` forever. Only a
+ *  registry that actually names a Codex account makes this check real. */
+export function checkCodexBinary(hasCodexAccounts: boolean): Result {
   const what = "codex --version";
+  if (!hasCodexAccounts) return { ok: true, what: `${what} — not needed (no codex accounts)` };
   const r = runBounded("codex", ["--version"], 10_000);
   if (!r.ok) return { ok: false, what, why: r.stderr };
   const out = r.stdout.trim() || "ok";
@@ -260,14 +267,19 @@ function checkClaudeTree(home: string, fix: boolean, issues: PermIssue[]): void 
 /** `codex/`: the directory itself (0700), the shared rollout store
  *  `codex/sessions` (0700 — its CONTENTS are never walked or chmod'ed;
  *  Codex owns them, exactly as `claude/<name>/` is not walked above), and
- *  each `codex/<name>` account home (0700) with only `auth.json` and
- *  `config.toml` checked (0600 each) inside it.
+ *  each `codex/<name>` account home (0700). Inside an account home, exactly
+ *  two entries are checked BY NAME — `auth.json` and `config.toml`, both
+ *  0600 — and nothing else under it is ever examined: this is not a
+ *  `readdirSync`'d walk of the account home the way `codex/sessions`'
+ *  parent or an ms-owned dir (`walkOwnedDir`) is, so an account home is
+ *  never listed and a third file placed inside one (by a human, or by
+ *  Codex itself) is neither reported nor touched.
  *
  *  A home's own `sessions` entry is ALWAYS a symlink — `ensureCodexHome`
  *  (src/accounts-codex.ts) puts it there on purpose, pointing at the shared
- *  store above — and is deliberately never passed to `checkEntry`: every
- *  OTHER symlink found under the store is a stray to report, this one is
- *  the expected shape and must never be. */
+ *  store above — and is one of the things this function deliberately never
+ *  names: every OTHER symlink found under an ms-owned, walked directory is
+ *  a stray to report, this one is the expected shape and must never be. */
 function checkCodexTree(home: string, fix: boolean, issues: PermIssue[]): void {
   const codexDir = path.join(home, "codex");
   const st = checkEntry(codexDir, 0o700, issues);
@@ -465,16 +477,52 @@ function checkCodexSessionsLink(a: Account, fix: boolean): Result {
   try {
     st = lstatSync(link);
   } catch {
-    /* missing — the only case --fix ever touches, below */
+    /* missing entirely — the ordinary "recreate the link" case, below */
   }
+
+  if (st?.isSymbolicLink()) {
+    // A symlink sits here, but `symlinksTo` above still said no. Two very
+    // different situations share that one fact, and only one of them is
+    // ours to repair: the link's own TEXT names the shared store by path
+    // and that store directory is simply the thing that's missing right
+    // now (fixable — recreate the STORE, never the link, which is already
+    // correct), or the link genuinely points somewhere else entirely (not
+    // ours to touch, `--fix` or not — it might be deliberate).
+    let rawTarget: string | null = null;
+    try {
+      rawTarget = readlinkSync(link);
+    } catch {
+      /* a readlink failing right after a successful lstat would be bizarre;
+         fall through to "points elsewhere" below either way */
+    }
+    if (rawTarget !== null && path.resolve(rawTarget) === path.resolve(target)) {
+      if (!fix) return { ok: false, what, why: `shared store missing — ${link} points at ${target}, which does not exist` };
+      try {
+        mkdirSync(target, { recursive: true, mode: 0o700 });
+        chmodSync(target, 0o700); // mkdir's mode is masked by umask; this is not
+      } catch (e) {
+        return { ok: false, what, why: `shared store missing — --fix failed: ${(e as Error).message}` };
+      }
+      return symlinksTo(link, target)
+        ? { ok: true, what, fixed: true }
+        : { ok: false, what, why: "shared store missing — still missing after --fix" };
+    }
+    return {
+      ok: false,
+      what,
+      why: `${link} is a symlink but points elsewhere (${rawTarget ?? "unreadable"}), not at ${target} — never touched automatically`,
+    };
+  }
+
   if (st) {
-    // Something is already there — a real directory (moved or created
-    // before the link existed, ensureCodexHome's own doc comment on this
-    // exact case), a symlink to somewhere else, or a plain file. None of
-    // those is ours to replace: doing so could throw away real sessions.
-    const shape = st.isSymbolicLink() ? "a symlink elsewhere" : st.isDirectory() ? "a real directory" : "a file";
+    // A real directory (moved or created before the link existed,
+    // ensureCodexHome's own doc comment on this exact case) or a plain
+    // file. Neither is ours to replace: doing so could throw away real
+    // sessions.
+    const shape = st.isDirectory() ? "a real directory" : "a file";
     return { ok: false, what, why: `${link} exists and is ${shape}, not a symlink to ${target} — never touched automatically` };
   }
+
   if (!fix) return { ok: false, what, why: `${link} is missing (want a symlink to ${target})` };
   try {
     symlinkSync(target, link, "dir");
@@ -610,13 +658,16 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
   results.push(checkClaudeBinary());
   results.push(checkHooks(fix));
 
-  // Codex: the binary, then every registered Codex account — read here,
-  // ahead of the registry's own ✓/✗ line below, so a Codex row still gets
-  // its checks even when this same registry later turns out to have an
-  // unrelated bad entry (checkRegistry reports that separately, by index).
-  results.push(checkCodexBinary());
+  // Codex: the binary, then every registered Codex account — the registry
+  // is read here, ahead of its own ✓/✗ line below, so (a) a Codex row still
+  // gets its checks even when this same registry later turns out to have an
+  // unrelated bad entry (checkRegistry reports that separately, by index),
+  // and (b) `checkCodexBinary` knows whether there is any Codex account to
+  // even ask the question for.
   const { registry, parseError, problems } = loadRegistry();
-  for (const a of registry.accounts.filter((a) => a.provider === "codex")) {
+  const codexAccounts = registry.accounts.filter((a) => a.provider === "codex");
+  results.push(checkCodexBinary(codexAccounts.length > 0));
+  for (const a of codexAccounts) {
     results.push(...(await checkCodexAccount(a, fix)));
   }
 

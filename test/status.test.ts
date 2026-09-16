@@ -395,12 +395,13 @@ test("ms status: a Codex account row renders — for FABLE and a missing 5H wind
 
   // The Pro-plan shape from the spike record: no primary_window at all (5H
   // has nothing to show), a secondary (weekly) window that does.
+  const CODEX_ACCESS_TOKEN = "SEKRET-STATUS-TOKEN";
   const codexDir = path.join(msHome, "codex", "codexacct");
   mkdirSync(codexDir, { recursive: true, mode: 0o700 });
   writeFileSync(
     path.join(codexDir, "auth.json"),
     JSON.stringify({
-      tokens: { id_token: "id-codexacct", access_token: "at-codexacct", refresh_token: "rt-codexacct", account_id: "acct-codex-1" },
+      tokens: { id_token: "id-codexacct", access_token: CODEX_ACCESS_TOKEN, refresh_token: "rt-codexacct", account_id: "acct-codex-1" },
       last_refresh: new Date().toISOString(), // fresh: no refresh attempted, no network call beyond the usage read
     }),
     { mode: 0o600 },
@@ -426,12 +427,14 @@ test("ms status: a Codex account row renders — for FABLE and a missing 5H wind
     PATH: `${tmuxDir}:${process.env.PATH}`,
     TMUX: `${TMUX_SOCKET},123,0`,
     TMUX_PANE: "%1",
-    MS_TEST_USAGE: JSON.stringify({ "at-codexacct": { body: CODEX_OK } }),
+    MS_TEST_USAGE: JSON.stringify({ [CODEX_ACCESS_TOKEN]: { body: CODEX_OK } }),
     NODE_OPTIONS: `--disable-warning=ExperimentalWarning --import ${fetchStubUrl}`,
   };
 
   const r = run(["status"], env);
   assert.equal(r.code, 0, r.stderr);
+  assert.ok(!r.stdout.includes(CODEX_ACCESS_TOKEN), `token leaked in table output: ${r.stdout}`);
+  assert.ok(!r.stderr.includes(CODEX_ACCESS_TOKEN), `token leaked in stderr: ${r.stderr}`);
 
   const lines = r.stdout.split("\n");
   const codexLine = lines.find((l) => l.startsWith("codexacct"))!;
@@ -449,6 +452,43 @@ test("ms status: a Codex account row renders — for FABLE and a missing 5H wind
   assert.equal(s3Cells[2], "codex"); // PROVIDER
   assert.equal(s3Cells[3], "codexacct"); // ACCOUNT
   assert.equal(s3Cells[s3Cells.length - 1], "unreported");
+
+  // --json is a second, independent render path (JSON.stringify over the
+  // snapshot/session rows, not the table) — prove it separately rather than
+  // assuming the table's leak-freedom says anything about it.
+  const rJson = run(["status", "--json"], env);
+  assert.equal(rJson.code, 0, rJson.stderr);
+  assert.ok(!rJson.stdout.includes(CODEX_ACCESS_TOKEN), `token leaked in --json output: ${rJson.stdout}`);
+  assert.ok(!rJson.stderr.includes(CODEX_ACCESS_TOKEN), `token leaked in --json stderr: ${rJson.stderr}`);
+  const parsed = JSON.parse(rJson.stdout) as { accounts: { name: string }[] };
+  assert.ok(parsed.accounts.some((a) => a.name === "codexacct"), rJson.stdout);
+});
+
+test("ms status: a Codex account with no auth.json reads STATE no-grant through the REAL snapshot poll — pollCodexUsage's own 'no credentials' AuthError, not a hand-written accountState call", async () => {
+  const { home, msHome } = tempHome();
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: [{ name: "codexnogrant", provider: "codex", label: "CodexNoGrant", shared: false }],
+    }),
+    { mode: 0o600 },
+  );
+  // Deliberately no `codex/codexnogrant/auth.json` at all — not even the
+  // home directory — exactly the state of a row `accounts add --provider
+  // codex` created that has never been through `login`. No sessions exist
+  // either, so this needs no tmux stub and (Codex has no keychain fallback)
+  // no `security` stub — the account poll is the only thing this test does.
+
+  const r = run(["status"], { HOME: home, MS_HOME: msHome });
+  assert.equal(r.code, 0, r.stderr);
+
+  const lines = r.stdout.split("\n");
+  const codexLine = lines.find((l) => l.startsWith("codexnogrant"))!;
+  assert.ok(codexLine, r.stdout);
+  const cCells = cells(codexLine);
+  assert.equal(cCells[0], "codexnogrant");
+  assert.equal(cCells[6], "no-grant");
 });
 
 test("ms status --json prints { accounts, sessions, takenAt } and parses", async () => {

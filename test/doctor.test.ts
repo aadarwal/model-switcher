@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync, realpathSync, existsSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { stubDir, tempHome, run } from "./helpers.ts";
@@ -196,7 +196,7 @@ test("checkClaudeBinary: ok when present, fails when missing", async (t) => {
 
 // --- codex ---------------------------------------------------------------
 
-test("checkCodexBinary: ok, and reports the version, when in the tested 0.153.x range", async (t) => {
+test("checkCodexBinary(true): ok, and reports the version, when in the tested 0.153.x range", async (t) => {
   base();
   const savedPath = process.env.PATH;
   t.after(() => { process.env.PATH = savedPath; });
@@ -204,13 +204,13 @@ test("checkCodexBinary: ok, and reports the version, when in the tested 0.153.x 
   const { dir, stub } = stubDir();
   stub("codex", 'case "$1" in --version) echo "codex-cli 0.153.4" ;; esac\nexit 0');
   process.env.PATH = `${dir}:${process.env.PATH}`;
-  const r = checkCodexBinary();
+  const r = checkCodexBinary(true);
   assert.equal(r.ok, true);
   assert.match(r.what, /0\.153\.4/);
   assert.doesNotMatch(r.what, /different minor/);
 });
 
-test("checkCodexBinary: a different minor is still ok — never a failure — with a note in the line", async (t) => {
+test("checkCodexBinary(true): a different minor is still ok — never a failure — with a note in the line", async (t) => {
   base();
   const savedPath = process.env.PATH;
   t.after(() => { process.env.PATH = savedPath; });
@@ -218,19 +218,33 @@ test("checkCodexBinary: a different minor is still ok — never a failure — wi
   const { dir, stub } = stubDir();
   stub("codex", 'case "$1" in --version) echo "codex-cli 0.160.2" ;; esac\nexit 0');
   process.env.PATH = `${dir}:${process.env.PATH}`;
-  const r = checkCodexBinary();
+  const r = checkCodexBinary(true);
   assert.equal(r.ok, true);
   assert.match(r.what, /0\.160\.2/);
   assert.match(r.what, /different minor/);
 });
 
-test("checkCodexBinary: ✗ (bounded) when codex is missing", async (t) => {
+test("checkCodexBinary(true): ✗ (bounded) when codex is missing", async (t) => {
   base();
   const savedPath = process.env.PATH;
   t.after(() => { process.env.PATH = savedPath; });
   const { checkCodexBinary } = await import("../src/doctor.ts");
   process.env.PATH = "/nonexistent-empty-dir";
-  assert.equal(checkCodexBinary().ok, false);
+  assert.equal(checkCodexBinary(true).ok, false);
+});
+
+test("checkCodexBinary(false): ok and never spawns codex at all — a Claude-only machine must never fail on a missing Codex CLI", async (t) => {
+  base();
+  const savedPath = process.env.PATH;
+  t.after(() => { process.env.PATH = savedPath; });
+  const { checkCodexBinary } = await import("../src/doctor.ts");
+  // No `codex` anywhere on PATH. If this spawned anyway, `runBounded` would
+  // report ENOENT and the result would be ✗ — so ok:true here is itself the
+  // proof that the spawn never happened.
+  process.env.PATH = "/nonexistent-empty-dir";
+  const r = checkCodexBinary(false);
+  assert.equal(r.ok, true);
+  assert.match(r.what, /not needed \(no codex accounts\)/);
 });
 
 // --- hooks -------------------------------------------------------------
@@ -418,22 +432,32 @@ test("checkStorePermissions: the shared codex/sessions store is checked (0700) b
   assert.equal(statSync(rolloutFile).mode & 0o777, 0o644, "codex's own rollout files must never be chmodded");
 });
 
-test("checkStorePermissions: a codex account's own 'sessions' symlink to the shared store is never reported as a stray symlink", async () => {
+test("checkStorePermissions: codex/<name>/ is scoped — only auth.json and config.toml are checked BY NAME; the account home is never listed, so its 'sessions' symlink and any other file underneath are neither reported nor touched", async () => {
   const { msHome } = base();
   process.env.MS_HOME = msHome;
   const { ensureCodexHome } = await import("../src/accounts-codex.ts");
-  ensureCodexHome("codexacct"); // builds codex/sessions AND codex/codexacct/sessions -> a symlink to it
+  const dir = ensureCodexHome("codexacct"); // builds codex/sessions AND codex/codexacct/sessions -> a symlink to it
 
-  const link = path.join(msHome, "codex", "codexacct", "sessions");
+  const link = path.join(dir, "sessions");
   assert.ok(lstatSync(link).isSymbolicLink(), "fixture sanity: the per-home entry really is a symlink");
 
+  // A stray file that is neither of the two names this check knows about —
+  // proof the account home is never `readdirSync`'d, only probed by name.
+  const stray = path.join(dir, "notes.txt");
+  writeFileSync(stray, "hello", { mode: 0o644 });
+
   const { checkStorePermissions } = await import("../src/doctor.ts");
-  const r = checkStorePermissions(false);
-  assert.ok(!r.some((x) => x.what.includes(path.relative(msHome, link))), JSON.stringify(r));
-  assert.ok(!r.some((x) => /symlink/i.test(x.why ?? "")), JSON.stringify(r));
+  const before = checkStorePermissions(false);
+  assert.ok(!before.some((x) => x.what.includes(path.relative(msHome, link))), JSON.stringify(before));
+  assert.ok(!before.some((x) => /symlink/i.test(x.why ?? "")), JSON.stringify(before));
+  assert.ok(!before.some((x) => /notes\.txt/.test(x.what)), JSON.stringify(before));
   // The store is otherwise clean: one aggregate ✓ line, nothing else to report.
-  assert.equal(r.length, 1);
-  assert.equal(r[0]!.ok, true);
+  assert.equal(before.length, 1);
+  assert.equal(before[0]!.ok, true);
+
+  checkStorePermissions(true); // --fix must not touch either stray either
+  assert.ok(lstatSync(link).isSymbolicLink(), "the symlink must still be a symlink, never replaced");
+  assert.equal(statSync(stray).mode & 0o777, 0o644, "an unnamed file under an account home must never be chmodded");
 });
 
 // --- the registry itself ---------------------------------------------------
@@ -723,15 +747,16 @@ test("checkCodexAccount: --fix on a config.toml it cannot safely rewrite surface
   }
 });
 
-test("checkCodexAccount: sessions store missing → ✗; --fix recreates the symlink", async () => {
+test("checkCodexAccount: the account's own sessions LINK is missing (the shared store already exists) → ✗; --fix recreates the LINK", async () => {
   const { msHome } = base();
   process.env.MS_HOME = msHome;
   // The shared store itself (normally created by `loadRegistry`'s own
   // `ensureStore`, ahead of every account check in `runDoctor`) — created
   // here explicitly since this test calls `checkCodexAccount` directly. No
   // ensureCodexHome for the ACCOUNT home, though — build that one by hand,
-  // deliberately without its own `sessions` entry, so the "missing" branch
-  // is what gets exercised.
+  // deliberately without its own `sessions` entry, so the "link missing,
+  // store present" branch is what gets exercised (distinct from "link
+  // present but dangling because the STORE is missing", tested separately).
   const { ensureStore } = await import("../src/paths.ts");
   ensureStore();
   const dir = path.join(msHome, "codex", "codexacct");
@@ -752,7 +777,8 @@ test("checkCodexAccount: sessions store missing → ✗; --fix recreates the sym
     const before = await checkCodexAccount(codexAccount(), false);
     const linkBefore = before.find((r) => /sessions store linked/.test(r.what))!;
     assert.equal(linkBefore.ok, false);
-    assert.match(linkBefore.why ?? "", /missing/);
+    assert.match(linkBefore.why ?? "", /is missing \(want a symlink/);
+    assert.doesNotMatch(linkBefore.why ?? "", /shared store missing/);
 
     const after = await checkCodexAccount(codexAccount(), true);
     const linkAfter = after.find((r) => /sessions store linked/.test(r.what))!;
@@ -796,6 +822,91 @@ test("checkCodexAccount: --fix never touches an existing real directory at the s
     assert.equal(lstatSync(realSessions).isDirectory(), true);
     assert.equal(lstatSync(realSessions).isSymbolicLink(), false);
     assert.equal(readFileSync(marker, "utf8"), "real session data");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: a symlink correctly pointing at the shared store, when the store itself is missing, reports 'shared store missing'; --fix recreates the STORE, not the link", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  const dir = path.join(msHome, "codex", "codexacct");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+  const { p } = await import("../src/paths.ts");
+  const target = p.codexSessions();
+  const link = path.join(dir, "sessions");
+  // The link is correct and pre-existing — pointing at the shared store by
+  // name — but nothing has ever created that store directory (never call
+  // ensureStore/ensureCodexHome in this fixture).
+  symlinkSync(target, link, "dir");
+  assert.ok(!existsSync(target), "fixture sanity: the shared store must not exist yet");
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const before = await checkCodexAccount(codexAccount(), false);
+    const linkBefore = before.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkBefore.ok, false);
+    assert.match(linkBefore.why ?? "", /shared store missing/);
+    assert.ok(lstatSync(link).isSymbolicLink(), "the link itself is untouched by a plain check");
+
+    const after = await checkCodexAccount(codexAccount(), true);
+    const linkAfter = after.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkAfter.ok, true);
+    assert.equal(linkAfter.fixed, true);
+    assert.equal(statSync(target).isDirectory(), true);
+    assert.equal(statSync(target).mode & 0o777, 0o700);
+    // The link itself was never recreated — same inode/target as before.
+    assert.equal(realpathSync(link), realpathSync(target));
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: a symlink pointing SOMEWHERE ELSE (not the shared store) is reported and left alone — --fix never touches it, even though it is technically 'broken'", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  const dir = path.join(msHome, "codex", "codexacct");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+  const { ensureStore } = await import("../src/paths.ts"); // the shared store DOES exist here
+  ensureStore();
+  const elsewhere = path.join(msHome, "somewhere-else");
+  mkdirSync(elsewhere, { recursive: true, mode: 0o700 });
+  const link = path.join(dir, "sessions");
+  symlinkSync(elsewhere, link, "dir"); // deliberately the wrong target
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const before = await checkCodexAccount(codexAccount(), false);
+    const linkBefore = before.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkBefore.ok, false);
+    assert.match(linkBefore.why ?? "", /points elsewhere/);
+    assert.doesNotMatch(linkBefore.why ?? "", /shared store missing/);
+
+    const after = await checkCodexAccount(codexAccount(), true); // --fix too
+    const linkAfter = after.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkAfter.ok, false);
+    assert.match(linkAfter.why ?? "", /points elsewhere/);
+    assert.equal(realpathSync(link), realpathSync(elsewhere), "never touched, --fix or not");
   } finally {
     globalThis.fetch = savedFetch;
   }
@@ -1015,9 +1126,59 @@ test("runDoctor --fix: installs hooks and exits 0 on the healthy subset", async 
   assert.ok(after.results.some((r) => r.ok && r.fixed && /Claude hooks installed/.test(r.what)));
 });
 
+test("runDoctor: a Claude-only machine (no codex accounts, codex truly absent from PATH — not merely unstubbed) never fails on codex --version", async (t: TestContext) => {
+  const { home, msHome } = base();
+  // A self-contained PATH — no ambient fallback — with tmux/claude/security/ms
+  // stubbed and, deliberately, NO `codex` anywhere: if the fix regresses and
+  // this spawns `codex` anyway, it fails with ENOENT and this test catches it
+  // instead of silently passing off a real `codex` the host happens to have.
+  const { dir, stub } = stubDir();
+  stub("tmux", HEALTHY_TMUX);
+  stub("claude", HEALTHY_CLAUDE);
+  stub("security", "exit 44");
+  process.env.MS_BIN = path.join(home, "real-ms");
+  writeFileSync(process.env.MS_BIN, "#!/bin/sh\n");
+  chmodSync(process.env.MS_BIN, 0o755);
+  symlinkSync(process.env.MS_BIN, path.join(dir, "ms"));
+  process.env.PATH = dir;
+  t.after(() => { delete process.env.MS_BIN; });
+
+  writeHealthyAccountFiles(msHome, "gmail");
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  saveLaunchToken("gmail", "sk-ant-oat01-AbCdEfGh12345678_-ijklmnop0123456789");
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true }] }),
+    { mode: 0o600 },
+  );
+
+  const { runDoctor } = await import("../src/doctor.ts");
+  const before = await runDoctor(false);
+  assert.ok(before.results.some((r) => !r.ok && /Claude hooks installed/.test(r.what))); // the one real problem here
+  const codexBefore = before.results.find((r) => r.what.startsWith("codex --version"))!;
+  assert.equal(codexBefore.ok, true, JSON.stringify(codexBefore));
+  assert.match(codexBefore.what, /not needed \(no codex accounts\)/);
+
+  const after = await runDoctor(true);
+  assert.equal(after.exitCode, 0, after.lines.join("\n"));
+  const codexAfter = after.results.find((r) => r.what.startsWith("codex --version"))!;
+  assert.equal(codexAfter.ok, true);
+  assert.equal(codexAfter.fixed, undefined, "never 'fixed' — there was never anything to fix");
+});
+
 test("runDoctor --fix: Codex hooks land as TOML tables + trusted_hash (a pre-existing [projects.\"…\"] table survives), a missing sessions link is recreated, a 0644 auth.json is fixed to 0600, a hooks refusal is printed verbatim and still fails the run, the sessions symlink is never flagged as stray, and no token ever appears", async (t: TestContext) => {
-  const { msHome } = base();
+  const { home, msHome } = base();
   stubHealthyBinaries(); // tmux/claude/codex/security all stubbed healthy
+  // ms itself on PATH too (same pattern as the sibling runDoctor tests) —
+  // without it, checkPathBinary's own ✗ would join codexbad's hooks line in
+  // the failing set and this test's "exactly one failure" assertion below
+  // would be proving nothing specific to Codex.
+  process.env.MS_BIN = path.join(home, "real-ms");
+  writeFileSync(process.env.MS_BIN, "#!/bin/sh\n");
+  chmodSync(process.env.MS_BIN, 0o755);
+  const { dir: msStubDir } = stubDir();
+  symlinkSync(process.env.MS_BIN, path.join(msStubDir, "ms"));
+  process.env.PATH = `${msStubDir}:${process.env.PATH}`;
   t.after(() => { delete process.env.MS_BIN; });
 
   const ACCESS_TOKEN = "SEKRET-CODEX-ACCESS-TOKEN-VALUE";
@@ -1070,8 +1231,13 @@ test("runDoctor --fix: Codex hooks land as TOML tables + trusted_hash (a pre-exi
     const { runDoctor } = await import("../src/doctor.ts");
     const { results, lines, exitCode } = await runDoctor(true);
 
-    // codexbad's refusal keeps the whole run red.
+    // codexbad's refusal keeps the whole run red — and is the ONLY thing
+    // wrong: everything else this fixture set up (or --fix repaired) reads
+    // ok, so the failing set is exactly that one line, not "1 or more".
     assert.equal(exitCode, 1, lines.join("\n"));
+    const failing = results.filter((r) => !r.ok);
+    assert.equal(failing.length, 1, JSON.stringify(failing));
+    assert.equal(failing[0]!.what, "codex account codexbad: hooks installed");
 
     // codexok: hooks installed as TOML tables with trusted_hash entries, and
     // the pre-existing [projects."…"] table is untouched.

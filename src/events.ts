@@ -1,12 +1,13 @@
 import { appendFileSync, existsSync, readFileSync, openSync, closeSync, fstatSync, readSync, statSync, chmodSync } from "node:fs";
 import { ensureSessionDir, p } from "./paths.ts";
 
-/** `stop` is Codex's: its Stop hook fires when a turn COMPLETES, and the
- * turn watchdog (`ms _turn`) reads the presence of one for a turn id as
- * "that turn finished, stand down". Claude Code has no equivalent — its
- * wall arrives as a StopFailure, so nothing there needs a turn's end
- * recorded. Recording the successful end of a turn is only load-bearing
- * where the SIGNAL is a turn that never ended. */
+/** `stop` is Codex's: it records that ONE turn finished, from either of the
+ * two places that can say so — the Stop hook, which fires only on success,
+ * and `ms _codex_watch` reading the turn's `task_complete` out of the
+ * rollout. The fleet watchdog reads its presence for a turn id as "that turn
+ * is settled, stop watching it". Claude Code has no equivalent, because its
+ * wall arrives as a StopFailure: recording the END of a turn is only
+ * load-bearing where the SIGNAL is a turn that never ended. */
 export type EventKind = "started" | "resumed" | "cleared" | "compacted" | "activity" | "stop" | "rate_limited" | "ended" | "died" | "recovery" | "note";
 /** `cliSessionId` is the CLI's own id as the hook reported it. When a
  * SessionStart moves the session onto a NEW id — a `/clear`, an interactive

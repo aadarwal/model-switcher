@@ -103,7 +103,7 @@ const ARM_LOCK_WAIT_MS = 2_000;
  * rollout grows by a few KB a turn; anything past this is a file the tool has
  * no business slurping into memory, and the offset still advances so the next
  * pass continues where this one stopped. */
-const ROLLOUT_CHUNK_MAX = 4 << 20;
+export const ROLLOUT_CHUNK_MAX = 4 << 20;
 
 /**
  * `ms _hook codex` — the four lifecycle events, written down.
@@ -368,6 +368,13 @@ export async function codexWatch(): Promise<number> {
           const settled = await readRollout(st, s, turn);
           if (!settled) inFlight ??= s;
         }
+        // The claim is re-read before anything is decided. This pass began
+        // when its own timer's claim expired, and a `UserPromptSubmit` that
+        // won the lock in that gap has already armed a replacement: re-arming
+        // on top of it would leave TWO timers, each renewing the other's claim
+        // for as long as the fleet is busy. Somebody else's pending timer is
+        // also a reason not to clear the claim out from under it.
+        if (timerPending(st)) return;
         // Re-arm only while there is something to watch. `??=` above kept the
         // FIRST still-flying session, and its socket is the one the next timer
         // rides on — the watch is per tmux server, and that is a server with
@@ -448,24 +455,60 @@ async function readRollout(st: State, s: SessionRow, turn: { turnId: string }): 
   // is a partial line the writer has not finished, and belongs to the next
   // pass — so the offset stops there, not at `size`.
   const lastNewline = buf.lastIndexOf(0x0a);
-  if (lastNewline < 0) return false; // not one complete line yet; keep the offset
+  if (lastNewline < 0) {
+    // A whole cap-sized read with not one newline in it is not a record being
+    // written, it is a line longer than the cap — and keeping the offset would
+    // stall this session for ever, re-reading the same 4 MiB every pass and
+    // never seeing the turn end. Step over it. Nothing is lost that this tool
+    // could have read: a `task_complete` record is a few hundred bytes.
+    if (buf.length >= ROLLOUT_CHUNK_MAX) {
+      st.updateSession(s.id, { rolloutOffset: from + buf.length });
+      note(`${s.id}: skipped ${buf.length} rollout bytes with no line break`);
+    }
+    return false;
+  }
   const complete = buf.subarray(0, lastNewline + 1).toString("utf8");
-  st.updateSession(s.id, { rolloutOffset: from + lastNewline + 1 });
 
+  // Every event is appended BEFORE the offset moves past the bytes it came
+  // from. The other order loses a record for good: an append that throws (a
+  // full disk, a bad mode) against an offset already advanced means the next
+  // pass starts after the record and the turn is never settled — so the
+  // watchdog re-arms for ever over a session that walled. Each append is
+  // guarded for the same reason `recordWall` guards its own: one line we could
+  // not write must not cost the rest of the chunk.
   let settled = false;
+  let lost = false; // a record for our turn that could not be written down
   for (const line of complete.split("\n")) {
     if (!line.trim()) continue;
     const rec = parseTaskComplete(line);
     if (!rec || rec.turnId !== turn.turnId) continue;
+    let ok: boolean;
     if (rec.usageLimited) {
-      await recordWall(st, s, turn.turnId);
+      ok = await recordWall(st, s, turn.turnId);
     } else {
-      appendEvent({ t: nowSeconds(), kind: "stop", session: s.id, generation: s.generation, cliSessionId: s.cliSessionId, turnId: turn.turnId,
-        ...(rec.errorInfo ? { kindDetail: rec.errorInfo } : {}) });
+      try {
+        appendEvent({ t: nowSeconds(), kind: "stop", session: s.id, generation: s.generation, cliSessionId: s.cliSessionId, turnId: turn.turnId,
+          ...(rec.errorInfo ? { kindDetail: rec.errorInfo } : {}) });
+        ok = true;
+      } catch { ok = false; }
     }
-    settled = true;
+    if (ok) settled = true;
+    else lost = true;
   }
+  // The offset moves only over bytes whose meaning is now recorded. A chunk
+  // that carried nothing for this turn is fully consumed however it went; a
+  // chunk whose record we could not write down is re-read next pass, which is
+  // the entire reason the append comes first.
+  if (!lost) st.updateSession(s.id, { rolloutOffset: from + lastNewline + 1 });
   return settled;
+}
+
+/** One line to stderr, only when asked for. `_codex_watch` runs inside the
+ * tmux server, never in a CLI transcript, so a diagnostic here costs a human
+ * nothing — but it is still gated, because a watchdog that chattered every
+ * 45 s would drown the one line worth reading. */
+function note(text: string): void {
+  if (process.env.MS_VERBOSE === "1") process.stderr.write(`ms _codex_watch: ${text}\n`);
 }
 
 /** One rollout line, if it is a `task_complete` for some turn. Anything else —
@@ -493,24 +536,31 @@ function parseTaskComplete(line: string): { turnId: string; usageLimited: boolea
  * the source never made; the chooser polls real usage before it picks anyway,
  * so the label is provenance, not input.
  */
-async function recordWall(st: State, s: SessionRow, turnId: string): Promise<void> {
+async function recordWall(st: State, s: SessionRow, turnId: string): Promise<boolean> {
   const kind: RecoveryWallKind = "session";
-  try { appendEvent({ t: nowSeconds(), kind: "rate_limited", session: s.id, generation: s.generation, cliSessionId: s.cliSessionId, turnId, kindDetail: kind }); }
-  catch { /* the recovery below is the load-bearing record */ }
+  let recorded = false;
+  try {
+    appendEvent({ t: nowSeconds(), kind: "rate_limited", session: s.id, generation: s.generation, cliSessionId: s.cliSessionId, turnId, kindDetail: kind });
+    recorded = true;
+  } catch { /* with the flag on, the recovery below is the load-bearing record */ }
 
   // Spike verdict G1 is PARTIAL: no live Codex wall has ever been observed, so
   // the automatic path ships disabled. The event above is what `ms status`
-  // reads, and the manual verbs still move the session.
-  if (process.env.MS_CODEX_AUTOROTATE !== "1") return;
+  // reads, and the manual verbs still move the session. With the flag off it
+  // is ALSO the only record, so an append that failed is a wall not yet read —
+  // the caller leaves the offset where it is and the next pass tries again.
+  if (process.env.MS_CODEX_AUTOROTATE !== "1") return recorded;
   // Re-read: the row was listed before this file was read.
   const now = st.getSession(s.id);
-  if (!now || now.generation !== s.generation || now.desired !== "running") return;
+  if (!now || now.generation !== s.generation || now.desired !== "running") return recorded;
   // A concurrent duplicate is one transaction, not two: either the insert or
   // its unique index tells us a recovery is already open.
   try { st.addRecovery({ sessionId: s.id, generation: now.generation, turnId, kind }); } catch { /* already pending */ }
   // `run-shell -b` runs the worker inside the tmux server, outside this
   // process's tree, so killing the pane cannot kill the recovery.
   new Tmux(now.socket).runShell([msBinary(), "_recover", s.id]);
+  // The recovery row is now the record, whether or not the event line landed.
+  return true;
 }
 
 /** Every byte of stdin, capped: a hook that waits forever hangs Codex's turn. */

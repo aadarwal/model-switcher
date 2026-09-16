@@ -39,9 +39,13 @@
 // `codexHooksInstalled` reads false and the wizard re-installs. Nothing here
 // touches a credential; `config.toml` holds none.
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
+// Shared with the launcher's own config.toml writer rather than reimplemented:
+// one definition of "where does the TOML end and the comment begin" is the
+// only way both writers agree about what a line says.
+import { stripComment } from "../providers/codex-cli.ts";
 
 /** The four lifecycle events the Codex hook subscribes to, with the snake_case
  * spelling Codex uses in a trust key and the timeout it applies by default.
@@ -114,28 +118,101 @@ function trustKey(configPath: string, snake: string, matcherIndex: number): stri
   return `${configPath}:${snake}:${matcherIndex}:0`;
 }
 
+/** What the installer decided. `problem` is a refusal the caller reports
+ * verbatim: a home this tool cannot write without risking the human's own
+ * configuration is never written to, and never silently skipped either. */
+export type InstallResult = { changed: boolean; backup: string | null; problem?: string };
+
+/**
+ * A table header, strictly.
+ *
+ * `[[hooks.SessionStart]]`, `[hooks.state."…"]`, and the quoted or spaced
+ * spellings of each, all mean what they mean whether or not a comment follows
+ * them — so the comment comes off first (`stripComment`, shared with the
+ * launcher's writer) and the match is made on what is left.
+ *
+ * Only the two shapes this tool writes are recognised. Everything else under
+ * `hooks` is `"unknown"`, which is a REFUSAL rather than a guess, because
+ * every one of those spellings can change the matcher index our trust key is
+ * built from: `[hooks]` with a `SessionStart = [...]` inside it is the same
+ * subscription written another way, and `[hooks.state]` with a quoted key
+ * under it is the same trust entry. A wrong index does not fail loudly — it
+ * writes a `trusted_hash` for somebody else's hook and leaves ours silently
+ * untrusted, or collides with a key the human already has and makes the whole
+ * file unparseable to Codex.
+ */
+type Header =
+  | { kind: "event"; table: string }
+  | { kind: "state"; key: string }
+  | { kind: "unknown" }
+  | null;
+
+/** `hooks`, in any legal spelling of one key segment. */
+const HOOKS = String.raw`(?:hooks|"hooks"|'hooks')`;
+const STATE = String.raw`(?:state|"state"|'state')`;
+const BARE = String.raw`[A-Za-z0-9_-]+`;
+const EVENT_HEADER = new RegExp(String.raw`^\[\[\s*${HOOKS}\s*\.\s*(?:(${BARE})|"(${BARE})"|'(${BARE})')\s*\]\]$`);
+const STATE_HEADER = new RegExp(String.raw`^\[\s*${HOOKS}\s*\.\s*${STATE}\s*\.\s*("(?:[^"\\]|\\.)*"|'[^']*')\s*\]$`);
+
+/**
+ * Whether a line is a table header at all: after its comment is cut and its
+ * whitespace trimmed, a header is a line that both opens and closes with
+ * brackets. A continuation line of a multi-line array value can start with
+ * `[`, but it ends with a comma or nothing — so this does not mistake one for
+ * a header, and a header is never mistaken for a value.
+ */
+const looksLikeHeader = (line: string): boolean => line.startsWith("[") && line.endsWith("]");
+
+function classify(raw: string): Header {
+  const line = stripComment(raw).trim();
+  if (!looksLikeHeader(line)) return null;
+  const ev = EVENT_HEADER.exec(line);
+  if (ev) return { kind: "event", table: ev[1] ?? ev[2] ?? ev[3]! };
+  const st = STATE_HEADER.exec(line);
+  if (st) return { kind: "state", key: unquoteTomlKey(st[1]) };
+  // Not one of ours — but is it under `hooks` at all? A header that does not
+  // contain the word cannot be, whatever else it is, and refusing on every
+  // unparsed header would refuse on a nested array literal that happens to sit
+  // on its own line. (A key that spells the word with an escape —
+  // `["\u0068ooks".SessionStart]` — defeats this; it also defeats every other
+  // reader of this file, Codex's own included, and is not a shape any tool
+  // writes.)
+  return /hooks/.test(line) ? { kind: "unknown" } : null;
+}
+
+/** The inverse of `tomlString` for the one quoted segment `STATE_HEADER`
+ * captured: a basic string's `\"` and `\\` unescape, a literal string's
+ * contents are taken as they stand. */
+function unquoteTomlKey(quoted: string): string {
+  const body = quoted.slice(1, -1);
+  return quoted[0] === "'" ? body : body.replace(/\\(["\\])/g, "$1");
+}
+
 /** Lines of the file that are not ours: everything before the begin marker and
  * everything after the end marker. A file with no markers is all prefix, so a
- * first install appends. An unterminated begin marker (a half-written file, a
- * hand edit) would otherwise swallow the rest of the file into our block, so
- * it is treated as ours to the end and the suffix is empty — which is what the
- * marker literally says. */
-function split(text: string): { prefix: string[]; suffix: string[] } {
+ * first install appends.
+ *
+ * A begin marker with no end is NOT ours to the end of the file: a half-written
+ * file or a hand edit would then have everything below it swallowed into our
+ * block and replaced. `end < 0` is returned as a refusal instead, because the
+ * one thing an installer must never do is delete configuration it did not
+ * write. */
+function split(text: string): { prefix: string[]; suffix: string[] } | null {
   const lines = text.split("\n");
   const begin = lines.findIndex((l) => BEGIN_RE.test(l));
   if (begin < 0) return { prefix: lines, suffix: [] };
   const end = lines.findIndex((l, i) => i > begin && END_RE.test(l));
-  return { prefix: lines.slice(0, begin), suffix: end < 0 ? [] : lines.slice(end + 1) };
+  if (end < 0) return null;
+  return { prefix: lines.slice(0, begin), suffix: lines.slice(end + 1) };
 }
 
 /** How many `[[hooks.<Event>]]` tables for this event the home already has
- * ahead of ours. A line scan, not a TOML parse: the header of an array-of-
- * tables is a whole line, and the only way to fake one is to put it inside a
- * multi-line string, which no Codex config does. */
+ * ahead of ours — the matcher index our trust key is built from. */
 function matcherIndexes(prefix: string[]): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const e of EVENTS) {
-    out[e.table] = prefix.filter((l) => new RegExp(String.raw`^\s*\[\[hooks\.${e.table}\]\]\s*$`).test(l)).length;
+  const out: Record<string, number> = Object.fromEntries(EVENTS.map((e) => [e.table, 0]));
+  for (const line of prefix) {
+    const h = classify(line);
+    if (h?.kind === "event" && h.table in out) out[h.table]++;
   }
   return out;
 }
@@ -161,32 +238,59 @@ function block(configPath: string, msBin: string, prefix: string[]): string {
 }
 
 /**
- * The file we would write for a given current text.
+ * Everything that makes this home unsafe to write, or null.
  *
- * Throws when the home already runs THIS tool's command from a table outside
- * our markers — a hand install, or a copy-paste from another home. Appending
- * our block there would leave Codex running the hook twice for every event
- * and, worse, could make our `[hooks.state."…:<event>:0:0"]` collide with a
- * trust entry the human already has for that index, which is a duplicate TOML
- * key and a config Codex can no longer parse. There is no safe automatic
- * repair — dropping the stray table would silently delete the trust the human
- * granted through `/settings` — so this refuses, names the file and says what
- * to remove. Same discipline as `installClaudeHooks` refusing a settings.json
- * it cannot parse: never overwrite what you did not write.
+ * Three refusals, all the same principle: never overwrite, duplicate or
+ * invalidate what somebody else put in this file.
+ *
+ *  * a `hooks` header this tool cannot classify — it may or may not shift the
+ *    matcher index, and neither answer can be guessed;
+ *  * a table already running THIS tool's command outside our markers (a hand
+ *    install, a copy-paste from another home) — appending would run the hook
+ *    twice for every event, and dropping the stray table would silently delete
+ *    the trust the human granted through `/settings`;
+ *  * a `[hooks.state."<one of our keys>"]` already in the file outside our
+ *    block — writing ours would be a DUPLICATE TOML key, and Codex refuses the
+ *    whole file, hooks and model and MCP servers with it.
  */
-function compose(configPath: string, msBin: string, text: string): string {
-  const { prefix, suffix } = split(text);
-  const needle = `command = ${tomlString(codexHookCommand(msBin))}`;
-  if ([...prefix, ...suffix].some((l) => l.includes(needle))) {
-    throw new Error(`${configPath}: a hook already runs \`${codexHookCommand(msBin)}\` outside the ms-hooks markers; remove that table by hand, refusing to install a duplicate`);
+function unsafe(configPath: string, msBin: string, prefix: string[], suffix: string[]): string | null {
+  const outside = [...prefix, ...suffix];
+  for (const line of outside) {
+    if (classify(line)?.kind === "unknown") {
+      return `${configPath}: a 'hooks' table this tool cannot read (${stripComment(line).trim()}); install the hooks by hand or simplify that table, refusing to guess`;
+    }
   }
+  const needle = `command = ${tomlString(codexHookCommand(msBin))}`;
+  if (outside.some((l) => l.includes(needle))) {
+    return `${configPath}: a hook already runs \`${codexHookCommand(msBin)}\` outside the ms-hooks markers; remove that table by hand, refusing to install a duplicate`;
+  }
+  const idx = matcherIndexes(prefix);
+  const ours = new Set(EVENTS.map((e) => trustKey(configPath, e.snake, idx[e.table])));
+  for (const line of outside) {
+    const h = classify(line);
+    if (h?.kind === "state" && ours.has(h.key)) {
+      return `${configPath}: the trust entry [hooks.state."${h.key}"] is already in this file outside the ms-hooks markers; remove it by hand, refusing to write a duplicate key`;
+    }
+  }
+  return null;
+}
+
+/** The file we would write for a given current text, or the reason not to. */
+function compose(configPath: string, msBin: string, text: string): { next: string } | { problem: string } {
+  const parts = split(text);
+  if (!parts) {
+    return { problem: `${configPath}: a '# ms-hooks-begin' marker with no '# ms-hooks-end'; repair or remove that block by hand, refusing to overwrite everything below it` };
+  }
+  const { prefix, suffix } = parts;
+  const problem = unsafe(configPath, msBin, prefix, suffix);
+  if (problem) return { problem };
   // Exactly one blank line between the human's last table and ours, and
   // between ours and whatever followed it — so a second install produces the
   // same bytes as the first and `changed` stays honest.
   const head = prefix.join("\n").replace(/\n+$/, "");
   const tail = suffix.join("\n").replace(/^\n+/, "").replace(/\n+$/, "");
-  const parts = [head, block(configPath, msBin, prefix), tail].filter((s) => s !== "");
-  return parts.join("\n\n") + "\n";
+  const pieces = [head, block(configPath, msBin, prefix), tail].filter((x) => x !== "");
+  return { next: pieces.join("\n\n") + "\n" };
 }
 
 /**
@@ -198,11 +302,13 @@ function compose(configPath: string, msBin: string, text: string): string {
  * and reports `changed: false`, so the installer is idempotent and leaves one
  * backup per real change, not one per invocation.
  */
-export function installCodexHooks(homeDir: string, msBin: string): { changed: boolean; backup: string | null } {
+export function installCodexHooks(homeDir: string, msBin: string): InstallResult {
   const file = codexConfigPath(homeDir);
   const existed = existsSync(file);
   const text = existed ? readFileSync(file, "utf8") : "";
-  const next = compose(file, msBin, text);
+  const composed = compose(file, msBin, text);
+  if ("problem" in composed) return { changed: false, backup: null, problem: composed.problem };
+  const next = composed.next;
   if (existed && next === text) return { changed: false, backup: null };
 
   let backup: string | null = null;
@@ -224,42 +330,48 @@ type Table = { index: number; command: string | null };
 /**
  * A targeted scan for the two shapes this tool writes — `[[hooks.<Event>]]`
  * with its one-line `hooks = [...]`, and `[hooks.state."<key>"]` with its
- * `trusted_hash` — and nothing else. It is not a TOML parser and does not
- * pretend to be one: a zero-dependency tool that had to parse TOML to answer
- * "are my hooks installed?" would be carrying a parser to read four lines it
- * wrote itself. Anything it does not recognise simply ends the current table,
- * which is the conservative answer (`installed` reads false and the installer
- * rewrites its block).
+ * `trusted_hash` — over the SAME strict classifier the installer uses, so the
+ * two can never disagree about what a line says. It is not a TOML parser and
+ * does not pretend to be one; a zero-dependency tool that had to parse TOML to
+ * answer "are my hooks installed?" would be carrying a parser to read four
+ * lines it wrote itself.
+ *
+ * `blocked` is set by a `hooks` header the classifier could not read. It makes
+ * `codexHooksInstalled` answer false, which sends the caller to the installer,
+ * which refuses with a message naming the line — rather than this reporting a
+ * confident `true` about an index it could not compute.
  */
-function scan(text: string): { tables: Map<string, Table[]>; trust: Map<string, string> } {
+function scan(text: string): { tables: Map<string, Table[]>; trust: Map<string, string>; blocked: boolean } {
   const tables = new Map<string, Table[]>();
   const trust = new Map<string, string>();
+  let blocked = false;
   let current: Table | null = null;
   let trustKeyNow: string | null = null;
   for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    if (line.startsWith("#") || line === "") continue;
-    const arr = line.match(/^\[\[hooks\.(\w+)\]\]$/);
-    const state = line.match(/^\[hooks\.state\."(.*)"\]$/);
-    if (arr) {
-      const list = tables.get(arr[1]) ?? [];
-      current = { index: list.length, command: null };
-      list.push(current);
-      tables.set(arr[1], list);
-      trustKeyNow = null;
-      continue;
-    }
-    if (state) {
+    const header = classify(raw);
+    if (header) {
       current = null;
-      trustKeyNow = state[1].replace(/\\(["\\])/g, "$1");
+      trustKeyNow = null;
+      if (header.kind === "event") {
+        const list = tables.get(header.table) ?? [];
+        current = { index: list.length, command: null };
+        list.push(current);
+        tables.set(header.table, list);
+      } else if (header.kind === "state") {
+        trustKeyNow = header.key;
+      } else {
+        blocked = true;
+      }
       continue;
     }
+    const line = stripComment(raw).trim();
+    if (line === "") continue;
     if (line.startsWith("[")) { current = null; trustKeyNow = null; continue; }
     if (current && /^hooks\s*=/.test(line)) { current.command = line; continue; }
     const hash = trustKeyNow ? line.match(/^trusted_hash\s*=\s*"([^"]*)"$/) : null;
     if (hash) trust.set(trustKeyNow!, hash[1]);
   }
-  return { tables, trust };
+  return { tables, trust, blocked };
 }
 
 /**
@@ -277,7 +389,8 @@ export function codexHooksInstalled(homeDir: string, msBin: string): boolean {
   const file = codexConfigPath(homeDir);
   let text: string;
   try { text = readFileSync(file, "utf8"); } catch { return false; }
-  const { tables, trust } = scan(text);
+  const { tables, trust, blocked } = scan(text);
+  if (blocked) return false;
   const cmd = codexHookCommand(msBin);
   const needle = `command = ${tomlString(cmd)}`;
   return EVENTS.every((e) => {
@@ -287,11 +400,16 @@ export function codexHooksInstalled(homeDir: string, msBin: string): boolean {
   });
 }
 
+/** Always 0600, on every write and not only on the first. `config.toml` is
+ * not a secret, but it names every project this account is trusted in and is
+ * the file whose hooks decide what runs unattended; inheriting a mode a
+ * previous writer chose (or a umask allowed) would mean a home that is
+ * world-readable stays world-readable for ever. */
 function writeAtomic(file: string, text: string): void {
-  const mode = existsSync(file) ? statSync(file).mode & 0o777 : 0o600;
   const tmp = `${file}.tmp-${process.pid}`;
   try {
-    writeFileSync(tmp, text, { mode });
+    writeFileSync(tmp, text, { mode: 0o600 });
+    chmodSync(tmp, 0o600); // writeFileSync's mode is subject to umask; this is not
     renameSync(tmp, file);
   } catch (e) {
     try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* best effort */ }

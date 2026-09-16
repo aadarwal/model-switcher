@@ -203,9 +203,127 @@ test("a hand-installed copy of our own hook outside the markers is refused, neve
     "",
   ].join("\n");
   writeFileSync(config(d), hand, { mode: 0o600 });
-  assert.throws(() => installCodexHooks(d, MS), /outside the ms-hooks markers/);
+  const r = installCodexHooks(d, MS);
+  assert.equal(r.changed, false);
+  assert.match(r.problem!, /outside the ms-hooks markers/);
   assert.equal(read(d), hand, "and the file is untouched");
   // A hand install for ANOTHER binary is the human's business and installs fine.
   assert.equal(installCodexHooks(d, "/usr/local/bin/ms").changed, true);
   assert.equal(codexHooksInstalled(d, "/usr/local/bin/ms"), true);
+});
+
+test("a header wearing a trailing comment is the same header, and still shifts our matcher index", () => {
+  // `[[hooks.SessionStart]] # mine` is a legal header. A scanner that could not
+  // see it would put our trust entry at index 0 — the human's — leaving OUR
+  // hook silently untrusted while `codexHooksInstalled` reported true.
+  const d = home();
+  writeFileSync(config(d), [
+    "[[hooks.SessionStart]] # added by hand, keep",
+    'hooks = [{ type = "command", command = "their-own-hook" }] # theirs',
+    "",
+  ].join("\n"), { mode: 0o600 });
+
+  assert.equal(installCodexHooks(d, MS).changed, true);
+  const text = read(d);
+  assert.ok(text.includes("# added by hand, keep"), "the comment survives with its line");
+  assert.ok(text.includes(`[hooks.state."${config(d)}:session_start:1:0"]`), "ours is the SECOND SessionStart table");
+  assert.ok(!text.includes(`[hooks.state."${config(d)}:session_start:0:0"]`));
+  assert.equal(codexHooksInstalled(d, MS), true);
+  // A `#` inside a quoted key is part of the key, not a comment.
+  const q = home();
+  writeFileSync(config(q), ['[projects."/Users/a/sr#c/app"]', 'trust_level = "trusted"', ""].join("\n"), { mode: 0o600 });
+  assert.equal(installCodexHooks(q, MS).changed, true);
+  assert.ok(read(q).includes('[projects."/Users/a/sr#c/app"]'));
+});
+
+test("a hooks table this tool cannot classify is refused, not guessed at", () => {
+  // Every one of these is a legal way to write something that changes the
+  // matcher index our trust key is built from. Guessing wrong writes a
+  // trusted_hash for somebody else's hook, or a duplicate key that makes Codex
+  // reject the whole file — so none of them is guessed at.
+  for (const header of [
+    "[hooks]",                       // SessionStart = [...] could follow
+    "[hooks.state]",                 // a quoted trust key could follow
+    "[[hooks.SessionStart.extra]]",  // three segments, not two
+    '[[hooks."Session Start"]]',     // a quoted event this tool cannot spell
+    "[[hooks]]",                     // an array of hooks tables
+  ]) {
+    const d = home();
+    const before = `${header}\nsomething = 1\n`;
+    writeFileSync(config(d), before, { mode: 0o600 });
+    const r = installCodexHooks(d, MS);
+    assert.equal(r.changed, false, header);
+    assert.match(r.problem!, /cannot read/, header);
+    assert.equal(read(d), before, `${header}: untouched`);
+    assert.equal(codexHooksInstalled(d, MS), false, `${header}: and never reported installed`);
+  }
+  // And a home whose block IS fully installed still reads as NOT installed
+  // while an unreadable hooks table sits beside it: the tables and hashes all
+  // match, but the index they were computed from can no longer be trusted, and
+  // a confident `true` here is how our hook ends up silently untrusted.
+  const installed = home();
+  installCodexHooks(installed, MS);
+  assert.equal(codexHooksInstalled(installed, MS), true);
+  writeFileSync(config(installed), `[hooks]\nSessionStart = []\n\n${read(installed)}`, { mode: 0o600 });
+  assert.equal(codexHooksInstalled(installed, MS), false, "installed, but not readably so");
+  assert.match(installCodexHooks(installed, MS).problem!, /cannot read/, "and the installer says why");
+
+  // A table that is not under `hooks` at all is none of our business, and a
+  // nested array literal on its own line is not a header.
+  const ok = home();
+  writeFileSync(config(ok), ['[mcp_servers.anu]', 'matrix = [', '  [1, 2]', ']', ""].join("\n"), { mode: 0o600 });
+  assert.equal(installCodexHooks(ok, MS).changed, true);
+  assert.ok(read(ok).includes("  [1, 2]"));
+});
+
+test("a trust entry already carrying one of OUR keys is refused: a duplicate key breaks the file", () => {
+  // Codex rejects a config.toml with two `[hooks.state."same key"]` tables —
+  // and it is not only the hooks that stop working, it is the model, the
+  // approval policy and every MCP server in the file.
+  const d = home();
+  const before = [
+    `[hooks.state."${config(d)}:stop:0:0"]`,
+    'trusted_hash = "sha256:deadbeef"',
+    "",
+  ].join("\n");
+  writeFileSync(config(d), before, { mode: 0o600 });
+  const r = installCodexHooks(d, MS);
+  assert.equal(r.changed, false);
+  assert.match(r.problem!, /already in this file outside the ms-hooks markers/);
+  assert.equal(read(d), before, "untouched");
+  // The SAME key under a different home is a different key, and installs fine.
+  const other = home();
+  writeFileSync(config(other), before, { mode: 0o600 });
+  assert.equal(installCodexHooks(other, MS).changed, true, "the key names the OTHER home's config path");
+});
+
+test("a begin marker with no end is refused, never used to truncate the file", () => {
+  // `split` would otherwise return an empty suffix and the write would delete
+  // everything below the marker.
+  const d = home();
+  const before = [
+    'model = "gpt-5-codex"',
+    "# ms-hooks-begin (model-switcher — do not edit between the markers)",
+    "[[hooks.SessionStart]]",
+    `hooks = [{ type = "command", command = "${CMD}" }]`,
+    "",
+    "[mcp_servers.x]",
+    'command = "x-mcp"',
+    "",
+  ].join("\n");
+  writeFileSync(config(d), before, { mode: 0o600 });
+  const r = installCodexHooks(d, MS);
+  assert.equal(r.changed, false);
+  assert.match(r.problem!, /no '# ms-hooks-end'/);
+  assert.equal(read(d), before, "every byte below the marker survives");
+  assert.ok(read(d).includes("[mcp_servers.x]"));
+});
+
+test("every write is 0600, not merely the first", () => {
+  const d = home();
+  writeFileSync(config(d), 'model = "gpt-5-codex"\n', { mode: 0o644 });
+  assert.equal(installCodexHooks(d, MS).changed, true);
+  assert.equal(statSync(config(d)).mode & 0o777, 0o600, "a world-readable home does not stay world-readable");
+  assert.equal(installCodexHooks(d, "/usr/local/bin/ms").changed, true);
+  assert.equal(statSync(config(d)).mode & 0o777, 0o600);
 });

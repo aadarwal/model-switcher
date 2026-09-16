@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { stubDir, tempHome } from "./helpers.ts";
 
@@ -175,13 +175,25 @@ test("a torn trailing line is kept for the next pass, and the offset advances on
   assert.equal((await row(w.openState))!.rolloutOffset, Buffer.byteLength(readFileSync(file, "utf8")), "and the offset is now the whole file");
 });
 
-test("bytes already read are never read twice", async () => {
-  const w = await world({ rollouts: { s1: [taskComplete("t-1", "usage_limit_exceeded")] }, autorotate: true });
+test("bytes already read are never read twice, with the turn still in flight", async () => {
+  // The turn stays OPEN on purpose. A settled turn is skipped by the in-flight
+  // test before the file is ever opened, so a test that let the turn settle
+  // would prove nothing about the offset — which is the thing that has to be
+  // right when a session takes many turns against one growing rollout.
+  const w = await world({ rollouts: { s1: [noise(1), taskComplete("t-OTHER", "usage_limit_exceeded"), noise(2)] }, autorotate: true });
+  const wholeFile = Buffer.byteLength(readFileSync(w.rollout("s1"), "utf8"));
+
   assert.equal(await watch(), 0);
-  assert.equal(events(w.msHome).filter((e) => e.kind === "rate_limited").length, 1);
-  // A second pass over the same file must not re-read the same record. (The
-  // turn is settled now, so the session is skipped outright — belt and braces:
-  // the offset is what makes it safe even if it were not.)
+  assert.equal((await row(w.openState))!.rolloutOffset, wholeFile, "the whole file was consumed");
+  assert.deepEqual(events(w.msHome).map((e) => e.kind), ["activity"], "and none of it was ours");
+
+  // A second pass adds nothing and moves nothing: every byte is behind us.
+  assert.equal(await watch(), 0);
+  assert.equal((await row(w.openState))!.rolloutOffset, wholeFile);
+  assert.deepEqual(events(w.msHome).map((e) => e.kind), ["activity"]);
+
+  // Only the NEW bytes are read when the writer appends this turn's ending.
+  appendFileSync(w.rollout("s1"), taskComplete("t-1", "usage_limit_exceeded") + "\n");
   assert.equal(await watch(), 0);
   assert.equal(events(w.msHome).filter((e) => e.kind === "rate_limited").length, 1, "one wall, one event");
 });
@@ -266,7 +278,27 @@ test("a rollout that is missing, unreadable or empty is not evidence: the turn s
   st.updateSession("s1", { transcriptPath: null }); st.close();
   assert.equal(await watch(), 0);
   assert.deepEqual(events(b.msHome).map((e) => e.kind), ["activity"]);
-  assert.equal(rearms(b.tlog), 1, "unreadable is not finished");
+  assert.equal(rearms(b.tlog), 1, "a path we never learned is not finished");
+
+  // a path that is gone: the file was rotated away, or the home was wiped
+  const gone = await world({ rollouts: { s1: [taskComplete("t-1", "usage_limit_exceeded")] }, autorotate: true });
+  rmSync(gone.rollout("s1"));
+  assert.equal(await watch(), 0);
+  assert.deepEqual(events(gone.msHome).map((e) => e.kind), ["activity"], "a missing file records nothing");
+  assert.equal(rearms(gone.tlog), 1);
+
+  // a path we are not allowed to open — the one case the name claimed and the
+  // test did not cover. statSync succeeds; the open is what fails.
+  const denied = await world({ rollouts: { s1: [taskComplete("t-1", "usage_limit_exceeded")] }, autorotate: true });
+  chmodSync(denied.rollout("s1"), 0o000);
+  try {
+    assert.equal(await watch(), 0);
+    assert.deepEqual(events(denied.msHome).map((e) => e.kind), ["activity"], "an unreadable file records nothing");
+    assert.equal((await row(denied.openState))!.rolloutOffset, 0, "and moves no offset");
+    assert.equal(rearms(denied.tlog), 1, "unreadable is not finished");
+  } finally {
+    chmodSync(denied.rollout("s1"), 0o600);
+  }
 });
 
 test("a rollout that shrank is re-read from the start rather than from a meaningless offset", async () => {
@@ -369,4 +401,116 @@ test("the timer claim covers exactly the interval the timer was given", async ()
     const until = Number(st.getKv("codexWatchArmedUntil"));
     assert.ok(until >= NOW() + 118 && until <= NOW() + 121, `claimed until ${until - NOW()}s out, expected ~120`);
   } finally { st.close(); }
+});
+
+test("an append that fails leaves the offset where it was: the record is read again, never lost", async () => {
+  // The offset used to move before the events were written. An append that
+  // throws — a full disk, a mode nothing can write — then meant the next pass
+  // started AFTER the record, the turn was never settled, and the watchdog
+  // re-armed for ever over a session that had walled.
+  const w = await world({ rollouts: { s1: [noise(1), taskComplete("t-1", "usage_limit_exceeded")] } });
+  const log = path.join(w.msHome, "sessions", "s1", "events.jsonl");
+  chmodSync(log, 0o400); // appendEvent will throw
+  try {
+    assert.equal(await watch(), 0);
+    assert.equal((await row(w.openState))!.rolloutOffset, 0, "the bytes we could not record are still ahead of us");
+    assert.equal(rearms(w.tlog), 1, "and the turn is still in flight");
+  } finally {
+    chmodSync(log, 0o600);
+  }
+  // With the log writable again the very same bytes are read, and the wall
+  // lands. Nothing was lost.
+  assert.equal(await watch(), 0);
+  assert.equal(events(w.msHome).pop()!.kind, "rate_limited");
+  assert.equal((await row(w.openState))!.rolloutOffset, Buffer.byteLength(readFileSync(w.rollout("s1"), "utf8")));
+
+  // The ordinary ending goes the same way. A `stop` that could not be written
+  // is a turn the tool still believes is running, so its bytes must come round
+  // again too — otherwise the watchdog re-arms for ever over a finished turn.
+  const b = await world({ rollouts: { s1: [noise(1), taskComplete("t-1", null)] } });
+  const blog = path.join(b.msHome, "sessions", "s1", "events.jsonl");
+  chmodSync(blog, 0o400);
+  try {
+    assert.equal(await watch(), 0);
+    assert.equal((await row(b.openState))!.rolloutOffset, 0, "a stop we could not record leaves the bytes ahead of us");
+    assert.equal(rearms(b.tlog), 1, "and the turn reads as still in flight");
+  } finally {
+    chmodSync(blog, 0o600);
+  }
+  assert.equal(await watch(), 0);
+  assert.equal(events(b.msHome).pop()!.kind, "stop", "the same record lands on the next pass");
+  assert.equal(rearms(b.tlog), 1, "and nothing re-arms once it has");
+});
+
+test("a timer somebody else already armed is neither doubled nor cleared", async () => {
+  // The pass begins when its own claim expires, and a UserPromptSubmit that
+  // won the lock in that gap has already armed a replacement. Re-arming on top
+  // of it leaves TWO timers, each renewing the other's claim for as long as the
+  // fleet is busy.
+  const w = await world({ rollouts: { s1: [noise(1)] } });
+  const st = w.openState();
+  const until = NOW() + 90;
+  st.setKv("codexWatchArmedUntil", String(until));
+  st.close();
+
+  assert.equal(await watch(), 0);
+  assert.equal(rearms(w.tlog, 120) + rearms(w.tlog, 45), 0, "no second timer");
+  const after = w.openState();
+  try { assert.equal(Number(after.getKv("codexWatchArmedUntil")), until, "and the other timer's claim is left alone"); } finally { after.close(); }
+
+  // The same guard must not clear a live claim when nothing is in flight
+  // either: that timer is still coming, and clearing would let the next hook
+  // arm a second one.
+  const idle = await world({ rollouts: { s1: [taskComplete("t-1", null)] } });
+  const st2 = idle.openState();
+  st2.setKv("codexWatchArmedUntil", String(NOW() + 90));
+  st2.close();
+  assert.equal(await watch(), 0);
+  const after2 = idle.openState();
+  try { assert.ok(Number(after2.getKv("codexWatchArmedUntil")) > NOW(), "the pending claim survives"); } finally { after2.close(); }
+});
+
+test("a line longer than the read cap is stepped over rather than stalling the session for ever", async () => {
+  // A whole cap-sized read with no newline in it is not a record being written,
+  // it is a line longer than the cap. Keeping the offset would re-read the same
+  // bytes every pass and the turn would never end.
+  const w = await world({ rollouts: { s1: [] } });
+  const { ROLLOUT_CHUNK_MAX } = await import("../src/hooks/codex-hook.ts");
+  writeFileSync(w.rollout("s1"), "x".repeat(ROLLOUT_CHUNK_MAX + 1024));
+
+  // Skipping bytes is worth saying out loud — but only when asked. A watchdog
+  // that wrote a line every 45 s would drown the one line worth reading.
+  const said: string[] = [];
+  const real = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((c: string) => { said.push(String(c)); return true; }) as typeof process.stderr.write;
+  try {
+    delete process.env.MS_VERBOSE;
+    assert.equal(await watch(), 0);
+    assert.deepEqual(said, [], "silent by default");
+  } finally {
+    process.stderr.write = real;
+  }
+  assert.equal((await row(w.openState))!.rolloutOffset, ROLLOUT_CHUNK_MAX, "exactly the cap, no more");
+  assert.deepEqual(events(w.msHome).map((e) => e.kind), ["activity"], "and nothing is invented from it");
+
+  // The rest of the monster line goes the same way, and then the real record
+  // behind it is read.
+  appendFileSync(w.rollout("s1"), "\n" + taskComplete("t-1", null) + "\n");
+  assert.equal(await watch(), 0);
+  assert.equal(events(w.msHome).pop()!.kind, "stop");
+
+  // Asked for, it says so. (A fresh world, because `watch` reads whichever
+  // store MS_HOME currently points at.)
+  const loud = await world({ rollouts: { s1: [] } });
+  writeFileSync(loud.rollout("s1"), "x".repeat(ROLLOUT_CHUNK_MAX + 1024));
+  const heard: string[] = [];
+  process.stderr.write = ((c: string) => { heard.push(String(c)); return true; }) as typeof process.stderr.write;
+  try {
+    process.env.MS_VERBOSE = "1";
+    assert.equal(await watch(), 0);
+  } finally {
+    process.stderr.write = real;
+    delete process.env.MS_VERBOSE;
+  }
+  assert.match(heard.join(""), /s1: skipped \d+ rollout bytes with no line break/);
 });

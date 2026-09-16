@@ -37,9 +37,12 @@ const LEAD = String.raw`^\s*(?:⎿\s*)?`;
  * settings URL is a second, independent anchor for the case where the TUI
  * wraps the sentence and the first line on screen is the URL.
  *
- * Text still only NAMES a wall. For Codex the trigger is the turn watchdog's
- * own usage poll reading a window at 100 (`ms _turn`); this is the gate that
- * decides whether that poll is worth making.
+ * Text still only NAMES a wall, and for Codex it does not even do that any
+ * more: the trigger is the rollout record `ms _codex_watch` tails
+ * (`task_complete` with `error.codex_error_info === "usage_limit_exceeded"`),
+ * which is first-party and unquotable. These patterns survive for `ms status`
+ * alone, which reads a pane that LOOKS walled and nothing has reported as
+ * `unreported`.
  */
 const PATTERNS: [WallKind, RegExp][] = [
   ["fable", new RegExp(LEAD + String.raw`(?:you'?ve reached your fable limit|fable limit reached)`, "i")],

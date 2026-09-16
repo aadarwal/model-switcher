@@ -125,3 +125,36 @@ test("Codex wall text quoted in prose, or left behind by an earlier turn, is not
   // and a real wall from a PREVIOUS turn is out of scope once a new turn starts
   assert.equal(wallKindFromText(`❯ first\n${CODEX}\n❯ second\n  Done.\n\n❯ \n`), null);
 });
+
+/**
+ * The wall as the Codex TUI actually draws it, and the 429 that merely looks
+ * like one.
+ *
+ * Both strings are verbatim from the source of `rust-v0.154.0` (commit
+ * 6b9826e) and from the verified record quoted in the wall-drill research
+ * (docs/superpowers/plans/2026-09-16-codex-wall-mock.md): the message text is
+ * built at `codex-rs/protocol/src/error.rs:710-751` and printed as one red
+ * `■ {message}` line by `codex-rs/tui/src/history_cell/notices.rs:244-250`.
+ *
+ * The negative matters as much as the positive. A 429 whose body is NOT
+ * `{"error":{"type":"usage_limit_reached"}}` becomes `RetryLimit` instead
+ * (`codex-rs/codex-api/src/api_bridge.rs:165`) and renders "exceeded retry
+ * limit, last status: 429 Too Many Requests"
+ * (`codex-rs/protocol/src/error.rs:628-640`) — a transient failure that must
+ * never be read as being out of quota.
+ */
+const CODEX_TUI = "■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 11th, 2026 9:23 PM.";
+
+test("the Codex wall is named through the TUI's own ■ error glyph, and a generic 429 is not a wall", () => {
+  assert.equal(wallKindFromText(plain(CODEX_TUI)), "session");
+  assert.equal(wallKindFromText(plain("■ You've hit your usage limit. Try again later.")), "session");
+  // The same-day reset variant, which renders a bare clock time.
+  assert.equal(wallKindFromText(plain("■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 10:29 PM.")), "session");
+  // The glyph does not weaken the quoted-prose guard: mid-line is still no.
+  assert.equal(wallKindFromText(`❯ what happens\n  it prints ■ You've hit your usage limit. and stops\n\n❯ \n`), null);
+
+  // The generic 429. Same status upstream, different error, different text —
+  // and it must not rotate an account that still has quota.
+  assert.equal(wallKindFromText(plain("■ exceeded retry limit, last status: 429 Too Many Requests")), null);
+  assert.equal(wallKindFromText(plain("■ exceeded retry limit, last status: 429 Too Many Requests, request id: req_123")), null);
+});

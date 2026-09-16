@@ -18,7 +18,22 @@
  */
 export type WallKind = "session" | "weekly" | "fable";
 
-const LEAD = String.raw`^\s*(?:⎿\s*)?`;
+/**
+ * The line start, with one optional leading glyph.
+ *
+ * `⎿` is Claude Code's result marker. `■` is Codex's: every error the Codex
+ * TUI renders is one red line built as `format!("■ {message}")`
+ * (openai/codex `rust-v0.154.0`, `codex-rs/tui/src/history_cell/notices.rs:244-250`,
+ * reached from `turn_runtime.rs:372-385`), so the real wall never reaches the
+ * screen bare — it arrives as `■ You've hit your usage limit. …`. Without the
+ * glyph here the anchor below could not match the one line it was written for.
+ * Found by the wall drill (docs/superpowers/plans/2026-09-16-codex-wall-mock.md).
+ *
+ * Widening the anchor does not weaken it: the guard is that the phrase must
+ * open its LINE, and a glyph the TUI itself prefixes is still the start of the
+ * line. Prose that quotes the phrase mid-sentence stays unmatched.
+ */
+const LEAD = String.raw`^\s*(?:[⎿■]\s*)?`;
 /**
  * Order matters: the first pattern that matches names the kind, and the
  * session clause below is a PREFIX of the Codex weekly one ("You've hit your

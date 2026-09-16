@@ -121,6 +121,20 @@ export class State {
     this.db.prepare("INSERT INTO launches (id,sessionId,generation,account,command,env,createdAt) VALUES (?,?,?,?,?,?,?)")
       .run(l.id, l.sessionId, l.generation, l.account, JSON.stringify(l.command), JSON.stringify(l.env), l.createdAt);
   }
+  /**
+   * How many times this session has been handed to another account since
+   * `since` (unix seconds).
+   *
+   * Every respawn a recovery makes writes a launch row, and the only launch
+   * with generation 1 is the one the session was BORN on — so "generation > 1"
+   * is exactly "a change", with no join and no interpretation. This is the
+   * record `src/recover.ts`'s rate cap reads: it spans recoveries, where the
+   * attempts of any one of them cannot.
+   */
+  accountChangesSince(sessionId: string, since: number): number {
+    const r = this.db.prepare("SELECT COUNT(*) AS n FROM launches WHERE sessionId=? AND generation>1 AND createdAt>=?").get(sessionId, since) as { n: number } | undefined;
+    return Number(r?.n ?? 0);
+  }
   getLaunch(id: string): LaunchRow | null {
     const r = this.db.prepare("SELECT * FROM launches WHERE id=?").get(id) as Record<string, unknown> | undefined;
     return r ? { ...(r as unknown as LaunchRow), command: JSON.parse(String(r.command)), env: JSON.parse(String(r.env)) } : null;

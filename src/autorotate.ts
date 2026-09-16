@@ -21,10 +21,16 @@
 // is still read directly as a fallback, so a `ms _recover` run by hand from a
 // flagged shell behaves the way the person in front of it expects.
 //
-// Absent means OFF (spike verdict G1: PARTIAL — no live Codex wall has been
-// observed, so the automatic path ships disabled).
+// Absent means ON. The gate shipped off while no live Codex wall had been
+// observed (spike verdict G1: PARTIAL); that gap is closed. The wall's on-disk
+// record was checked against 85 real walled rollouts on this machine, and the
+// whole chain — watchdog, handoff, `codex resume` with the continuation, the
+// real account answering — was observed end to end against a mock-walled
+// scratch account (docs/superpowers/plans/2026-09-16-live-matrix-codex-wall.md).
+// So the default inverts: automatic Codex recovery is on unless somebody says
+// otherwise, and `MS_CODEX_AUTOROTATE=0` (or a stored "0") is how they say it.
 
-/** The one key. Its value is exactly "1" or "0"; absent is off. */
+/** The one key. Its value is exactly "1" or "0"; absent is on. */
 export const CODEX_AUTOROTATE_KEY = "codexAutorotate";
 
 /** The minimum of `State` this module needs — structural on purpose, so
@@ -50,12 +56,16 @@ export function codexAutorotateEnv(): boolean | null {
  * The gate. The stored value wins whenever there is one, because the store is
  * the only thing a tmux-dispatched process can see; the environment is the
  * fallback for the case where nothing has mirrored one yet.
+ *
+ * Only an explicit "off" turns this off — a stored "0", or, while nothing has
+ * been stored, an exported `MS_CODEX_AUTOROTATE` that is not "1". Everything
+ * else, silence included, is on.
  */
 export function codexAutorotateEnabled(st: AutorotateStore): boolean {
   const stored = st.getKv(CODEX_AUTOROTATE_KEY);
   if (stored === "1") return true;
   if (stored === "0") return false;
-  return codexAutorotateEnv() === true;
+  return codexAutorotateEnv() !== false;
 }
 
 /**
@@ -75,9 +85,10 @@ export function syncCodexAutorotate(st: AutorotateStore): void {
   st.setKv(CODEX_AUTOROTATE_KEY, want);
 }
 
-/** The doctor line's text, so the gate is stated in exactly one place. */
+/** The doctor line's text, so the gate is stated in exactly one place. Each
+ * half names the export that would flip it, in the shell that runs `codex`. */
 export function codexAutorotateLine(on: boolean): string {
   return on
-    ? "codex auto-recovery: on"
-    : "codex auto-recovery: off (set MS_CODEX_AUTOROTATE=1 in the shell that runs codex)";
+    ? "codex auto-recovery: on (export MS_CODEX_AUTOROTATE=0 to disable)"
+    : "codex auto-recovery: off (export MS_CODEX_AUTOROTATE=1 to enable)";
 }

@@ -41,8 +41,12 @@ test("the environment is three-valued: on, off, and not set here", () => {
   }
 });
 
-test("absent everywhere is off: Codex automatic recovery ships disabled", () => {
-  withEnv(undefined, () => assert.equal(codexAutorotateEnabled(store()), false));
+test("absent everywhere is ON: Codex automatic recovery is the default since 0.2.4", () => {
+  // The gate shipped off while no live Codex wall had been observed. It has
+  // been now — 85 real walled rollouts carry the record the tool parses, and
+  // the whole chain was watched end to end — so silence means on.
+  withEnv(undefined, () => assert.equal(codexAutorotateEnabled(store()), true));
+  withEnv("", () => assert.equal(codexAutorotateEnabled(store()), true, "an empty export is not somebody saying no"));
 });
 
 test("the stored gate is read WITHOUT the environment — the tmux-dispatched case", () => {
@@ -65,8 +69,15 @@ test("the stored gate WINS over the environment whenever there is one", () => {
 test("the environment is the fallback only while nothing has been stored", () => {
   withEnv("1", () => assert.equal(codexAutorotateEnabled(store()), true));
   withEnv("0", () => assert.equal(codexAutorotateEnabled(store()), false));
+  // Only "1" is yes, so every other exported value is off — `false` and `no`
+  // as intended, but a typo too. Somebody who exports MS_CODEX_AUTOROTATE=true
+  // to be explicit turns the feature OFF, and the mirror writes that down.
+  // That is the rule `codexAutorotateEnv` states, and the README's env table
+  // says it in those words rather than "anything else leaves it on".
+  withEnv("true", () => assert.equal(codexAutorotateEnabled(store()), false, "not '1' is off, exactly as codexAutorotateEnv reads it"));
   // A value the gate does not recognise is not a gate: fall back, do not guess.
   withEnv("1", () => assert.equal(codexAutorotateEnabled(store({ [CODEX_AUTOROTATE_KEY]: "yes" })), true));
+  withEnv(undefined, () => assert.equal(codexAutorotateEnabled(store({ [CODEX_AUTOROTATE_KEY]: "yes" })), true, "an unrecognised row falls back to the default, which is on"));
 });
 
 test("syncCodexAutorotate mirrors an export, and an unset variable changes nothing", () => {
@@ -91,7 +102,7 @@ test("syncCodexAutorotate mirrors an export, and an unset variable changes nothi
   assert.equal(s4.writes, 0);
 });
 
-test("the doctor line names the shell the variable belongs in", () => {
-  assert.equal(codexAutorotateLine(false), "codex auto-recovery: off (set MS_CODEX_AUTOROTATE=1 in the shell that runs codex)");
-  assert.equal(codexAutorotateLine(true), "codex auto-recovery: on");
+test("the doctor line names the export that would flip it, both ways round", () => {
+  assert.equal(codexAutorotateLine(true), "codex auto-recovery: on (export MS_CODEX_AUTOROTATE=0 to disable)");
+  assert.equal(codexAutorotateLine(false), "codex auto-recovery: off (export MS_CODEX_AUTOROTATE=1 to enable)");
 });

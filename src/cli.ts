@@ -5,6 +5,7 @@ import { execLaunch } from "./exec.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
 import { codexHook, codexWatch } from "./hooks/codex-hook.ts";
 import { attachVerb, launchClaude, launchCodex } from "./launch.ts";
+import { dashboard } from "./dashboard.ts";
 import { statuslineVerb } from "./setup/statusline.ts";
 import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { paneDied, reconcile } from "./reconcile.ts";
@@ -34,9 +35,10 @@ registerVerb("accounts", accountsVerb);
 registerVerb("rotate", rotateVerb);
 registerVerb("switch", switchVerb);
 registerVerb("stop", stopVerb);
+registerVerb("dashboard", dashboard);
 
 const USAGE = `usage: ms <verb> [args]
-  setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach
+  setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach | dashboard
   (internal: _exec _hook _codex_watch _recover _pane_died _statusline)`;
 
 function version(): string {

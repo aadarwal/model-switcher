@@ -472,32 +472,25 @@ async function identifyOrRefuse(name: string): Promise<Profile> {
   return profile;
 }
 
-/** Steps 3–4's checks on a launch token that is already on disk: it runs the
- *  CLI, and the organisation it reports is the one the poll grant reported.
- *  A token that cannot answer is an error; an identity that cannot be
- *  confirmed is recorded as false with a warning, never assumed true. */
+/** Runs the launch token headlessly (the probe) — the one thing that proves
+ *  it is USABLE. The organisation `claude auth status --json` names under it
+ *  is only ever a bonus, verified live not to exist on 2.1.273 (a setup-token
+ *  is inference-scope only, so it 403s the profile/usage endpoints and never
+ *  writes `oauthAccount` locally): when the CLI does name one and it
+ *  disagrees with the poll grant's own organisation, that is the one signal
+ *  worth refusing on; naming none, or agreeing, is silent either way. */
 function checkLaunchToken(
   name: string,
   token: string,
   profile: Profile,
-): { verified: boolean; probe: { ok: boolean; detail: string } } {
+): { verified: boolean; probe: { ok: boolean; detail: string }; mismatchOrg: string | null } {
   const scratch = scratchConfigDir();
   try {
     const probe = probeLaunchToken(token, scratch);
-    if (!probe.ok) return { verified: false, probe };
+    if (!probe.ok) return { verified: false, probe, mismatchOrg: null };
     const org = organisationFromLaunchToken(token, scratch);
-    if (!org) {
-      warn(`warning: claude auth status named no organisation for ${name}; identity is recorded as unverified`);
-      return { verified: false, probe };
-    }
-    if (org !== profile.orgId) {
-      warn(
-        `warning: ${name}'s launch token reports organisation ${org}, but its poll grant reports ${profile.orgId}; ` +
-          `identity is recorded as unverified`,
-      );
-      return { verified: false, probe };
-    }
-    return { verified: true, probe };
+    if (org && org !== profile.orgId) return { verified: false, probe, mismatchOrg: org };
+    return { verified: true, probe, mismatchOrg: null };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -507,7 +500,7 @@ function report(name: string, profile: Profile, verified: boolean): void {
   out(
     `${name}: organisation ${profile.orgId}${profile.orgName ? ` (${profile.orgName})` : ""}` +
       `${profile.email ? `, ${profile.email}` : ""} — poll grant ok, launch token ok, ` +
-      `identity ${verified ? "verified" : "unverified"}\n`,
+      `identity ${verified ? "verified (both credentials usable)" : "unverified"}\n`,
   );
 }
 
@@ -576,13 +569,23 @@ async function cmdLogin(name: string): Promise<number> {
   }
   // The organisation is a fact about the grant now on disk: record it before
   // the mint, and never leave a stale verdict standing beside a fresh org.
-  update(name, { orgId: profile.orgId, identityVerified: false });
+  update(name, { orgId: profile.orgId, identityVerified: false, identityMethod: undefined });
+  // The browser flow that opens next (`claude setup-token`) is a SEPARATE
+  // sign-in from the one that just produced the poll grant, and this tool has
+  // no way to check the human used the same account for both — the probe only
+  // proves the launch token can run the CLI, never whose account it is.
+  out(`${name}: sign in as the SAME account in the next browser tab\n`);
   const token = await mintLaunchToken(name, dir);
   saveLaunchToken(name, token);
-  const { verified, probe } = checkLaunchToken(name, token, profile);
-  update(name, { identityVerified: verified });
+  const { verified, probe, mismatchOrg } = checkLaunchToken(name, token, profile);
+  update(name, { identityVerified: verified, identityMethod: verified ? "both-usable" : undefined });
   if (!probe.ok) {
     throw new Error(`the launch token for ${name} did not answer the headless check (${probe.detail})`);
+  }
+  if (mismatchOrg) {
+    throw new Error(
+      `${name}: the launch token belongs to a different organisation (it reports ${mismatchOrg}, but the poll grant reports ${profile.orgId})`,
+    );
   }
   report(name, profile, verified);
   return 0;
@@ -598,10 +601,15 @@ async function cmdVerify(name: string): Promise<number> {
   const profile = await identifyOrRefuse(name);
   const token = readLaunchToken(name);
   if (!token) throw new Error(`no launch token for ${name} — run: ms accounts login ${name}`);
-  const { verified, probe } = checkLaunchToken(name, token, profile);
-  update(name, { orgId: profile.orgId, identityVerified: verified });
+  const { verified, probe, mismatchOrg } = checkLaunchToken(name, token, profile);
+  update(name, { orgId: profile.orgId, identityVerified: verified, identityMethod: verified ? "both-usable" : undefined });
   if (!probe.ok) {
     throw new Error(`the launch token for ${name} did not answer the headless check (${probe.detail})`);
+  }
+  if (mismatchOrg) {
+    throw new Error(
+      `${name}: the launch token belongs to a different organisation (it reports ${mismatchOrg}, but the poll grant reports ${profile.orgId})`,
+    );
   }
   report(name, profile, verified);
   return 0;

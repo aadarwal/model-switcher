@@ -365,23 +365,39 @@ test("accounts login refuses a second account resolving to the same organisation
   assert.match(s.ms(["ls"]).stdout, /gmail\s+gmail\s+-\s+no\s+no\s+no/);
 });
 
-test("accounts login records identityVerified false with a warning when auth status names no org", () => {
-  const s = scene({ authStatus: "{}" });
-  s.ms(["add", "gmail"]);
-  const r = s.ms(["login", "gmail"]);
-  assert.equal(r.code, 0, r.stderr);
-  assert.equal(s.row("gmail").orgId, "org-1");
-  assert.equal(s.row("gmail").identityVerified, false);
-  assert.match(r.stderr, /warning/i);
+test("accounts login: identityVerified follows the probe, not whether auth status names an org", () => {
+  // Verified live (2026-09-15): a setup-token never gets an org from `claude
+  // auth status --json` at all, so naming none is the ORDINARY case, not a
+  // reason to warn or to sink identityVerified — only the probe (does the
+  // token actually run the CLI?) decides it now.
+  const ok = scene({ authStatus: "{}" });
+  ok.ms(["add", "gmail"]);
+  const okRun = ok.ms(["login", "gmail"]);
+  assert.equal(okRun.code, 0, okRun.stderr);
+  assert.equal(ok.row("gmail").orgId, "org-1");
+  assert.equal(ok.row("gmail").identityVerified, true);
+  assert.equal(ok.row("gmail").identityMethod, "both-usable");
+  assert.equal(/warning/i.test(okRun.stderr), false, okRun.stderr);
+
+  const failing = scene({ authStatus: "{}", probeOut: "I am sorry, I cannot do that." });
+  failing.ms(["add", "gmail"]);
+  const failRun = failing.ms(["login", "gmail"]);
+  assert.equal(failRun.code, 1);
+  assert.equal(failing.row("gmail").identityVerified, false);
+  assert.equal(failing.row("gmail").identityMethod, undefined);
+  assert.equal(/warning/i.test(failRun.stderr), false, failRun.stderr);
 });
 
-test("accounts login records identityVerified false with a warning when the orgs disagree", () => {
+test("accounts login refuses when the launch token reports a different organisation than the poll grant", () => {
   const s = scene({ authStatus: '{"organization":{"uuid":"org-9"}}' });
   s.ms(["add", "gmail"]);
   const r = s.ms(["login", "gmail"]);
-  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /the launch token belongs to a different organisation/);
   assert.equal(s.row("gmail").identityVerified, false);
-  assert.match(r.stderr, /warning/i);
+  assert.equal(s.row("gmail").identityMethod, undefined);
+  // the mint itself succeeded — a refused identity is not a failed mint
+  assert.ok(existsSync(s.tokenFile("gmail")));
 });
 
 test("accounts login fails when setup-token prints nothing token-shaped", () => {

@@ -2,7 +2,20 @@ import { existsSync, readFileSync, writeFileSync, renameSync, rmSync } from "nod
 import { ensureStore, p } from "./paths.ts";
 
 export type Provider = "claude" | "codex";
-export type Account = { name: string; provider: Provider; label: string; orgId: string | null; shared: boolean; identityVerified: boolean };
+/** `identityMethod` names HOW `identityVerified` was earned — today always
+ * `"both-usable"` (the poll grant was read and the launch token's own probe
+ * ran, in the same `login`/`verify`), set only when `identityVerified` is
+ * true. It is optional so a registry written before this field existed keeps
+ * loading unchanged. */
+export type Account = {
+  name: string;
+  provider: Provider;
+  label: string;
+  orgId: string | null;
+  shared: boolean;
+  identityVerified: boolean;
+  identityMethod?: string;
+};
 export type Registry = { version: 1; accounts: Account[] };
 export class RegistryUnreadable extends Error {}
 
@@ -42,6 +55,7 @@ export function validateRegistry(raw: unknown): { registry: Registry; problems: 
       name: a.name, provider: a.provider, label: typeof a.label === "string" ? a.label : a.name,
       orgId: typeof a.orgId === "string" ? a.orgId : null,
       shared: a.shared === true, identityVerified: a.identityVerified === true,
+      ...(typeof a.identityMethod === "string" ? { identityMethod: a.identityMethod } : {}),
     });
   });
   return { registry: { version: 1, accounts: out }, problems };

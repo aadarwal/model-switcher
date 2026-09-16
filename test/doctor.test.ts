@@ -351,6 +351,29 @@ test("checkClaudeAccount: a grant-less account fails readable, launch token, and
   assert.equal(byWhat(/identity verified/)!.ok, false);
 });
 
+/** root reads a 0000 file, so denying ourselves a read proves nothing there. */
+const CAN_DENY_READ = process.getuid?.() !== 0;
+
+test("checkClaudeAccount: a launch token that is there but unreadable asks for a chmod, not a login", { skip: !CAN_DENY_READ }, async (t) => {
+  // `readLaunchToken` reports an unreadable file as null, exactly as it reports
+  // an absent one — the two need different repairs, so the doctor asks whether
+  // the file is there rather than inferring it from the null.
+  base();
+  stubHealthyBinaries();
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  const { p } = await import("../src/paths.ts");
+  saveLaunchToken("gmail", "sk-ant-oat01-AbCdEfGh12345678_-ijklmnop0123456789");
+  chmodSync(p.launchToken("gmail"), 0o000);
+  t.after(() => chmodSync(p.launchToken("gmail"), 0o600));
+
+  const { checkClaudeAccount } = await import("../src/doctor.ts");
+  const rs = await checkClaudeAccount(account({ name: "gmail" }), false);
+  const token = rs.find((r) => /launch token present/.test(r.what))!;
+  assert.equal(token.ok, false);
+  assert.match(token.why!, /^unreadable \(chmod 600 .*gmail\.token\)$/);
+  assert.doesNotMatch(token.why!, /accounts login/, "a permission is not a login to redo");
+});
+
 test("checkClaudeAccount: a due grant WITHOUT --fix is reported, never refreshed (no network call)", async () => {
   const { msHome } = base();
   writeDueCredential(msHome, "gmail", "at-1", "rt-1");

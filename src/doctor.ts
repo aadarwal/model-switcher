@@ -16,7 +16,7 @@
 // a ✗ once fixes (if requested) have been applied.
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, lstatSync, readdirSync, realpathSync, type Stats } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readdirSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
@@ -314,10 +314,20 @@ export async function checkClaudeAccount(a: Account, fix: boolean): Promise<Resu
     }
   }
 
+  // A file that is there but unreadable is a different repair from a file that
+  // is absent: `chmod 600` on the one, a fresh login for the other. Both read
+  // as null through `readLaunchToken`, which is why the existence check is
+  // asked separately rather than inferred from it.
   out.push(
     readLaunchToken(a.name)
       ? { ok: true, what: `${tag}: launch token present` }
-      : { ok: false, what: `${tag}: launch token present`, why: `no launch token (ms accounts login ${a.name})` },
+      : {
+          ok: false,
+          what: `${tag}: launch token present`,
+          why: existsSync(p.launchToken(a.name))
+            ? `unreadable (chmod 600 ${p.launchToken(a.name)})`
+            : `no launch token (ms accounts login ${a.name})`,
+        },
   );
 
   out.push(

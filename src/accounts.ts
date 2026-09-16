@@ -652,6 +652,24 @@ function table(rows: string[][]): string {
     .join("\n")}\n`;
 }
 
+/**
+ * The TOKEN column: three values, because there are three states and only two
+ * of them used to have a word.
+ *
+ * `existsSync` alone said `yes` for a file nothing can read — while every other
+ * reader of the same file (`ms doctor`, `ms status`, the recovery worker, which
+ * all go through `readLaunchToken`) treated it as absent. A `chmod 000` token
+ * therefore had the account book saying it was there and the doctor saying it
+ * was not, which is the one thing a book like this must never do.
+ *
+ * `unreadable` is the honest third answer: the file is on disk, and the value
+ * is not usable — a permission to fix, not a login to redo.
+ */
+function tokenCell(name: string): string {
+  if (readLaunchToken(name)) return "yes";
+  return existsSync(p.launchToken(name)) ? "unreadable" : "no";
+}
+
 function cmdLs(): number {
   const r = load();
   const claude = r.registry.accounts.filter((a) => a.provider === "claude");
@@ -662,7 +680,7 @@ function cmdLs(): number {
       a.label,
       a.orgId ?? "-",
       hasPollGrant(a.name) ? "yes" : "no",
-      existsSync(p.launchToken(a.name)) ? "yes" : "no",
+      tokenCell(a.name),
       a.identityVerified ? "yes" : "no",
     ]);
   }

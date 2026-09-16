@@ -18,7 +18,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -764,6 +764,26 @@ test("accounts ls shows a registered-but-uncredentialed account as no/no/no", ()
   const r = s.ms(["ls"]);
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, /gmail\s+gmail\s+-\s+no\s+no\s+no/);
+});
+
+/** root reads a 0000 file, so denying ourselves a read proves nothing there. */
+const CAN_DENY_READ = process.getuid?.() !== 0;
+
+test("accounts ls calls a token it cannot read `unreadable`, not `yes`", { skip: !CAN_DENY_READ }, (t) => {
+  // The book and the doctor must not disagree about the same file. `existsSync`
+  // said `yes` for a `chmod 000` token while every other reader of it — the
+  // doctor, the status line, the recovery worker, all through
+  // `readLaunchToken` — treated it as absent.
+  const s = scene();
+  s.ms(["add", "gmail", "--label", "Personal"]);
+  assert.equal(s.ms(["login", "gmail"]).code, 0);
+  chmodSync(s.tokenFile("gmail"), 0o000);
+  t.after(() => chmodSync(s.tokenFile("gmail"), 0o600));
+
+  const r = s.ms(["ls"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /gmail\s+Personal\s+org-1\s+yes\s+unreadable\s+yes/);
+  assert.equal(r.stdout.includes(TOKEN), false, "the account book never prints a credential");
 });
 
 test("accounts ls fills the POLL column without reading any secret", () => {

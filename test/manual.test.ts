@@ -1217,6 +1217,32 @@ test("switchAll reports every candidate in the store's order, as each one finish
   assert.deepEqual(results.map((r) => r.code), [0, 0, 0]);
 });
 
+// Re-review round C2, finding 2: `switchOne`'s return carries an extra
+// `fromTransaction?: true` (used only by `switchVerb`'s single-session path
+// to decide whether recoverSession already printed the reason) that
+// `SwitchResult` never declared. `switchAll` used to spread that whole
+// object into `results[]`, so a transaction refusal leaked the field into
+// `/api/switch-all`'s JSON — undocumented API surface nothing reads.
+test("switchAll's results never carry switchOne's fromTransaction flag, even on a transaction refusal", async (t) => {
+  const w = await fleet(t, fleetSessions(1));
+  const { acquire } = await import("../src/lock.ts");
+  const held = [0, 1, 2, 3].map((k) => acquire(`handoff-${k}`));
+  assert.ok(held.every(Boolean), "the test could not fill the handoff slots");
+  t.after(() => held.forEach((r) => r?.()));
+
+  const { results, code } = await switchAll("home", { force: false, continueAfter: "auto", timeoutMs: 60_000 });
+
+  assert.equal(code, 1, "the one candidate was refused");
+  assert.equal(results.length, 1);
+  const r = results[0]!;
+  // A transaction refusal — not a bare validation refusal — is exactly the
+  // path that used to carry fromTransaction: true.
+  assert.match(r.message, /handoff slots are busy/, "not a transaction refusal — this test proves nothing");
+  assert.deepEqual(Object.keys(r).sort(), ["code", "message", "session"], `leaked field(s): ${JSON.stringify(r)}`);
+  assert.ok(!("fromTransaction" in r), `fromTransaction leaked into switchAll's result: ${JSON.stringify(r)}`);
+  assert.equal(JSON.parse(JSON.stringify(r)).fromTransaction, undefined, "…and it does not survive a JSON round-trip either");
+});
+
 test("switch --all --timeout 0 moves nothing and says so", async (t) => {
   const w = await fleet(t, FLEET);
   const say = stderr(t);

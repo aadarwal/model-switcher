@@ -416,7 +416,12 @@ export async function switchAll(
       return { session: session.id, code: EXIT_REFUSED, message: `not started: the ${budgetSaid(opts.timeoutMs)} budget ran out` };
     }
     try {
-      return { session: session.id, ...(await switchOne(session.id, to, { continueAfter: opts.continueAfter, force: opts.force })) };
+      // Not a bare spread: `switchOne` also returns `fromTransaction?: true`
+      // (used only by `switchVerb`'s single-session path, above), which
+      // `SwitchResult` never declared — spreading it in would leak an
+      // undocumented field into `/api/switch-all`'s JSON. Named fields only.
+      const r = await switchOne(session.id, to, { continueAfter: opts.continueAfter, force: opts.force });
+      return { session: session.id, code: r.code, message: r.message };
     } catch (e) {
       return { session: session.id, code: EXIT_REFUSED, message: (e as Error)?.message || String(e) };
     }

@@ -734,8 +734,10 @@ test("a POST verb reconciles first (a GET never does): a closed pane's row is re
   }
 
   // A read never repairs. (What it REPORTS for a closed pane is a separate
-  // matter: `statusJson()` spreads the raw row, so its `state` is the store's
-  // own word, not `computeSession`'s "gone" override — see fix-C-report.md.)
+  // matter: since R1, `statusJson()` overrides the raw row's `state` with
+  // `computeSession`'s own word — including its "gone" override — so a GET
+  // here would already show "gone" for f3; this assertion is only about the
+  // STORE, which a read must never touch.)
   const state = await handle({ method: "GET", path: "/api/state" });
   const stateJson = state.json as { sessions: { id: string }[] };
   assert.ok(stateJson.sessions.some((s) => s.id === "f3"));

@@ -42,6 +42,7 @@ import {
   accountRowHtml,
   sessionRowHtml,
   formatSwitchAll,
+  fleetCandidateIds,
   MAX_POLL_FAILURES,
 } from "./client-logic.ts";
 
@@ -104,6 +105,7 @@ const EMBEDDED = [
   accountRowHtml,
   sessionRowHtml,
   formatSwitchAll,
+  fleetCandidateIds,
 ];
 
 /** The names the page's own script depends on being present, verbatim, in
@@ -142,6 +144,12 @@ ${EMBEDDED_FUNCTIONS}
   var busySessions = Object.create(null);
   var moveMsg = null;
   var moveBusy = false;
+  // rereview-C.md defect 3: every candidate id fleetCandidateIds() named
+  // when the current fleet move started — set alongside moveBusy, cleared
+  // alongside it. Without this, moveBusy only ever disabled the "Go" button
+  // itself, and a click on a per-row button for one of these sessions
+  // queued a second, redundant handoff for the whole --all budget.
+  var moveBusyIds = [];
   var lastTakenAt = null;
   var currentAccounts = [];
   var currentSessions = [];
@@ -184,7 +192,8 @@ ${EMBEDDED_FUNCTIONS}
   function applyBusy() {
     var cells = document.querySelectorAll("#sessions-table td[data-session]");
     Array.prototype.forEach.call(cells, function (cell) {
-      var busy = !!busySessions[cell.getAttribute("data-session")];
+      var id = cell.getAttribute("data-session");
+      var busy = !!busySessions[id] || moveBusyIds.indexOf(id) >= 0;
       Array.prototype.forEach.call(cell.querySelectorAll("button, select"), function (c) { c.disabled = busy; });
     });
     el("moveall-go").disabled = moveBusy;
@@ -313,10 +322,15 @@ ${EMBEDDED_FUNCTIONS}
   el("moveall-go").addEventListener("click", function () {
     var to = el("moveall-account").value;
     if (!to || moveBusy) return;
+    var provider = el("moveall-provider").value;
     moveBusy = true;
+    // rereview-C.md defect 3: every row this move can touch is busy too,
+    // from the moment the request goes out — not just the "Go" button.
+    moveBusyIds = fleetCandidateIds(currentSessions, provider, to);
     applyBusy();
     post("/api/switch-all", buildSwitchAllBody(to, forceChecked())).then(function (r) {
       moveBusy = false;
+      moveBusyIds = [];
       applyBusy();
       // Finding C3: one line per session and the same summary the CLI
       // prints — never "HTTP 200", which is all this used to say whether

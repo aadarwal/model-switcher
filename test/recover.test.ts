@@ -137,6 +137,9 @@ type WorldOptions = {
    * got there by submitting one, and a transcript is what makes `--resume` the
    * right relaunch. `false` is the pane nobody has typed into yet. */
   activity?: boolean;
+  /** Did the tool watch this CLI session id begin? Default yes (a `started`
+   * event from the first launch). `false` is an id no event ever carried. */
+  born?: boolean;
   panes?: string;
   /** Make the stub tmux fail this subcommand, and only this one. */
   failOn?: string;
@@ -217,6 +220,11 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
       flags: ["--model", "sonnet"],
       ...opts.session,
     });
+    // The conversation's birth, as Claude Code's own SessionStart hook reported
+    // it at the first launch. Without one the tool never watched this id begin,
+    // and it may not CREATE it (a corrupted `cliSessionId` must not come back
+    // as a brand new empty conversation under the bogus id).
+    if (opts.born !== false) appendEvent({ t: nowSeconds() - 60, kind: "started", session: "s1", generation: 1, cliSessionId: "c-1" });
     // Before the wall, so the recovery is never obsolete by it: the turn that
     // walled is what wrote this, and it is also the transcript on disk.
     if (opts.activity !== false) appendEvent({ t: nowSeconds() - 20, kind: "activity", session: "s1", generation: 2, cliSessionId: "c-1" });
@@ -411,11 +419,12 @@ test("a conversation that has never had a turn is started under its own id, not 
   assert.match(recoverLog(w), /c-1 has no transcript yet/);
 });
 
-test("a turn on the current conversation is what makes it resumable", async (t) => {
-  // The other branch, told apart by the ID and not merely by the kind: the
-  // activity on the record belongs to the conversation the human LEFT, so the
-  // one they are in now still has nothing on disk.
-  const w = await world(t, { activity: false, session: { cliSessionId: "c-2" }, wall: false, recovery: false });
+test("a conversation a /clear has just begun is started under its own id too", async (t) => {
+  // The other half of "born": a `cleared` report is Claude Code saying this
+  // conversation begins here, and nobody has typed into it since. Told apart by
+  // the ID and not merely by the kind — the activity on the record belongs to
+  // the conversation the human LEFT.
+  const w = await world(t, { activity: false, born: false, session: { cliSessionId: "c-2" }, wall: false, recovery: false });
   appendEvent({ t: nowSeconds() - 30, kind: "activity", session: "s1", generation: 2, cliSessionId: "c-1" });
   appendEvent({ t: nowSeconds() - 20, kind: "cleared", session: "s1", generation: 2, cliSessionId: "c-2", prevCliSessionId: "c-1" });
   appendEvent({ t: nowSeconds() - 10, kind: "rate_limited", session: "s1", generation: 2, cliSessionId: "c-2", kindDetail: "session" });
@@ -430,6 +439,27 @@ test("a turn on the current conversation is what makes it resumable", async (t) 
 
   assert.equal(await recoverSession("s1"), 0);
   assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["claude", "--session-id", "c-2", "--model", "sonnet"]);
+});
+
+test("an id no event ever carried is resumed, not created, and the failure is loud", async (t) => {
+  // Live matrix case 8: a corrupted `cliSessionId`. It has no `activity`, so
+  // the transcript rule alone would relaunch it with `--session-id` — making a
+  // brand new, empty conversation under the bogus id and calling the handoff a
+  // success, with the human's work not merely unreachable but unmentioned.
+  // `--session-id` MAKES a conversation, so it is only ever for an id we
+  // watched be born. Everything else goes to `--resume`, which fails audibly.
+  const w = await world(t, { activity: false, born: false, session: { cliSessionId: "c-BOGUS" }, respawnDead: 1 });
+  process.env.MS_READY_MS = "10000"; // the pane is what ends this, not the clock
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.deepEqual(launch.command, ["claude", "--resume", "c-BOGUS", CONTINUATION, "--model", "sonnet"]);
+  const s = session(w);
+  assert.equal(s.state, "parked", "a row nobody can explain ends with a human, not with a new conversation");
+  assert.equal(rows(w, "attempts").at(-1)!.note, "dead");
+  assert.match(recoverLog(w), /the resumed CLI exited \(pane_dead_status 1\)/);
+  assert.doesNotMatch(recoverLog(w), /no transcript yet/);
 });
 
 test("activity newer than the wall makes the recovery obsolete, and nothing is typed", async (t) => {

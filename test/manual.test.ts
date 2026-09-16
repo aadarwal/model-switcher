@@ -153,6 +153,8 @@ type WorldOptions = {
   /** Has the conversation ever had a turn? Default yes: a pane the human has
    * worked in has a transcript, which is what `--resume` needs to exist. */
   activity?: boolean;
+  /** Did the tool watch this CLI session id begin? Default yes. */
+  born?: boolean;
   panes?: string;
   /** What the stub server answers `serverIdentity` with. */
   identity?: string;
@@ -245,6 +247,10 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
       flags: ["--model", "sonnet"],
       ...opts.session,
     });
+    // The conversation's birth, as the first launch's SessionStart hook
+    // reported it: an id the tool never watched begin may be resumed but never
+    // created (`--session-id` would make a new, empty one under a bogus id).
+    if (opts.born !== false) appendEvent({ t: nowSeconds() - 60, kind: "started", session: "s1", generation: 1, cliSessionId: "c-1" });
     if (opts.activity !== false) appendEvent({ t: nowSeconds() - 20, kind: "activity", session: "s1", generation: 2, cliSessionId: "c-1" });
     if (opts.wall) appendEvent({ t: nowSeconds() - 10, kind: "rate_limited", session: "s1", generation: 2, cliSessionId: "c-1", kindDetail: "session" });
     if (opts.recovery) st.addRecovery({ sessionId: "s1", generation: 2, turnId: null, kind: "session" });

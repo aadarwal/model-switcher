@@ -325,26 +325,41 @@ function obsoleteReason(session: SessionRow, rec: RecoveryRow, tmux: Tmux): stri
 }
 
 /**
- * Has the conversation the session is in NOW ever been given a turn?
+ * Should this relaunch START the conversation rather than resume it?
  *
  * Claude Code writes a transcript only once a prompt has been submitted, so a
- * CLI session id with no `activity` event behind it — a launch nobody has typed
- * into yet, or the conversation a `/clear` has just started — has no file on
- * disk to resume. And `--resume` on such an id does NOT quietly start a fresh
- * conversation: verified live against 2.1.273, it prints "No conversation found
- * with session ID: <id>" and exits 1, which is how a rotation of an untouched
- * pane came back a corpse within a second.
+ * CLI session id nobody has typed into — a launch just made, or the conversation
+ * a `/clear` has just begun — has no file on disk to resume. And `--resume` on
+ * such an id does NOT quietly start a fresh one: verified live against 2.1.273,
+ * it prints "No conversation found with session ID: <id>" and exits 1, which is
+ * how a rotation of an untouched pane came back a corpse within a second.
+ * `--session-id <id>` is the relaunch that works there.
  *
- * `--session-id <id>` is the relaunch that works there: a new conversation
- * carrying the id the store already records, so the row, the hook's reports and
- * the readiness check all still agree about which conversation this is.
+ * TWO things must be true, and the first is the one a missing `activity` cannot
+ * tell you on its own. `--session-id` MAKES a conversation, so using it for an
+ * id we cannot vouch for turns a broken handoff into a silent one: a corrupted
+ * `cliSessionId` came back as a brand new, empty conversation under the bogus
+ * id, `running`, with the human's work not merely unreachable but unmentioned.
  *
- * The id is compared, not merely the kind: after a `/clear` the row moves onto
- * a new id (src/hooks/claude-hook.ts), and the turns of the conversation the
- * human LEFT say nothing about whether the one they are in has a transcript.
+ * So the id must be one we watched be born — a `started` or a `cleared` event
+ * for THIS session carrying exactly it, which is Claude Code's own hook saying
+ * "this conversation begins here" — and it must have no `activity`. An id no
+ * event ever carried is not ours to create: it goes to `--resume`, which fails
+ * fast and audibly (the pane dies; readiness sees it and parks), and a park is
+ * the honest end for a row nobody can explain.
+ *
+ * A `resumed` is deliberately not a birth: it says an existing conversation was
+ * picked up, which is evidence for `--resume`, not against it.
  */
-function hasTranscript(id: string, cliSessionId: string): boolean {
-  return readEvents(id).some((e) => e.kind === "activity" && e.cliSessionId === cliSessionId);
+function startsFresh(id: string, cliSessionId: string): boolean {
+  let born = false;
+  let used = false;
+  for (const e of readEvents(id)) {
+    if (e.cliSessionId !== cliSessionId) continue;
+    if (e.kind === "started" || e.kind === "cleared") born = true;
+    if (e.kind === "activity") used = true;
+  }
+  return born && !used;
 }
 
 /**
@@ -898,14 +913,15 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
 
   // 7. The new generation, written down before it is started.
   const next = g + 1;
-  // A conversation with no transcript cannot be resumed, and has no unfinished
-  // work to continue: it is relaunched under its own id instead.
-  const resumable = hasTranscript(id, session.cliSessionId!);
-  const continuing = resumable && (!manual || manual.continueAfter);
-  const command = resumable
-    ? ["claude", "--resume", session.cliSessionId!, ...(continuing ? [CONTINUATION] : []), ...flagsForResume(session.flags)]
-    : ["claude", "--session-id", session.cliSessionId!, ...flagsForResume(session.flags)];
-  if (!resumable) {
+  // A conversation we watched begin and nobody has typed into cannot be
+  // resumed, and has no unfinished work to continue: it is started under its
+  // own id instead. Anything else is resumed.
+  const fresh = startsFresh(id, session.cliSessionId!);
+  const continuing = !fresh && (!manual || manual.continueAfter);
+  const command = fresh
+    ? ["claude", "--session-id", session.cliSessionId!, ...flagsForResume(session.flags)]
+    : ["claude", "--resume", session.cliSessionId!, ...(continuing ? [CONTINUATION] : []), ...flagsForResume(session.flags)];
+  if (fresh) {
     logLine(id, next, `${session.cliSessionId} has no transcript yet (no turn was ever submitted); starting it under the same id rather than resuming`);
   }
   const launchId = randomUUID();

@@ -18,7 +18,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -557,6 +557,48 @@ test("accounts login records the scoped keychain item its login wrote", () => {
   assert.equal(s.row("gmail").orgId, "org-1");
   // the probe asks whether an item exists, never for its value
   assert.equal(s.securityLog().split("\n")[0].includes("-w"), false);
+});
+
+test("accounts login discards a credentials file it did not write, so the fresh grant wins", () => {
+  // A refresh's write-back moves a keychain-held grant into
+  // `.credentials.json`, and `readPollGrant` prefers that file. On macOS the
+  // next `claude auth login` mints into the KEYCHAIN, so without this the
+  // account would keep polling with the credential the human just replaced —
+  // for ever, because nothing else ever removes that file.
+  const s = scene({ noCredFile: true });
+  const scoped = s.scopedService("gmail");
+  const stale = path.join(s.configDir("gmail"), ".credentials.json");
+  mkdirSync(s.configDir("gmail"), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    stale,
+    JSON.stringify({ claudeAiOauth: { accessToken: "at-stale", refreshToken: "rt-stale", expiresAt: Date.now() + 3_600_000 } }),
+    { mode: 0o600 },
+  );
+  s.ms(["add", "gmail"]);
+
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_AFTER: scoped });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(existsSync(stale), false, "the file the login did not write did not survive it");
+  // And the grant the login DID write is the one the account is now pointed
+  // at: a note is only ever recorded when the keychain item is what answered.
+  assert.deepEqual(JSON.parse(readFileSync(s.noteFile("gmail"), "utf8")), { service: scoped, account: BARE });
+
+  const ls = s.ms(["ls"], { MS_TEST_KEYCHAIN_OK: scoped });
+  assert.equal(ls.code, 0, ls.stderr);
+  assert.match(ls.stdout, /gmail\s+claude\s+gmail\s+org-1\s+yes\s+yes\s+yes/);
+  assert.equal(ls.stdout.includes("stale"), false, "the account book never prints a credential");
+});
+
+test("accounts login KEEPS the credentials file when the login itself wrote it", () => {
+  // The other half: on Linux (and under the stub here) `claude auth login`
+  // writes that file itself, and it IS the fresh grant. Only a file the login
+  // left untouched is stale.
+  const s = scene();
+  const cred = path.join(s.configDir("gmail"), ".credentials.json");
+  s.ms(["add", "gmail"]);
+  assert.equal(s.ms(["login", "gmail"]).code, 0);
+  assert.ok(existsSync(cred), "the login's own credential was deleted out from under it");
+  assert.deepEqual(JSON.parse(readFileSync(cred, "utf8")), JSON.parse(CRED));
 });
 
 test("accounts login fails loudly, naming the service it expected, when nothing answers", () => {

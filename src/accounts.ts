@@ -45,6 +45,7 @@ import { deleteLaunchToken, looksLikeSetupToken, readLaunchToken, saveLaunchToke
 import {
   AuthError,
   deleteKeychainItem,
+  discardStaleCredFile,
   fetchProfile,
   keychainItemExists,
   keychainItemFor,
@@ -53,6 +54,7 @@ import {
   readPollCredentials,
   readPollGrant,
   refreshPollCredentials,
+  stampCredFile,
   writeKeychainNote,
 } from "./providers/claude-usage.ts";
 import { wallKindFromText } from "./wall.ts";
@@ -613,7 +615,14 @@ export async function cmdLogin(name: string): Promise<number> {
     if (pollGrantUsable(name, dir)) {
       out(`${name}: a usable poll grant is already in place — skipping claude auth login\n`);
     } else {
+      // A `.credentials.json` left by an earlier refresh's write-back outranks
+      // the keychain (`readPollGrant` prefers the file), so on macOS — where
+      // this login mints into the keychain — it would shadow the grant the
+      // human is standing here minting. A file this login does not itself
+      // write does not survive it; one it does write IS the new grant.
+      const before = stampCredFile(name);
       runAuthLogin(name, dir);
+      discardStaleCredFile(name, before);
     }
     locatePollCredential(name, dir);
     // Identity (and the duplicate refusal) before a token is ever minted: a

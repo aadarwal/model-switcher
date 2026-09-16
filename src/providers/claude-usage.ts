@@ -23,7 +23,7 @@
 // No token or credential value ever appears in a message or a log line here;
 // error text carries only a status and a URL path.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { userInfo } from "node:os";
@@ -312,6 +312,52 @@ export function readPollGrant(name: string): PollGrantRead {
 export function readPollCredentials(name: string): PollCredentials | null {
   const r = readPollGrant(name);
   return r.state === "ok" ? r.cred : null;
+}
+
+/** Enough of a credentials file to tell whether something REPLACED it. A
+ *  write through that path moves at least one of the three, and `writeCredFile`
+ *  renames a fresh temp file over it, which moves all of them. */
+export type CredFileStamp = { ino: number; mtimeMs: number; size: number } | null;
+
+/** The stamp, or null when there is no file. Never throws, never reads a byte
+ *  of the credential. */
+export function stampCredFile(name: string): CredFileStamp {
+  try {
+    const st = statSync(credFile(name));
+    return { ino: Number(st.ino), mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Drop a credentials file that a fresh `claude auth login` did NOT write.
+ *
+ * `readPollGrant` prefers the file over the keychain, and on macOS a login
+ * mints into the KEYCHAIN — so a `.credentials.json` left behind by an earlier
+ * refresh's write-back (which is where every refreshed grant now goes) would
+ * outrank the credential the human just minted, for ever, and nothing else
+ * would ever remove it. It goes.
+ *
+ * A file the login wrote ITSELF is the new grant and must survive: that is how
+ * a login lands on Linux, and deleting it would take the only copy. Which is
+ * why this compares a stamp taken BEFORE the login — an unchanged file is one
+ * the login did not touch, and only that one is stale.
+ *
+ * Best effort: nothing here is a secret, on argv or anywhere else, and a file
+ * that would not unlink is not a login to fail.
+ */
+export function discardStaleCredFile(name: string, before: CredFileStamp): boolean {
+  if (before === null) return false;
+  const now = stampCredFile(name);
+  if (now === null) return false;
+  if (now.ino !== before.ino || now.mtimeMs !== before.mtimeMs || now.size !== before.size) return false;
+  try {
+    unlinkSync(credFile(name));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // --- Refresh, with write-back -----------------------------------------

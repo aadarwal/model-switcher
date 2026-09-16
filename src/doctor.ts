@@ -16,15 +16,18 @@
 // a ✗ once fixes (if requested) have been applied.
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, readdirSync, realpathSync, type Stats } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, symlinkSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
-import { msBinary, msHome, p } from "./paths.ts";
+import { claudeSettingsPath, msBinary, msHome, p } from "./paths.ts";
 import { claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
+import { codexConfigPath, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
 import { loadRegistry, type Account } from "./registry.ts";
 import { AuthError, TransientError, readPollCredentials, refreshPollCredentials } from "./providers/claude-usage.ts";
+import { fetchCodexUsage, readCodexCredentials } from "./providers/codex-usage.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
+import { codexAutorotateEnabled, codexAutorotateLine } from "./autorotate.ts";
 import { openState, type SessionRow } from "./state.ts";
 import { Tmux } from "./tmux.ts";
 import { resolveOnPath } from "./exec.ts";
@@ -39,6 +42,14 @@ const MIN_NODE = [22, 15, 0] as const;
  *  refresh token just to look at it. */
 const REFRESH_DUE_MS = 60_000;
 const REFRESH_TIMEOUT_MS = 10_000;
+/** The MAJOR.MINOR family the spike record (2026-09-16) proved live. A
+ *  different minor is never a failure — Codex's own compatibility is not
+ *  this tool's to judge — just a line worth a human's eye. */
+const CODEX_TESTED_MINOR = "0.153";
+/** Bounded, and never a refresh: `ms doctor` proves a Codex credential with
+ *  the access token already on disk, exactly as it never refreshes a Claude
+ *  poll grant outside `--fix` (see `checkClaudeAccount` below). */
+const CODEX_USAGE_TIMEOUT_MS = 10_000;
 
 export function renderLine(r: Result): string {
   if (r.ok) return r.fixed ? `✓ ${r.what} → fixed` : `✓ ${r.what}`;
@@ -90,24 +101,63 @@ export function checkTmux(): Result {
   return ok ? { ok: true, what: `${what} (found ${r.stdout.trim()})` } : { ok: false, what, why: `found ${r.stdout.trim()}` };
 }
 
-export function checkClaudeBinary(): Result {
+/** The Claude CLI's version — gated on there being a Claude account at all,
+ *  exactly as `checkCodexBinary` is gated on a Codex one. A ChatGPT-only
+ *  human has no reason to have Claude Code installed; failing their doctor
+ *  for ever over a binary this tool would never run for them is not a fault
+ *  report, it is noise that also makes `ms setup` unable to finish. */
+export function checkClaudeBinary(hasClaudeAccounts = true): Result {
   const what = "claude --version";
+  if (!hasClaudeAccounts) return { ok: true, what: `${what} — not needed (no claude accounts)` };
   const r = runBounded("claude", ["--version"], 10_000);
   return r.ok ? { ok: true, what: `${what} (${r.stdout.trim() || "ok"})` } : { ok: false, what, why: r.stderr };
 }
 
-// --- Claude hooks ----------------------------------------------------------
-
-function claudeSettingsPath(): string {
-  return path.join(process.env.HOME || homedir(), ".claude", "settings.json");
+/** Report the Codex CLI's own version; never fail on it. A different minor
+ *  than the tested `0.153.x` family is worth a note in the ✓ line — this
+ *  tool's Codex support (hook TOML shape, wall text, rollout record fields)
+ *  was verified against that range, not proven broken on another one, so a
+ *  ✗ here would be a guess this tool has no business making.
+ *
+ *  `hasCodexAccounts` gates whether this even SPAWNS `codex`. A Claude-only
+ *  machine has no reason to have the Codex CLI installed at all — the tool
+ *  runs no Codex account without one, so a missing binary there is not a
+ *  fault to report, let alone one that fails `ms doctor` forever. Only a
+ *  registry that actually names a Codex account makes this check real. */
+export function checkCodexBinary(hasCodexAccounts: boolean): Result {
+  const what = "codex --version";
+  if (!hasCodexAccounts) return { ok: true, what: `${what} — not needed (no codex accounts)` };
+  const r = runBounded("codex", ["--version"], 10_000);
+  if (!r.ok) return { ok: false, what, why: r.stderr };
+  const out = r.stdout.trim() || "ok";
+  const m = out.match(/(\d+)\.(\d+)\.\d+/);
+  const minor = m ? `${m[1]}.${m[2]}` : null;
+  if (minor && minor !== CODEX_TESTED_MINOR) {
+    return { ok: true, what: `${what} (${out}) — tested range is ${CODEX_TESTED_MINOR}.x, this is a different minor` };
+  }
+  return { ok: true, what: `${what} (${out})` };
 }
 
-export function checkHooks(fix: boolean): Result {
+// --- Claude hooks ----------------------------------------------------------
+
+/** Claude Code's settings file — where its hooks and its statusline live.
+ *  Re-exported (it lives in ./paths.ts, beside every other path this tool
+ *  knows) because `ms setup` installs into the very file this checks, and two
+ *  spellings of one path is how an installer and its check drift apart. It
+ *  honours `CLAUDE_CONFIG_DIR` exactly as `ms _statusline` does. */
+export { claudeSettingsPath };
+
+export function checkHooks(fix: boolean, hasClaudeAccounts = true): Result {
   const what = "Claude hooks installed";
+  if (!hasClaudeAccounts) return { ok: true, what: `${what} — not needed (no claude accounts)` };
   const settingsPath = claudeSettingsPath();
   const msBin = msBinary();
   if (claudeHooksInstalled(settingsPath, msBin)) return { ok: true, what };
-  if (!fix) return { ok: false, what, why: `not all four present in ${settingsPath} for ${msBin}` };
+  // "for `msBin`" covers both halves of what installed now means: the four
+  // entries present, AND no OTHER `_hook claude` entry left behind by an `ms`
+  // that moved. `--fix` repairs either, by re-running the installer, which
+  // replaces every ms-owned entry rather than adding beside it.
+  if (!fix) return { ok: false, what, why: `not all four present (or a stale ms entry remains) in ${settingsPath} for ${msBin}` };
   try {
     installClaudeHooks(settingsPath, msBin);
   } catch (e) {
@@ -229,6 +279,78 @@ function checkClaudeTree(home: string, fix: boolean, issues: PermIssue[]): void 
   }
 }
 
+/** The name `fsx.ts`'s `backupThroughLink(file, "bak-ms-")` gives a
+ *  `config.toml` backup: the target's own name, the family suffix, and a
+ *  millisecond timestamp (plus a `-<n>` counter on a same-millisecond
+ *  collision). Matched by this PREFIX only — never a full listing of the
+ *  account home, and never a suffix/extension guess — so a human's own
+ *  `config.toml.orig` or similar is never swept in by accident. */
+const CODEX_CONFIG_BACKUP_PREFIX = "config.toml.bak-ms-";
+
+/** `codex/`: the directory itself (0700), the shared rollout store
+ *  `codex/sessions` (0700 — its CONTENTS are never walked or chmod'ed;
+ *  Codex owns them, exactly as `claude/<name>/` is not walked above), and
+ *  each `codex/<name>` account home (0700). Inside an account home, two
+ *  entries are checked BY NAME — `auth.json` and `config.toml`, both 0600 —
+ *  plus, by PREFIX (`CODEX_CONFIG_BACKUP_PREFIX`, fix-A-report.md A-M4's
+ *  "not done" half; fix-R), every `config.toml.bak-ms-*` backup this tool
+ *  itself wrote there (`installCodexHooks`'s `composeCodexHooks`, via
+ *  `backupThroughLink`) — new ones are already 0600 at creation, but one
+ *  written before that landed, or touched by something else afterward, is
+ *  fixed by nothing else. Nothing else under an account home is ever
+ *  examined: unlike `codex/sessions`' parent or an ms-owned dir
+ *  (`walkOwnedDir`), this is not a full `readdirSync`'d WALK — a third file
+ *  placed inside one (by a human, or by Codex itself) that does not match a
+ *  known name or this one prefix is neither reported nor touched.
+ *
+ *  A home's own `sessions` entry is ALWAYS a symlink — `ensureCodexHome`
+ *  (src/accounts-codex.ts) puts it there on purpose, pointing at the shared
+ *  store above — and is one of the things this function deliberately never
+ *  names: every OTHER symlink found under an ms-owned, walked directory is
+ *  a stray to report, this one is the expected shape and must never be. */
+function checkCodexTree(home: string, fix: boolean, issues: PermIssue[]): void {
+  const codexDir = path.join(home, "codex");
+  const st = checkEntry(codexDir, 0o700, issues);
+  if (!st || !st.isDirectory()) return;
+  if ((st.mode & 0o777) !== 0o700 && fix) {
+    try {
+      chmodSync(codexDir, 0o700);
+    } catch {
+      /* recorded already */
+    }
+  }
+
+  checkEntry(path.join(codexDir, "sessions"), 0o700, issues);
+
+  let entries;
+  try {
+    entries = readdirSync(codexDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    if (e.name === "sessions") continue; // the shared store, checked above
+    const accountDir = path.join(codexDir, e.name);
+    const ast = checkEntry(accountDir, 0o700, issues);
+    if (!ast || !ast.isDirectory()) continue;
+    checkEntry(path.join(accountDir, "auth.json"), 0o600, issues);
+    checkEntry(path.join(accountDir, "config.toml"), 0o600, issues);
+    // accountDir/sessions is the per-home symlink — intentionally never
+    // checked; see the doc comment above. The one thing this DOES still read
+    // the account home's own listing for: our own config.toml backups, named
+    // by prefix only, so a stray file with any other name is still untouched.
+    let acctEntries: string[];
+    try {
+      acctEntries = readdirSync(accountDir);
+    } catch {
+      continue;
+    }
+    for (const name of acctEntries) {
+      if (name.startsWith(CODEX_CONFIG_BACKUP_PREFIX)) checkEntry(path.join(accountDir, name), 0o600, issues);
+    }
+  }
+}
+
 export function checkStorePermissions(fix: boolean): Result[] {
   const home = msHome();
   const issues: PermIssue[] = [];
@@ -246,6 +368,7 @@ export function checkStorePermissions(fix: boolean): Result[] {
   // locks.sqlite (checked above), and the locks/ directory no longer exists.
   for (const sub of ["launch", "sessions", "hooks"]) walkOwnedDir(path.join(home, sub), fix, issues);
   checkClaudeTree(home, fix, issues);
+  checkCodexTree(home, fix, issues);
 
   if (issues.length === 0) return [{ ok: true, what: "store permissions (0700 dirs, 0600 files) under MS_HOME" }];
 
@@ -339,6 +462,154 @@ export async function checkClaudeAccount(a: Account, fix: boolean): Promise<Resu
   return out;
 }
 
+// --- Codex accounts ------------------------------------------------------
+//
+// Codex carries one credential, not two (src/accounts-codex.ts): `auth.json`
+// in the account's own CODEX_HOME both runs `codex` as the account and reads
+// its usage, so there is no launch-token/poll-grant split to check here —
+// just whether that one file is readable, whether it still answers the
+// usage endpoint, whether the account's hooks are installed and trusted,
+// and whether its home's `sessions` entry still points at the shared
+// rollout store. `--fix` never refreshes the credential (there is no
+// refresh call here at all, unlike the Claude side) and never touches an
+// existing `sessions` entry — only a missing one is ever created.
+
+function checkCodexHooksLine(a: Account, home: string, fix: boolean): Result {
+  const what = `codex account ${a.name}: hooks installed`;
+  const msBin = msBinary();
+  if (codexHooksInstalled(home, msBin)) return { ok: true, what };
+  if (!fix) return { ok: false, what, why: `not installed in ${codexConfigPath(home)}` };
+  const res = installCodexHooks(home, msBin);
+  // A refusal (a home this installer cannot safely rewrite) is never
+  // "nothing to do" — it is reported verbatim, the same way `res.problem`
+  // itself is worded: a reason a human can act on, not a guess papered over.
+  if (res.problem) return { ok: false, what, why: res.problem };
+  return codexHooksInstalled(home, msBin)
+    ? { ok: true, what, fixed: true }
+    : { ok: false, what, why: `still not installed in ${codexConfigPath(home)} after --fix` };
+}
+
+/** Whether `link` is a symlink that resolves to the same place as `target`. */
+function symlinksTo(link: string, target: string): boolean {
+  let st: Stats;
+  try {
+    st = lstatSync(link);
+  } catch {
+    return false;
+  }
+  if (!st.isSymbolicLink()) return false;
+  try {
+    return realpathSync(link) === realpathSync(target);
+  } catch {
+    return false; // dangling — points somewhere that no longer exists
+  }
+}
+
+function checkCodexSessionsLink(a: Account, fix: boolean): Result {
+  const what = `codex account ${a.name}: sessions store linked`;
+  const link = p.codexSessionsLink(a.name);
+  const target = p.codexSessions();
+
+  if (symlinksTo(link, target)) return { ok: true, what };
+
+  let st: Stats | null = null;
+  try {
+    st = lstatSync(link);
+  } catch {
+    /* missing entirely — the ordinary "recreate the link" case, below */
+  }
+
+  if (st?.isSymbolicLink()) {
+    // A symlink sits here, but `symlinksTo` above still said no. Two very
+    // different situations share that one fact, and only one of them is
+    // ours to repair: the link's own TEXT names the shared store by path
+    // and that store directory is simply the thing that's missing right
+    // now (fixable — recreate the STORE, never the link, which is already
+    // correct), or the link genuinely points somewhere else entirely (not
+    // ours to touch, `--fix` or not — it might be deliberate).
+    let rawTarget: string | null = null;
+    try {
+      rawTarget = readlinkSync(link);
+    } catch {
+      /* a readlink failing right after a successful lstat would be bizarre;
+         fall through to "points elsewhere" below either way */
+    }
+    if (rawTarget !== null && path.resolve(rawTarget) === path.resolve(target)) {
+      if (!fix) return { ok: false, what, why: `shared store missing — ${link} points at ${target}, which does not exist` };
+      try {
+        mkdirSync(target, { recursive: true, mode: 0o700 });
+        chmodSync(target, 0o700); // mkdir's mode is masked by umask; this is not
+      } catch (e) {
+        return { ok: false, what, why: `shared store missing — --fix failed: ${(e as Error).message}` };
+      }
+      return symlinksTo(link, target)
+        ? { ok: true, what, fixed: true }
+        : { ok: false, what, why: "shared store missing — still missing after --fix" };
+    }
+    return {
+      ok: false,
+      what,
+      why: `${link} is a symlink but points elsewhere (${rawTarget ?? "unreadable"}), not at ${target} — never touched automatically`,
+    };
+  }
+
+  if (st) {
+    // A real directory (moved or created before the link existed,
+    // ensureCodexHome's own doc comment on this exact case) or a plain
+    // file. Neither is ours to replace: doing so could throw away real
+    // sessions.
+    const shape = st.isDirectory() ? "a real directory" : "a file";
+    return { ok: false, what, why: `${link} exists and is ${shape}, not a symlink to ${target} — never touched automatically` };
+  }
+
+  if (!fix) return { ok: false, what, why: `${link} is missing (want a symlink to ${target})` };
+  try {
+    symlinkSync(target, link, "dir");
+  } catch (e) {
+    return { ok: false, what, why: `missing — --fix failed: ${(e as Error).message}` };
+  }
+  return symlinksTo(link, target) ? { ok: true, what, fixed: true } : { ok: false, what, why: "still not linked after --fix" };
+}
+
+export async function checkCodexAccount(a: Account, fix: boolean): Promise<Result[]> {
+  const tag = `codex account ${a.name}`;
+  const out: Result[] = [];
+  const home = p.codexHome(a.name);
+
+  const cred = readCodexCredentials(home);
+  out.push(
+    cred
+      ? { ok: true, what: `${tag}: credentials readable` }
+      : {
+          ok: false,
+          what: `${tag}: credentials readable`,
+          why: `no readable auth.json in ${home} (ms accounts login ${a.name} --provider codex)`,
+        },
+  );
+
+  if (!cred) {
+    out.push({ ok: false, what: `${tag}: usage fetch ok`, why: "no credentials to fetch with" });
+  } else {
+    try {
+      // Bounded, and never a refresh — the stored access token is used as
+      // is, exactly as `ms doctor` (without --fix) never refreshes a Claude
+      // poll grant either; a stale token simply reads as `auth` below.
+      await fetchCodexUsage(cred, AbortSignal.timeout(CODEX_USAGE_TIMEOUT_MS));
+      out.push({ ok: true, what: `${tag}: usage fetch ok` });
+    } catch (e) {
+      const kind = e instanceof AuthError ? "auth" : e instanceof TransientError ? "transient" : "error";
+      const msg = e instanceof Error ? e.message : String(e);
+      const why = kind === "auth" ? `auth: ${msg} (ms accounts login ${a.name} --provider codex)` : `${kind}: ${msg}`;
+      out.push({ ok: false, what: `${tag}: usage fetch ok`, why });
+    }
+  }
+
+  out.push(checkCodexHooksLine(a, home, fix));
+  out.push(checkCodexSessionsLink(a, fix));
+
+  return out;
+}
+
 // --- Orphaned session state -------------------------------------------
 
 /** The live pane ids on one tmux socket, memoized for the run: with many
@@ -423,13 +694,47 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
   const results: Result[] = [];
   results.push(checkNode());
   results.push(checkTmux());
-  results.push(checkClaudeBinary());
-  results.push(checkHooks(fix));
+
+  // The registry is read here, ahead of its own ✓/✗ line below, so (a) a
+  // Codex row still gets its checks even when this same registry later turns
+  // out to have an unrelated bad entry (checkRegistry reports that
+  // separately, by index), and (b) both CLI checks — and the Claude hook
+  // check, which writes into Claude Code's own settings file — know whether
+  // there is any account of that provider to ask the question for at all.
+  const { registry, parseError, problems } = loadRegistry();
+  const codexAccounts = registry.accounts.filter((a) => a.provider === "codex");
+  const claudeAccounts = registry.accounts.filter((a) => a.provider === "claude");
+  // A parse error empties `registry.accounts` the same way a truly empty
+  // registry would (loadRegistry's documented behaviour), so
+  // `claudeAccounts.length > 0` alone cannot tell "no claude accounts" apart
+  // from "no idea — the file did not parse". Only the FORMER earns a "not
+  // needed" — the latter must run the real check rather than print two
+  // green lines (`claude --version`, `Claude hooks installed`) that assert
+  // something this doctor run never actually knew. `checkRegistry` below
+  // still reports the parse error itself as its own ✗, so nothing goes
+  // silent either way.
+  const hasClaudeAccounts = claudeAccounts.length > 0 || parseError !== null;
+
+  results.push(checkClaudeBinary(hasClaudeAccounts));
+  results.push(checkHooks(fix, hasClaudeAccounts));
+  results.push(checkCodexBinary(codexAccounts.length > 0));
+  // The Codex auto-recovery gate, stated rather than left to be guessed at:
+  // it ships off, it is a stored setting (src/autorotate.ts) because the
+  // processes that read it are dispatched by tmux, and the line names the
+  // shell the variable that sets it belongs in. Never a ✗ — off is the
+  // shipped default, not a fault.
+  if (codexAccounts.length > 0) {
+    const st = openState();
+    try { results.push({ ok: true, what: codexAutorotateLine(codexAutorotateEnabled(st)) }); } finally { st.close(); }
+  }
+  for (const a of codexAccounts) {
+    results.push(...(await checkCodexAccount(a, fix)));
+  }
+
   results.push(...checkStorePermissions(fix));
 
-  const { registry, parseError, problems } = loadRegistry();
   results.push(...checkRegistry(parseError, problems));
-  for (const a of registry.accounts.filter((a) => a.provider === "claude")) {
+  for (const a of claudeAccounts) {
     results.push(...(await checkClaudeAccount(a, fix)));
   }
 

@@ -1,7 +1,13 @@
 // src/launch.ts
 //
-// `ms claude` (spec §7): choose the account, write down what is about to run,
-// and hand the running of it to tmux.
+// `ms claude` and `ms codex` (spec §7): choose the account, write down what is
+// about to run, and hand the running of it to tmux.
+//
+// One verb, twice. `launchWith(provider, argv)` is the whole sequence and
+// `planFor(provider)` is everything the two providers do differently — which
+// is four things: what a `need` can mean, what counts as a launch credential,
+// what the account's own home must be told first, and the argv. Nothing else
+// about a launch varies by CLI, and nothing else should learn to.
 //
 // Nothing of ours stays resident. The launch is a record in the store plus one
 // tmux command whose argv is `ms _exec <launch-id>`; `src/exec.ts` picks that
@@ -24,11 +30,15 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
 import { ensureStore, msBinary, msHome, p } from "./paths.ts";
-import { findAccount, loadRegistry } from "./registry.ts";
+import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import { parseNeed, pickAccounts, type Need, type PickInput } from "./pick.ts";
+import { syncCodexAutorotate } from "./autorotate.ts";
 import { openState } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
+import { readCodexAuth } from "./providers/codex-probe.ts";
+import { codexLaunchCommand } from "./providers/codex-cli.ts";
+import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
 
 /** Exit codes, fixed by spec §7 so a caller can branch on them. */
@@ -54,8 +64,12 @@ const SNAPSHOT_MAX_AGE_MS = 20_000;
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
-function say(msg: string, detail: string[] = []): void {
-  process.stderr.write(`ms claude: ${msg}\n${detail.map((l) => `  ${l}\n`).join("")}`);
+/** Every refusal is prefixed with the verb the human typed — which is the
+ *  provider's own name, for both of them. */
+function sayFor(provider: Provider) {
+  return (msg: string, detail: string[] = []): void => {
+    process.stderr.write(`ms ${provider}: ${msg}\n${detail.map((l) => `  ${l}\n`).join("")}`);
+  };
 }
 
 // --- The command line --------------------------------------------------
@@ -63,14 +77,16 @@ function say(msg: string, detail: string[] = []): void {
 type Parsed = { as: string | null; need: Need | null; args: string[] };
 
 /**
- * `ms claude [--as name] [--need any|fable] [-- <claude args>]`.
+ * `ms <cli> [--as name] [--need any|fable] [-- <cli args>]`.
  *
  * `--` is the boundary, and it is a hard one: everything after it is the
- * user's own claude command line and passes through untouched, and anything
- * before it that is not one of our two flags is a mistake rather than a guess
- * (a mistyped `--need` must not silently become an argument to claude).
+ * user's own command line for the CLI and passes through untouched, and
+ * anything before it that is not one of our two flags is a mistake rather
+ * than a guess (a mistyped `--need` must not silently become an argument to
+ * the CLI). `cli` appears only in that refusal, so the human is told where
+ * their own argument belongs in the command they actually typed.
  */
-export function parseLaunchArgs(argv: string[]): Parsed | { error: string } {
+export function parseLaunchArgs(argv: string[], cli = "claude"): Parsed | { error: string } {
   let as: string | null = null;
   let need: Need | null = null;
   const args: string[] = [];
@@ -90,7 +106,7 @@ export function parseLaunchArgs(argv: string[]): Parsed | { error: string } {
       need = parsed;
       continue;
     }
-    return { error: `unexpected argument ${JSON.stringify(a)} — put claude's own arguments after --` };
+    return { error: `unexpected argument ${JSON.stringify(a)} — put ${cli}'s own arguments after --` };
   }
   // `--session-id` is how the launch keeps its grip on the CLI session across
   // a rotation; a user-supplied one would break the only handle we have.
@@ -137,12 +153,26 @@ export function autoNeed(args: string[]): Need {
 
 type LastPick = { name: string; at: number };
 
-/** The remembered pick for this need, or null when there is none young
- *  enough to still be evidence. */
-export function readLastPick(need: Need): LastPick | null {
+/**
+ * The memo's key. It is per (provider, need) because an account name is only
+ * unique within a provider — the registry deliberately allows `claude:work`
+ * and `codex:work` — and because the two CLIs are not interchangeable: a
+ * Claude account offered to `ms codex` would launch the wrong binary on a
+ * credential it has no way to read.
+ *
+ * Claude's keys stay UNPREFIXED, exactly as they were written before there
+ * was a second provider, so an upgrade keeps the fallback already on disk
+ * rather than silently losing it for the next ten minutes.
+ */
+const lastPickKey = (provider: Provider, need: Need): string =>
+  provider === "claude" ? need : `${provider}:${need}`;
+
+/** The remembered pick for this provider and need, or null when there is none
+ *  young enough to still be evidence. */
+export function readLastPick(provider: Provider, need: Need): LastPick | null {
   try {
     const j = JSON.parse(readFileSync(p.lastPick, "utf8")) as Record<string, unknown>;
-    const e = j?.[need];
+    const e = j?.[lastPickKey(provider, need)];
     if (!e || typeof e !== "object") return null;
     const { name, at } = e as { name?: unknown; at?: unknown };
     if (typeof name !== "string" || !name) return null;
@@ -157,10 +187,11 @@ export function readLastPick(need: Need): LastPick | null {
   }
 }
 
-/** Remember a real pick, per need, without disturbing the other need's entry.
- *  This is a hint file, never a source of truth: a write that fails costs the
- *  next launch its fallback and nothing else, so it is never worth an error. */
-export function writeLastPick(need: Need, name: string): void {
+/** Remember a real pick, per provider and need, without disturbing any other
+ *  entry. This is a hint file, never a source of truth: a write that fails
+ *  costs the next launch its fallback and nothing else, so it is never worth
+ *  an error. */
+export function writeLastPick(provider: Provider, need: Need, name: string): void {
   ensureStore();
   let j: Record<string, unknown> = {};
   try {
@@ -169,7 +200,7 @@ export function writeLastPick(need: Need, name: string): void {
   } catch {
     /* absent or torn: start a fresh one */
   }
-  j[need] = { name, at: Date.now() };
+  j[lastPickKey(provider, need)] = { name, at: Date.now() };
   const tmp = `${p.lastPick}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   try {
     writeFileSync(tmp, JSON.stringify(j) + "\n", { mode: 0o600 });
@@ -221,10 +252,89 @@ export const attachVerb: Verb = async (argv) => {
   return tmux.attach(TOOL_SESSION);
 };
 
-export const launchClaude: Verb = async (argv) => {
-  const parsed = parseLaunchArgs(argv);
+/**
+ * What one provider's launch does differently, and nothing else.
+ *
+ * The spine below is identical for both CLIs — parse, choose, record, respawn,
+ * attach — and everything that is not identical is in here, so a third
+ * provider is a third entry rather than a second copy of the verb.
+ */
+type ProviderPlan = {
+  /** The need this run is choosing for, or a refusal to state at all. */
+  need: Need | { error: string };
+  /** Existence of the account's launch credential, checked before anything is
+   *  written. The VALUE never leaves the module that reads it. */
+  credential(account: string): { error: string } | null;
+  /** Anything the account's own home must say before the CLI starts. */
+  prepare(account: string, cwd: string): { error: string } | null;
+  /** The session id this tool hands the CLI, when the CLI can be told one. */
+  cliSessionId(): string | null;
+  /** The argv tmux is told to run. */
+  command(cliSessionId: string | null, args: string[]): string[];
+  /** What the status line says in parentheses. */
+  label(need: Need): string;
+};
+
+function planFor(provider: Provider, parsed: Parsed): ProviderPlan {
+  if (provider === "codex") {
+    return {
+      // Codex reports ONE subscription's windows and no model-scoped window
+      // at all (src/providers/codex-usage.ts maps `weeklyFable` to null), so
+      // `--need fable` is not a preference this provider can fail to meet —
+      // it is a question about a window that does not exist.
+      need: parsed.need === "fable" ? { error: "codex has no fable window" } : "any",
+      credential: (account) =>
+        // Existence of a USABLE credential, and nothing more: the value stays
+        // in the module that read it, and `_exec` hands the CLI the
+        // DIRECTORY, never a byte of the file. A present-but-empty `auth.json`
+        // — a login that was interrupted, a file someone truncated — is not a
+        // credential, and answering "yes" for it would put the modal-free
+        // launch in front of a CLI that cannot authenticate.
+        readCodexAuth(p.codexHome(account))?.accessToken
+          ? null
+          : { error: `no codex credential for account '${account}' (run: ms accounts login ${account} --provider codex)` },
+      prepare: (account, cwd) => {
+        // Trust (a modal an unattended launch must never meet) and the hooks
+        // (a home with none starts fine and reports NOTHING — see
+        // `ensureCodexReady`'s own doc comment) — both answered by the one
+        // call a rotation's `prepareCandidate` also makes, so a home good
+        // enough to launch into and a home good enough to rotate into can
+        // never drift apart. Verified on Codex 0.153.4.
+        const refusal = ensureCodexReady(p.codexHome(account), cwd, msBinary());
+        return refusal ? { error: refusal.problem } : null;
+      },
+      cliSessionId: () => null, // there is no `--session-id`; the hook reports it
+      command: (_id, args) => codexLaunchCommand(args),
+      label: () => "codex",
+    };
+  }
+  return {
+    need: parsed.need ?? autoNeed(parsed.args),
+    credential: (account) =>
+      readLaunchToken(account)
+        ? null
+        : { error: `no launch token for account '${account}' (run: ms accounts login ${account})` },
+    prepare: () => null,
+    cliSessionId: () => randomUUID(),
+    command: (id, args) => ["claude", "--session-id", id!, ...args],
+    label: (need) => need,
+  };
+}
+
+/**
+ * The launch, for either CLI.
+ *
+ * Everything provider-shaped is in `planFor` above; what is left is the
+ * sequence that must not vary — because it is the sequence that keeps a pane
+ * accounted for before anything can run in it.
+ */
+async function launchWith(provider: Provider, argv: string[]): Promise<number> {
+  const say = sayFor(provider);
+  const parsed = parseLaunchArgs(argv, provider);
   if ("error" in parsed) { say(parsed.error); return EXIT_USAGE_ERROR; }
-  const need = parsed.need ?? autoNeed(parsed.args);
+  const plan = planFor(provider, parsed);
+  if (typeof plan.need !== "string") { say(plan.need.error); return EXIT_USAGE_ERROR; }
+  const need = plan.need;
 
   // An unreadable accounts.json is "could not look", never "nothing is
   // there": reporting it as an empty pool would send the human hunting for a
@@ -238,21 +348,25 @@ export const launchClaude: Verb = async (argv) => {
   let remember: (() => void) | null = null;
 
   if (parsed.as) {
-    const named = findAccount(registry, parsed.as, "claude");
+    const named = findAccount(registry, parsed.as, provider);
     if (!named) { say(`no such account '${parsed.as}'`); return EXIT_ACCOUNT; }
     account = named.name;
   } else {
-    const mine = new Set(registry.accounts.filter((a) => a.provider === "claude").map((a) => a.name));
+    const mine = new Set(registry.accounts.filter((a) => a.provider === provider).map((a) => a.name));
     // Not "the pool is full" — there is no pool. A configuration answer.
-    if (!mine.size) { say("no claude account is registered (run: ms accounts add <name>)"); return EXIT_ACCOUNT; }
+    if (!mine.size) {
+      const how = provider === "claude" ? "" : ` --provider ${provider}`;
+      say(`no ${provider} account is registered (run: ms accounts add <name>${how})`);
+      return EXIT_ACCOUNT;
+    }
     const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
     // The registry can break between our read and the snapshot's own.
     if (snapshot.registryError) { say(`cannot read the registry: ${snapshot.registryError}`); return EXIT_ACCOUNT; }
-    // Only this provider's accounts: a codex row has no poller yet, and
-    // letting it into the set would make "every account transient" unsayable.
-    // Identity is (provider, name), so the provider is part of the match — a
-    // codex account sharing a name is a different account, not this one.
-    const rows = snapshot.accounts.filter((a) => a.provider === "claude" && mine.has(a.name));
+    // Only this provider's accounts. Identity is (provider, name), so the
+    // provider is part of the match — an account of the same name under the
+    // other provider is a DIFFERENT account, not this one, and letting it
+    // into the set would make "every account transient" unsayable.
+    const rows = snapshot.accounts.filter((a) => a.provider === provider && mine.has(a.name));
     // The whole snapshot travels, only its rows narrowed: `toPickInputs` reads
     // more than `accounts` (an unreadable registry yields no inputs at all),
     // and a hand-built partial would silently drop whatever it learns next.
@@ -262,11 +376,11 @@ export const launchClaude: Verb = async (argv) => {
     const first = picks[0];
     if (first) {
       account = first.name;
-      remember = () => writeLastPick(need, first.name);
+      remember = () => writeLastPick(provider, need, first.name);
     } else if (usageUnreachable(rows, inputs)) {
-      const last = readLastPick(need);
+      const last = readLastPick(provider, need);
       if (!last) { say("usage unreachable", reasons); return EXIT_UNREACHABLE; }
-      if (!findAccount(registry, last.name, "claude")) {
+      if (!findAccount(registry, last.name, provider)) {
         say(`usage unreachable, and the last pick '${last.name}' is no longer registered`, reasons);
         return EXIT_UNREACHABLE;
       }
@@ -279,28 +393,43 @@ export const launchClaude: Verb = async (argv) => {
 
   // Existence only: the value belongs in the pane's environment (src/exec.ts),
   // never here, and never in a message.
-  if (!readLaunchToken(account)) {
-    say(`no launch token for account '${account}' (run: ms accounts login ${account})`);
-    return EXIT_ACCOUNT;
-  }
+  const missing = plan.credential(account);
+  if (missing) { say(missing.error); return EXIT_ACCOUNT; }
 
   const msBin = msBinary();
   const cwd = process.cwd();
+
+  // The account's own home, made ready for THIS directory, before a row is
+  // written or a pane is touched: a launch that cannot prepare the home has
+  // not started, and must leave nothing behind saying it did.
+  const unprepared = plan.prepare(account, cwd);
+  if (unprepared) { say(unprepared.error); return EXIT_ACCOUNT; }
+
   const sessionId = randomUUID();
-  const cliSessionId = randomUUID();
+  const cliSessionId = plan.cliSessionId();
   const launchId = randomUUID();
-  const command = ["claude", "--session-id", cliSessionId, ...parsed.args];
+  const command = plan.command(cliSessionId, parsed.args);
+  const label = plan.label(need);
   const inside = !!process.env.TMUX && !!process.env.TMUX_PANE;
   const tmux = inside ? tmuxFromEnv() : new Tmux(TOOL_SOCKET());
   const socket = tmux.socket ?? "";
 
   const st = openState();
   try {
+    // `ms codex` runs in the human's own shell, which is where
+    // `MS_CODEX_AUTOROTATE` is exported — and where the processes that READ
+    // the gate (`ms _recover`, `ms _codex_watch`, both dispatched by `tmux
+    // run-shell`) never run. Carry it into the store on the way past, so
+    // exporting it works inside an existing tmux server too, not only when
+    // this launch happened to start the server itself.
+    if (provider === "codex") {
+      try { syncCodexAutorotate(st); } catch { /* the gate is not worth failing a launch over */ }
+    }
     if (inside) {
       const pane = currentPane()!;
       const serverStart = tmux.serverIdentity();
       st.createSession({
-        id: sessionId, provider: "claude", cliSessionId, cwd, socket, pane, serverStart,
+        id: sessionId, provider, cliSessionId, cwd, socket, pane, serverStart,
         need, account, generation: 1, state: "launching", desired: "running",
         // The pass-through arguments verbatim: a rotation re-applies exactly
         // what this launch was asked for.
@@ -314,7 +443,7 @@ export const launchClaude: Verb = async (argv) => {
       // The respawn below replaces the shell this process is running in, so
       // tmux kills us the moment it is issued: everything else happens first.
       remember?.();
-      process.stderr.write(`ms: ${account} (${need}) → pane ${pane}\n`);
+      process.stderr.write(`ms: ${account} (${label}) → pane ${pane}\n`);
       tmux.respawn(pane, cwd, [msBin, "_exec", launchId]);
       return EXIT_OK;
     }
@@ -334,7 +463,7 @@ export const launchClaude: Verb = async (argv) => {
       : tmux.newSession(TOOL_SESSION, cwd, PLACEHOLDER);
     const serverStart = tmux.serverIdentity();
     st.createSession({
-      id: sessionId, provider: "claude", cliSessionId, cwd, socket, pane, serverStart,
+      id: sessionId, provider, cliSessionId, cwd, socket, pane, serverStart,
       need, account, generation: 1, state: "launching", desired: "running", flags: parsed.args,
     });
     st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
@@ -344,7 +473,7 @@ export const launchClaude: Verb = async (argv) => {
     tmux.setPaneDiedHook(pane, [msBin, "_pane_died", sessionId]);
     tmux.respawn(pane, cwd, [msBin, "_exec", launchId]);
     remember?.();
-    process.stderr.write(`ms: ${account} (${need}) → pane ${pane}\n`);
+    process.stderr.write(`ms: ${account} (${label}) → pane ${pane}\n`);
     st.close(); // the attach below lasts as long as the session does
 
     // The launch has already happened. An attach that fails — no terminal, a
@@ -357,4 +486,10 @@ export const launchClaude: Verb = async (argv) => {
   } finally {
     st.close(); // idempotent
   }
-};
+}
+
+/** `ms claude` (spec §7). */
+export const launchClaude: Verb = (argv) => launchWith("claude", argv);
+
+/** `ms codex` — the same launch, on a ChatGPT subscription. */
+export const launchCodex: Verb = (argv) => launchWith("codex", argv);

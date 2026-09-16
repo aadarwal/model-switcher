@@ -41,7 +41,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { handBackShell, releasePane } from "./handback.ts";
 import { Locked, withLock } from "./lock.ts";
-import { isBusy, recoverSession, safeCapture, sessionLockName, stopPane } from "./recover.ts";
+import { HANDOFF_SLOTS, isBusy, recoverSession, safeCapture, sessionLockName, stopPane, takeFailReason } from "./recover.ts";
 import { findAccount, loadRegistry } from "./registry.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
@@ -65,7 +65,10 @@ const pollMs = (): number => Number(process.env.MS_POLL_MS) || 500;
 
 const USAGE: Record<string, string> = {
   rotate: "usage: ms rotate [<session|pane>] [--force]",
-  switch: "usage: ms switch [<session|pane>] --to <account> [--continue] [--force]",
+  switch: [
+    "usage: ms switch [<session|pane>] --to <account> [--continue] [--force]",
+    "       ms switch --all --to <account> [--continue] [--force] [--timeout <seconds>]",
+  ].join("\n"),
   stop: "usage: ms stop [<session|pane>]",
 };
 
@@ -82,8 +85,8 @@ function usage(verb: string, why: string): 2 {
 
 // --- The command line --------------------------------------------------
 
-type Options = { target: string | null; to: string | null; force: boolean; continueAfter: boolean };
-type Allowed = { to?: boolean; continueAfter?: boolean; force?: boolean };
+type Options = { target: string | null; to: string | null; force: boolean; continueAfter: boolean; all: boolean; timeoutSeconds: number | null };
+type Allowed = { to?: boolean; continueAfter?: boolean; force?: boolean; all?: boolean; timeout?: boolean };
 
 /**
  * One positional (a session id or a `%N` pane) plus whichever flags the verb
@@ -92,7 +95,7 @@ type Allowed = { to?: boolean; continueAfter?: boolean; force?: boolean };
  * move the session to an account nobody chose.
  */
 export function parseManualArgs(argv: string[], allowed: Allowed): Options | { error: string } {
-  const out: Options = { target: null, to: null, force: false, continueAfter: false };
+  const out: Options = { target: null, to: null, force: false, continueAfter: false, all: false, timeoutSeconds: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (allowed.to && (a === "--to" || a.startsWith("--to="))) {
@@ -106,6 +109,19 @@ export function parseManualArgs(argv: string[], allowed: Allowed): Options | { e
       out.to = v;
       continue;
     }
+    if (allowed.timeout && (a === "--timeout" || a.startsWith("--timeout="))) {
+      const joined = a.startsWith("--timeout=");
+      const v = joined ? a.slice("--timeout=".length) : argv[i + 1];
+      // Same rule as `--to`, and one more: a budget that is not a number of
+      // seconds is not a budget. `0` is legal and means "start nothing".
+      if (!v || (!joined && v.startsWith("-"))) return { error: "--timeout needs a number of seconds" };
+      if (!joined) i++;
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0) return { error: `--timeout needs a number of seconds, not ${JSON.stringify(v)}` };
+      out.timeoutSeconds = n;
+      continue;
+    }
+    if (allowed.all && a === "--all") { out.all = true; continue; }
     if (allowed.force && a === "--force") { out.force = true; continue; }
     if (allowed.continueAfter && a === "--continue") { out.continueAfter = true; continue; }
     if (a.startsWith("-")) return { error: `unexpected option ${JSON.stringify(a)}` };
@@ -237,37 +253,236 @@ export const rotateVerb: Verb = async (argv) => {
 
 // --- ms switch ----------------------------------------------------------
 
-export const switchVerb: Verb = async (argv) => {
-  const parsed = parseManualArgs(argv, { to: true, force: true, continueAfter: true });
-  if ("error" in parsed) return usage("switch", parsed.error);
-  if (!parsed.to) return usage("switch", "--to <account> is required");
-  const found = withSession(parsed.target);
-  if ("error" in found) return found.code === EXIT_USAGE ? usage("switch", found.error) : refuse("switch", found.error);
+/** What one session's move came to: 0 and how it went, or non-zero and why not. */
+export type SwitchResult = { session: string; code: number; message: string };
+export type SwitchOneOptions = {
+  /** `true` always carries the unfinished work over, `false` never does, and
+   * `"auto"` is the switch's own rule: a walled screen means the turn never
+   * finished, so the work carries over whether or not the human thought to
+   * ask. */
+  continueAfter: boolean | "auto";
+  force: boolean;
+};
+
+/**
+ * The fallback message a transaction refusal carries when, somehow,
+ * `recover.ts`'s own `takeFailReason` has nothing recorded for this session
+ * — every `RecoverCode` a manual (`opts.manual.toAccount`-carrying) call can
+ * return other than 0 is produced by `fail()`, which always records one
+ * first, so this is defensive rather than a path either verb takes today.
+ */
+export const HANDOFF_REPORTED = "the handoff did not happen (the reason is above, and in ms status)";
+
+/** How long `--all` keeps starting new moves for, when nobody says. */
+const ALL_TIMEOUT_SECONDS = 600;
+
+/** A budget said back to the human in the units they wrote it in. Rounding to
+ * seconds would report `--timeout 0.4` as "the 0s budget ran out" — a budget
+ * they never set, and one that reads as a bug rather than as a short deadline. */
+const budgetSaid = (ms: number): string => (ms >= 1000 ? `${Math.round(ms / 1000)}s` : `${ms}ms`);
+
+/**
+ * Move ONE session to `to`: the whole of `ms switch`'s per-session path, minus
+ * the printing and the process's exit code.
+ *
+ * Every refusal is returned rather than printed, because the two callers say
+ * them differently — `ms switch` in its own name (`ms switch: <why>`), `ms
+ * switch --all` under the session's (`ms: s3 refused: <why>`) — and a body that
+ * printed would say it twice or in the wrong voice.
+ *
+ * A TRANSACTION refusal (recoverSession returned non-zero) sets
+ * `fromTransaction: true` and a `message` that is the transaction's OWN
+ * reason (`recover.ts`'s `takeFailReason`, fix-C-report.md item 2) — the
+ * exact words `recoverSession` already wrote to stderr and to the session's
+ * recover log. `switchVerb` uses the flag, not the message text, to print
+ * nothing for it (recoverSession said it once already); `switchAllVerb`
+ * prints it under the session's own name either way, so the fleet line now
+ * carries the real reason instead of a pointer at stderr the dashboard's
+ * `captured()` may already have discarded.
+ */
+export async function switchOne(
+  sessionId: string,
+  to: string,
+  opts: SwitchOneOptions,
+): Promise<{ code: number; message: string; fromTransaction?: true }> {
+  const found = withSession(sessionId);
+  // `resolveSession` speaks the CLI's exit codes, and 2 there means "the
+  // command line is wrong" — which is never what a named session is. A library
+  // that returned it would have its caller print a usage line for a session id
+  // it was handed, so every non-zero answer from here is a refusal.
+  if ("error" in found) return { code: EXIT_REFUSED, message: found.error };
   const session = found.session;
-  const to = parsed.to;
 
   // The typo-catchers first, because they need no tmux at all: a mistyped
   // account name never becomes a question anybody asks the pane, and the
   // transaction never kills a healthy CLI on its way to finding out.
   const { registry, parseError } = loadRegistry();
-  if (parseError) return refuse("switch", `cannot read the registry: ${parseError}`);
-  if (!findAccount(registry, to, session.provider)) return refuse("switch", `no such ${session.provider} account '${to}'`);
-  if (to === session.account) return refuse("switch", `${session.id} is already on ${to}`);
+  if (parseError) return { code: EXIT_REFUSED, message: `cannot read the registry: ${parseError}` };
+  if (!findAccount(registry, to, session.provider)) return { code: EXIT_REFUSED, message: `no such ${session.provider} account '${to}'` };
+  if (to === session.account) return { code: EXIT_REFUSED, message: `${session.id} is already on ${to}` };
 
   const tmux = new Tmux(session.socket || null);
   const stale = staleServer(tmux, session);
-  if (stale) return refuse("switch", stale);
+  if (stale) return { code: EXIT_REFUSED, message: stale };
   const screen = safeCapture(tmux, session.pane);
-  const busy = midTurn(session, screen, parsed.force);
-  if (busy) return refuse("switch", busy);
+  const busy = midTurn(session, screen, opts.force);
+  if (busy) return { code: EXIT_REFUSED, message: busy };
 
   // A switch of a conversation that had finished resumes without a
   // continuation (spec §9) — but a walled screen says the turn never finished,
   // so the work carries over whether or not the human thought to ask.
-  const continueAfter = parsed.continueAfter || wallOnScreen(screen) !== null;
-  const code = await recoverSession(session.id, { manual: { toAccount: to, continueAfter }, force: parsed.force });
-  if (code !== EXIT_OK) return EXIT_REFUSED;
-  process.stderr.write(`ms: ${session.id} switched → ${to}\n`);
+  const continueAfter = opts.continueAfter === "auto" ? wallOnScreen(screen) !== null : opts.continueAfter;
+  const code = await recoverSession(session.id, { manual: { toAccount: to, continueAfter }, force: opts.force });
+  if (code !== EXIT_OK) {
+    return { code: EXIT_REFUSED, message: takeFailReason(session.id) ?? HANDOFF_REPORTED, fromTransaction: true };
+  }
+  return { code: EXIT_OK, message: `switched → ${to}` };
+}
+
+/**
+ * Move the whole fleet to `to`: every session of that account's provider that
+ * is not already there.
+ *
+ * Three bounds, and each one is the point:
+ *
+ *   * **The pool is `HANDOFF_SLOTS` wide.** The slots are a counting bound the
+ *     recovery transaction already enforces across processes; a worker that
+ *     finds none free stands down and asks tmux to run it again in 30 s. That
+ *     is right for an automatic rotation and wrong for a human watching this
+ *     command: their fleet move would finish minutes later, as automatic
+ *     rotations, choosing accounts nobody named. So we never start a fifth.
+ *   * **`timeoutMs` stops STARTING, never stops a move in flight.** A handoff
+ *     is `/exit` plus a respawn plus up to a minute of readiness; cancelling
+ *     one midway would leave a pane between two CLIs. The ones already going
+ *     finish; the ones not yet begun are refused, and say so.
+ *   * **A session on its way out is not part of the fleet.** `stopped` is
+ *     where a session whose pane is gone ends up (reconciliation writes it),
+ *     and `desired: stopped` is one the human has already told to leave —
+ *     dragging either into a fleet move would fail it for a reason that has
+ *     nothing to do with the accounts.
+ *
+ * `results` is in candidate order — the store's own order — however the moves
+ * finished; `onResult` is the other half of that, called as each one lands, so
+ * a caller can print a line per session while the rest are still running.
+ */
+export async function switchAll(
+  to: string,
+  opts: { force: boolean; continueAfter: boolean | "auto"; timeoutMs: number; onResult?: (r: SwitchResult) => void },
+): Promise<{ results: SwitchResult[]; code: number; message: string | null }> {
+  // Which fleet `to` names, and the three ways that question has no answer.
+  // They live HERE rather than in the verb because the verb is not the only
+  // caller — the dashboard's `POST /api/switch-all` calls this function — and
+  // `findAccount` with no provider returns the FIRST name match: a guard the
+  // verb kept to itself would let a `home` that two providers both claim move
+  // the whole claude fleet on a codex typo, out of the very registry the CLI
+  // refuses. `message` is what a caller says in its own voice; nothing was
+  // started, so there is nothing to summarise under it.
+  const { registry, parseError } = loadRegistry();
+  if (parseError) return { results: [], code: EXIT_REFUSED, message: `cannot read the registry: ${parseError}` };
+  const named = registry.accounts.filter((a) => a.name === to);
+  if (!named.length) return { results: [], code: EXIT_REFUSED, message: `no such account '${to}'` };
+  if (named.length > 1) {
+    const which = named.map((a) => `a ${a.provider}`).join(" and ");
+    return { results: [], code: EXIT_REFUSED, message: `'${to}' names ${which} account; --all cannot tell which fleet you mean` };
+  }
+  const account = named[0]!;
+
+  const st = openState();
+  let candidates: SessionRow[];
+  try {
+    candidates = st
+      .listSessions()
+      .filter((s) => s.provider === account.provider && s.account !== to && s.state !== "stopped" && s.desired !== "stopped");
+  } finally {
+    st.close();
+  }
+
+  const results: SwitchResult[] = new Array(candidates.length);
+  const deadline = performance.now() + opts.timeoutMs;
+  let next = 0;
+  /**
+   * One candidate's answer, whatever happened — including a throw.
+   *
+   * `switchOne` returns its refusals, but `openState` is outside every guard
+   * the transaction has: a store it cannot open throws past all of them. Left
+   * to reject, that throw takes `Promise.all` with it — the summary never
+   * prints, every sibling's result is lost with it, and the workers still
+   * running keep driving handoffs while the process unwinds. One session's bad
+   * luck is that session's refusal, never the fleet's. The message is the
+   * error's own; none of the paths that reach here carry a credential in one.
+   */
+  const attempt = async (session: SessionRow): Promise<SwitchResult> => {
+    if (performance.now() >= deadline) {
+      return { session: session.id, code: EXIT_REFUSED, message: `not started: the ${budgetSaid(opts.timeoutMs)} budget ran out` };
+    }
+    try {
+      // Not a bare spread: `switchOne` also returns `fromTransaction?: true`
+      // (used only by `switchVerb`'s single-session path, above), which
+      // `SwitchResult` never declared — spreading it in would leak an
+      // undocumented field into `/api/switch-all`'s JSON. Named fields only.
+      const r = await switchOne(session.id, to, { continueAfter: opts.continueAfter, force: opts.force });
+      return { session: session.id, code: r.code, message: r.message };
+    } catch (e) {
+      return { session: session.id, code: EXIT_REFUSED, message: (e as Error)?.message || String(e) };
+    }
+  };
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      const session = candidates[i];
+      if (!session) return;
+      const result = await attempt(session);
+      results[i] = result;
+      opts.onResult?.(result);
+    }
+  };
+  // `next++` needs no lock: one event loop, and nothing awaits between the read
+  // and the increment.
+  await Promise.all(Array.from({ length: Math.min(HANDOFF_SLOTS, candidates.length) }, worker));
+  return { results, code: results.some((r) => r.code !== EXIT_OK) ? EXIT_REFUSED : EXIT_OK, message: null };
+}
+
+/** `ms switch --all --to <account>`: the fleet move, and its summary. */
+async function switchAllVerb(parsed: Options): Promise<number> {
+  // `ms switch --all s1 --to home` is two commands at once, and the one the
+  // human meant cannot be guessed from it.
+  if (parsed.target) return usage("switch", `--all moves every session; ${JSON.stringify(parsed.target)} names one`);
+  if (!parsed.to) return usage("switch", "--all needs --to <account>");
+  const to = parsed.to;
+
+  const { results, code, message } = await switchAll(to, {
+    force: parsed.force,
+    continueAfter: parsed.continueAfter || "auto",
+    timeoutMs: (parsed.timeoutSeconds ?? ALL_TIMEOUT_SECONDS) * 1000,
+    onResult: (r) =>
+      process.stderr.write(r.code === EXIT_OK ? `ms: ${r.session} moved → ${to}\n` : `ms: ${r.session} refused: ${r.message}\n`),
+  });
+  // A destination that is no destination: `switchAll` refused before it started
+  // anything, and this verb says so in its own name. No summary follows — a
+  // move that never began has nothing to count.
+  if (message) return refuse("switch", message);
+  const moved = results.filter((r) => r.code === EXIT_OK).length;
+  process.stderr.write(`ms: moved ${moved}, refused ${results.length - moved}\n`);
+  return code;
+}
+
+export const switchVerb: Verb = async (argv) => {
+  const parsed = parseManualArgs(argv, { to: true, force: true, continueAfter: true, all: true, timeout: true });
+  if ("error" in parsed) return usage("switch", parsed.error);
+  if (parsed.all) return switchAllVerb(parsed);
+  // One session waits exactly as long as its own handoff takes; there is
+  // nothing for a budget to stop starting.
+  if (parsed.timeoutSeconds !== null) return usage("switch", "--timeout bounds --all");
+  if (!parsed.to) return usage("switch", "--to <account> is required");
+  const found = withSession(parsed.target);
+  if ("error" in found) return found.code === EXIT_USAGE ? usage("switch", found.error) : refuse("switch", found.error);
+
+  const r = await switchOne(found.session.id, parsed.to, {
+    continueAfter: parsed.continueAfter || "auto",
+    force: parsed.force,
+  });
+  if (r.code !== EXIT_OK) return r.fromTransaction ? EXIT_REFUSED : refuse("switch", r.message);
+  process.stderr.write(`ms: ${found.session.id} ${r.message}\n`);
   return EXIT_OK;
 };
 

@@ -3,34 +3,45 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { execLaunch } from "./exec.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
-import { attachVerb, launchClaude } from "./launch.ts";
+import { codexHook, codexWatch } from "./hooks/codex-hook.ts";
+import { attachVerb, launchClaude, launchCodex } from "./launch.ts";
+import { dashboard } from "./dashboard.ts";
+import { statuslineVerb } from "./setup/statusline.ts";
 import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { paneDied, reconcile } from "./reconcile.ts";
 import { recoverVerb } from "./recover.ts";
 import { status } from "./status.ts";
 import { doctor } from "./doctor.ts";
 import { accountsVerb } from "./accounts.ts";
+import { setupVerb } from "./setup.ts";
 
 export type Verb = (args: string[]) => Promise<number>;
 const verbs = new Map<string, Verb>();
 export function registerVerb(name: string, fn: Verb): void { verbs.set(name, fn); }
 
 registerVerb("_exec", execLaunch);
-registerVerb("_hook", async ([which]) => (which === "claude" ? claudeHook() : 0));
+registerVerb("_hook", async ([which]) => (which === "claude" ? claudeHook() : which === "codex" ? codexHook() : 2));
+// The Codex fleet watchdog: ONE timer per tmux server, dispatched by tmux, so
+// it inherits no MS_* identity and reads every Codex session from the store.
+registerVerb("_codex_watch", codexWatch);
 registerVerb("_pane_died", paneDied);
+registerVerb("_statusline", statuslineVerb);
 registerVerb("claude", launchClaude);
+registerVerb("codex", launchCodex);
 registerVerb("attach", attachVerb);
 registerVerb("_recover", recoverVerb);
 registerVerb("status", status);
 registerVerb("doctor", doctor);
 registerVerb("accounts", accountsVerb);
+registerVerb("setup", setupVerb);
 registerVerb("rotate", rotateVerb);
 registerVerb("switch", switchVerb);
 registerVerb("stop", stopVerb);
+registerVerb("dashboard", dashboard);
 
 const USAGE = `usage: ms <verb> [args]
-  setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach
-  (internal: _exec _hook _recover _pane_died)`;
+  setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach | dashboard
+  (internal: _exec _hook _codex_watch _recover _pane_died _statusline)`;
 
 function version(): string {
   const pkg = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");

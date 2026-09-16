@@ -12,7 +12,17 @@ export type Provider = "claude" | "codex";
 export type SessionState = "launching" | "running" | "walled" | "stopping" | "resuming" | "continuing" | "parked" | "waiting" | "stopped";
 export type SessionRow = { id: string; provider: Provider; cliSessionId: string | null; cwd: string; socket: string; pane: string;
   serverStart: string; need: "any" | "fable"; account: string; generation: number; state: SessionState;
-  desired: "running" | "stopped"; flags: string[]; wakeupAt: number | null; createdAt: number; updatedAt: number };
+  desired: "running" | "stopped"; flags: string[]; wakeupAt: number | null; createdAt: number; updatedAt: number;
+  /** Codex's rollout file for this conversation, as its own hook payloads
+   *  report it (`transcript_path`). It is the ONLY place a usage-limit turn
+   *  leaves a record: that branch fires no hook and emits no notify, but it
+   *  IS persisted here as a `task_complete` whose `error.codex_error_info` is
+   *  `usage_limit_exceeded`. Null until a SessionStart has reported one. */
+  transcriptPath: string | null;
+  /** How many bytes of `transcriptPath` the tool has already read and acted
+   *  on. The watchdog is a tailer, so this is what keeps a resumed session's
+   *  re-rendered history — old failures included — from being read twice. */
+  rolloutOffset: number };
 export type LaunchRow = { id: string; sessionId: string; generation: number; account: string; command: string[]; env: Record<string, string>; createdAt: number };
 export type WallKind = "session" | "weekly" | "fable" | "unknown";
 export type RecoveryRow = { id: number; sessionId: string; generation: number; turnId: string | null; kind: WallKind;
@@ -23,7 +33,9 @@ type RecoveryInput = Omit<RecoveryRow, "id" | "status" | "owner" | "attempts" | 
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, provider TEXT, cliSessionId TEXT, cwd TEXT, socket TEXT, pane TEXT,
-  serverStart TEXT, need TEXT, account TEXT, generation INTEGER, state TEXT, desired TEXT, flags TEXT, wakeupAt INTEGER, createdAt INTEGER, updatedAt INTEGER);
+  serverStart TEXT, need TEXT, account TEXT, generation INTEGER, state TEXT, desired TEXT, flags TEXT, wakeupAt INTEGER, createdAt INTEGER, updatedAt INTEGER,
+  transcriptPath TEXT, rolloutOffset INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS launches (id TEXT PRIMARY KEY, sessionId TEXT, generation INTEGER, account TEXT, command TEXT, env TEXT, createdAt INTEGER);
 CREATE TABLE IF NOT EXISTS recoveries (id INTEGER PRIMARY KEY AUTOINCREMENT, sessionId TEXT, generation INTEGER, turnId TEXT, kind TEXT,
   status TEXT, owner TEXT, attempts INTEGER DEFAULT 0, nextAttemptAt INTEGER, createdAt INTEGER, updatedAt INTEGER);
@@ -44,7 +56,25 @@ const now = () => Math.floor(Date.now() / 1000);
 const SESSION_COLUMNS = new Set<string>([
   "provider", "cliSessionId", "cwd", "socket", "pane", "serverStart", "need",
   "account", "generation", "state", "desired", "flags", "wakeupAt",
+  "transcriptPath", "rolloutOffset",
 ]);
+
+/**
+ * Columns added to `sessions` after the table shipped, newest last.
+ *
+ * `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+ * a store written by an older build keeps the old shape and every query naming
+ * a new column fails — not at install time, but the first time a hook runs.
+ * The constructor therefore asks the table what columns it HAS and adds only
+ * the missing ones. `ALTER TABLE … ADD COLUMN` is the one schema change SQLite
+ * does in place and without rewriting rows, and a NOT NULL column is legal
+ * there precisely because it carries a DEFAULT — which is also what gives
+ * every pre-existing row an honest value.
+ */
+const ADDED_SESSION_COLUMNS: readonly [string, string][] = [
+  ["transcriptPath", "transcriptPath TEXT"],
+  ["rolloutOffset", "rolloutOffset INTEGER NOT NULL DEFAULT 0"],
+];
 
 function isUniqueConstraintError(e: unknown): boolean {
   if (!(e instanceof Error)) return false;
@@ -54,12 +84,27 @@ function isUniqueConstraintError(e: unknown): boolean {
 
 export class State {
   private closed = false;
-  constructor(private db: DatabaseSync) { db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); db.exec(SCHEMA); }
+  constructor(private db: DatabaseSync) {
+    db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+    db.exec(SCHEMA);
+    this.migrate();
+  }
+  /** Bring a store written by an older build up to the current shape. Additive
+   * only: it never drops or rewrites a column, so downgrading is survivable
+   * and a half-applied migration simply finishes on the next open. */
+  private migrate(): void {
+    const have = new Set((this.db.prepare("PRAGMA table_info(sessions)").all() as { name: string }[]).map((r) => r.name));
+    for (const [col, ddl] of ADDED_SESSION_COLUMNS) if (!have.has(col)) this.db.exec(`ALTER TABLE sessions ADD COLUMN ${ddl}`);
+  }
   private rowToSession(r: Record<string, unknown> | undefined): SessionRow | null {
     if (!r) return null;
     return { ...(r as unknown as SessionRow), flags: JSON.parse(String(r.flags ?? "[]")) };
   }
-  createSession(s: Omit<SessionRow, "wakeupAt" | "createdAt" | "updatedAt">): void {
+  /** `transcriptPath` and `rolloutOffset` are deliberately NOT creation inputs:
+   * nothing knows a Codex rollout path before the CLI has reported one, and the
+   * offset starts at zero by definition. Both take their column defaults and
+   * are written later through `updateSession`. */
+  createSession(s: Omit<SessionRow, "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset">): void {
     const t = now();
     this.db.prepare(`INSERT INTO sessions (id,provider,cliSessionId,cwd,socket,pane,serverStart,need,account,generation,state,desired,flags,wakeupAt,createdAt,updatedAt)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(s.id, s.provider, s.cliSessionId, s.cwd, s.socket, s.pane, s.serverStart, s.need, s.account, s.generation, s.state, s.desired, JSON.stringify(s.flags), null, t, t);
@@ -157,6 +202,32 @@ export class State {
     }
   }
   attempts(recoveryId: number): AttemptRow[] { return this.db.prepare("SELECT * FROM attempts WHERE recoveryId=? ORDER BY id").all(recoveryId) as AttemptRow[]; }
+  /** A tiny key/value side table for state that belongs to the TOOL rather
+   * than to any one session — currently just the Codex watchdog's single
+   * armed-until epoch, which is what makes one timer per tmux server instead
+   * of one per turn. */
+  getKv(k: string): string | null {
+    const r = this.db.prepare("SELECT v FROM kv WHERE k=?").get(k) as { v: string } | undefined;
+    return r ? r.v : null;
+  }
+  setKv(k: string, v: string): void { this.db.prepare("INSERT INTO kv (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(k, v); }
+  delKv(k: string): void { this.db.prepare("DELETE FROM kv WHERE k=?").run(k); }
+  /**
+   * Move a session's rollout offset, but ONLY while it still names the file
+   * the offset was measured in.
+   *
+   * The Codex watch reads a row at the start of a pass and stamps the offset
+   * at the end of it. In between, a `/new` in that pane fires a SessionStart
+   * whose hook points the row at a fresh rollout and resets the offset to 0 —
+   * and that hook does not hold the watch's lock. A plain `updateSession`
+   * would then stamp the OLD file's offset onto the NEW path, and the watch
+   * would skip the first N bytes of a conversation it has never read (it
+   * self-heals only while the new file happens to be shorter). The path in
+   * the WHERE clause is what makes the write a no-op instead.
+   */
+  advanceRolloutOffset(sessionId: string, transcriptPath: string, offset: number): void {
+    this.db.prepare("UPDATE sessions SET rolloutOffset=?, updatedAt=? WHERE id=? AND transcriptPath=?").run(offset, now(), sessionId, transcriptPath);
+  }
   setWakeup(sessionId: string, at: number | null): void { this.db.prepare("UPDATE sessions SET wakeupAt=?, updatedAt=? WHERE id=?").run(at, now(), sessionId); }
   /**
    * Clear a wake-up ONLY if it is still the exact deadline being consumed.

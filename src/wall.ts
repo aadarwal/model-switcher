@@ -19,10 +19,36 @@
 export type WallKind = "session" | "weekly" | "fable";
 
 const LEAD = String.raw`^\s*(?:⎿\s*)?`;
+/**
+ * Order matters: the first pattern that matches names the kind, and the
+ * session clause below is a PREFIX of the Codex weekly one ("You've hit your
+ * usage limit for this week"), so the weekly entry has to be tried first.
+ *
+ * The Codex entries come from the spike record (2026-09-16, Codex CLI
+ * 0.153.4). Its default Pro wall, verbatim, is:
+ *
+ *   You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage
+ *   to purchase more credits or try again later.
+ *
+ * whose opening clause the existing `session` pattern already matched — it is
+ * listed explicitly all the same, because the wording "varies with reset time,
+ * plan, model and workspace limits" and a Codex reader should not have to
+ * discover that its wall is covered by a clause written for Claude. The
+ * settings URL is a second, independent anchor for the case where the TUI
+ * wraps the sentence and the first line on screen is the URL.
+ *
+ * Text still only NAMES a wall, and for Codex it does not even do that any
+ * more: the trigger is the rollout record `ms _codex_watch` tails
+ * (`task_complete` with `error.codex_error_info === "usage_limit_exceeded"`),
+ * which is first-party and unquotable. These patterns survive for `ms status`
+ * alone, which reads a pane that LOOKS walled and nothing has reported as
+ * `unreported`.
+ */
 const PATTERNS: [WallKind, RegExp][] = [
   ["fable", new RegExp(LEAD + String.raw`(?:you'?ve reached your fable limit|fable limit reached)`, "i")],
-  ["weekly", new RegExp(LEAD + String.raw`(?:you'?(?:ve|\s+have) reached your weekly usage limit|weekly limit reached)`, "i")],
+  ["weekly", new RegExp(LEAD + String.raw`(?:you'?(?:ve|\s+have) reached your weekly usage limit|weekly limit reached|you'?ve hit your (?:usage |rate )?limits? for (?:this|the) week)`, "i")],
   ["session", new RegExp(LEAD + String.raw`(?:you'?ve hit your (?:usage |session |weekly )?limit|new messages wait for your usage limit to reset|claude usage limit reached|usage limit reached)`, "i")],
+  ["session", new RegExp(LEAD + String.raw`visit https?://chatgpt\.com/codex/settings/usage`, "i")],
 ];
 
 /** A choice cursor in an option list (`❯ 1. Yes`). It wears the prompt glyph but

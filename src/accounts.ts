@@ -1,7 +1,14 @@
 // src/accounts.ts
 //
-// `ms accounts` — the Claude account book. A Claude account carries TWO
-// independent credentials, both minted by Claude Code itself (spec §6):
+// `ms accounts` — the account book, and the Claude half of it. Every verb is
+// dispatched from here; a row whose provider is `codex` is handed to
+// src/accounts-codex.ts, which keeps that provider's one-credential,
+// one-CODEX_HOME shape out of the two-credential logic below. Names are unique
+// PER PROVIDER (src/registry.ts), so `--provider` disambiguates a name both
+// providers hold and is needed for nothing else.
+//
+// A Claude account carries TWO independent credentials, both minted by Claude
+// Code itself (spec §6):
 //
 //   poll grant    `claude auth login` into this tool's own CLAUDE_CONFIG_DIR
 //                 (`claude/<name>/`). Profile-scoped; the only credential
@@ -32,7 +39,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { withLock } from "./lock.ts";
 import { ensureStore, p } from "./paths.ts";
-import { type Account, findAccount, loadRegistry, NAME_PATTERN, saveRegistry } from "./registry.ts";
+import { type Account, findAccount, loadRegistry, NAME_PATTERN, type Provider, saveRegistry } from "./registry.ts";
+import { addCodex, CODEX_RESERVED_NAMES, codexCells, loginCodex, removeCodex, verifyCodex } from "./accounts-codex.ts";
 import { deleteLaunchToken, looksLikeSetupToken, readLaunchToken, saveLaunchToken } from "./launch-credentials.ts";
 import {
   AuthError,
@@ -83,13 +91,20 @@ const ORG_ID_PATHS: string[][] = [
   ["organization_uuid"],
 ];
 
+const PROVIDERS: Provider[] = ["claude", "codex"];
+
 const USAGE = `usage: ms accounts <command>
-  add <name> [--label L] [--shared]   register a Claude account (no credentials yet)
-  login <name>                        mint both credentials and record the organisation
-  verify <name>                       re-check an account's credentials and identity
-  remove <name>                       delete the row, the launch token and the config dir
-  token <name>                        print the launch token
-  ls                                  list the accounts`;
+  add <name> [--provider claude|codex] [--label L] [--shared]
+                                      register an account (no credentials yet)
+  login <name> [--provider P] [--device-auth]
+                                      mint the credentials and record the identity
+  verify <name> [--provider P]        re-check an account's credentials and identity
+  remove <name> [--provider P]        delete the row and everything it names
+  token <name>                        print the launch token (claude only)
+  ls                                  list the accounts
+
+--provider is needed only when one name is held by BOTH providers; names are
+unique per provider, so a claude "work" and a codex "work" are two accounts.`;
 
 const out = (s: string) => process.stdout.write(s);
 const warn = (s: string) => process.stderr.write(`ms accounts: ${s}\n`);
@@ -111,7 +126,12 @@ function tokenPattern(): RegExp {
   return new RegExp(`${TOKEN_PREFIX}[A-Za-z0-9_-]+`, "g");
 }
 
-function redact(s: string): string {
+/** Exported for src/accounts-codex.ts, which forwards `codex login`'s device
+ *  code and URL to the human and must scrub those lines with the SAME scrubber
+ *  the Claude mint uses — a second copy could drift from this one. (That makes
+ *  the two modules a cycle; it is safe, and stays safe: nothing crosses it but
+ *  this hoisted function declaration, and only from inside a function body.) */
+export function redact(s: string): string {
   return s.replace(tokenPattern(), `${TOKEN_PREFIX}<redacted>`);
 }
 
@@ -122,8 +142,12 @@ function redact(s: string): string {
  *  to match, and `…is sk-ant-` is the same trap one character earlier. So a
  *  fragment carrying the prefix, or ending in any part of it, waits for its
  *  newline; everything else — a prompt with no newline, which the human needs
- *  to SEE while the mint waits — goes straight out. */
-function mightCarryToken(fragment: string): boolean {
+ *  to SEE while the mint waits — goes straight out.
+ *
+ *  Exported for src/accounts-codex.ts alongside `redact`: `codex login` streams
+ *  a device code the same way, and the holdback rule has to be the SAME rule on
+ *  both sides, or one of them leaks on a chunk boundary the other survives. */
+export function mightCarryToken(fragment: string): boolean {
   if (fragment.includes(TOKEN_PREFIX)) return true;
   for (let n = Math.min(fragment.length, TOKEN_PREFIX.length - 1); n > 0; n--) {
     if (fragment.endsWith(TOKEN_PREFIX.slice(0, n))) return true;
@@ -511,15 +535,25 @@ function report(name: string, profile: Profile, verified: boolean): void {
 
 // --- The verbs ---------------------------------------------------------
 
-function cmdAdd(args: string[]): number {
+/** `--provider claude|codex`, from either spelling. Anything else is a typo
+ *  worth naming, not a row to invent a provider for. */
+function asProvider(verb: string, value: string | undefined): Provider {
+  if (value && (PROVIDERS as string[]).includes(value)) return value as Provider;
+  throw new UsageError(`${verb}: --provider takes claude|codex${value ? `, not '${value}'` : ""}`, true);
+}
+
+export function cmdAdd(args: string[]): number {
   let name: string | null = null;
   let label: string | null = null;
+  let provider: Provider = "claude";
   let shared = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--shared") shared = true;
     else if (a === "--label") label = args[++i] ?? "";
     else if (a.startsWith("--label=")) label = a.slice("--label=".length);
+    else if (a === "--provider") provider = asProvider("add", args[++i]);
+    else if (a.startsWith("--provider=")) provider = asProvider("add", a.slice("--provider=".length));
     else if (a.startsWith("-")) throw new UsageError(`add: unknown option ${a}`, true);
     else if (name === null) name = a;
     else throw new UsageError(`add: unexpected argument ${a}`, true);
@@ -529,8 +563,14 @@ function cmdAdd(args: string[]): number {
     throw new UsageError(`'${name}' is not a usable account name (lower-case letters, digits, '-' and '_', up to 32)`);
   }
   if (label !== null && !label.trim()) throw new UsageError("--label needs a value", true);
+  if (provider === "codex" && CODEX_RESERVED_NAMES.includes(name)) {
+    throw new UsageError(`'${name}' is reserved: MS_HOME/codex/${name} is the shared rollout store, not an account home`);
+  }
   const r = load();
-  if (findAccount(r.registry, name, "claude")) throw new UsageError(`${name} is already registered`);
+  // Names are unique PER PROVIDER (src/registry.ts): a claude "work" and a
+  // codex "work" are two accounts, and only a clash within one is a duplicate.
+  if (findAccount(r.registry, name, provider)) throw new UsageError(`${name} is already registered (${provider})`);
+  if (provider === "codex") return addCodex(name, label ?? name, shared);
   r.registry.accounts.push({
     name,
     provider: "claude",
@@ -544,7 +584,7 @@ function cmdAdd(args: string[]): number {
   return 0;
 }
 
-async function cmdLogin(name: string): Promise<number> {
+export async function cmdLogin(name: string): Promise<number> {
   mustFind(name);
   const { dir, created } = claudeConfigDir(name);
   let profile: Profile;
@@ -596,7 +636,7 @@ async function cmdLogin(name: string): Promise<number> {
   return 0;
 }
 
-async function cmdVerify(name: string): Promise<number> {
+export async function cmdVerify(name: string): Promise<number> {
   mustFind(name);
   // Step 2's check, re-run: where the credential lives can change under us
   // (Claude Code re-minting it into the keychain, a lost note), and repairing
@@ -670,52 +710,132 @@ function tokenCell(name: string): string {
   return existsSync(p.launchToken(name)) ? "unreadable" : "no";
 }
 
-function cmdLs(): number {
+/** At most this many usage probes in flight at once while `ls` fills the POLL
+ *  column. A book of codex accounts is a book of bounded HTTP reads, and firing
+ *  all of them at one endpoint the instant someone types `ls` is how a listing
+ *  earns a 429 — the very answer that would then read `unknown`. Four keeps the
+ *  table fast without making the request pattern a burst. */
+const LS_PROBE_CONCURRENCY = 4;
+
+/**
+ * `items.map(work)`, with at most `limit` of them running at once.
+ *
+ * A fixed set of workers pulling from one shared cursor: no dependency, no
+ * queue, and each result lands back at its own index, so the caller still gets
+ * an array in input order however the work interleaved.
+ */
+async function mapLimit<T, R>(items: T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < items.length; i = next++) out[i] = await work(items[i]);
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return out;
+}
+
+/**
+ * Every account, in registry order, under one set of columns.
+ *
+ * PROVIDER earns its column the moment two providers share the book: names are
+ * unique PER PROVIDER, so a claude `work` and a codex `work` are two different
+ * accounts and a table that showed only the name would print the same row
+ * twice with no way to tell which is which.
+ *
+ * The cells themselves are per-provider (`codexCells`, and the Claude pair
+ * below), because the same word means a different check on each side. Codex
+ * rows are probed CONCURRENTLY — a book of them must not cost the sum of their
+ * timeouts — but never more than `LS_PROBE_CONCURRENCY` of them at a time.
+ */
+async function cmdLs(): Promise<number> {
   const r = load();
-  const claude = r.registry.accounts.filter((a) => a.provider === "claude");
-  const rows = [["NAME", "LABEL", "ORG", "POLL", "TOKEN", "VERIFIED"]];
-  for (const a of claude) {
-    rows.push([
-      a.name,
-      a.label,
-      a.orgId ?? "-",
-      hasPollGrant(a.name) ? "yes" : "no",
-      tokenCell(a.name),
-      a.identityVerified ? "yes" : "no",
-    ]);
-  }
+  const cells = await mapLimit(r.registry.accounts, LS_PROBE_CONCURRENCY, async (a) =>
+    a.provider === "codex"
+      ? await codexCells(a)
+      : {
+          poll: hasPollGrant(a.name) ? "yes" : "no",
+          token: tokenCell(a.name),
+          verified: a.identityVerified ? "yes" : "no",
+        },
+  );
+  const rows = [["NAME", "PROVIDER", "LABEL", "ORG", "POLL", "TOKEN", "VERIFIED"]];
+  r.registry.accounts.forEach((a, i) => {
+    rows.push([a.name, a.provider, a.label, a.orgId ?? "-", cells[i].poll, cells[i].token, cells[i].verified]);
+  });
   out(table(rows));
-  // This verb is the Claude account book; a codex row belongs to its own
-  // provider's columns, so it is named here rather than silently hidden.
-  const others = r.registry.accounts.length - claude.length;
-  if (others > 0) out(`(${others} non-Claude account${others === 1 ? "" : "s"} not shown)\n`);
   return 0;
+}
+
+/** The verbs that act on ONE existing account, and so share a target. */
+const TARGET_VERBS = ["login", "verify", "remove", "token"];
+
+/** A target verb's arguments: the name, plus its flags. */
+function parseTarget(verb: string, args: string[]): { name: string; provider: Provider | null; deviceAuth: boolean } {
+  let name: string | null = null;
+  let provider: Provider | null = null;
+  let deviceAuth = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--provider") provider = asProvider(verb, args[++i]);
+    else if (a.startsWith("--provider=")) provider = asProvider(verb, a.slice("--provider=".length));
+    else if (a === "--device-auth" && verb === "login") deviceAuth = true;
+    else if (a.startsWith("-")) throw new UsageError(`${verb}: unknown option ${a}`, true);
+    else if (name === null) name = a;
+    else throw new UsageError(`${verb}: unexpected argument ${a}`, true);
+  }
+  if (!name) throw new UsageError(`${verb} needs an account name`, true);
+  return { name, provider, deviceAuth };
+}
+
+/**
+ * The row a target verb acts on.
+ *
+ * `--provider` is REQUIRED only when one name is held by both providers. Most
+ * books have no collision at all, and making every command carry the flag
+ * would be a tax everyone pays for a case almost nobody has — but guessing
+ * which of two accounts the human meant is the one thing that must not happen,
+ * so an ambiguous name is refused, naming the flag that resolves it.
+ */
+function resolveTarget(name: string, provider: Provider | null): Account {
+  const rows = load().registry.accounts.filter((a) => a.name === name && (!provider || a.provider === provider));
+  if (rows.length === 0) {
+    throw new UsageError(
+      provider
+        ? `no such ${provider} account: ${name} (add it with: ms accounts add ${name} --provider ${provider})`
+        : `no such account: ${name} (add it with: ms accounts add ${name})`,
+    );
+  }
+  if (rows.length > 1) {
+    throw new UsageError(
+      `${name} names both a ${rows.map((a) => a.provider).join(" and a ")} account — say which with --provider`,
+    );
+  }
+  return rows[0];
 }
 
 export async function accountsVerb(args: string[]): Promise<number> {
   const [sub, ...rest] = args;
-  const name = rest[0];
   try {
-    if (sub && sub !== "add" && sub !== "ls" && !name) {
-      throw new UsageError(`${sub} needs an account name`, true);
+    if (sub === "add") return cmdAdd(rest);
+    if (sub === "ls") return await cmdLs();
+    if (sub && TARGET_VERBS.includes(sub)) {
+      const t = parseTarget(sub, rest);
+      const row = resolveTarget(t.name, t.provider);
+      const codex = row.provider === "codex";
+      if (t.deviceAuth && !codex) throw new UsageError("login: --device-auth is a codex option", true);
+      if (sub === "login") return codex ? await loginCodex(row.name, { deviceAuth: t.deviceAuth }) : await cmdLogin(row.name);
+      if (sub === "verify") return codex ? await verifyCodex(row.name) : await cmdVerify(row.name);
+      if (sub === "remove") return codex ? removeCodex(row.name) : cmdRemove(row.name);
+      // `token` is the launch grant, and only Claude has a second credential to
+      // print: a codex account IS its CODEX_HOME. Exits 1, not 2 — the command
+      // was well formed, there is simply nothing of that kind to hand over.
+      if (codex) {
+        throw new Error(`codex accounts have no launch token; the CLI reads CODEX_HOME (${p.codexHome(row.name)})`);
+      }
+      return cmdToken(row.name);
     }
-    switch (sub) {
-      case "add":
-        return cmdAdd(rest);
-      case "login":
-        return await cmdLogin(name!);
-      case "verify":
-        return await cmdVerify(name!);
-      case "remove":
-        return cmdRemove(name!);
-      case "token":
-        return cmdToken(name!);
-      case "ls":
-        return cmdLs();
-      default:
-        process.stderr.write(`${sub ? `ms accounts: unknown command '${sub}'\n` : ""}${USAGE}\n`);
-        return 2;
-    }
+    process.stderr.write(`${sub ? `ms accounts: unknown command '${sub}'\n` : ""}${USAGE}\n`);
+    return 2;
   } catch (e) {
     if (!(e instanceof UsageError)) throw e;
     process.stderr.write(`ms accounts: ${e.message}\n${e.showUsage ? `${USAGE}\n` : ""}`);

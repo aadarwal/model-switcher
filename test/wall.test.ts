@@ -96,3 +96,32 @@ test("a choice cursor in an option list is not a composer and not an echo", () =
   // an unboxed option list with no composer at all: the cursor is still not an echo
   assert.equal(wallKindFromText(`❯ switch me to opus\n${FABLE}\n\n  ❯ 1. Yes\n    2. No\n`), "fable");
 });
+
+/** The Codex wall, verbatim from the spike record (Codex CLI 0.153.4, Pro plan,
+ * no reset time). The wording "varies with reset time, plan, model and
+ * workspace limits", so the variants below are the ones the record names. */
+const CODEX = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later.";
+
+test("the Codex wall is named from its own default text and its wrapped variants", () => {
+  assert.equal(wallKindFromText(plain(CODEX)), "session");
+  // Codex's TUI is not Claude's: it draws no `⎿` result marker, and the wall
+  // may arrive indented or wrapped so that the settings URL is its own line.
+  assert.equal(wallKindFromText(plain(`  ${CODEX}`)), "session");
+  assert.equal(wallKindFromText(plain("Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later.")), "session");
+  // The weekly variant the spike quoted. It must not fall through to `session`:
+  // the session clause is a prefix of it, so the weekly pattern is tried first.
+  assert.equal(wallKindFromText(plain("You've hit your usage limit for this week.")), "weekly");
+  assert.equal(wallKindFromText(plain("Youve hit your usage limit for the week")), "weekly");
+  // A Codex turn that merely worked is not a wall.
+  assert.equal(wallKindFromText(plain("• Ran `npm test` — 418 passing")), null);
+});
+
+test("Codex wall text quoted in prose, or left behind by an earlier turn, is not a wall", () => {
+  // The spike proved this one the hard way: the model was ASKED to echo "You've
+  // hit your usage limit for this week." and it came back verbatim in Stop's
+  // last_assistant_message. Text is never evidence on its own.
+  assert.equal(wallKindFromText(`❯ what does codex say when it runs out\n  it says You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to buy more.\n\n❯ \n`), null);
+  assert.equal(wallKindFromText(`❯ explain\n  the docs mention you've hit your usage limit for this week as the weekly wording\n\n❯ \n`), null);
+  // and a real wall from a PREVIOUS turn is out of scope once a new turn starts
+  assert.equal(wallKindFromText(`❯ first\n${CODEX}\n❯ second\n  Done.\n\n❯ \n`), null);
+});

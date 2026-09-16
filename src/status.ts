@@ -32,42 +32,61 @@ const DASH = "—";
 export type AccountState = "ok" | "stale" | "auth" | "transient" | "no-grant" | "no-token";
 
 /** `pollOne` (src/snapshot.ts) names a missing poll grant with this exact
- *  phrase; anything else classified `auth` is a live credential that the
- *  provider itself rejected (a dead refresh token, a revoked grant). */
-const NO_GRANT_RE = /no poll grant|credentials missing/i;
+ *  phrase for Claude ("no poll grant …") and Codex ("no credentials …");
+ *  anything else classified `auth` is a live credential that the provider
+ *  itself rejected (a dead refresh token, a revoked grant). */
+const NO_GRANT_RE = /no poll grant|credentials missing|no credentials/i;
 
 /**
  * The single STATE word for an account row.
  *
  * `no-token` is checked first and independently of the usage poll: the
- * launch grant and the poll grant are two separate credentials (spec §6),
- * and an account with no launch token cannot be run with at all, however
- * well its usage reads. Everything after that is what the last poll found,
- * worst first: a dead credential outranks a slow network, which outranks a
- * reading this round merely didn't refresh.
+ * launch grant and the poll grant are two separate credentials for Claude
+ * (spec §6), and a Claude account with no launch token cannot be run with
+ * at all, however well its usage reads. Codex has no such second
+ * credential — the CLI reads CODEX_HOME directly — so `no-token` can never
+ * apply to a codex row, whatever `hasToken` was computed as upstream; a
+ * missing or unreadable Codex `auth.json` instead surfaces as `no-grant`
+ * below, via the poller's own "no credentials" message.
+ *
+ * Everything after that is what the last poll found, worst first: a dead
+ * credential outranks a slow network, which outranks a reading this round
+ * merely didn't refresh.
  */
 export function accountState(a: AccountUsage, hasToken: boolean): AccountState {
-  if (!hasToken) return "no-token";
+  if (!hasToken && a.provider !== "codex") return "no-token";
   if (a.errorKind === "auth") return NO_GRANT_RE.test(a.error ?? "") ? "no-grant" : "auth";
-  // "other" (e.g. codex's not-yet-implemented poller) is not one of the six
-  // named states; it is folded into "transient" — not fatal, not a reason to
-  // re-login, worth another look later.
+  // "other" is not one of the six named states; it is folded into
+  // "transient" — not fatal, not a reason to re-login, worth another look
+  // later.
   if (a.errorKind === "transient" || a.errorKind === "other") return "transient";
   if (a.stale) return "stale";
   return "ok";
 }
 
 /** One decimal only when the value isn't integral (42, not 42.0; 42.5, not
- *  42.50); "—" for a window the account doesn't have. */
-function fmtPercent(w: Window | null | undefined): string {
+ *  42.50); "—" for a window the account doesn't have.
+ *
+ *  `Cli`-suffixed on purpose: src/dashboard/client-logic.ts has its own
+ *  `fmtPercent`, doing the same job for the dashboard page's <script>, whose
+ *  runtime source page.ts embeds by `fn.toString()` under that exact name.
+ *  Bundled into the same file (esbuild, scripts/build.mjs), two same-named
+ *  top-level functions collide and one gets silently renamed — which is
+ *  exactly the class of bug scripts/check-dist.mjs exists to catch (it did,
+ *  against this pair, before this rename). Never let this name collide with
+ *  client-logic.ts's again. */
+function fmtPercentCli(w: Window | null | undefined): string {
   if (!w || !Number.isFinite(w.usedPercent)) return DASH;
   const v = Math.round(w.usedPercent * 10) / 10;
   return `${Number.isInteger(v) ? v : v.toFixed(1)}%`;
 }
 
 /** The earliest of the account's WEEKLY resets — session/5h resets far more
- *  often and is not "the" reset a human waiting on this account cares about. */
-export function earliestWeeklyReset(u: AccountUsage["usage"]): string | null {
+ *  often and is not "the" reset a human waiting on this account cares about.
+ *  `Cli`-suffixed for the same reason as `fmtPercentCli` above: keeps this
+ *  file's own copy from colliding with client-logic.ts's `earliestWeeklyReset`
+ *  once both are bundled into dist/ms.js. */
+export function earliestWeeklyResetCli(u: AccountUsage["usage"]): string | null {
   if (!u) return null;
   const candidates = [u.weeklyAll?.resetsAt, u.weeklyFable?.resetsAt].filter((x): x is string => !!x);
   if (!candidates.length) return null;
@@ -75,25 +94,39 @@ export function earliestWeeklyReset(u: AccountUsage["usage"]): string | null {
 }
 
 /** Local wall-clock time, `YYYY-MM-DD HH:MM` — never UTC, never an ISO
- *  string a human has to convert in their head. */
-export function localTime(epochMs: number): string {
+ *  string a human has to convert in their head. `Cli`-suffixed for the same
+ *  reason as `fmtPercentCli` above: keeps this file's own copy from
+ *  colliding with client-logic.ts's `localTime`. */
+export function localTimeCli(epochMs: number): string {
   const d = new Date(epochMs);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function accountRow(a: AccountUsage, registry: Registry): string[] {
+/** Everything an account row needs that isn't already on `AccountUsage`
+ *  itself — the registry's own LABEL and the table's own STATE word — in
+ *  one place, so `accountRow()` (the text table) and `statusJson()` (Plan 4
+ *  Task 2's dashboard) compute it identically rather than one of them
+ *  copying the other's logic. See review round 1 (P4-T2), findings 1 & 2. */
+export type AccountComputed = { label: string; state: AccountState };
+
+function computeAccount(a: AccountUsage, registry: Registry): AccountComputed {
   const label = findAccount(registry, a.name, a.provider)?.label ?? a.name;
   const hasToken = !!readLaunchToken(a.name);
-  const reset = earliestWeeklyReset(a.usage);
+  return { label, state: accountState(a, hasToken) };
+}
+
+function accountRow(a: AccountUsage, registry: Registry): string[] {
+  const c = computeAccount(a, registry);
+  const reset = earliestWeeklyResetCli(a.usage);
   return [
     a.name,
-    label,
-    fmtPercent(a.usage?.session ?? null),
-    fmtPercent(a.usage?.weeklyAll ?? null),
-    fmtPercent(a.usage?.weeklyFable ?? null),
-    reset ? localTime(Date.parse(reset)) : DASH,
-    accountState(a, hasToken),
+    c.label,
+    fmtPercentCli(a.usage?.session ?? null),
+    fmtPercentCli(a.usage?.weeklyAll ?? null),
+    fmtPercentCli(a.usage?.weeklyFable ?? null),
+    reset ? localTimeCli(Date.parse(reset)) : DASH,
+    c.state,
   ];
 }
 
@@ -119,7 +152,32 @@ export function sessionWalled(s: SessionRow, hasPendingRecovery: boolean, screen
   return alreadyReported ? "" : "unreported";
 }
 
-function sessionRow(s: SessionRow, st: State): string[] {
+/**
+ * One session row. Its STATE is the store's own word for the session, with
+ * exactly one substitution made here (`gone`, below) — this verb reports, it
+ * never repairs.
+ *
+ * So a Codex row may honestly read `launching` for as long as the human leaves
+ * a freshly launched pane idle: Codex 0.153.4's interactive TUI fires its
+ * SessionStart hook at the first SUBMITTED PROMPT, not at process start, and
+ * `launching → running` is that hook's move to make (src/hooks/codex-hook.ts).
+ * The pane is up and fine; nothing has been typed into it yet. Reconciliation
+ * adopts such a row as `running` once it is past its stuck threshold with a
+ * live pane (src/reconcile.ts), and the same lazy hook is why a `cliSessionId`
+ * of null is the NORMAL state of a new Codex session rather than a fault.
+ * Nothing here second-guesses either; a status that repaired what it printed
+ * would be a different verb.
+ */
+/** Everything a session row needs that lives outside `SessionRow` itself —
+ *  the live "gone" override, the open recovery's own status word, and the
+ *  WALLED? reading — computed once so `sessionRow()` (the text table) and
+ *  `statusJson()` (Plan 4 Task 2's dashboard) never compute it two
+ *  different ways. See review round 1 (P4-T2), finding 1. `pending` is
+ *  `null` exactly where the table prints "—" (no open recovery); JSON has
+ *  no dash of its own. */
+export type SessionComputed = { state: string; pending: string | null; walled: Walled };
+
+function computeSession(s: SessionRow, st: State): SessionComputed {
   const tmux = new Tmux(s.socket || null);
   const hasPane = !!s.pane;
   const exists = hasPane && tmux.paneExists(s.pane);
@@ -135,16 +193,22 @@ function sessionRow(s: SessionRow, st: State): string[] {
   // render's paneExists catches up and shows "gone".
   const screen = exists ? tmux.capture(s.pane) : null;
   const walled = sessionWalled(s, rec !== null, screen, exists ? readEvents(s.id) : []);
+  return { state, pending: rec ? rec.status : null, walled };
+}
+
+function sessionRow(s: SessionRow, st: State): string[] {
+  const c = computeSession(s, st);
   return [
     s.id,
     s.pane || DASH,
+    s.provider,
     s.account,
     s.need,
-    state,
+    c.state,
     String(s.generation),
-    rec ? rec.status : DASH,
-    s.wakeupAt != null ? localTime(s.wakeupAt * 1000) : DASH,
-    walled,
+    c.pending ?? DASH,
+    s.wakeupAt != null ? localTimeCli(s.wakeupAt * 1000) : DASH,
+    c.walled,
   ];
 }
 
@@ -156,19 +220,55 @@ function table(headers: string[], rows: string[][]): string[] {
   return [line(headers), ...rows.map(line)];
 }
 
-type JsonOutput = { accounts: AccountUsage[]; sessions: SessionRow[]; takenAt: number | null };
+/** Additive over the raw rows: every existing key of `AccountUsage` /
+ *  `SessionRow` is present unchanged, plus the words the text table
+ *  computes and this JSON didn't use to carry (review round 1, finding 1:
+ *  LABEL/PENDING/WALLED? were rendering as placeholders on the dashboard
+ *  page because they simply weren't in this JSON at all).
+ *
+ *  `state` overrides `SessionRow`'s own (narrower) `SessionState` — it is
+ *  `computeSession`'s COMPUTED state (`SessionComputed`, above), which adds
+ *  the live `gone` override `SessionState` has no room for, so this is the
+ *  same word `ms status`'s text table prints, not the store's raw column
+ *  (fix-C-report.md item 1 / fix-R). */
+export type StatusAccountRow = AccountUsage & AccountComputed;
+export type StatusSessionRow = Omit<SessionRow, "state"> & { state: string; pending: string | null; walled: Walled };
+export type StatusJson = { accounts: StatusAccountRow[]; sessions: StatusSessionRow[]; takenAt: number | null };
+
+/**
+ * The `--json` shape below, isolated so another caller (the dashboard API,
+ * Plan 4 Task 1/2) can get the same numbers without going through stdout —
+ * and, since review round 1, the exact same COMPUTED words the text table
+ * prints (`computeAccount`/`computeSession` above), not just the raw
+ * snapshot/store rows a consumer would otherwise have to re-derive (badly:
+ * finding 2's page.ts copy never checked `hasToken`). Extracted without
+ * changing what `ms status --json` itself prints beyond that addition —
+ * `render`'s json branch below is still just `JSON.stringify` over this.
+ */
+export async function statusJson(): Promise<StatusJson> {
+  const { registry } = loadRegistry();
+  const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
+  const st = openState();
+  try {
+    const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry) }));
+    const sessions = st.listSessions().map((s) => {
+      const c = computeSession(s, st);
+      return { ...s, state: c.state, pending: c.pending, walled: c.walled };
+    });
+    return { accounts, sessions, takenAt: snapshot.takenAt };
+  } finally {
+    st.close();
+  }
+}
 
 async function render(json: boolean): Promise<string> {
+  if (json) return JSON.stringify(await statusJson()) + "\n";
+
   const { registry, parseError } = loadRegistry();
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
   const st = openState();
   try {
     const sessions = st.listSessions();
-    if (json) {
-      const out: JsonOutput = { accounts: snapshot.accounts, sessions, takenAt: snapshot.takenAt };
-      return JSON.stringify(out) + "\n";
-    }
-
     const lines: string[] = [];
     // A registry the loader could not read is not silently a pool of zero
     // accounts — say so, first, before either table (which may still show
@@ -180,7 +280,11 @@ async function render(json: boolean): Promise<string> {
     ));
     lines.push("");
     lines.push(...table(
-      ["SESSION", "PANE", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?"],
+      // PROVIDER sits next to ACCOUNT: identity in this tool is
+      // (provider, name), and an account name is only reused across
+      // providers, never within one — so a session's own credential is
+      // named by both cells together, not ACCOUNT alone.
+      ["SESSION", "PANE", "PROVIDER", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?"],
       sessions.map((s) => sessionRow(s, st)),
     ));
     return lines.join("\n") + "\n";

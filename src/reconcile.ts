@@ -426,10 +426,47 @@ function redispatchOrphan(st: State, servers: Servers, s: SessionRow, rec: Recov
   return [`session ${s.id}: recovery ${rec.id} had no worker and no timer, dispatched`];
 }
 
+/**
+ * A Codex pane that is up and simply has not been typed into yet (C2).
+ *
+ * Codex 0.153.4's interactive TUI fires its SessionStart hook at the first
+ * SUBMITTED PROMPT, not at process start — verified live, the 2026-09-16
+ * matrix. So a freshly launched Codex session sits in `launching` with a null
+ * `cliSessionId` for as long as the human leaves it idle, which can be all
+ * afternoon, and (e)/(f) below would read that silence as a launch that never
+ * landed and park a session whose TUI is on screen in front of them. The event
+ * log cannot tell those two apart for this CLI; the PANE can.
+ *
+ * So: for a Codex row only, a live pane past the threshold is adopted as
+ * `running` rather than parked. Both facts are required and both must be
+ * POSITIVE — the pane confirmed present in a pane list we actually got
+ * (`presenceOf`), and tmux answering that it is not dead. A pane we could not
+ * ask about, or one that is really gone, is not a session to adopt, and the
+ * existing rules keep their say over it.
+ *
+ * Nothing here is true of Claude Code, which reports SessionStart at startup
+ * whether or not anybody types: a Claude row still silent after five minutes
+ * really has failed, and still parks. Returns null when this is not that case.
+ */
+function adoptIdleCodex(st: State, servers: Servers, s: SessionRow, presence: Presence): string[] | null {
+  if (s.provider !== "codex") return null;
+  if (presence !== "present") return null;
+  if (paneIsDead(servers, s)) return null;
+  const was = s.state;
+  st.updateSession(s.id, { state: "running" });
+  log(s.id, s.generation, `idle pane adopted: ${was} for over ${STUCK_SECONDS / 60} minutes with no event, but the pane is alive (codex reports SessionStart only at the first prompt)`);
+  return [`session ${s.id}: idle pane adopted, ${was} with a live pane is running`];
+}
+
 /** (e)/(f) A transition that never completed. The event log is the only
  * witness — the CLI's own hooks write it — so "no event for THIS generation"
- * is the test, never the newest event of any generation. */
-function stuck(st: State, s: SessionRow): string[] {
+ * is the test, never the newest event of any generation.
+ *
+ * With one exception, and it is a whole CLI wide: a Codex pane reports nothing
+ * until the human's first prompt, so silence there is not evidence of failure
+ * while the pane is alive. `adoptIdleCodex` is that reading, and it runs only
+ * after the event log has already come up empty. */
+function stuck(st: State, servers: Servers, s: SessionRow, presence: Presence): string[] {
   const resuming = s.state === "resuming" || s.state === "continuing";
   const launching = s.state === "launching";
   if (!resuming && !launching) return [];
@@ -443,9 +480,17 @@ function stuck(st: State, s: SessionRow): string[] {
     // back — parking it for saying so in the other word would be a repair that
     // is itself the damage.
     if (events.some((e) => e.kind === "resumed" || e.kind === "started")) return [];
+    // `continuing` is not adopted: it is written only AFTER a report was
+    // already accepted (src/recover.ts), so its silence is not the lazy hook.
+    if (s.state === "resuming") {
+      const adopted = adoptIdleCodex(st, servers, s, presence);
+      if (adopted) return adopted;
+    }
     return [park(st, s, `${s.state} for over ${minutes} minutes with no resumed event`)];
   }
   if (events.some((e) => e.kind === "started")) return [];
+  const adopted = adoptIdleCodex(st, servers, s, presence);
+  if (adopted) return adopted;
   return [park(st, s, `launching for over ${minutes} minutes with no started event`)];
 }
 
@@ -578,7 +623,7 @@ export function reconcile(): string[] {
         }
         out.push(...reclaimRecovery(st, servers, s, rec)); // (b)
         out.push(...redispatchOrphan(st, servers, s, rec)); // (5)
-        out.push(...stuck(st, s)); // (e), (f)
+        out.push(...stuck(st, servers, s, presence)); // (e), (f)
       } catch (e) {
         out.push(`session ${scanned.id}: reconcile failed: ${reason(e)}`);
       } finally {

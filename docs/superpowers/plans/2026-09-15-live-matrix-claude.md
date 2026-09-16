@@ -30,3 +30,15 @@ Exit criteria: 1–8 and 11 PASS; 9, 10, 12 PASS or a documented reason. Failure
 
 ## Verdict
 Cases 1, 2, 4, 5, 6, 7, 11 PASS; 3 PASS on exclusion / FAIL on the handoff of a never-used session (B1–B3); 8 PASS with a documented CLI deviation; 9 PASS with B5; 10 not reproducible as written, variant surfaced B6; 12 not run (documented). Real-wall handoff time: ~2 s. Fix wave for B1–B6 before Plan 2.
+
+## Re-run after the fix wave (engine 602cd1b, 2026-09-15 22:40 ET)
+| # | Result | Evidence |
+|---|--------|----------|
+| 3 | PASS | never-used session (%51): rotate A relaunched with `claude --session-id <id>` (B1) → kratuvak; B waited on the session lock and then performed its own manual move → gmail (two explicit manual moves serialize; concurrent handoffs on one pane remain impossible) |
+| 8 | FAIL (B1b) | bogus `cliSessionId` + `rotate --force` → B1's "no activity for this id" rule relaunched a NEW conversation under the bogus id in 3 s (`started:4`, running) instead of parking — a corrupted id is indistinguishable from a fresh post-`/clear` id by events alone |
+| 9 | PASS | worker killed -9 at +1.25 s → `running gen=2` within 3 s (B5) |
+| 10v | PASS (B6) / FAIL (B9) | other tokens unreadable: `dirk: no launch token; trying the next account` ×2, `no candidate account has a launch token`, no throw, no owned row — but the MANUAL rotate left a `pending` ownerless recovery behind, which the 45 s orphan rule would turn into an AUTOMATIC rotation; the hint says `ms accounts add` (B8) |
+
+- **B1b** Relaunch with `--session-id <id>` only when the tool saw that id born (a `started` or `cleared` event carries it) and it has no `activity`; any other id with no transcript is broken → `--resume` (fails fast under B2) → parked.
+- **B8** (cosmetic) "no candidate account has a launch token (run: ms accounts add <name>)" → `ms accounts login <name>`.
+- **B9** A failed MANUAL move (no candidate, refused, threw) must finish the recovery it opened (`obsolete`) — never leave an ownerless `pending` row for the orphan rule to re-dispatch as an automatic rotation.

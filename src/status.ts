@@ -180,19 +180,33 @@ function table(headers: string[], rows: string[][]): string[] {
   return [line(headers), ...rows.map(line)];
 }
 
-type JsonOutput = { accounts: AccountUsage[]; sessions: SessionRow[]; takenAt: number | null };
+export type StatusJson = { accounts: AccountUsage[]; sessions: SessionRow[]; takenAt: number | null };
+
+/**
+ * The `--json` shape below, isolated so another caller (the dashboard API,
+ * Plan 4 Task 1) can get the same numbers without going through stdout. Pure
+ * over the snapshot and the store; extracted without changing what `ms
+ * status --json` itself prints — `render`'s json branch below is now just
+ * `JSON.stringify` over this.
+ */
+export async function statusJson(): Promise<StatusJson> {
+  const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
+  const st = openState();
+  try {
+    return { accounts: snapshot.accounts, sessions: st.listSessions(), takenAt: snapshot.takenAt };
+  } finally {
+    st.close();
+  }
+}
 
 async function render(json: boolean): Promise<string> {
+  if (json) return JSON.stringify(await statusJson()) + "\n";
+
   const { registry, parseError } = loadRegistry();
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
   const st = openState();
   try {
     const sessions = st.listSessions();
-    if (json) {
-      const out: JsonOutput = { accounts: snapshot.accounts, sessions, takenAt: snapshot.takenAt };
-      return JSON.stringify(out) + "\n";
-    }
-
     const lines: string[] = [];
     // A registry the loader could not read is not silently a pool of zero
     // accounts — say so, first, before either table (which may still show

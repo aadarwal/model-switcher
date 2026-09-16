@@ -139,10 +139,14 @@ the *same* pane on the new account running `claude --resume <id> "<continuation>
 `codex resume <id>`). The continuation is an argument to that invocation, never keystrokes
 typed into a shell. Four handoffs run at a time across the whole tmux server.
 
-Automatic recovery for Codex ships **off**: no live Codex wall has been observed yet, and
-`ms` will not move a session on a signal nobody has seen. Export `MS_CODEX_AUTOROTATE=1` in
-the shell that runs `codex` to enable it; `ms rotate`, `ms switch` and `ms stop` move a
-Codex session today regardless.
+Automatic recovery for Codex is **on**: the wall record was checked against 85 real walled
+rollouts and the whole handoff was watched end to end, so `ms` moves a walled Codex session
+the way it moves a Claude one — bounded by the caps that make an unattended rotation safe:
+one recovery per fresh turn, an exclusive session lock, each candidate account tried at most
+once per wall, at most three account changes per session per ten minutes (the fourth parks
+it for a human), and a pause until the earliest reset when nothing has room, never a spin.
+Export `MS_CODEX_AUTOROTATE=0` in the shell that runs `codex` to turn it off; `ms rotate`,
+`ms switch` and `ms stop` move a Codex session either way.
 
 ### The chooser
 
@@ -183,7 +187,7 @@ own tmux socket. Directories are 0700 and files 0600.
 |---|---|
 | `MS_HOME` | Where all state lives. Default `~/.config/model-switcher`. |
 | `MS_BIN` | The absolute `ms` path written into hook commands, Codex trust hashes, the statusline wrapper and the alias block. The Homebrew shim sets it to `/opt/homebrew/opt/model-switcher/bin/ms` — the stable path, so everything the wizard wrote survives an upgrade. Set it yourself only when running `ms` from somewhere unusual. |
-| `MS_CODEX_AUTOROTATE` | `1` enables automatic recovery for Codex sessions. Export it in the shell that runs `codex`; `ms` mirrors it into the store so the tmux-dispatched watchdog and worker read it too. `ms doctor` prints its state. Ships off. |
+| `MS_CODEX_AUTOROTATE` | `0` disables automatic recovery for Codex sessions; anything else, unset included, leaves it on. Export it in the shell that runs `codex`; `ms` mirrors it into the store so the tmux-dispatched watchdog and worker read it too. `ms doctor` prints its state. Ships on. |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere `ms` reads or writes that settings file. |
 | `MS_VERBOSE` | `1` prints what each invocation's start-of-run repair did. |
 | `MS_ENTRY` | `src` or `dist` — which entry point `bin/ms` runs. For development; the brew shim sets `dist`. |

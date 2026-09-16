@@ -730,6 +730,101 @@ test("a fourth try is not taken: three failed attempts park the session", async 
   assert.match(recoverLog(w), /gave up after 3 attempts/);
 });
 
+/** The launch rows a session's past handoffs left behind — one per respawn, as
+ *  `handoff` writes them. The launch a session was BORN on is generation 1 and
+ *  is never a change, so these all start at 2. */
+function seedChanges(count: number, secondsAgo: number): void {
+  const st = openState();
+  try {
+    for (let i = 0; i < count; i++) {
+      st.createLaunch({
+        id: `launch-${i}-${secondsAgo}`,
+        sessionId: "s1",
+        generation: 2 + i,
+        account: ["gmail", "work", "dirk"][i % 3]!,
+        command: ["claude"],
+        env: {},
+        createdAt: nowSeconds() - secondsAgo,
+      });
+    }
+  } finally {
+    st.close();
+  }
+}
+
+test("a fourth account change inside ten minutes parks the session, naming the cap", async (t) => {
+  // The rate cap. `MAX_FAILED_ATTEMPTS` bounds one episode's FAILURES, and a
+  // handoff that worked is not a failure — so a signal that keeps being wrong
+  // walked a live conversation through the whole fleet, one successful
+  // rotation at a time, spending no budget at all. Three in ten minutes is
+  // already far more than a working session needs; the fourth is a loop.
+  const w = await world(t);
+  seedChanges(3, 60);
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  const s = session(w);
+  assert.equal(s.state, "parked");
+  assert.equal(s.account, "dirk", "nothing moved");
+  assert.equal(s.wakeupAt, null, "a parked session is not also waiting for a window");
+  assert.equal(rows(w, "recoveries")[0].status, "failed");
+  assert.equal(rows(w, "attempts").length, 0, "no candidate was spent on a move that never happened");
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "nothing is typed");
+  assert.ok(!respawnLine(w), "and nothing is respawned");
+  assert.match(recoverLog(w), /3 account changes in the last 10 minutes; the cap is 3 per 10 minutes — s1 is parked/);
+});
+
+test("the cap is a WINDOW: three changes an hour ago do not stop the next one", async (t) => {
+  // A session that rotated three times this morning is not a session in a
+  // loop. The cap counts what happened in the last ten minutes and nothing
+  // else, or a long-lived pane would park itself on its own history.
+  const w = await world(t);
+  seedChanges(3, 3600);
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.equal(session(w).account, "gmail");
+  assert.notEqual(session(w).state, "parked");
+});
+
+test("the rate cap is the unattended path's: a human's fourth move in ten minutes is theirs to make", async (t) => {
+  // A safety rail that locked a person out of their own session would not be
+  // one. `ms rotate`/`ms switch` are a person asking, and they are answered.
+  const w = await world(t, { screen: IDLE_SCREEN, recovery: false, wall: false });
+  seedChanges(3, 60);
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "work", continueAfter: false } }), 0);
+  assert.equal(session(w).account, "work");
+  assert.notEqual(session(w).state, "parked");
+});
+
+test("a candidate this wall already tried is never offered it again", async (t) => {
+  // One try per account per wall. gmail has the most room and would be picked
+  // first — but an earlier pass of this same episode already tried it and
+  // could not use it, and handing it the session again would spin between two
+  // accounts until the budget ran out.
+  const w = await world(t);
+  const st = openState();
+  try {
+    st.addAttempt({ recoveryId: st.pendingRecovery("s1")!.id, account: "gmail", outcome: "auth", note: "no launch token" });
+  } finally {
+    st.close();
+  }
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.equal(session(w).account, "work", "the account with the most room was spent; the next one takes it");
+  assert.deepEqual(
+    rows(w, "attempts").map((a) => [a.account, a.outcome]),
+    [["gmail", "auth"], ["dirk", "exhausted"]],
+    "and gmail was never tried a second time",
+  );
+});
+
 test("a held session lock refuses the recovery without typing anything", async (t) => {
   const w = await world(t);
   const { acquire } = await import("../src/lock.ts");
@@ -1286,7 +1381,8 @@ test("a failure against the account being left does not spend a candidate", asyn
 // twice rather than on `/exit`, its relaunch is `codex resume <id>` (or a
 // plain `codex`, for a conversation nobody has typed into yet), its home must
 // be made to trust the session's directory before the CLI can start
-// unattended, and its automatic path is gated until a live wall has been seen.
+// unattended, and its automatic path has a gate of its own — on by default
+// since 0.2.4, and turned off only by an explicit `MS_CODEX_AUTOROTATE=0`.
 //
 // The usage snapshot is STATED on disk, fresh, exactly as src/snapshot.ts
 // would have written it: what a rotation is answerable for here is choosing
@@ -1489,8 +1585,11 @@ async function codexWorld(t: TestContext, opts: CodexWorldOptions = {}): Promise
   process.env.MS_READY_MS = "10000";
   process.env.MS_SETTLE_MS = "200";
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
-  if (opts.autorotate === false) delete process.env.MS_CODEX_AUTOROTATE;
-  else process.env.MS_CODEX_AUTOROTATE = "1";
+  // 0.2.4: automatic Codex recovery is ON by default, so the ordinary fixture
+  // exports NOTHING — every codex test below runs on the shipped default.
+  // `autorotate: false` is somebody turning it off, which is an explicit "0".
+  if (opts.autorotate === false) process.env.MS_CODEX_AUTOROTATE = "0";
+  else delete process.env.MS_CODEX_AUTOROTATE;
 
   // The claude accounts are fully launchable on purpose: if the candidate pool
   // ever stopped filtering by provider, one would be CHOSEN (they have the
@@ -1567,6 +1666,9 @@ test("the codex happy path: work hands off to home and the resumed conversation 
   const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
   t.after(stop);
 
+  // Nothing is exported and nothing is stored: this is the shipped default
+  // since 0.2.4, and it rotates.
+  assert.equal(process.env.MS_CODEX_AUTOROTATE, undefined, "no flag asked for this");
   assert.equal(await recoverSession("s1"), 0);
 
   const s = session(w);
@@ -1606,14 +1708,13 @@ test("the codex happy path: work hands off to home and the resumed conversation 
   assert.match(recoverLog(w), /s1: work → home \(weekly wall, generation 3\)/);
 });
 
-test("without MS_CODEX_AUTOROTATE nothing automatic moves a codex session — and a manual rotate still does", async (t) => {
-  // Spike G1 is PARTIAL: no exhausted ChatGPT account existed, so what a
-  // walled Codex pane reports is unverified. Until it is, the tool will not
-  // move a Codex session on a signal nobody has seen.
+test("MS_CODEX_AUTOROTATE=0 stops the automatic path — and a manual rotate still moves the session", async (t) => {
+  // The gate is off only because somebody turned it off. The wall stays on the
+  // record for `ms status` and for the human's own verb.
   const w = await codexWorld(t, { autorotate: false });
 
   assert.equal(await recoverSession("s1"), 1);
-  assert.match(recoverLog(w), /codex automatic recovery is disabled until a live wall is observed \(set MS_CODEX_AUTOROTATE=1\)/);
+  assert.match(recoverLog(w), /codex automatic recovery is turned off here/);
   assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "nothing is typed");
   assert.ok(!respawnLine(w), "and nothing is respawned");
   const rec = rows(w, "recoveries")[0];
@@ -1623,11 +1724,10 @@ test("without MS_CODEX_AUTOROTATE nothing automatic moves a codex session — an
   assert.equal(session(w).account, "work");
   assert.equal(session(w).state, "walled");
 
-  // Exactly "1" is on. A variable somebody exported as "0" to turn this OFF
-  // must never read as having turned it on.
-  process.env.MS_CODEX_AUTOROTATE = "0";
+  // Anything that is not "1" is somebody saying no, the same way.
+  process.env.MS_CODEX_AUTOROTATE = "false";
   assert.equal(await recoverSession("s1"), 1);
-  assert.ok(!respawnLine(w), "'0' is somebody saying no");
+  assert.ok(!respawnLine(w), "'false' is somebody saying no");
   delete process.env.MS_CODEX_AUTOROTATE;
 
   // The gate is on the AUTOMATIC claim only. `ms rotate` is a person asking.
@@ -1639,14 +1739,15 @@ test("without MS_CODEX_AUTOROTATE nothing automatic moves a codex session — an
   assert.deepEqual(sendKeys(w), [`send-keys -t ${PANE} C-c`, `send-keys -t ${PANE} C-c`]);
 });
 
-test("the codex gate is a STORED setting: kv acts with nothing in the environment, and kv wins over it", async (t) => {
+test("the codex gate is a STORED setting: the row the hook writes beats the environment", async (t) => {
   // A-I2. `ms _recover` is dispatched by `tmux run-shell`, which runs it with
   // the tmux SERVER's global environment — not the shell that exported the
   // flag. Reading `process.env` here read the wrong environment, so a wall
   // inside an existing tmux was recorded and nothing opened. The gate the
-  // worker reads is the row the hook writes.
+  // worker reads is the row the hook writes — here it says on while the
+  // environment this process happens to carry says off.
   const w = await codexWorld(t, { autorotate: false });
-  assert.equal(process.env.MS_CODEX_AUTOROTATE, undefined, "nothing in this process's environment");
+  assert.equal(process.env.MS_CODEX_AUTOROTATE, "0", "the environment says no");
   setGate("1");
 
   const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
@@ -1665,7 +1766,7 @@ test("a stored 'off' wins over an exported MS_CODEX_AUTOROTATE=1", async (t) => 
   t.after(() => { delete process.env.MS_CODEX_AUTOROTATE; });
 
   assert.equal(await recoverSession("s1"), 1);
-  assert.match(recoverLog(w), /codex automatic recovery is disabled until a live wall is observed/);
+  assert.match(recoverLog(w), /codex automatic recovery is turned off here/);
   assert.ok(!respawnLine(w), "nothing is respawned");
   assert.equal(rows(w, "recoveries")[0].status, "pending", "and the wall is left for the human's own verb");
 });

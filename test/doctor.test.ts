@@ -619,7 +619,7 @@ test("runDoctor: a clean, empty registry is one ✓ 'accounts.json' line", async
   assert.equal(line!.ok, true);
 });
 
-test("runDoctor: the codex auto-recovery gate line reflects the stored kv value, off by default and on/off from kv", async () => {
+test("runDoctor: the codex auto-recovery gate line reflects the stored kv value, on by default and on/off from kv", async () => {
   // Rereview A, Minor 2: only codexAutorotateLine itself (a pure function,
   // test/autorotate.test.ts) was asserted — deleting the doctor.ts:718
   // results.push that prints it left this file 60/60 green. This exercises
@@ -644,12 +644,14 @@ test("runDoctor: the codex auto-recovery gate line reflects the stored kv value,
     const { codexAutorotateLine } = await import("../src/autorotate.ts");
     const { runDoctor } = await import("../src/doctor.ts");
 
-    // kv absent: off is the shipped default — and it must still be a ✓, not
-    // a ✗, because off is not a fault.
+    // kv absent: ON is the shipped default since 0.2.4, and the line says so
+    // along with the export that would turn it off.
+    delete process.env.MS_CODEX_AUTOROTATE;
     const absent = await runDoctor(false);
-    const absentLine = absent.results.find((r) => r.what === codexAutorotateLine(false));
+    const absentLine = absent.results.find((r) => r.what === codexAutorotateLine(true));
     assert.ok(absentLine, absent.lines.join("\n"));
     assert.equal(absentLine!.ok, true);
+    assert.match(absentLine!.what, /export MS_CODEX_AUTOROTATE=0 to disable/);
 
     const stOn = openState();
     stOn.setKv("codexAutorotate", "1");
@@ -665,6 +667,7 @@ test("runDoctor: the codex auto-recovery gate line reflects the stored kv value,
     const off = await runDoctor(false);
     const offLine = off.results.find((r) => r.what === codexAutorotateLine(false));
     assert.ok(offLine, off.lines.join("\n"));
+    // Off is somebody's deliberate choice, not a fault: still a ✓.
     assert.equal(offLine!.ok, true);
   } finally {
     globalThis.fetch = savedFetch;

@@ -30,16 +30,19 @@
 // has a turn in flight. A per-turn timer would have meant N timers for N
 // parallel panes, all of them reading the same rows.
 //
-// Automatic rotation stays OFF until a live Codex wall has been observed
-// (spike verdict G1: PARTIAL). Without the gate the watch records the
-// `rate_limited` event — which is what `ms status` reads — and stops there.
-// The gate is the single line that turns evidence into action, and it is a row
-// in the store rather than `process.env` because `_codex_watch` and `_recover`
-// are dispatched by `tmux run-shell`, which hands them the tmux server's
-// global environment and not the shell that exported `MS_CODEX_AUTOROTATE`
-// (src/autorotate.ts). THIS hook is one of the few `ms` processes that does
-// see the human's own environment — the CLI inherits the pane's — so it
-// mirrors an exported value into the store on its way past.
+// Automatic rotation is ON by default since 0.2.4: the record above was
+// verified against 85 real walled rollouts, and the whole chain from this
+// watchdog to the resumed conversation answering was observed live against a
+// mock-walled account. With the gate turned OFF (`MS_CODEX_AUTOROTATE=0`) the
+// watch still records the `rate_limited` event — which is what `ms status`
+// reads — and stops there. The gate is the single line that turns evidence
+// into action, and it is a row in the store rather than `process.env` because
+// `_codex_watch` and `_recover` are dispatched by `tmux run-shell`, which
+// hands them the tmux server's global environment and not the shell that
+// exported `MS_CODEX_AUTOROTATE` (src/autorotate.ts). THIS hook is one of the
+// few `ms` processes that does see the human's own environment — the CLI
+// inherits the pane's — so it mirrors an exported value into the store on its
+// way past.
 //
 // Neither verb ever prints. `_hook` is read by the Codex TUI, which renders a
 // hook's output; `_codex_watch` is dispatched by tmux, where stderr becomes a
@@ -133,7 +136,7 @@ export async function codexHook(): Promise<number> {
 
     // The gate, carried from the human's shell into the store the dispatched
     // processes can actually read. Only when the variable is set here — the
-    // ordinary case is unset, and that must cost no store at all.
+    // ordinary case is unset (and on), and that must cost no store at all.
     await mirrorAutorotate();
 
     if (process.stdin.isTTY) return 0;
@@ -584,15 +587,24 @@ function note(text: string): void {
   if (process.env.MS_VERBOSE === "1") process.stderr.write(`ms _codex_watch: ${text}\n`);
 }
 
-/** One rollout line, if it is a `task_complete` for some turn. Anything else —
+/** The two spellings of "the turn ended". `task_complete` is what Codex
+ * 0.153.4 writes and what 85 walled rollouts on this machine carry;
+ * `turn_complete` is the v2 alias the protocol names for the same event
+ * (`codex-rs/protocol/src/protocol.rs`). A tailer that knew only the older
+ * spelling would read a v2 rollout as a turn that never ends: the wall would
+ * go unrecorded and the watchdog would re-arm over it for ever. Both are read
+ * identically, because they ARE the same record. */
+const TURN_END_TYPES: ReadonlySet<string> = new Set(["task_complete", "turn_complete"]);
+
+/** One rollout line, if it is a turn's ending for some turn. Anything else —
  * another event type, a line that is not JSON, a record with no turn id — is
  * not this tool's business and returns null. The field names are snake_case,
  * as the rollout writes them. */
-function parseTaskComplete(line: string): { turnId: string; usageLimited: boolean; errorInfo: string | null } | null {
+export function parseTaskComplete(line: string): { turnId: string; usageLimited: boolean; errorInfo: string | null } | null {
   let rec: { payload?: { type?: unknown; turn_id?: unknown; error?: { codex_error_info?: unknown } | null } };
   try { rec = JSON.parse(line) as typeof rec; } catch { return null; }
   const payload = rec?.payload;
-  if (!payload || payload.type !== "task_complete") return null;
+  if (!payload || typeof payload.type !== "string" || !TURN_END_TYPES.has(payload.type)) return null;
   const turnId = typeof payload.turn_id === "string" ? payload.turn_id : null;
   if (!turnId) return null;
   const info = payload.error && typeof payload.error.codex_error_info === "string" ? payload.error.codex_error_info : null;
@@ -600,9 +612,9 @@ function parseTaskComplete(line: string): { turnId: string; usageLimited: boolea
 }
 
 /**
- * The wall: record it, and — only behind the flag — open the recovery and ask
- * tmux to dispatch the worker, in that order and for the same reasons as the
- * Claude hook's `rateLimited`.
+ * The wall: record it, and — unless the gate has been turned off — open the
+ * recovery and ask tmux to dispatch the worker, in that order and for the same
+ * reasons as the Claude hook's `rateLimited`.
  *
  * The kind is `session`. The rollout record says the turn hit a usage limit
  * and not WHICH window, and inventing `weekly` from nothing would be a claim
@@ -617,11 +629,11 @@ async function recordWall(st: State, s: SessionRow, turnId: string): Promise<boo
     recorded = true;
   } catch { /* with the flag on, the recovery below is the load-bearing record */ }
 
-  // Spike verdict G1 is PARTIAL: no live Codex wall has ever been observed, so
-  // the automatic path ships disabled. The event above is what `ms status`
-  // reads, and the manual verbs still move the session. With the flag off it
-  // is ALSO the only record, so an append that failed is a wall not yet read —
-  // the caller leaves the offset where it is and the next pass tries again.
+  // The gate, off only when somebody exported `MS_CODEX_AUTOROTATE=0`. The
+  // event above is what `ms status` reads, and the manual verbs still move the
+  // session. With the gate off it is ALSO the only record, so an append that
+  // failed is a wall not yet read — the caller leaves the offset where it is
+  // and the next pass tries again.
   if (!codexAutorotateEnabled(st)) return recorded;
   // Re-read: the row was listed before this file was read.
   const now = st.getSession(s.id);

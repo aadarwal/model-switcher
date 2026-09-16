@@ -16,9 +16,10 @@ const NOW = () => Math.floor(Date.now() / 1000);
 
 /** A rollout line, in the shape and spelling Codex 0.153.4 persists (snake_case,
  * `event_msg` wrapper, `task_complete` payload). A successful turn writes the
- * same record with `error` absent. */
-function taskComplete(turnId: string, error: string | null): string {
-  const payload: Record<string, unknown> = { type: "task_complete", turn_id: turnId, last_agent_message: error ? null : "done" };
+ * same record with `error` absent. `type` is the payload spelling: the v2
+ * protocol calls the same event `turn_complete`, and the tailer reads both. */
+function taskComplete(turnId: string, error: string | null, type = "task_complete"): string {
+  const payload: Record<string, unknown> = { type, turn_id: turnId, last_agent_message: error ? null : "done" };
   if (error) payload.error = { message: "You've hit your usage limit.", codex_error_info: error };
   return JSON.stringify({ timestamp: new Date().toISOString(), type: "event_msg", payload });
 }
@@ -50,7 +51,11 @@ async function world(opts: { rows?: Record<string, unknown>[]; events?: Record<s
   process.env.MS_HOME = msHome;
   process.env.MS_BIN = MS_BIN;
   process.env.PATH = `${dir}:${process.env.PATH}`;
-  if (opts.autorotate) process.env.MS_CODEX_AUTOROTATE = "1";
+  // 0.2.4: automatic Codex recovery is ON by default, so the ordinary fixture
+  // exports NOTHING and every test below runs on the shipped default.
+  // `autorotate: false` is somebody turning it off, which is now an explicit
+  // "0" rather than the absence of a variable.
+  if (opts.autorotate === false) process.env.MS_CODEX_AUTOROTATE = "0";
   else delete process.env.MS_CODEX_AUTOROTATE;
 
   const rollout = (id: string) => path.join(home, `rollout-${id}.jsonl`);
@@ -115,10 +120,11 @@ test("a usage-limit task_complete for the current turn is recorded as rate_limit
   assert.deepEqual([ev.kind, ev.kindDetail, ev.turnId, ev.generation], ["rate_limited", "session", "t-1", 2]);
 });
 
-test("without MS_CODEX_AUTOROTATE the wall is recorded and nothing is rotated", async () => {
-  // Spike verdict G1 is PARTIAL — no live Codex wall has ever been seen — so
-  // the automatic path ships disabled.
-  const w = await world({ rollouts: { s1: [taskComplete("t-1", "usage_limit_exceeded")] } });
+test("with MS_CODEX_AUTOROTATE=0 the wall is still recorded, and nothing is rotated", async () => {
+  // Turning the gate off does not blind the tool: `ms status` reads the event,
+  // and the human's own `ms rotate` moves the session. What is off is the
+  // claim nobody is in front of.
+  const w = await world({ rollouts: { s1: [taskComplete("t-1", "usage_limit_exceeded")] }, autorotate: false });
   assert.equal(await watch(), 0);
   assert.equal(events(w.msHome).pop()!.kind, "rate_limited");
   const st = w.openState();
@@ -126,8 +132,12 @@ test("without MS_CODEX_AUTOROTATE the wall is recorded and nothing is rotated", 
   assert.doesNotMatch(tmuxLog(w.tlog), /_recover/);
 });
 
-test("with MS_CODEX_AUTOROTATE=1 the same record opens a recovery and dispatches the worker", async () => {
-  const w = await world({ rollouts: { s1: [taskComplete("t-1", "usage_limit_exceeded")] }, autorotate: true });
+test("the shipped default rotates: the same record opens a recovery and dispatches the worker", async () => {
+  // Nothing is exported here. 0.2.4 turns the automatic path on by default —
+  // the wall's on-disk record was verified against 85 real walled rollouts and
+  // the whole handoff was watched end to end.
+  const w = await world({ rollouts: { s1: [taskComplete("t-1", "usage_limit_exceeded")] } });
+  assert.equal(process.env.MS_CODEX_AUTOROTATE, undefined, "nothing in the environment says to do this");
   assert.equal(await watch(), 0);
   assert.equal(events(w.msHome).pop()!.kind, "rate_limited");
   const st = w.openState() as unknown as { pendingRecovery: (s: string) => Record<string, unknown>; close: () => void };
@@ -136,6 +146,52 @@ test("with MS_CODEX_AUTOROTATE=1 the same record opens a recovery and dispatches
     assert.deepEqual([rec.kind, rec.turnId, rec.generation], ["session", "t-1", 2]);
   } finally { st.close(); }
   assert.match(tmuxLog(w.tlog), /-S \/private\/tmp\/tmux-501\/default run-shell -b '.*ms' '_recover' 's1'/);
+});
+
+test("a turn ends under either spelling: task_complete and turn_complete are one record", async () => {
+  // The v2 protocol renames the event (`codex-rs/protocol/src/protocol.rs`);
+  // it is the same ending. A tailer that knew only the older spelling would
+  // read a v2 rollout as a turn that never ends — the wall would go
+  // unrecorded and the watchdog would re-arm over it for ever.
+  for (const type of ["task_complete", "turn_complete"]) {
+    const ok = await world({ rollouts: { s1: [noise(1), taskComplete("t-1", null, type)] } });
+    assert.equal(await watch(), 0);
+    const done = events(ok.msHome).pop()!;
+    assert.deepEqual([done.kind, done.turnId], ["stop", "t-1"], `${type}: a clean turn ends`);
+    assert.equal(rearms(ok.tlog), 0, `${type}: nothing is in flight any more`);
+
+    const walled = await world({ rollouts: { s1: [noise(1), taskComplete("t-1", "usage_limit_exceeded", type)] } });
+    assert.equal(await watch(), 0);
+    const ev = events(walled.msHome).pop()!;
+    assert.deepEqual([ev.kind, ev.kindDetail, ev.turnId], ["rate_limited", "session", "t-1"], `${type}: a walled turn is a wall`);
+    assert.match(tmuxLog(walled.tlog), /_recover' 's1'/, `${type}: and the worker is dispatched`);
+  }
+});
+
+test("a wall is acted on ONCE: the same turn's record never opens a second recovery", async () => {
+  // The cap the consult asked for first, and it is turn-bound rather than
+  // time-bound: `rate_limited` ends the turn as surely as `stop` does, so the
+  // next pass finds nothing in flight for this session and never reads the
+  // record again. `codex resume` re-renders a whole conversation, so the same
+  // bytes DO come round again — acting on them twice would rotate a session
+  // for a wall it already left.
+  const w = await world({ rollouts: { s1: [taskComplete("t-1", "usage_limit_exceeded")] } });
+  assert.equal(await watch(), 0);
+  const dispatches = () => (tmuxLog(w.tlog).match(/_recover' 's1'/g) ?? []).length;
+  const walls = () => events(w.msHome).filter((e) => e.kind === "rate_limited").length;
+  assert.equal(walls(), 1);
+  assert.equal(dispatches(), 1);
+
+  // The record comes round again — a resumed conversation re-rendering its own
+  // history — and the second pass acts on none of it.
+  appendFileSync(w.rollout("s1"), taskComplete("t-1", "usage_limit_exceeded") + "\n");
+  const st = w.openState();
+  try { st.delKv("codexWatchArmedUntil"); } finally { st.close(); }
+  assert.equal(await watch(), 0);
+  assert.equal(walls(), 1, "the wall is recorded once");
+  assert.equal(dispatches(), 1, "and one worker is dispatched for it");
+  const open = w.openState() as unknown as { pendingRecovery: (s: string) => Record<string, unknown> | null; close: () => void };
+  try { assert.equal(open.pendingRecovery("s1")!.turnId, "t-1", "the one open recovery is still the first"); } finally { open.close(); }
 });
 
 test("a usage-limit record for an OLD turn is history, not a wall", async () => {
@@ -408,7 +464,11 @@ test("an append that fails leaves the offset where it was: the record is read ag
   // throws — a full disk, a mode nothing can write — then meant the next pass
   // started AFTER the record, the turn was never settled, and the watchdog
   // re-armed for ever over a session that had walled.
-  const w = await world({ rollouts: { s1: [noise(1), taskComplete("t-1", "usage_limit_exceeded")] } });
+  // With the gate OFF the event is the only record a wall leaves, so an append
+  // that failed is a wall not yet read. (With it on, the recovery row is the
+  // load-bearing record and the bytes are consumed — which is why this half
+  // names the gate rather than leaving it to the default.)
+  const w = await world({ rollouts: { s1: [noise(1), taskComplete("t-1", "usage_limit_exceeded")] }, autorotate: false });
   const log = path.join(w.msHome, "sessions", "s1", "events.jsonl");
   chmodSync(log, 0o400); // appendEvent will throw
   try {

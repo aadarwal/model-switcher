@@ -794,10 +794,10 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
   results.push(checkHooks(fix, hasClaudeAccounts));
   results.push(checkCodexBinary(codexAccounts.length > 0));
   // The Codex auto-recovery gate, stated rather than left to be guessed at:
-  // it ships off, it is a stored setting (src/autorotate.ts) because the
-  // processes that read it are dispatched by tmux, and the line names the
-  // shell the variable that sets it belongs in. Never a ✗ — off is the
-  // shipped default, not a fault.
+  // it ships ON since 0.2.4, it is a stored setting (src/autorotate.ts)
+  // because the processes that read it are dispatched by tmux, and each half
+  // of the line names the export that would flip it, in the shell that runs
+  // `codex`. Never a ✗ — off is somebody's deliberate choice, not a fault.
   if (codexAccounts.length > 0) {
     const st = openState();
     try { results.push({ ok: true, what: codexAutorotateLine(codexAutorotateEnabled(st)) }); } finally { st.close(); }

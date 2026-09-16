@@ -72,17 +72,16 @@ export const CONTINUATION =
   "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions. If the last user message was already answered, or needs nothing more, say so in one line and wait for the user; do not start new work.";
 
 /**
- * Codex automatic rotation ships OFF, and this is the refusal (spike G1:
- * PARTIAL). Every other Codex behaviour a rotation depends on was verified
- * live; the WALL was not, because no exhausted ChatGPT account existed to
- * produce one. Until a real one shows what a walled Codex pane reports, the
- * tool will not move a Codex session on its own say-so: a rotation opened on
- * a signal nobody has seen is a rotation that can fire on a pane that is
- * merely working.
+ * Codex automatic rotation is ON by default since 0.2.4, and this is the
+ * refusal for a machine where somebody has turned it off. It shipped off while
+ * the wall was unobserved (spike G1: PARTIAL); that gap closed on 2026-09-16,
+ * when the wall's on-disk record was checked against 85 real walled rollouts
+ * and the whole chain — watchdog, handoff, `codex resume` with the
+ * continuation, the real account answering — was observed live.
  *
  * The human's own verbs are never gated by this — `ms rotate`, `ms switch`
- * and `ms stop` move a Codex session today. What is gated is the automatic
- * claim, which is the one path with no person in front of it.
+ * and `ms stop` move a Codex session whatever the gate says. What is gated is
+ * the automatic claim, which is the one path with no person in front of it.
  *
  * The gate itself is `codexAutorotateEnabled` (src/autorotate.ts): a row in
  * the store with the environment variable in front of it. It has to be. This
@@ -92,7 +91,7 @@ export const CONTINUATION =
  * environment, and the symptom was silence.
  */
 const CODEX_AUTOROTATE_MESSAGE =
-  "codex automatic recovery is disabled until a live wall is observed (set MS_CODEX_AUTOROTATE=1)";
+  "codex automatic recovery is turned off here (unset MS_CODEX_AUTOROTATE, or export MS_CODEX_AUTOROTATE=1, in the shell that runs codex)";
 
 /** One recovery at a time per session; a second worker is a duplicate. */
 const SESSION_LOCK_WAIT_MS = 5_000;
@@ -127,6 +126,29 @@ const MIN_DISPATCH_SECONDS = 30;
 const SNAPSHOT_MAX_AGE_MS = 20_000;
 /** Spec §9: three failures and the session is parked for a human. */
 const MAX_FAILED_ATTEMPTS = 3;
+/**
+ * The rate cap on UNATTENDED moving: at most this many account changes for one
+ * session inside `CHANGE_WINDOW_SECONDS`, counted across recoveries rather
+ * than within one.
+ *
+ * `MAX_FAILED_ATTEMPTS` bounds one episode; nothing bounded the episodes. A
+ * fleet-wide misreading — a wall signal that fires on something that is not a
+ * wall, an account whose usage reads 100 the moment it is handed work — walks
+ * a live conversation through every account there is, one respawn at a time,
+ * each of them a successful handoff that spends no budget at all. Three in ten
+ * minutes is already far more rotation than a working session has any reason
+ * to need, so the fourth is not a rotation, it is a loop: the session parks and
+ * a human decides.
+ *
+ * Counted from the `launches` table, which is the record of what actually
+ * happened — every respawn a recovery made writes one, and only the launch a
+ * session was BORN on is generation 1. The human's own `ms rotate`/`switch` is
+ * never refused by this (see `transaction`), but their moves DO count, because
+ * the thing being capped is how often this conversation is torn down and
+ * brought back, not who asked.
+ */
+export const MAX_ACCOUNT_CHANGES = 3;
+export const CHANGE_WINDOW_SECONDS = 600;
 
 /** Every poll in this module. Tests set it low so the loops run in
  * milliseconds; nothing else in the transaction depends on the value. */
@@ -1009,6 +1031,21 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
     // "three failed transactions" arrive after one and a half.
     const failedSoFar = st.attempts(rec.id).filter((a) => FAILURE_OUTCOMES.has(a.outcome)).length;
     if (failedSoFar >= MAX_FAILED_ATTEMPTS) return park(st, id, rec.id, g, `gave up after ${MAX_FAILED_ATTEMPTS} attempts`);
+
+    // The rate cap, in the same place and for the same reason: before anything
+    // is disturbed. The budget above bounds ONE episode's failures; this bounds
+    // how often this session is moved at all, across episodes, so a signal that
+    // keeps being wrong cannot walk a live conversation through the whole fleet
+    // one successful handoff at a time. Only the automatic path is refused — a
+    // human asking for a fourth move in ten minutes is a human who means it,
+    // and parking them out of their own session is not a safety rail.
+    if (!opts.manual) {
+      const changes = st.accountChangesSince(id, nowSeconds() - CHANGE_WINDOW_SECONDS);
+      if (changes >= MAX_ACCOUNT_CHANGES) {
+        const minutes = Math.round(CHANGE_WINDOW_SECONDS / 60);
+        return park(st, id, rec.id, g, `${changes} account changes in the last ${minutes} minutes; the cap is ${MAX_ACCOUNT_CHANGES} per ${minutes} minutes — ${id} is parked`);
+      }
+    }
 
     // Without a CLI session id there is nothing to resume, and a respawn would
     // start a new conversation — the exact failure §9 calls resume-broken. Park

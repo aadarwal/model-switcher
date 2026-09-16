@@ -29,6 +29,7 @@ import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { stubDir, tempHome } from "./helpers.ts";
 import { ran } from "../src/setup/steps.ts";
+import { shellQuote } from "../src/fsx.ts";
 
 /** The fixture launch token. Asserted ABSENT from every byte the wizard and
  *  its children write; distinctive so the assertion cannot pass by accident. */
@@ -470,7 +471,7 @@ test("the opt-ins install when they are accepted", () => {
   assert.equal(r.code, 0, r.all);
   assert.deepEqual(s.setupState().optIns, { statusline: true, alias: true });
   assert.equal(s.settings().statusLine.command, `'${s.msBin}' _statusline`);
-  assert.match(readFileSync(s.rcFile, "utf8"), new RegExp(`alias claude='${s.msBin} claude'`));
+  assert.ok(readFileSync(s.rcFile, "utf8").includes(`alias claude=${shellQuote(`${shellQuote(s.msBin)} claude`)}`));
 });
 
 test("a prerequisite the machine does not have stops the run before anything is installed", () => {

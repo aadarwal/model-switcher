@@ -203,6 +203,46 @@ test("an ms entry under an event this tool no longer subscribes to is pruned", (
   );
   installClaudeHooks(file, NEW);
   const after = JSON.parse(readFileSync(file, "utf8"));
-  assert.deepEqual(after.hooks.PreToolUse, [], "ours, and nothing else, is removed from an event we do not use");
+  assert.equal("PreToolUse" in after.hooks, false, "an event left with nothing but our own entry is dropped, not left as an empty array");
   assert.equal(claudeHooksInstalled(file, NEW), true);
+});
+
+test("D2: pruning an unsubscribed event's last ms entry removes the key, not just the array's contents", () => {
+  const { home } = tempHome();
+  const file = path.join(home, "settings.json");
+  writeFileSync(
+    file,
+    JSON.stringify(
+      {
+        hooks: {
+          // An event we still subscribe to, so pass 2 repopulates it.
+          SessionStart: [{ matcher: "", hooks: [{ type: "command", command: cmdFor(OLD) }] }],
+          // An event we no longer subscribe to, holding only an ms entry —
+          // pass 2 never revisits this one, so pass 1 must not leave it as
+          // a dangling `"PreToolUse": []`.
+          PreToolUse: [{ matcher: "", hooks: [{ type: "command", command: cmdFor(OLD) }] }],
+          // An event we no longer subscribe to, but with a non-ms hook
+          // alongside ours: the event stays, just without our entry.
+          Notification: [
+            { matcher: "", hooks: [{ type: "command", command: cmdFor(OLD) }] },
+            { matcher: "", hooks: [{ type: "command", command: "say hi" }] },
+          ],
+        },
+      },
+      null,
+      2,
+    ),
+  );
+  const r = installClaudeHooks(file, NEW);
+  assert.equal(r.changed, true);
+  const after = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(msEntries(after, "SessionStart"), [cmdFor(NEW)]);
+  assert.equal("PreToolUse" in after.hooks, false, "the only-ours, no-longer-subscribed event is removed entirely");
+  assert.deepEqual(after.hooks.Notification, [{ matcher: "", hooks: [{ type: "command", command: "say hi" }] }], "a shared event keeps the other tool's entry");
+  assert.equal(claudeHooksInstalled(file, NEW), true);
+
+  // Re-running against the now-clean file is a true no-op.
+  const second = installClaudeHooks(file, NEW);
+  assert.equal(second.changed, false);
+  assert.equal(second.backup, null);
 });

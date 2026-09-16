@@ -6,13 +6,20 @@ import path from "node:path";
 import { tempHome, stubDir, run } from "./helpers.ts";
 import { installStatusline, removeStatusline } from "../src/setup/statusline.ts";
 import { installAlias, removeAlias, rcPathFor } from "../src/setup/alias.ts";
+import { shellQuote } from "../src/fsx.ts";
 
 const MS = "/opt/homebrew/bin/ms";
 
+/** The exact TEXT of one alias line `installAlias` writes: `msBin` quoted as
+ *  its own shell word inside the value, then the whole `<bin> <name>`
+ *  command quoted again for the rc file — a shell re-parses an alias's body
+ *  every time it is USED, after the outer layer has already been stripped
+ *  by the rc file's own parse. */
+const aliasLine = (name: "claude" | "codex", bin: string) => `alias ${name}=${shellQuote(`${shellQuote(bin)} ${name}`)}`;
+
 /** The exact block `installAlias` writes, as a plain string, so a test can
  *  place it anywhere in a fixture file rather than only where install put it. */
-const installBlock = (bin: string) =>
-  ["# ms-alias-begin", `alias claude='${bin} claude'`, `alias codex='${bin} codex'`, "# ms-alias-end"].join("\n");
+const installBlock = (bin: string) => ["# ms-alias-begin", aliasLine("claude", bin), aliasLine("codex", bin), "# ms-alias-end"].join("\n");
 
 /**
  * A brand-new executable's first-ever exec on this machine can take several
@@ -369,8 +376,8 @@ test("installAlias creates a missing rc file at 0644 with the alias block, no ba
   assert.equal(statSync(rc).mode & 0o777, 0o644);
   const text = readFileSync(rc, "utf8");
   assert.ok(text.includes("# ms-alias-begin"));
-  assert.ok(text.includes(`alias claude='${MS} claude'`));
-  assert.ok(text.includes(`alias codex='${MS} codex'`));
+  assert.ok(text.includes(aliasLine("claude", MS)));
+  assert.ok(text.includes(aliasLine("codex", MS)));
   assert.ok(text.includes("# ms-alias-end"));
 });
 
@@ -389,7 +396,7 @@ test("installAlias appends to existing rc content, backs it up, and is idempoten
   const afterFirst = readFileSync(rc, "utf8");
   assert.ok(afterFirst.includes('export PATH="$HOME/bin:$PATH"'));
   assert.ok(afterFirst.includes('alias ll="ls -la"'));
-  assert.ok(afterFirst.includes(`alias claude='${MS} claude'`));
+  assert.ok(afterFirst.includes(aliasLine("claude", MS)));
 
   const backupsAfterFirst = readdirSync(home).filter((f) => f.startsWith(".zshrc.bak-ms-")).length;
   const second = installAlias(rc, MS);
@@ -420,7 +427,7 @@ test("installAlias/removeAlias round-trip a file with NO trailing newline byte-i
 
   installAlias(rc, MS);
   const installed = readFileSync(rc, "utf8");
-  assert.ok(installed.includes(`alias claude='${MS} claude'`));
+  assert.ok(installed.includes(aliasLine("claude", MS)));
 
   const r = removeAlias(rc);
   assert.equal(r.changed, true);
@@ -441,7 +448,7 @@ test("removeAlias refuses a hand-edited block rather than deleting it", () => {
   const installed = readFileSync(rc, "utf8");
 
   // A human added a third line inside the markers.
-  const handEdited = installed.replace(`alias codex='${MS} codex'`, `alias codex='${MS} codex'\nalias foo='bar'`);
+  const handEdited = installed.replace("# ms-alias-end", "alias foo='bar'\n# ms-alias-end");
   writeFileSync(rc, handEdited);
   const r = removeAlias(rc);
   assert.equal(r.changed, false);
@@ -450,13 +457,13 @@ test("removeAlias refuses a hand-edited block rather than deleting it", () => {
   assert.equal(readFileSync(rc, "utf8"), handEdited, "untouched");
 
   // A human renamed one of the two aliases.
-  writeFileSync(rc, installed.replace(`alias codex='${MS} codex'`, `alias c='${MS} codex'`));
+  writeFileSync(rc, installed.replace(aliasLine("codex", MS), aliasLine("codex", MS).replace(/^alias codex=/, "alias c=")));
   const r2 = removeAlias(rc);
   assert.equal(r2.changed, false);
   assert.match(r2.problem!, /hand-edited/);
 
   // The two alias lines point at DIFFERENT binaries — also not ours to trust.
-  writeFileSync(rc, installed.replace(`alias codex='${MS} codex'`, `alias codex='/usr/local/bin/ms codex'`));
+  writeFileSync(rc, installed.replace(aliasLine("codex", MS), aliasLine("codex", "/usr/local/bin/ms")));
   const r3 = removeAlias(rc);
   assert.equal(r3.changed, false);
   assert.match(r3.problem!, /hand-edited/);
@@ -575,7 +582,7 @@ test("re-installing for a different binary replaces the block rather than stacki
   const text = readFileSync(rc, "utf8");
   assert.equal(text.match(/# ms-alias-begin/g)?.length, 1, "one block, not two");
   assert.ok(!text.includes(MS), "the old binary's alias lines are gone");
-  assert.ok(text.includes(`alias claude='${other} claude'`));
+  assert.ok(text.includes(aliasLine("claude", other)));
 });
 
 test("an alias begin marker with no end is refused, never used to truncate the file", () => {

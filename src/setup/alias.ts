@@ -27,10 +27,21 @@ const END_RE = /^\s*# ms-alias-end\b/;
 /** The block this tool owns, markers included, for a given binary. Each
  * alias's VALUE is the whole command (`<bin> claude`), quoted as ONE shell
  * word — so a `'` inside the path is escaped rather than ending the quoted
- * run and turning the rest of the rc file into a syntax error. For a path
- * with neither quote nor oddity this is byte-for-byte what it always was. */
+ * run and turning the rest of the rc file into a syntax error. That outer
+ * quoting protects the RC FILE'S parse of the `alias` statement, but a
+ * shell re-parses an alias's own body every time the alias is USED — by
+ * then the outer quotes are long gone, so `msBin` must ALSO be quoted as
+ * its own shell word inside the value (`shellQuote(msBin)`) before the
+ * whole `<quoted-bin> claude` command is quoted again for the rc file. For
+ * a path with neither quote nor oddity this still round-trips to the same
+ * command, just wrapped twice. */
 function block(msBin: string): string {
-  return [BEGIN, `alias claude=${shellQuote(`${msBin} claude`)}`, `alias codex=${shellQuote(`${msBin} codex`)}`, END].join("\n");
+  return [
+    BEGIN,
+    `alias claude=${shellQuote(`${shellQuote(msBin)} claude`)}`,
+    `alias codex=${shellQuote(`${shellQuote(msBin)} codex`)}`,
+    END,
+  ].join("\n");
 }
 
 function escapeRegExp(s: string): string {
@@ -40,13 +51,24 @@ function escapeRegExp(s: string): string {
 /** The EXACT shape `block()` produces, for validating a block found on disk
  * before `removeAlias` ever deletes it — a hand edit (an extra line, a
  * renamed alias, a different binary in one line than the other) must refuse,
- * never be guessed at and silently dropped. Each alias's VALUE is `<bin>
- * claude`/`<bin> codex` (the whole command, not just the binary), so the
- * captures strip that fixed suffix to get at `<bin>` itself — that is what
- * the caller compares between the two lines, not the raw captured text
- * (which is never equal to itself between the two lines even when the block
- * is exactly what `installAlias` writes). */
-const EXPECTED_BLOCK_RE = new RegExp(`^${escapeRegExp(BEGIN)}\\nalias claude='(.*) claude'\\nalias codex='(.*) codex'\\n${escapeRegExp(END)}$`);
+ * never be guessed at and silently dropped. Each alias's VALUE is now a
+ * quote nested inside a quote (`shellQuote(shellQuote(bin) + " claude")`),
+ * so the outer `shellQuote` always turns the inner wrapper's own leading and
+ * trailing `'` into the same fixed 5-char open (`''\''`) and 4-char close
+ * (`'\''`) — whatever `bin` itself contains — with the escaped `<bin>` and
+ * literal ` claude`/` codex` suffix in between. The captures strip those
+ * fixed markers to get at the escaped `<bin>` itself — that is what the
+ * caller compares between the two lines, not the raw line text (which is
+ * never equal between the two lines even when the block is exactly what
+ * `installAlias` writes, since one ends in `claude` and the other `codex`). */
+const QUOTE_OPEN = "''\\''"; // outer shellQuote's escape of the inner wrapper's OPENING '
+const QUOTE_CLOSE = "'\\''"; // outer shellQuote's escape of the inner wrapper's CLOSING '
+const EXPECTED_BLOCK_RE = new RegExp(
+  `^${escapeRegExp(BEGIN)}` +
+    `\\nalias claude=${escapeRegExp(QUOTE_OPEN)}(.*)${escapeRegExp(QUOTE_CLOSE)} claude'` +
+    `\\nalias codex=${escapeRegExp(QUOTE_OPEN)}(.*)${escapeRegExp(QUOTE_CLOSE)} codex'` +
+    `\\n${escapeRegExp(END)}$`,
+);
 
 /**
  * Finds the marker block using LINE boundaries only (never trimmed), so

@@ -116,7 +116,12 @@ export function installClaudeHooks(settingsPath: string, msBin: string): { chang
   // Pass 1: strip every ms-owned command from EVERY event — including one we
   // no longer subscribe to — leaving each entry's other hooks (another
   // tool's, sharing the same entry) and every non-ms entry exactly as found.
-  // An entry left with no hooks at all was only ever ours, so it goes.
+  // An entry left with no hooks at all was only ever ours, so it goes. An
+  // event left with no entries at all — an event ONLY we ever subscribed to,
+  // and (for one we no longer subscribe to) pass 2 will never revisit — is
+  // deleted outright rather than left as a dangling `"Event": []`: litter no
+  // verb ever removes, and untrue besides (the human's settings file would
+  // read as still wiring an event nothing handles).
   for (const event of Object.keys(hooks)) {
     const list = hooks[event];
     if (!Array.isArray(list)) throw new Error(`${settingsPath}: hooks.${event} is not an array; fix it by hand, refusing to overwrite it`);
@@ -127,7 +132,8 @@ export function installClaudeHooks(settingsPath: string, msBin: string): { chang
       if (others.length === entry.hooks.length) kept.push(entry);
       else if (others.length > 0) kept.push({ ...entry, hooks: others });
     }
-    hooks[event] = kept;
+    if (kept.length === 0) delete hooks[event];
+    else hooks[event] = kept;
   }
 
   // Pass 2: add this binary's four, each in its own entry, with its matcher.

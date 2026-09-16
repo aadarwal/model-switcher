@@ -7,7 +7,20 @@
 // rc file is ever opened.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { tempHome } from "./helpers.ts";
 import { backupThroughLink, resolveTarget, shellQuote, writeAtomicThroughLink } from "../src/fsx.ts";
@@ -117,7 +130,7 @@ test("installAlias writes through a symlinked rc file", () => {
   assert.equal(lstatSync(link).isSymbolicLink(), true, ".zshrc must still be a symlink");
   const after = readFileSync(real, "utf8");
   assert.ok(after.startsWith("export A=1\n"), after);
-  assert.ok(after.includes(`alias claude='${MS} claude'`), after);
+  assert.ok(after.includes(`alias claude=${shellQuote(`${shellQuote(MS)} claude`)}`), after);
 });
 
 test("installCodexHooks writes through a symlinked config.toml", () => {
@@ -143,6 +156,59 @@ test("installCodexHooks writes through a symlinked config.toml", () => {
 
 // --- quoting ---------------------------------------------------------------
 
+/**
+ * Proves the alias survives actual shell USE, not just a string-shape
+ * check. `installAlias`'s outer `shellQuote` only protects the RC FILE'S
+ * own parse of the `alias …=…` line; a shell re-parses an alias's BODY
+ * every time the alias is used, after that outer layer has already been
+ * stripped away — so `msBin` must also be quoted as its own word *inside*
+ * the value. This writes the block for an `msBin` whose path has both a
+ * space and a `'` (the pair that breaks naive quoting), points it at a stub
+ * `ms` that records its own argv, has each shell load the written file as
+ * its OWN startup file (bash `--rcfile`, zsh `ZDOTDIR`/`.zshrc`) and then
+ * run `claude` as a separate, later command — mirroring how a human's
+ * terminal actually sources an rc file once and then types commands at it,
+ * and avoiding the unrelated bash/zsh quirk where an alias defined and used
+ * on the very same parsed `-c` line never takes effect at all, fixed
+ * quoting or not — and asserts the stub actually ran with `claude` as its
+ * first argument.
+ */
+function assertAliasSurvivesShellUse(t: import("node:test").TestContext, home: string): void {
+  const stubDir = path.join(home, "App Support", "it's");
+  mkdirSync(stubDir, { recursive: true });
+  const msBin = path.join(stubDir, "ms");
+  writeFileSync(msBin, '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$MS_TEST_RECORDER"\n');
+  chmodSync(msBin, 0o755);
+
+  function runAndCheck(shell: string, label: string, args: string[], env: Record<string, string>): void {
+    const probe = spawnSync(shell, ["-c", "exit 0"]);
+    if (probe.error) {
+      t.diagnostic(`${shell} not installed — skipping (${label})`);
+      return;
+    }
+    const recorder = path.join(home, `argv-${label}.out`);
+    if (existsSync(recorder)) rmSync(recorder);
+    const runResult = spawnSync(shell, args, {
+      env: { ...process.env, ...env, MS_TEST_RECORDER: recorder },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.ok(existsSync(recorder), `${label}: stub never ran — stdout=${runResult.stdout} stderr=${runResult.stderr}`);
+    assert.equal(readFileSync(recorder, "utf8").trim(), "claude", `${label}: stub's own argv`);
+  }
+
+  const bashRc = path.join(home, "bashrc-test");
+  const bashInstalled = installAlias(bashRc, msBin);
+  assert.equal(bashInstalled.changed, true, bashInstalled.problem ?? "installAlias (bash) did not write");
+  runAndCheck("bash", "bash", ["--rcfile", bashRc, "-i", "-c", "claude"], {});
+
+  const zdotDir = path.join(home, "zdotdir-test");
+  const zshRc = path.join(zdotDir, ".zshrc"); // zsh only sources a file with this exact name
+  const zshInstalled = installAlias(zshRc, msBin);
+  assert.equal(zshInstalled.changed, true, zshInstalled.problem ?? "installAlias (zsh) did not write");
+  runAndCheck("zsh", "zsh", ["-i", "-c", "claude"], { ZDOTDIR: zdotDir });
+}
+
 test("a binary path with a space is one shell word in every command this tool writes", () => {
   const spaced = "/Users/a b/model switcher/bin/ms";
   assert.equal(claudeHookCommand(spaced), `'${spaced}' _hook claude`);
@@ -151,14 +217,14 @@ test("a binary path with a space is one shell word in every command this tool wr
   const rc = path.join(home, ".zshrc");
   installAlias(rc, spaced);
   const text = readFileSync(rc, "utf8");
-  assert.ok(text.includes(`alias claude='${spaced} claude'`), text);
+  assert.ok(text.includes(`alias claude=${shellQuote(`${shellQuote(spaced)} claude`)}`), text);
 
   const settings = path.join(home, "settings.json");
   installStatusline(settings, spaced);
   assert.equal(JSON.parse(readFileSync(settings, "utf8")).statusLine.command, `'${spaced}' _statusline`);
 });
 
-test("a binary path containing a single quote is escaped, not left to break the line", () => {
+test("a binary path containing a single quote is escaped, not left to break the line", (t) => {
   const quoted = "/Users/it's/ms";
   assert.equal(claudeHookCommand(quoted), `'/Users/it'\\''s/ms' _hook claude`);
 
@@ -166,9 +232,11 @@ test("a binary path containing a single quote is escaped, not left to break the 
   const rc = path.join(home, ".zshrc");
   installAlias(rc, quoted);
   const text = readFileSync(rc, "utf8");
-  assert.ok(text.includes(`alias claude='/Users/it'\\''s/ms claude'`), text);
-  // Prove it is really one word to a shell, not just escaped-looking.
-  assert.ok(!existsSync("/nope"));
+  assert.ok(text.includes(`alias claude=${shellQuote(`${shellQuote(quoted)} claude`)}`), text);
+  // Prove it is really one word to a shell, not just escaped-looking — and
+  // not just at the rc file's own parse, but at the alias's own use, which
+  // re-parses the body a second time.
+  assertAliasSurvivesShellUse(t, home);
 
   const settings = path.join(home, "settings.json");
   installStatusline(settings, quoted);

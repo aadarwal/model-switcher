@@ -333,6 +333,34 @@ test("checkClaudeBinary / checkHooks: not needed when the registry names no Clau
   assert.match(hooksLine!.what, /not needed \(no claude accounts\)/);
 });
 
+test("D3: an unparsable registry is not 'not needed' — checkClaudeBinary and checkHooks actually run", async () => {
+  const { msHome } = base();
+  // Malformed JSON (a trailing comma), NOT an empty/missing file — the case
+  // `loadRegistry` reports as a `parseError`, which empties `accounts` the
+  // same way a genuinely account-less registry does. Before the fix, that
+  // emptiness alone made both checks below claim "not needed", two green
+  // lines this run has no basis for.
+  writeFileSync(path.join(msHome, "accounts.json"), '{"version":1,"accounts":[{"name":"a",}]}');
+  stubHealthyBinaries();
+
+  const { runDoctor } = await import("../src/doctor.ts");
+  const { results } = await runDoctor(false);
+
+  const registryLine = results.find((r) => r.what === "accounts.json");
+  assert.equal(registryLine?.ok, false, "the parse error itself is still reported — nothing goes silent");
+  assert.match(registryLine!.why ?? "", /JSON/);
+
+  const claudeLine = results.find((r) => r.what.startsWith("claude --version"));
+  assert.doesNotMatch(claudeLine!.what, /not needed/, "an unparsable registry is not the same thing as no claude accounts");
+  assert.equal(claudeLine?.ok, true);
+  assert.match(claudeLine!.what, /1\.2\.3/, "the stubbed binary was actually invoked");
+
+  const hooksLine = results.find((r) => r.what.startsWith("Claude hooks installed"));
+  assert.doesNotMatch(hooksLine!.what, /not needed/);
+  assert.equal(hooksLine?.ok, false, "no hooks are installed in this fresh settings file — the real check found that");
+  assert.match(hooksLine!.why ?? "", /not all four present/);
+});
+
 // --- store permissions ---------------------------------------------------
 
 test("checkStorePermissions: a 0644 ms-owned file (accounts.json) is ✗; --fix chmods it to ✓", async () => {

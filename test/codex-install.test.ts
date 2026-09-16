@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { tempHome } from "./helpers.ts";
-import { codexHookTables, codexHooksInstalled, codexTrustedHash, ensureCodexHooks, installCodexHooks } from "../src/hooks/codex-install.ts";
+import { codexHookTables, codexHooksInstalled, codexTrustedHash, ensureCodexHooks, ensureCodexReady, installCodexHooks } from "../src/hooks/codex-install.ts";
 
 const MS = "/opt/homebrew/bin/ms";
 const CMD = `${MS} _hook codex`;
@@ -407,4 +408,74 @@ test("ensureCodexHooks is the one idempotent call: installs once, then does noth
   const refused = ensureCodexHooks(bad, MS);
   assert.match(refused.problem!, /cannot read/);
   assert.equal(refused.changed, false);
+});
+
+/**
+ * The account preparation must not overwrite a key a HUMAN put in this file.
+ *
+ * The case that made this worth pinning is the wall drill
+ * (docs/superpowers/plans/2026-09-16-codex-wall-mock.md): a scratch account's
+ * `config.toml` carries `openai_base_url` / `chatgpt_base_url` /
+ * `model_provider` / `[model_providers.mock]` pointing the CLI at a local
+ * mock, and `ms` then writes directory trust and its hook block into that very
+ * file on every launch. Those four keys are on Codex's project-local denylist
+ * (`codex-rs/config/src/loader/mod.rs:72-89`, test at
+ * `core/src/config/config_loader_tests.rs:3721-3812`), so a repo's
+ * `.codex/config.toml` CANNOT hold them — `$CODEX_HOME/config.toml` is the
+ * only place they work, which is the same file ms writes. If either writer
+ * re-serialised the file, the drill would silently talk to the real backend
+ * and spend the human's quota, which is exactly what it exists to avoid.
+ *
+ * Neither writer parses TOML, by design (see the doc comments on
+ * `ensureCodexTrust` and on `split`/`compose` here), so this holds — but it
+ * holds by construction, not by contract, and that is what a test is for.
+ */
+test("a human's base-URL overrides survive trust, a hook install, and a repair", () => {
+  const d = home();
+  const OVERRIDES =
+    'openai_base_url = "http://127.0.0.1:8899/backend-api/codex"\n' +
+    'chatgpt_base_url = "http://127.0.0.1:8899/backend-api"\n' +
+    'model_provider = "mock"\n' +
+    "\n" +
+    "[model_providers.mock]\n" +
+    'name = "mock"\n' +
+    'base_url = "http://127.0.0.1:8899/v1"\n' +
+    'wire_api = "responses"\n';
+  writeFileSync(config(d), OVERRIDES, { mode: 0o600 });
+
+  const cwd = mkdtempSync(path.join(tmpdir(), "ms-wall-cwd-"));
+  const survives = (why: string) => {
+    const text = read(d);
+    for (const line of OVERRIDES.split("\n").filter((l) => l !== "")) {
+      assert.ok(text.includes(line), `${why}: lost \`${line}\``);
+    }
+    // The keys must still be ROOT keys. A line that survived textually but now
+    // sits under a table header belongs to that table, and Codex would never
+    // read it as the override the human meant.
+    const head = text.split(/^\[/m)[0];
+    assert.ok(head.includes("openai_base_url = "), `${why}: openai_base_url fell under a table`);
+    assert.ok(head.includes("chatgpt_base_url = "), `${why}: chatgpt_base_url fell under a table`);
+  };
+
+  // 1. Trust + hooks, the one call every launch and every rotation makes.
+  assert.equal(ensureCodexReady(d, cwd, MS), null);
+  assert.equal(codexHooksInstalled(d, MS), true);
+  assert.ok(read(d).includes(`[projects."${realpathSync(cwd)}"]`), "trust was recorded");
+  survives("after ensureCodexReady");
+
+  // 2. A repair: the same home, a different ms binary, so the hook block and
+  //    every trust hash inside it are rewritten rather than left alone.
+  const OTHER = "/usr/local/bin/ms";
+  const repaired = ensureCodexHooks(d, OTHER);
+  assert.equal(repaired.problem, undefined);
+  assert.equal(repaired.changed, true, "the block really was rewritten");
+  assert.equal(codexHooksInstalled(d, OTHER), true);
+  survives("after a repair");
+
+  // 3. And the file is still one Codex can read: exactly one `[projects.…]`
+  //    table and one ms-hooks block, never two of either.
+  const text = read(d);
+  assert.equal(text.match(/^\[projects\./gm)?.length, 1);
+  assert.equal(text.match(/# ms-hooks-begin/g)?.length, 1);
+  assert.equal(text.match(/# ms-hooks-end/g)?.length, 1);
 });

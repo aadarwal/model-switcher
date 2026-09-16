@@ -729,6 +729,40 @@ test("ms codex launches the codex account with the most room, on its own home", 
   assert.equal(lastPick.any, undefined);
 });
 
+/** The stored gate row `ms codex` is supposed to mirror on the way past
+ *  (src/launch.ts:449) — `ms _recover`/`ms _codex_watch` are dispatched by
+ *  `tmux run-shell` and only ever see the tmux SERVER's environment, never
+ *  the shell that typed `export MS_CODEX_AUTOROTATE=1`, so something that
+ *  DOES run in that shell has to carry it into the store. */
+async function codexAutorotateKv(w: World): Promise<string | null> {
+  process.env.HOME = w.home; process.env.MS_HOME = w.msHome;
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    return st.getKv("codexAutorotate");
+  } finally {
+    st.close();
+  }
+}
+
+test("ms codex mirrors an exported MS_CODEX_AUTOROTATE into the stored kv row", async () => {
+  const on = await codexWorld([{ name: "home", weekly: 10 }]);
+  assert.equal(run(["codex"], on.env({ MS_CODEX_AUTOROTATE: "1" })).code, 0);
+  assert.equal(await codexAutorotateKv(on), "1");
+
+  // Exactly "1" is on: a variable somebody exported as "0" to turn this OFF
+  // must mirror as off, never as "nothing was said".
+  const off = await codexWorld([{ name: "home", weekly: 10 }]);
+  assert.equal(run(["codex"], off.env({ MS_CODEX_AUTOROTATE: "0" })).code, 0);
+  assert.equal(await codexAutorotateKv(off), "0");
+});
+
+test("ms codex leaves the stored kv row untouched when MS_CODEX_AUTOROTATE is not exported", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  assert.equal(run(["codex"], w.env()).code, 0);
+  assert.equal(await codexAutorotateKv(w), null, "no export means no write, not 'off'");
+});
+
 test("the cwd is trusted in the account's own home before the CLI is started", async () => {
   const w = await codexWorld([{ name: "home", weekly: 10 }]);
   const r = run(["codex"], w.env());

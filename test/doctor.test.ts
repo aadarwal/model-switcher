@@ -589,6 +589,58 @@ test("runDoctor: a clean, empty registry is one ✓ 'accounts.json' line", async
   assert.equal(line!.ok, true);
 });
 
+test("runDoctor: the codex auto-recovery gate line reflects the stored kv value, off by default and on/off from kv", async () => {
+  // Rereview A, Minor 2: only codexAutorotateLine itself (a pure function,
+  // test/autorotate.test.ts) was asserted — deleting the doctor.ts:718
+  // results.push that prints it left this file 60/60 green. This exercises
+  // runDoctor end to end, so that wiring is what is under test, not the line
+  // builder alone.
+  const { msHome } = base();
+  stubHealthyBinaries();
+  await writeHealthyCodexAccountFiles(msHome, "codexacct");
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: [{ name: "codexacct", provider: "codex", label: "CodexAcct", orgId: null, shared: false, identityVerified: true }],
+    }),
+    { mode: 0o600 },
+  );
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk(); // the per-account checks are not this test's concern
+  try {
+    const { openState } = await import("../src/state.ts");
+    const { codexAutorotateLine } = await import("../src/autorotate.ts");
+    const { runDoctor } = await import("../src/doctor.ts");
+
+    // kv absent: off is the shipped default — and it must still be a ✓, not
+    // a ✗, because off is not a fault.
+    const absent = await runDoctor(false);
+    const absentLine = absent.results.find((r) => r.what === codexAutorotateLine(false));
+    assert.ok(absentLine, absent.lines.join("\n"));
+    assert.equal(absentLine!.ok, true);
+
+    const stOn = openState();
+    stOn.setKv("codexAutorotate", "1");
+    stOn.close();
+    const on = await runDoctor(false);
+    const onLine = on.results.find((r) => r.what === codexAutorotateLine(true));
+    assert.ok(onLine, on.lines.join("\n"));
+    assert.equal(onLine!.ok, true);
+
+    const stOff = openState();
+    stOff.setKv("codexAutorotate", "0");
+    stOff.close();
+    const off = await runDoctor(false);
+    const offLine = off.results.find((r) => r.what === codexAutorotateLine(false));
+    assert.ok(offLine, off.lines.join("\n"));
+    assert.equal(offLine!.ok, true);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
 // --- accounts ------------------------------------------------------------
 
 test("checkClaudeAccount: a fully healthy account reports four ✓ lines", async () => {

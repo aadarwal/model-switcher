@@ -95,3 +95,26 @@ export function saveRegistry(r: Registry, prev: { parseError: string | null }): 
 export function findAccount(r: Registry, name: string, provider?: Provider): Account | undefined {
   return r.accounts.find((a) => a.name === name && (!provider || a.provider === provider));
 }
+
+/**
+ * The OTHER Claude account already claiming this organisation, if any.
+ *
+ * Identity is the organisation id (spec §6), so this is what makes two
+ * nicknames for one subscription an error rather than a silently doubled pool
+ * entry — and it lives HERE, beside the rows it reads, because more than one
+ * verb has to ask it of the same grant. `ms accounts login` and `ms accounts
+ * verify` refuse on it; `ms doctor` reports it. Live on 2026-09-16 the doctor
+ * asked a different question (the registry's own `identityVerified` flag) and
+ * printed ✓ for an account `verify` was turning away — a book and a doctor
+ * must never disagree about one credential.
+ */
+export function organisationClaimedBy(accounts: Account[], name: string, orgId: string): string | null {
+  const other = accounts.find((a) => a.provider === "claude" && a.name !== name && a.orgId === orgId);
+  return other ? other.name : null;
+}
+
+/** How a collision is WORDED, everywhere, so the refusal and the report can
+ *  never drift apart in the one place a human reads them side by side. */
+export function sameOrganisationAs(other: string): string {
+  return `resolves to the same organisation as ${other}`;
+}

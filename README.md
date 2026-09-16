@@ -231,6 +231,11 @@ MS_VERBOSE=1 ms status                # show what the start-of-run repair did
 A Claude account with no poll grant can launch but cannot be ranked; one with no launch
 token can be ranked but cannot be run. Both come from `ms accounts login`.
 
+The doctor's identity line runs the same organisation check `ms accounts verify` runs, on
+the grant itself, so the two never disagree; a grant that resolves to another registered
+account's organisation is reported with the `--relogin` that fixes it. When the check could
+not run this time, the line says `identity verified at login (not re-checked)`.
+
 ## Development
 
 ```bash

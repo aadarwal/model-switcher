@@ -825,6 +825,85 @@ test("checkClaudeAccount: --fix on a dead grant reports ✗ with the auth reason
   }
 });
 
+test("checkClaudeAccount: the identity line runs verify's own organisation check, and --fix leaves it", async () => {
+  // Live, 2026-09-16: a refused `ms accounts login dirk` left the wrong
+  // organisation's grant in dirk's keychain item. `ms accounts verify dirk`
+  // failed with "resolves to the same organisation as kratuvak" while
+  // `ms doctor` read the registry's stale `identityVerified: true` and printed
+  // ✓. A book and a doctor must never disagree about one credential, so the
+  // line asks the same question of the same GRANT.
+  const { msHome } = base();
+  stubHealthyBinaries();
+  writeHealthyAccountFiles(msHome, "dirk");
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  saveLaunchToken("dirk", "sk-ant-oat01-AbCdEfGh12345678_-ijklmnop0123456789");
+
+  const savedFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response(
+      JSON.stringify({ account: { email: "wrong@example.com" }, organization: { uuid: "org-K", name: "Kratuvak" } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as unknown as typeof fetch;
+  try {
+    const { checkClaudeAccount, renderLine } = await import("../src/doctor.ts");
+    const book = [account({ name: "dirk", orgId: "org-D" }), account({ name: "kratuvak", orgId: "org-K" })];
+
+    const rs = await checkClaudeAccount(account({ name: "dirk", orgId: "org-D", identityVerified: true }), false, book);
+    const id = rs.find((r) => /identity/.test(r.what));
+    assert.ok(id, JSON.stringify(rs));
+    assert.equal(
+      renderLine(id!),
+      "✗ claude account dirk: identity — resolves to the same organisation as kratuvak; run ms accounts login dirk --relogin",
+    );
+    assert.ok(calls > 0, "the grant itself was never read");
+
+    // --fix never touches an identity: same ✗, nothing repaired.
+    const fixed = await checkClaudeAccount(account({ name: "dirk", orgId: "org-D", identityVerified: true }), true, book);
+    const fixedId = fixed.find((r) => /identity/.test(r.what))!;
+    assert.equal(fixedId.ok, false);
+    assert.equal(fixedId.fixed, undefined, "an identity is never auto-repaired");
+    assert.equal(readFileSync(path.join(msHome, "claude", "dirk", ".credentials.json"), "utf8").includes("at-dirk"), true);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkClaudeAccount: no other account claims an organisation, so nothing is read over the network", async () => {
+  // The collision only ever exists against another registered account, so a
+  // book with nothing to collide with costs no call at all — exactly what
+  // `verify` would conclude, for free.
+  const { msHome } = base();
+  stubHealthyBinaries();
+  writeHealthyAccountFiles(msHome, "gmail");
+  const savedFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response(JSON.stringify({ organization: { uuid: "org-1" } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const { checkClaudeAccount } = await import("../src/doctor.ts");
+    const rs = await checkClaudeAccount(account({ name: "gmail", identityVerified: true }), false, [
+      account({ name: "gmail", orgId: null }),
+      account({ name: "other", orgId: null }),
+    ]);
+    const id = rs.find((r) => /identity/.test(r.what))!;
+    assert.equal(id.ok, true);
+    assert.equal(calls, 0, "a book with nothing to collide with must cost no network call");
+    // And the line says so: nothing was re-checked here, so it must not borrow
+    // the authority of a check that never ran.
+    assert.equal(id.what, "claude account gmail: identity verified at login (not re-checked)");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
 // --- codex accounts --------------------------------------------------------
 
 test("checkCodexAccount: a fully healthy account reports four ✓ lines, in order", async () => {

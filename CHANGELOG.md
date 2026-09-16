@@ -5,6 +5,13 @@
 - PROVIDER column on the accounts table, on the page and in ms status
 - MS_HOME is canonicalised at startup, so a symlinked store keeps its hooks
   and trust
+- a refused sign-in is discarded: when the login's identity check turns a browser
+  login away, the grant it just wrote is removed and the account is left as it was;
+  a pre-existing credential is never touched (proved by content, not assumed)
+- `ms accounts login <name> --relogin` forces a fresh sign-in even when a usable
+  grant exists; the old grant is replaced only after the new one passes the check
+- `ms doctor` runs `verify`'s organisation check on the grant itself, and says
+  `identity verified at login (not re-checked)` when it could not run
 
 ## 0.2.1
 

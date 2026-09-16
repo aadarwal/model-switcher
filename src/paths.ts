@@ -18,13 +18,23 @@ export const p = {
   launchToken: (name: string) => sub("launch", `${name}.token`),
   claudeConfigDir: (name: string) => sub("claude", name),
   codexHome: (name: string) => sub("codex", name),
+  /** The ONE rollout store every Codex home of this tool links its own
+   *  `sessions` at. Codex records a session's rollout under `$CODEX_HOME/
+   *  sessions`, so a per-account CODEX_HOME would give every account its own
+   *  island and a rotation could not resume a session started under another
+   *  account. Sharing the directory — and never an account's name — is what
+   *  lets `codex resume <id>` cross accounts. */
+  codexSessions: () => sub("codex", "sessions"),
   hooksDir: () => sub("hooks"),
 };
 export function ensureStore(): void {
   // Locks live in one file, MS_HOME/locks.sqlite (src/lock.ts) — there is
   // no locks/ subdirectory to create; the mkdir-lock design that once used
   // one is gone.
-  for (const d of [msHome(), sub("claude"), sub("codex"), sub("launch"), sub("sessions"), sub("hooks")]) {
+  // `codex/sessions` is the SHARED rollout store (p.codexSessions), not an
+  // account home: it is created here, once, so the first `accounts add
+  // --provider codex` has something to point its `sessions` symlink at.
+  for (const d of [msHome(), sub("claude"), sub("codex"), sub("codex", "sessions"), sub("launch"), sub("sessions"), sub("hooks")]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true, mode: 0o700 });
     chmodSync(d, 0o700);
   }

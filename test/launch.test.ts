@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { run, tempHome, stubDir } from "./helpers.ts";
@@ -72,6 +72,12 @@ case "$1" in
     mkdir -p "$MS_TMUX_SNAPSHOT"
     cp "$MS_HOME/state.sqlite" "$MS_TMUX_SNAPSHOT/state.sqlite" 2>/dev/null
     cp "$MS_HOME/state.sqlite-wal" "$MS_TMUX_SNAPSHOT/state.sqlite-wal" 2>/dev/null
+    for f in "$MS_HOME"/codex/*/config.toml; do
+      [ -f "$f" ] || continue
+      d="$MS_TMUX_SNAPSHOT/codex/$(basename "$(dirname "$f")")"
+      mkdir -p "$d"
+      cp "$f" "$d/config.toml"
+    done
     ;;
   attach-session) exit "\${MS_TMUX_ATTACH:-0}" ;;
 esac
@@ -568,4 +574,298 @@ test("an unreadable registry names the problem; it is never an empty pool", asyn
   assert.equal(/no such account/.test(as.stderr), false, as.stderr);
 
   assert.equal((await readState(w)).sessions.length, 0);
+});
+
+// --- ms codex ------------------------------------------------------------
+//
+// A Codex account carries ONE credential, `auth.json` inside its own
+// CODEX_HOME, and no launch token — so the world below is the Claude world's
+// shape with that one difference, plus a usage snapshot stated on disk.
+//
+// The snapshot is stated rather than served because the Codex POLLER is a
+// different task's: what `ms codex` is answerable for is choosing correctly
+// from the numbers the snapshot holds, whoever read them. A snapshot file
+// younger than the freshness window is served without a single request, so
+// these tests touch the network zero times — and the stub below turns any
+// attempt to into a loud failure rather than a call to chatgpt.com.
+
+/** `codex login`'s file, as far as a launch reads it: existence only. */
+const codexAuth = (name: string) =>
+  JSON.stringify({
+    tokens: { id_token: "x.y.z", access_token: `cat-${name}`, refresh_token: `crt-${name}`, account_id: `acc-${name}` },
+  });
+
+/** One row of the usage cache, as `src/snapshot.ts` writes it. Codex reports
+ *  no Fable-scoped window, so `weeklyFable` is null — which is exactly why
+ *  `--need fable` can never be answered by a Codex account. */
+const usageRow = (name: string, provider: "claude" | "codex", session: number, weekly: number) => ({
+  name, provider, shared: false,
+  usage: {
+    session: { usedPercent: session, resetsAt: "2026-09-16T00:00:00Z" },
+    weeklyAll: { usedPercent: weekly, resetsAt: "2026-09-20T00:00:00Z" },
+    weeklyFable: null,
+  },
+  error: null, errorKind: null, observedAt: Date.now(), stale: false,
+});
+
+/** The same row after a failed poll: a reading we could not take, which is
+ *  what makes a remembered pick admissible at all. */
+const unreachableRow = (name: string, provider: "claude" | "codex") => ({
+  name, provider, shared: false,
+  usage: null, error: "the usage endpoint could not be reached", errorKind: "transient",
+  observedAt: null, stale: true,
+});
+
+function noFetchStub(dir: string): string {
+  const f = path.join(dir, "no-fetch-stub.mjs");
+  writeFileSync(f, `globalThis.fetch = async (url) => { throw new Error("test: unexpected network call to " + url); };\n`);
+  return pathToFileURL(f).href;
+}
+
+type CodexSpec = { name: string; session?: number; weekly?: number; auth?: boolean; unreachable?: boolean };
+
+/** One claude account (so the registry is mixed and the provider filter has
+ *  something to filter) plus the named codex accounts. */
+async function codexWorld(codex: CodexSpec[]): Promise<World> {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  const log = path.join(dir, "tmux.log");
+  const atRespawn = path.join(dir, "at-respawn");
+  stub("tmux", TMUX_STUB);
+  const stubUrl = noFetchStub(dir);
+
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: [
+        { name: "gmail", provider: "claude", label: "Gmail", shared: false },
+        ...codex.map((c) => ({ name: c.name, provider: "codex", label: c.name, shared: false })),
+      ],
+    }),
+    { mode: 0o600 },
+  );
+
+  process.env.HOME = home; process.env.MS_HOME = msHome;
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  saveLaunchToken("gmail", SAMPLE_TOKEN);
+
+  for (const c of codex) {
+    const h = path.join(msHome, "codex", c.name);
+    mkdirSync(h, { recursive: true, mode: 0o700 });
+    if (c.auth !== false) writeFileSync(path.join(h, "auth.json"), codexAuth(c.name), { mode: 0o600 });
+  }
+
+  writeFileSync(
+    path.join(msHome, "snapshot.json"),
+    JSON.stringify({
+      takenAt: Date.now(),
+      accounts: [
+        usageRow("gmail", "claude", 10, 20),
+        ...codex.map((c) =>
+          c.unreachable ? unreachableRow(c.name, "codex") : usageRow(c.name, "codex", c.session ?? 0, c.weekly ?? 0),
+        ),
+      ],
+      backoff: {},
+    }),
+    { mode: 0o600 },
+  );
+
+  return {
+    home, msHome, log, atRespawn,
+    env: (over = {}) => ({
+      HOME: home, MS_HOME: msHome, MS_TMUX_LOG: log, MS_TMUX_SNAPSHOT: atRespawn,
+      PATH: `${dir}:${process.env.PATH}`,
+      ANTHROPIC_MODEL: "",
+      MS_TEST_USAGE: "{}",
+      NODE_OPTIONS: `--disable-warning=ExperimentalWarning --import ${stubUrl}`,
+      TMUX: TMUX_SOCKET + ",123,0", TMUX_PANE: PANE,
+      ...over,
+    }),
+  };
+}
+
+const configToml = (msHome: string, name: string) => path.join(msHome, "codex", name, "config.toml");
+
+test("ms codex launches the codex account with the most room, on its own home", async () => {
+  // `work` is ALSO a claude account name in the other world; identity is
+  // (provider, name), and nothing here may reach for the claude side.
+  const w = await codexWorld([{ name: "home", weekly: 10 }, { name: "work", weekly: 80 }]);
+  const r = run(["codex", "--", "--model", "gpt-5"], w.env());
+
+  assert.equal(r.code, 0, r.stderr);
+  // The parenthesis says what constrained the pick. Codex has one window and
+  // no fable scope, so there is no need to name — the provider is the fact.
+  assert.match(r.stderr, /^ms: home \(codex\) → pane %7$/m);
+  assert.equal(r.stdout, "");
+
+  const lines = logLines(w);
+  const respawn = lines.find((l) => l.startsWith(`-S ${TMUX_SOCKET} respawn-pane`));
+  assert.ok(respawn, `no respawn in:\n${lines.join("\n")}`);
+  const m = respawn!.match(new RegExp(`^-S ${TMUX_SOCKET} respawn-pane -k -c (\\S+) -t %7 '(\\S+)' '_exec' '(${UUID})'$`));
+  assert.ok(m, `respawn line not as expected: ${respawn}`);
+  assert.equal(m![2], MS_BIN);
+  const launchId = m![3]!;
+
+  const st = await readState(w, launchId);
+  assert.equal(st.sessions.length, 1);
+  const s = st.sessions[0]!;
+  assert.equal(s.provider, "codex");
+  assert.equal(s.account, "home");
+  assert.equal(s.need, "any");
+  assert.equal(s.state, "launching");
+  assert.equal(s.pane, PANE);
+  assert.equal(s.cwd, CWD);
+  assert.deepEqual(s.flags, ["--model", "gpt-5"]);
+  // Codex has no `--session-id`: the id arrives with the hook's SessionStart.
+  assert.equal(s.cliSessionId, null);
+
+  assert.deepEqual(st.launch!.command, ["codex", "--model", "gpt-5"]);
+  assert.deepEqual(st.launch!.env, {});
+
+  // The memo is per provider: a codex pick may never be offered to claude.
+  const lastPick = JSON.parse(readFileSync(path.join(w.msHome, "last-pick.json"), "utf8"));
+  assert.equal(lastPick["codex:any"].name, "home");
+  assert.equal(lastPick.any, undefined);
+});
+
+test("the cwd is trusted in the account's own home before the CLI is started", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 0, r.stderr);
+
+  const real = realpathSync(CWD);
+  const expected = `[projects.${JSON.stringify(real)}]`;
+  // What tmux was told to run the CLI with — i.e. the file as it stood at the
+  // instant the modal would otherwise have appeared.
+  const atRespawn = readFileSync(path.join(w.atRespawn, "codex", "home", "config.toml"), "utf8");
+  assert.ok(atRespawn.includes(expected), atRespawn);
+  assert.match(atRespawn, /^trust_level = "trusted"$/m);
+  // and it is only ever this account's home
+  assert.equal(existsSync(configToml(w.msHome, "home")), true);
+
+  // A second launch adds nothing: the table is written if absent, never again.
+  const before = readFileSync(configToml(w.msHome, "home"), "utf8");
+  const again = run(["codex"], w.env());
+  assert.equal(again.code, 0, again.stderr);
+  assert.equal(readFileSync(configToml(w.msHome, "home"), "utf8"), before);
+});
+
+test("the hook tables in the same config.toml survive a launch untouched", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const hooks = `[[hooks.SessionStart]]\nmatcher = "*"\nhooks = [{ type = "command", command = "/opt/ms _hook codex" }]\n\n[hooks.state."/x:session_start:0:0"]\ntrusted_hash = "sha256:deadbeef"\n`;
+  writeFileSync(configToml(w.msHome, "home"), hooks, { mode: 0o600 });
+
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 0, r.stderr);
+
+  const text = readFileSync(configToml(w.msHome, "home"), "utf8");
+  assert.ok(text.startsWith(hooks), `the hook tables were rewritten:\n${text}`);
+  assert.match(text, /^trust_level = "trusted"$/m);
+});
+
+test("ms codex --need fable is a usage error: there is no such window", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const r = run(["codex", "--need", "fable"], w.env());
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /^ms codex: codex has no fable window$/m);
+  assert.equal((await readState(w)).sessions.length, 0);
+
+  // `--need any` is the only thing there is, and it is allowed to be said
+  const ok = run(["codex", "--need=any"], w.env());
+  assert.equal(ok.code, 0, ok.stderr);
+});
+
+test("--as an account whose auth.json is missing: exit 1, naming the login", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }, { name: "work", weekly: 80, auth: false }]);
+  const r = run(["codex", "--as", "work"], w.env());
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /work/);
+  assert.match(r.stderr, /ms accounts login work/);
+  assert.equal(r.stderr.trim().split("\n").length, 1);
+  assert.equal((await readState(w)).sessions.length, 0);
+  assert.equal(existsSync(configToml(w.msHome, "work")), false, "an account that cannot launch trusts nothing");
+});
+
+test("a claude fallback pick is never reused for a codex launch", async () => {
+  const w = await codexWorld([{ name: "home", unreachable: true }]);
+  // A remembered CLAUDE pick, of an account name that does not even exist on
+  // the codex side of the registry: taking it would launch the wrong CLI on
+  // the wrong credential.
+  writeFileSync(
+    path.join(w.msHome, "last-pick.json"),
+    JSON.stringify({ any: { name: "home", at: Date.now() - 60_000 } }),
+    { mode: 0o600 },
+  );
+
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 4);
+  assert.match(r.stderr, /^ms codex: usage unreachable$/m);
+  assert.equal((await readState(w)).sessions.length, 0);
+
+  // ...and the codex memo, written by a codex launch, IS its fallback
+  writeFileSync(
+    path.join(w.msHome, "last-pick.json"),
+    JSON.stringify({ "codex:any": { name: "home", at: Date.now() - 60_000 } }),
+    { mode: 0o600 },
+  );
+  const again = run(["codex"], w.env());
+  assert.equal(again.code, 0, again.stderr);
+  assert.match(again.stderr, /^ms: home \(codex\) → pane %7$/m);
+});
+
+test("a registry with no codex account is a configuration answer: exit 1", async () => {
+  const w = await world(); // claude accounts only
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /^ms codex: no codex account is registered/m);
+  assert.match(r.stderr, /--provider codex/);
+});
+
+test("every codex account at 100: exit 3, and the claude accounts are not consulted", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 100 }, { name: "work", session: 100 }]);
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 3);
+  assert.match(r.stderr, /no account has room/);
+  assert.match(r.stderr, /home: weekly window at 100/);
+  assert.match(r.stderr, /work: session window at 100/);
+  // gmail has plenty of room and is the wrong provider: it is not even a
+  // candidate, so it never appears among the reasons.
+  assert.equal(/gmail/.test(r.stderr), false, r.stderr);
+});
+
+test("codex's own arguments go after --, and the message says so", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const loose = run(["codex", "--model", "x"], w.env());
+  assert.equal(loose.code, 2);
+  assert.match(loose.stderr, /unexpected argument "--model" — put codex's own arguments after --/);
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
+test("outside tmux, ms codex takes the same tool-owned server path", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const r = run(["codex"], w.env(OUTSIDE));
+  assert.equal(r.code, 0, r.stderr);
+  const sock = path.join(w.msHome, "tmux.sock");
+  const lines = logLines(w);
+  assert.ok(lines.includes(`-S ${sock} new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes("respawn-pane")), lines.join("\n"));
+  assert.equal(lines.at(-1), `-S ${sock} attach-session -t ms`);
+  assert.match(r.stderr, /^ms: home \(codex\) → pane %42$/m);
+  const st = await readState(w);
+  assert.equal(st.sessions[0]!.provider, "codex");
+  assert.equal(st.sessions[0]!.cliSessionId, null);
+  // the trust table was in place before the CLI was respawned into the pane
+  assert.match(readFileSync(path.join(w.atRespawn, "codex", "home", "config.toml"), "utf8"), /^trust_level = "trusted"$/m);
+});
+
+test("a home that cannot be written is a named refusal, not a silent modal", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  // A directory where config.toml must be a file: the write cannot succeed.
+  mkdirSync(configToml(w.msHome, "home"), { recursive: true });
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /trust/i);
+  assert.equal((await readState(w)).sessions.length, 0);
+  rmSync(configToml(w.msHome, "home"), { recursive: true, force: true });
 });

@@ -54,7 +54,7 @@ import {
   type PollCredentials,
   type Usage,
 } from "./providers/claude-usage.ts";
-import { fetchCodexUsage, readCodexCredentials, refreshCodexCredentials, type CodexAuth } from "./providers/codex-usage.ts";
+import { CodexAuthError, codexAccessTokenExpiryMs, fetchCodexUsage, readCodexCredentials, refreshCodexCredentials, type CodexAuth } from "./providers/codex-usage.ts";
 
 export type ErrorKind = "auth" | "transient" | "other";
 
@@ -303,27 +303,48 @@ async function pollClaudeUsage(a: Account, signal: AbortSignal): Promise<Usage> 
 
 // --- Polling one Codex account ------------------------------------------
 
-/** The G2 spike (whether a running `codex` process tolerates its on-disk
- *  grant rotating under it) has not run yet. Conservative rule until it does:
- *  a credential is due for refresh only when nothing managed is using it.
- *  This is the one function G2's verdict changes — PASS deletes the session
- *  check entirely and refreshes on the age test alone (or a 401) instead. */
-export const CODEX_REFRESH_AGE_MS = 55 * 60_000;
+/**
+ * How close to its own expiry an access token has to be before a poll spends
+ * the refresh token on it. Sixty seconds, from the proven poller
+ * (data/lib/providers/openai.ts): `if (expiry !== null && expiry < Date.now()
+ * + 60_000)`.
+ *
+ * The trigger is the TOKEN'S OWN `exp`, never how long ago it was last
+ * refreshed. A 55-minute age test refreshed every idle account on the first
+ * poll after 55 minutes — from `status --watch`, from every launch, from
+ * every recovery, roughly 26 times a day each — for a token that was valid
+ * for days, and each of those rotates the refresh token under every other
+ * copy of the same `auth.json`. A token that carries no readable `exp` is
+ * left alone: "the token does not say" is answered by a 401, below, not by a
+ * clock.
+ */
+export const CODEX_REFRESH_SKEW_MS = 60_000;
 
 function codexRefreshDue(auth: CodexAuth): boolean {
-  const t = auth.last_refresh ? Date.parse(auth.last_refresh) : NaN;
-  return !Number.isFinite(t) || Date.now() - t > CODEX_REFRESH_AGE_MS;
+  const exp = codexAccessTokenExpiryMs(auth);
+  return exp !== null && exp < Date.now() + CODEX_REFRESH_SKEW_MS;
 }
+
+/** The session states in which a `codex` process is actually holding this
+ *  account's `auth.json`. `parked` and `waiting` are NOT among them — both
+ *  are sessions with nothing running — and counting them as live is how one
+ *  lingering parked row used to block every refresh for an account until its
+ *  token died and the account read `auth`. (`stopped` was never counted.) */
+const CODEX_LIVE_STATES: ReadonlySet<string> = new Set(["running", "continuing", "resuming", "stopping"]);
 
 /** True when no managed Codex session for this account is still using its
  *  grant. A state read that fails (locked db, anything) answers false — the
  *  conservative side, since spending the one-shot refresh token on a guess is
- *  worse than polling one round on a slightly stale access token. */
+ *  worse than polling one round on a slightly stale access token.
+ *
+ *  The G2 spike (whether a running `codex` tolerates its on-disk grant
+ *  rotating under it) has not run yet; this guard is what stands in for its
+ *  verdict, and a PASS deletes it. */
 function codexRefreshAllowed(name: string): boolean {
   try {
     const state = openState();
     try {
-      return !state.listSessions().some((s) => s.provider === "codex" && s.account === name && s.state !== "stopped");
+      return !state.listSessions().some((s) => s.provider === "codex" && s.account === name && CODEX_LIVE_STATES.has(s.state));
     } finally {
       state.close();
     }
@@ -332,33 +353,68 @@ function codexRefreshAllowed(name: string): boolean {
   }
 }
 
+/**
+ * Rotate this account's grant under its own credential lock.
+ *
+ * Re-reading inside the lock is half the point: whoever we waited for has
+ * just written a fresh credential where we found the stale one. The session
+ * guard is re-checked in there too when it applies — the caller's check runs
+ * BEFORE the lock is even requested, so a session can start in the gap, and
+ * only a re-check made while holding the lock can see it.
+ */
+async function refreshCodexGrant(a: Account, dir: string, auth: CodexAuth, signal: AbortSignal): Promise<CodexAuth> {
+  return await withLock(
+    lockOf(a),
+    async () => {
+      const latest = readCodexCredentials(dir) ?? auth;
+      if (!codexRefreshDue(latest) || !codexRefreshAllowed(a.name)) return latest;
+      return await refreshCodexCredentials(dir, latest, signal);
+    },
+    { waitMs: POLL_TIMEOUT_MS },
+  );
+}
+
+/**
+ * The 401 answer: refresh once, and once only.
+ *
+ * The live-session guard deliberately does NOT apply here. It exists to avoid
+ * pulling a working token out from under a running `codex`, and a token the
+ * endpoint has just refused is not a working token — whoever is holding it is
+ * holding the same dead credential. Under the lock, a credential somebody else
+ * has already replaced is taken as the retry's token rather than refreshed
+ * again, so a fleet of pollers that all hit the same 401 spends exactly one
+ * refresh between them.
+ */
+async function refreshAfterUnauthorized(a: Account, dir: string, used: CodexAuth, signal: AbortSignal): Promise<CodexAuth> {
+  return await withLock(
+    lockOf(a),
+    async () => {
+      const latest = readCodexCredentials(dir);
+      if (latest && latest.tokens.access_token !== used.tokens.access_token) return latest;
+      return await refreshCodexCredentials(dir, latest ?? used, signal);
+    },
+    { waitMs: POLL_TIMEOUT_MS },
+  );
+}
+
 async function pollCodexUsage(a: Account, signal: AbortSignal): Promise<Usage> {
   const dir = p.codexHome(a.name);
   let auth = readCodexCredentials(dir);
   if (!auth) throw new AuthError(`no credentials (ms accounts login ${a.name})`);
-  if (codexRefreshDue(auth) && codexRefreshAllowed(a.name)) {
-    auth = await withLock(
-      lockOf(a),
-      async () => {
-        // Re-read inside the lock: whoever we waited for may have just
-        // rotated it, in which case there is nothing left to refresh. And
-        // re-check the session guard too — the outside check above runs
-        // BEFORE the lock is even requested, so a session can start in the
-        // gap between that check and actually holding the lock. That check
-        // was only ever a cheap pre-filter to skip taking the lock when
-        // refreshing is obviously unnecessary; this is the one that must
-        // not miss a session that started while we waited.
-        const latest = readCodexCredentials(dir) ?? auth!;
-        if (!codexRefreshDue(latest) || !codexRefreshAllowed(a.name)) return latest;
-        return await refreshCodexCredentials(dir, latest, signal);
-      },
-      { waitMs: POLL_TIMEOUT_MS },
-    );
+  // The cheap pre-filter: a token nowhere near its expiry costs no lock.
+  if (codexRefreshDue(auth) && codexRefreshAllowed(a.name)) auth = await refreshCodexGrant(a, dir, auth, signal);
+
+  try {
+    return await fetchCodexUsage(auth, signal);
+  } catch (err) {
+    // Exactly the proven poller's second trigger: a 401 earns one refresh and
+    // one retry. A 403 does not (no refresh changes a scope), and every other
+    // failure travels untouched.
+    if (!(err instanceof CodexAuthError) || err.status !== 401) throw err;
+    const refreshed = await refreshAfterUnauthorized(a, dir, auth, signal);
+    if (refreshed.tokens.access_token === auth.tokens.access_token) throw err; // nothing new to retry with
+    return await fetchCodexUsage(refreshed, signal);
   }
-  // Refresh skipped (fresh enough, or a live session owns the grant): poll
-  // with the stored access token and let a dead one classify as `auth` on
-  // its own, via fetchCodexUsage's 401/403 handling.
-  return await fetchCodexUsage(auth, signal);
 }
 
 type Polled = { entry: AccountUsage; backoffUntil: number | null };

@@ -45,7 +45,8 @@ import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
 import { pickAccounts, type PickInput, type Window } from "./pick.ts";
-import { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand, ensureCodexTrust } from "./providers/codex-cli.ts";
+import { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand } from "./providers/codex-cli.ts";
+import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
 import { ownerDead } from "./reconcile.ts";
 import { NAME_PATTERN, findAccount, loadRegistry } from "./registry.ts";
@@ -818,18 +819,26 @@ type Refusal = { outcome: AttemptOutcome; note: string; trust?: true };
  *     credential — an absent or truncated one is a login that has not
  *     happened, and answering "yes" for it respawns the pane onto a CLI that
  *     cannot authenticate;
- *   * that home must already trust this session's directory. Trust is per
- *     home (verified live), and the dialog is a MODAL: a relaunch that met it
- *     would sit in front of it for ever with the human's conversation behind
- *     it. So the table is written here, before the pane is touched — and when
- *     the writer refuses (a `projects` definition it will not edit, a
- *     `trust_level` a human set themselves), that is this candidate's
- *     failure, reported verbatim and skipped past, never a reason to go on
- *     and launch into the modal.
+ *   * that home must already trust this session's directory AND carry this
+ *     binary's hooks — `ensureCodexReady` (`src/hooks/codex-install.ts`), the
+ *     same call `launchCodex`'s own `prepare` makes for a fresh launch, so a
+ *     rotation target is held to the one standard rather than a copy of it.
+ *     Trust is per home (verified live) and its dialog is a MODAL: a relaunch
+ *     that met it would sit in front of it for ever with the human's
+ *     conversation behind it. A home with no hooks is worse and quieter — it
+ *     starts fine and reports NOTHING, so THIS rotation looks like it worked
+ *     and the NEXT one finds no conversation to resume and respawns a plain
+ *     `codex` over it, the exact harm a hook-less launch is refused for. So
+ *     both are made ready here, before the pane is touched — and when either
+ *     writer refuses (a `projects` definition it will not edit, a
+ *     `trust_level` a human set themselves, a `hooks` table it cannot read),
+ *     that is this candidate's failure, reported verbatim with the doctor
+ *     hint, and skipped past — never a reason to rotate a pane into a home
+ *     that cannot report back.
  *
- * `infra` rather than `auth` for the trust refusal: the account's credential
- * is fine, its home is not, and a human fixes it by editing a file rather
- * than by logging in again.
+ * `infra` rather than `auth` for either refusal: the account's credential is
+ * fine, its home is not, and a human fixes it by editing a file rather than
+ * by logging in again.
  */
 function prepareCandidate(session: SessionRow, name: string): Refusal | null {
   if (session.provider !== "codex") {
@@ -839,12 +848,8 @@ function prepareCandidate(session: SessionRow, name: string): Refusal | null {
   if (!readCodexAuth(home)?.accessToken) {
     return { outcome: "auth", note: `no codex credential (run: ms accounts login ${name} --provider codex)` };
   }
-  try {
-    const { problem } = ensureCodexTrust(home, session.cwd);
-    return problem ? { outcome: "infra", note: problem, trust: true } : null;
-  } catch (e) {
-    return { outcome: "infra", note: `cannot record directory trust in ${home}: ${(e as Error).message}`, trust: true };
-  }
+  const refusal = ensureCodexReady(home, session.cwd, msBinary());
+  return refusal ? { outcome: "infra", note: refusal.problem, trust: true } : null;
 }
 
 type Candidates = { names: string[]; inputs: PickInput[]; out: { name: string; why: string }[]; registryError: string | null };

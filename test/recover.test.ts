@@ -2015,6 +2015,50 @@ test("a codex home this tool will not edit costs that candidate, not the rotatio
   assert.match(recoverLog(w), /home: .*trying the next account/);
 });
 
+test("a candidate codex home with no hooks gets them installed before the relaunch", async (t) => {
+  // Minor 3 (rereview A): A-I4 closed launchCodex's own prepare but not
+  // prepareCandidate's — a hook-less home could still be rotated into, start
+  // fine, report NOTHING, and cost the NEXT rotation the conversation. Proven
+  // here the same way A-I4 proved the launch path: the hooks are on disk in
+  // the snapshot tmux was actually told to respawn onto, not a moment after.
+  const w = await codexWorld(t);
+  assert.equal(existsSync(configToml(w, "home")), false, "nothing has written this home's config yet");
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.equal(session(w).account, "home");
+
+  const { codexHooksInstalled } = await import("../src/hooks/codex-install.ts");
+  assert.equal(codexHooksInstalled(path.join(w.msHome, "codex", "home"), MS_BIN), true);
+  const atRespawn = trustAtRespawn(w, "home");
+  assert.ok(atRespawn.includes("[[hooks.SessionStart]]"), atRespawn);
+  assert.ok(atRespawn.includes(`command = "${MS_BIN} _hook codex"`), atRespawn);
+  // And trust, from the very same prepare: a rotation target gets both.
+  assert.match(atRespawn, /^trust_level = "trusted"$/m);
+});
+
+test("a codex home whose config carries a hand-written hook block is refused as a candidate, naming the doctor", async (t) => {
+  const w = await codexWorld(t);
+  // The installer's own refusal shape (test/codex-install.test.ts): a `hooks`
+  // header it cannot classify.
+  writeFileSync(configToml(w, "home"), "[hooks]\nSessionStart = []\n", { mode: 0o600 });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  assert.equal(session(w).account, "spare", "the next candidate took it; home cost only its own turn");
+  const attempts = rows(w, "attempts");
+  assert.deepEqual(
+    attempts.map((a) => [a.account, a.outcome]),
+    [["home", "infra"], ["work", "exhausted"]],
+  );
+  assert.match(String(attempts[0]!.note), /a 'hooks' table this tool cannot read/);
+  assert.match(String(attempts[0]!.note), /ms doctor --fix/);
+  assert.match(recoverLog(w), /home: .*trying the next account/);
+});
+
 test("a codex session that needs fable is refused: there is no such window to wait for", async (t) => {
   // Codex reports one subscription's windows and no model-scoped one at all,
   // so the chooser would pass over every account for "no fable window" and a

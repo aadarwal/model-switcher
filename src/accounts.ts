@@ -620,9 +620,18 @@ export async function cmdLogin(name: string): Promise<number> {
       // this login mints into the keychain — it would shadow the grant the
       // human is standing here minting. A file this login does not itself
       // write does not survive it; one it does write IS the new grant.
+      //
+      // And only when the login actually MINTED something to supersede it
+      // with. A `claude auth login` that exits 0 and leaves nothing ms can
+      // locate has superseded nothing, and unlinking here would take the
+      // account's only working credential — `locatePollCredential` would then
+      // fail, and the account would drop out of the pool over a file that was
+      // fine. `pollGrantUsable` says "not usable" for reasons that are not the
+      // grant's fault (no `claude` on PATH, an `auth status` that errors), so
+      // this is a live path, not a theoretical one.
       const before = stampCredFile(name);
       runAuthLogin(name, dir);
-      discardStaleCredFile(name, before);
+      if (keychainItemExists(keychainItemFor(name))) discardStaleCredFile(name, before);
     }
     locatePollCredential(name, dir);
     // Identity (and the duplicate refusal) before a token is ever minted: a

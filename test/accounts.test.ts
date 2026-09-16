@@ -589,6 +589,37 @@ test("accounts login discards a credentials file it did not write, so the fresh 
   assert.equal(ls.stdout.includes("stale"), false, "the account book never prints a credential");
 });
 
+test("accounts login KEEPS the credentials file when the login minted nothing it can locate", () => {
+  // The discard is only ever a SUPERSEDE: it drops a migrated file because the
+  // login put a better grant somewhere else. A `claude auth login` that exits
+  // 0 and leaves nothing behind — a CLI that no-ops, a flow the human
+  // abandoned into a zero exit — has superseded nothing, and unlinking here
+  // would take the account's only working credential and drop it out of the
+  // pool. Note that `pollGrantUsable` says "not usable" for reasons that are
+  // not the grant's fault (no `claude` on PATH, an `auth status` that errors),
+  // so this path is reachable with a perfectly good file sitting there.
+  const s = scene({ noCredFile: true });
+  const stale = path.join(s.configDir("gmail"), ".credentials.json");
+  const healthy = JSON.stringify({
+    claudeAiOauth: { accessToken: "at-migrated", refreshToken: "rt-migrated", expiresAt: Date.now() + 3_600_000 },
+  });
+  mkdirSync(s.configDir("gmail"), { recursive: true, mode: 0o700 });
+  writeFileSync(stale, healthy, { mode: 0o600 });
+  s.ms(["add", "gmail"]);
+
+  // No keychainOk and no keychainAfter: the login writes no file and mints no
+  // item, so there is nothing for it to have superseded.
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(existsSync(stale), "the login minted nothing, so it superseded nothing");
+  assert.equal(readFileSync(stale, "utf8"), healthy, "and the file was not rewritten either");
+
+  const ls = s.ms(["ls"]);
+  assert.equal(ls.code, 0, ls.stderr);
+  assert.match(ls.stdout, /gmail\s+claude\s+gmail\s+org-1\s+yes\s+yes/);
+  assert.equal(ls.stdout.includes("migrated"), false, "the account book never prints a credential");
+});
+
 test("accounts login KEEPS the credentials file when the login itself wrote it", () => {
   // The other half: on Linux (and under the stub here) `claude auth login`
   // writes that file itself, and it IS the fresh grant. Only a file the login

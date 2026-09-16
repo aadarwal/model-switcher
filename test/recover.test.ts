@@ -974,6 +974,74 @@ test("a throw past the transaction never leaves a recovery owned by a worker tha
   assert.ok(!respawnLine(w), "the launch was never written, so nothing was respawned");
 });
 
+test("the catch-all touches nothing when the recovery was never claimed", async (t) => {
+  // The first guard. The throw came BEFORE this worker owned anything — here,
+  // out of reading the session row itself, whose `flags` column is not JSON any
+  // more. There is no half-finished recovery to close and no session to park,
+  // and parking one anyway would turn a row somebody corrupted into a session a
+  // human has to go and rescue while the recovery it needs is thrown away.
+  const w = await world(t);
+  const file = path.join(w.msHome, "state.sqlite");
+  const db = new DatabaseSync(file);
+  try {
+    db.exec("PRAGMA busy_timeout=5000");
+    db.prepare("UPDATE sessions SET flags='{ not json' WHERE id='s1'").run();
+  } finally {
+    db.close();
+  }
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  const rec = rows(w, "recoveries")[0];
+  assert.equal(rec.status, "pending", "still owed to whoever comes next");
+  assert.equal(rec.owner, null);
+  // Read raw: the row this test corrupted is exactly the one `getSession` chokes on.
+  const after = new DatabaseSync(file);
+  try {
+    const row = after.prepare("SELECT state, wakeupAt FROM sessions WHERE id='s1'").get() as { state: string; wakeupAt: number | null };
+    assert.equal(row.state, "walled", "nothing was claimed, so nothing is parked");
+    assert.equal(row.wakeupAt, null);
+  } finally {
+    after.close();
+  }
+  assert.match(recoverLog(w), /recovery failed: /);
+  assert.doesNotMatch(recoverLog(w), /is parked/);
+});
+
+test("the catch-all never finishes a recovery another worker has taken", async (t) => {
+  // The second guard. Between this worker's claim and the throw, the row moved
+  // to somebody else — a reclaim, a manual verb that judged this pid dead. It
+  // is that worker's recovery now, and closing it `failed` from here would
+  // delete a live handoff's record out from under it.
+  const w = await world(t);
+  const db = new DatabaseSync(path.join(w.msHome, "state.sqlite"));
+  try {
+    db.exec("CREATE TRIGGER no_launches BEFORE INSERT ON launches BEGIN SELECT RAISE(ABORT, 'the store would not write'); END");
+  } finally {
+    db.close();
+  }
+  const other = `999999@${hostname()}`;
+  // The instant the first key goes out — well before the launch row is written.
+  const stop = onFirst(w, "send-keys", () => {
+    const d = new DatabaseSync(path.join(w.msHome, "state.sqlite"));
+    try {
+      d.exec("PRAGMA busy_timeout=5000");
+      d.prepare("UPDATE recoveries SET owner=? WHERE sessionId='s1'").run(other);
+    } finally {
+      d.close();
+    }
+  });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  const rec = rows(w, "recoveries")[0];
+  assert.equal(rec.status, "owned", "left exactly as its new owner had it");
+  assert.equal(rec.owner, other);
+  assert.notEqual(session(w).state, "parked", "and the other worker's session is not parked from here");
+  assert.match(recoverLog(w), /recovery failed: /);
+});
+
 test("no launch token ever reaches a tmux command line", async (t) => {
   const w = await world(t);
   const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });

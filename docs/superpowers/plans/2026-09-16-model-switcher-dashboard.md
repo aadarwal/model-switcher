@@ -99,3 +99,9 @@
 - **Spec coverage.** §13 `ms dashboard` (localhost page over the same store and verbs) → T1, T2, T4; bounded `ms switch --all` → T3; anu adoption of the Codex mechanics → T5. Linux, capacity caps and a keep-warm service remain deferred (not in scope).
 - **Placeholders.** Each code task names its inputs, outputs, tests and the exact routes/flags; the two live tasks are procedures with pass criteria.
 - **Type consistency.** `handle()` (T1) served by T2; `switchOne`/`switchAll` (T3) used by T1's `/api/switch-all` — T1 may land first with `switchAll` imported from `src/manual.ts` once T3 exports it; if T1 lands first, it registers `/api/switch-all` as 501 until T3 merges (say so in the test); `HANDOFF_SLOTS` exported from `src/recover.ts` in T3.
+
+---
+
+## Deviations
+
+- **Idle exit and result lifetime.** The idle window is **90 s**, not the 30 s written above (review round 1, finding 4: a hidden tab's own JS timers throttle from around 60 s, so a 30 s default could exit under a human's nose while the tab was merely backgrounded); a fleet move's result stays on the page for **10–15 s**, not 10 s flat — it expires after 10 s and is cleared by the next 5 s render.

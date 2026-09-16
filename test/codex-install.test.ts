@@ -327,3 +327,49 @@ test("every write is 0600, not merely the first", () => {
   assert.equal(installCodexHooks(d, "/usr/local/bin/ms").changed, true);
   assert.equal(statSync(config(d)).mode & 0o777, 0o600);
 });
+
+test("a table that merely CONTAINS the word 'hooks' is the human's, not ours: a webhooks project stays installed and untouched", () => {
+  // A-I1. `ensureCodexTrust` appends `[projects."<cwd>"]` to this very file on
+  // every launch, so `ms codex` from `~/src/webhooks-service` used to write a
+  // header the classifier called `unknown` — which made `codexHooksInstalled`
+  // false, `ms doctor` ✗, and `--fix` refuse. Only the FIRST key segment being
+  // `hooks` can shift the matcher index or collide with our trust keys; a
+  // `projects` or `mcp_servers` table carrying the substring cannot.
+  for (const header of [
+    '[projects."/Users/a/src/webhooks-service"]',
+    '[projects."/Users/a/src/git-hooks"]',
+    '[projects."/Users/a/src/pre-commit-hooks"]',
+    "[mcp_servers.githooks]",
+    '[mcp_servers."hooks-server"]',
+  ]) {
+    const d = home();
+    assert.equal(installCodexHooks(d, MS).changed, true, header);
+    assert.equal(codexHooksInstalled(d, MS), true, header);
+
+    // Exactly what a launch's trust writer appends, after our block.
+    const withProject = `${read(d)}\n${header}\ntrust_level = "trusted"\n`;
+    writeFileSync(config(d), withProject, { mode: 0o600 });
+    assert.equal(codexHooksInstalled(d, MS), true, `${header}: still installed`);
+
+    // And `doctor --fix`'s installer is a no-op on it — no refusal, no rewrite.
+    const again = installCodexHooks(d, MS);
+    assert.equal(again.problem, undefined, header);
+    assert.equal(again.changed, false, `${header}: nothing to change`);
+    assert.equal(again.backup, null, `${header}: nothing backed up`);
+    assert.equal(read(d), withProject, `${header}: byte for byte`);
+  }
+});
+
+test("a first install into a config that already carries a webhooks project is allowed, and keeps it verbatim", () => {
+  const d = home();
+  const before = ['[projects."/Users/a/src/webhooks-service"]', 'trust_level = "trusted"', ""].join("\n");
+  writeFileSync(config(d), before, { mode: 0o600 });
+  const r = installCodexHooks(d, MS);
+  assert.equal(r.problem, undefined);
+  assert.equal(r.changed, true);
+  assert.ok(read(d).includes('[projects."/Users/a/src/webhooks-service"]'));
+  assert.ok(read(d).includes('trust_level = "trusted"'));
+  assert.equal(codexHooksInstalled(d, MS), true);
+  // The project table is NOT counted as a matcher: our trust keys stay at index 0.
+  assert.ok(read(d).includes(`[hooks.state."${config(d)}:session_start:0:0"]`));
+});

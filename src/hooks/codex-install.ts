@@ -153,6 +153,21 @@ const STATE = String.raw`(?:state|"state"|'state')`;
 const BARE = String.raw`[A-Za-z0-9_-]+`;
 const EVENT_HEADER = new RegExp(String.raw`^\[\[\s*${HOOKS}\s*\.\s*(?:(${BARE})|"(${BARE})"|'(${BARE})')\s*\]\]$`);
 const STATE_HEADER = new RegExp(String.raw`^\[\s*${HOOKS}\s*\.\s*${STATE}\s*\.\s*("(?:[^"\\]|\\.)*"|'[^']*')\s*\]$`);
+/**
+ * A header whose FIRST key segment is `hooks` — `[hooks]`, `[[hooks]]`,
+ * `[hooks.state]`, `[[hooks.SessionStart.extra]]`, and the quoted spellings.
+ * Those are the only headers that can shift the matcher index our trust key is
+ * built from, or collide with one of our keys.
+ *
+ * It is deliberately NOT the substring `hooks`. `ensureCodexTrust` appends
+ * `[projects."<cwd>"]` to this very file on every launch, so a launch from
+ * `~/src/webhooks-service` (or `git-hooks`, `pre-commit-hooks`) would
+ * otherwise turn a correctly installed home into one the installer refuses to
+ * touch and `codexHooksInstalled` reports false — a home the wizard could
+ * never repair. A `projects` or `mcp_servers` table that merely carries the
+ * word is the human's, and is copied through byte for byte.
+ */
+const HOOKS_SEGMENT = new RegExp(String.raw`^\[\[?\s*${HOOKS}\s*[.\]]`);
 
 /**
  * Whether a line is a table header at all: after its comment is cut and its
@@ -170,14 +185,15 @@ function classify(raw: string): Header {
   if (ev) return { kind: "event", table: ev[1] ?? ev[2] ?? ev[3]! };
   const st = STATE_HEADER.exec(line);
   if (st) return { kind: "state", key: unquoteTomlKey(st[1]) };
-  // Not one of ours — but is it under `hooks` at all? A header that does not
-  // contain the word cannot be, whatever else it is, and refusing on every
+  // Not one of ours — but is it under `hooks` at all? Only a header whose
+  // FIRST key segment is `hooks` can be, whatever else it is; refusing on every
   // unparsed header would refuse on a nested array literal that happens to sit
-  // on its own line. (A key that spells the word with an escape —
-  // `["\u0068ooks".SessionStart]` — defeats this; it also defeats every other
+  // on its own line, and refusing on the mere substring would refuse on the
+  // human’s own `[projects."…/webhooks-service"]`. (A key that spells the word
+  // with an escape — `["\u0068ooks".SessionStart]` — defeats this; it also defeats every other
   // reader of this file, Codex's own included, and is not a shape any tool
   // writes.)
-  return /hooks/.test(line) ? { kind: "unknown" } : null;
+  return HOOKS_SEGMENT.test(line) ? { kind: "unknown" } : null;
 }
 
 /** The inverse of `tomlString` for the one quoted segment `STATE_HEADER`

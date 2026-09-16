@@ -40,8 +40,7 @@
 // hostile `retry-after` nor a clock jump can pin an account out for a day.
 
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import path from "node:path";
-import { ensureStore, msHome, p } from "./paths.ts";
+import { ensureStore, p } from "./paths.ts";
 import { Locked, withLock } from "./lock.ts";
 import { loadRegistry, type Account, type Provider } from "./registry.ts";
 import { openState } from "./state.ts";
@@ -287,12 +286,6 @@ async function pollClaudeUsage(a: Account, signal: AbortSignal): Promise<Usage> 
 
 // --- Polling one Codex account ------------------------------------------
 
-// Task 5 (running in parallel) is the one adding `p.codexHome` to
-// src/paths.ts; computed locally here so this task does not depend on that
-// branch landing first. The controller replaces this with `p.codexHome(name)`
-// at merge time.
-const codexHomeOf = (name: string): string => path.join(msHome(), "codex", name);
-
 /** The G2 spike (whether a running `codex` process tolerates its on-disk
  *  grant rotating under it) has not run yet. Conservative rule until it does:
  *  a credential is due for refresh only when nothing managed is using it.
@@ -323,7 +316,7 @@ function codexRefreshAllowed(name: string): boolean {
 }
 
 async function pollCodexUsage(a: Account, signal: AbortSignal): Promise<Usage> {
-  const dir = codexHomeOf(a.name);
+  const dir = p.codexHome(a.name);
   let auth = readCodexCredentials(dir);
   if (!auth) throw new AuthError(`no credentials (ms accounts login ${a.name})`);
   if (codexRefreshDue(auth) && codexRefreshAllowed(a.name)) {
@@ -331,9 +324,15 @@ async function pollCodexUsage(a: Account, signal: AbortSignal): Promise<Usage> {
       lockOf(a),
       async () => {
         // Re-read inside the lock: whoever we waited for may have just
-        // rotated it, in which case there is nothing left to refresh.
+        // rotated it, in which case there is nothing left to refresh. And
+        // re-check the session guard too — the outside check above runs
+        // BEFORE the lock is even requested, so a session can start in the
+        // gap between that check and actually holding the lock. That check
+        // was only ever a cheap pre-filter to skip taking the lock when
+        // refreshing is obviously unnecessary; this is the one that must
+        // not miss a session that started while we waited.
         const latest = readCodexCredentials(dir) ?? auth!;
-        if (!codexRefreshDue(latest)) return latest;
+        if (!codexRefreshDue(latest) || !codexRefreshAllowed(a.name)) return latest;
         return await refreshCodexCredentials(dir, latest, signal);
       },
       { waitMs: POLL_TIMEOUT_MS },

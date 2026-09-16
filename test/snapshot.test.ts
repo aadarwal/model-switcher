@@ -687,6 +687,132 @@ test("a codex 401 on the stored access token classifies as auth (refresh withhel
   assert.match(work.error!, /401/);
 });
 
+// The outside `codexRefreshDue && codexRefreshAllowed` check runs BEFORE the
+// credential lock is even requested — it is a cheap pre-filter, not the
+// decision. A session can start in the gap between that check and actually
+// holding the lock, and only a re-check made INSIDE the lock body can see it.
+test("a session that starts while waiting for the lock still stops the refresh", async () => {
+  const { msHome } = env([{ name: "work", provider: "codex" }]);
+  // Overdue and (at the moment of the outside check) no session — the
+  // pre-filter passes and pollCodexUsage goes to take the lock.
+  codexGrant(msHome, "work", { lastRefresh: new Date(Date.now() - 2 * HOUR).toISOString() });
+  const { getSnapshot } = await load();
+  const { acquire } = await import("../src/lock.ts");
+  const { openState } = await import("../src/state.ts");
+
+  // Play the other process: hold the credential lock so pollCodexUsage's
+  // withLock call has to wait, the same as a real race would force it to.
+  const release = acquire("account-codex-work")!;
+  assert.ok(release, "the test itself plays the other process");
+
+  const calls = stubFetch((url) =>
+    url === CODEX_TOKEN_URL
+      ? new Response(JSON.stringify({ access_token: "cat-should-not-be-used" }), { status: 200 })
+      : codexOk());
+  const pending = getSnapshot({ maxAgeMs: 0 });
+  await sleep(150); // it is now waiting on the lock, not refreshing
+
+  // NOW a codex session starts for "work" — exactly the race window the
+  // outside check, taken before the lock was even requested, could not see.
+  const state = openState();
+  state.createSession({
+    id: "sess-race", provider: "codex", cliSessionId: null, cwd: "/tmp", socket: "s", pane: "%1",
+    serverStart: "1", need: "any", account: "work", generation: 1, state: "running",
+    desired: "running", flags: [],
+  });
+  state.close();
+
+  release();
+  const s = await pending;
+
+  assert.deepEqual(calls.map((c) => c.url), [CODEX_USAGE_URL],
+    "no token-endpoint call: the lock body re-checked and saw the new session");
+  assert.equal(calls[0]!.auth, "Bearer cat-work", "polled with the stored, unrefreshed access token");
+  assert.equal(byName(s, "work").usage!.session!.usedPercent, 42);
+  assert.equal(byName(s, "work").error, null);
+});
+
+test("a real 429 through fetchCodexUsage backs off only codex:work, leaving claude:work untouched", async () => {
+  const { msHome, snapshot } = env([
+    { name: "work", provider: "claude" },
+    { name: "work", provider: "codex" },
+  ]);
+  grant(msHome, "work");
+  codexGrant(msHome, "work"); // fresh last_refresh: no refresh call to interfere
+  stubFetch((url) =>
+    url === CODEX_USAGE_URL
+      ? new Response("slow down", { status: 429, headers: { "retry-after": "86400" } })
+      : ok());
+  const { getSnapshot } = await load();
+
+  const s = await getSnapshot({ maxAgeMs: 0 });
+  const claude = s.accounts.find((a) => a.provider === "claude")!;
+  const codex = s.accounts.find((a) => a.provider === "codex")!;
+  assert.equal(claude.error, null, "the Claude row's own 200 was untouched by the Codex row's 429");
+  assert.equal(claude.usage!.session!.usedPercent, 10);
+  assert.equal(codex.errorKind, "transient");
+  assert.match(codex.error!, /429/);
+  assert.equal(codex.stale, true);
+
+  const backoff = JSON.parse(readFileSync(snapshot, "utf8")).backoff;
+  assert.deepEqual(Object.keys(backoff), ["codex:work"],
+    "only the codex row got a retry timer, from a REAL 429 through fetchCodexUsage");
+  const waitMs = backoff["codex:work"] - Date.now();
+  assert.ok(Math.abs(waitMs - 900_000) <= 2_000, `clamped to 15 min, got ${waitMs} ms`);
+});
+
+test("a codex refresh rejection classifies invalid_grant as auth, with no backoff", async () => {
+  const { msHome, snapshot } = env([{ name: "work", provider: "codex" }]);
+  codexGrant(msHome, "work", { lastRefresh: new Date(Date.now() - 2 * HOUR).toISOString() }); // due; no session, so refresh is attempted
+  stubFetch((url) =>
+    url === CODEX_TOKEN_URL
+      ? new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 })
+      : codexOk());
+  const { getSnapshot } = await load();
+
+  const s = await getSnapshot({ maxAgeMs: 0 });
+  const work = byName(s, "work");
+  assert.equal(work.errorKind, "auth");
+  assert.match(work.error!, /invalid_grant|refresh rejected/);
+  assert.equal(JSON.parse(readFileSync(snapshot, "utf8")).backoff["codex:work"], undefined,
+    "a dead refresh grant is not a retry timer");
+});
+
+test("a codex refresh rejection classifies a 5xx as transient, backs off, and keeps the last reading alive while recent", async () => {
+  const { msHome, snapshot } = env([{ name: "work", provider: "codex" }]);
+  codexGrant(msHome, "work"); // fresh last_refresh: the first poll is a plain read, no refresh
+  stubFetch(() => codexOk());
+  const { getSnapshot, toPickInputs } = await load();
+  const good = await getSnapshot();
+  const observedAt = byName(good, "work").observedAt;
+
+  // Age the on-disk credential past the 55-minute threshold, so the next
+  // poll (no session running) attempts a refresh — and the token endpoint
+  // is down.
+  codexGrant(msHome, "work", { lastRefresh: new Date(Date.now() - 2 * HOUR).toISOString() });
+  stubFetch((url) => (url === CODEX_TOKEN_URL ? new Response("down", { status: 502 }) : codexOk()));
+
+  const hit = await getSnapshot({ maxAgeMs: 0 });
+  const work = byName(hit, "work");
+  assert.equal(work.errorKind, "transient");
+  assert.ok(work.error);
+  assert.equal(work.stale, true);
+  assert.equal(work.observedAt, observedAt, "observedAt is the last SUCCESSFUL poll");
+  assert.equal(work.usage!.session!.usedPercent, 42, "the last reading is carried, not thrown away");
+
+  const backoffUntil = JSON.parse(readFileSync(snapshot, "utf8")).backoff["codex:work"];
+  assert.equal(typeof backoffUntil, "number");
+  const waitMs = backoffUntil - Date.now();
+  assert.ok(Math.abs(waitMs - 60_000) <= 2_000, `no retry-after on a 502: defaults to 1 min, got ${waitMs} ms`);
+
+  // The chooser still sees it: a recent reading survives a transient
+  // refresh failure, per the same age rule a transient usage-read failure
+  // gets.
+  const inputs = toPickInputs(hit);
+  const pin = inputs.find((i) => i.name === "work")!;
+  assert.equal(pin.error, null, "a recent reading survives a transient refresh failure");
+});
+
 // An errorless row that nothing refreshed used to have no age bound at all: a
 // busy fallback or a scoped poll could feed hours-old percentages to the
 // chooser, which is how a walled account gets picked.

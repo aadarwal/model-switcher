@@ -1,0 +1,38 @@
+#!/usr/bin/env node
+// The entry point for every invocation, including `ms _hook claude`, whose
+// stderr lands in the human's Claude transcript. So: it resolves an entry
+// (bin/resolve-entry.mjs decides which, and never throws), makes sure
+// something can read TypeScript before importing any, and says one plain line
+// if this install has no entry point at all. No runtime deps —
+// resolve-entry.mjs is a plain ESM sibling and tsx is only ever a dev tool.
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { resolveEntry } from "./resolve-entry.mjs";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const entry = resolveEntry(here);
+if (!entry) {
+  process.stderr.write("ms: no entry point — this install has neither dist/ms.js nor src/cli.ts beside bin/\n");
+  process.exit(1);
+}
+if (entry.endsWith(".ts")) await loadTypeScript();
+const { main } = await import(entry);
+process.exitCode = await main(process.argv.slice(2));
+
+/**
+ * Put tsx in front of the TypeScript sources, unless this process was already
+ * started with it (`node --import tsx bin/ms`, which is how the tests run).
+ * resolveEntry only chooses `src/` when tsx resolves or the human asked for it
+ * by name, so the catch here is for the second case: Node's own strip-only
+ * type stripping gets its try, and whatever it says names the file and line.
+ */
+async function loadTypeScript() {
+  const already = [...process.execArgv, process.env.NODE_OPTIONS ?? ""].some((a) => a.includes("tsx"));
+  if (already) return;
+  try {
+    const { register } = await import("tsx/esm/api");
+    register();
+  } catch {
+    /* no tsx in this install; fall through to whatever node itself can do */
+  }
+}

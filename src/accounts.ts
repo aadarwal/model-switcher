@@ -542,7 +542,7 @@ function asProvider(verb: string, value: string | undefined): Provider {
   throw new UsageError(`${verb}: --provider takes claude|codex${value ? `, not '${value}'` : ""}`, true);
 }
 
-function cmdAdd(args: string[]): number {
+export function cmdAdd(args: string[]): number {
   let name: string | null = null;
   let label: string | null = null;
   let provider: Provider = "claude";
@@ -584,7 +584,7 @@ function cmdAdd(args: string[]): number {
   return 0;
 }
 
-async function cmdLogin(name: string): Promise<number> {
+export async function cmdLogin(name: string): Promise<number> {
   mustFind(name);
   const { dir, created } = claudeConfigDir(name);
   let profile: Profile;
@@ -636,7 +636,7 @@ async function cmdLogin(name: string): Promise<number> {
   return 0;
 }
 
-async function cmdVerify(name: string): Promise<number> {
+export async function cmdVerify(name: string): Promise<number> {
   mustFind(name);
   // Step 2's check, re-run: where the credential lives can change under us
   // (Claude Code re-minting it into the keychain, a lost note), and repairing

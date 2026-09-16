@@ -12,6 +12,7 @@ import { recoverVerb } from "./recover.ts";
 import { status } from "./status.ts";
 import { doctor } from "./doctor.ts";
 import { accountsVerb } from "./accounts.ts";
+import { setupVerb } from "./setup.ts";
 
 export type Verb = (args: string[]) => Promise<number>;
 const verbs = new Map<string, Verb>();
@@ -31,6 +32,7 @@ registerVerb("_recover", recoverVerb);
 registerVerb("status", status);
 registerVerb("doctor", doctor);
 registerVerb("accounts", accountsVerb);
+registerVerb("setup", setupVerb);
 registerVerb("rotate", rotateVerb);
 registerVerb("switch", switchVerb);
 registerVerb("stop", stopVerb);

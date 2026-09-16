@@ -32,26 +32,33 @@ const DASH = "—";
 export type AccountState = "ok" | "stale" | "auth" | "transient" | "no-grant" | "no-token";
 
 /** `pollOne` (src/snapshot.ts) names a missing poll grant with this exact
- *  phrase; anything else classified `auth` is a live credential that the
- *  provider itself rejected (a dead refresh token, a revoked grant). */
-const NO_GRANT_RE = /no poll grant|credentials missing/i;
+ *  phrase for Claude ("no poll grant …") and Codex ("no credentials …");
+ *  anything else classified `auth` is a live credential that the provider
+ *  itself rejected (a dead refresh token, a revoked grant). */
+const NO_GRANT_RE = /no poll grant|credentials missing|no credentials/i;
 
 /**
  * The single STATE word for an account row.
  *
  * `no-token` is checked first and independently of the usage poll: the
- * launch grant and the poll grant are two separate credentials (spec §6),
- * and an account with no launch token cannot be run with at all, however
- * well its usage reads. Everything after that is what the last poll found,
- * worst first: a dead credential outranks a slow network, which outranks a
- * reading this round merely didn't refresh.
+ * launch grant and the poll grant are two separate credentials for Claude
+ * (spec §6), and a Claude account with no launch token cannot be run with
+ * at all, however well its usage reads. Codex has no such second
+ * credential — the CLI reads CODEX_HOME directly — so `no-token` can never
+ * apply to a codex row, whatever `hasToken` was computed as upstream; a
+ * missing or unreadable Codex `auth.json` instead surfaces as `no-grant`
+ * below, via the poller's own "no credentials" message.
+ *
+ * Everything after that is what the last poll found, worst first: a dead
+ * credential outranks a slow network, which outranks a reading this round
+ * merely didn't refresh.
  */
 export function accountState(a: AccountUsage, hasToken: boolean): AccountState {
-  if (!hasToken) return "no-token";
+  if (!hasToken && a.provider !== "codex") return "no-token";
   if (a.errorKind === "auth") return NO_GRANT_RE.test(a.error ?? "") ? "no-grant" : "auth";
-  // "other" (e.g. codex's not-yet-implemented poller) is not one of the six
-  // named states; it is folded into "transient" — not fatal, not a reason to
-  // re-login, worth another look later.
+  // "other" is not one of the six named states; it is folded into
+  // "transient" — not fatal, not a reason to re-login, worth another look
+  // later.
   if (a.errorKind === "transient" || a.errorKind === "other") return "transient";
   if (a.stale) return "stale";
   return "ok";
@@ -138,6 +145,7 @@ function sessionRow(s: SessionRow, st: State): string[] {
   return [
     s.id,
     s.pane || DASH,
+    s.provider,
     s.account,
     s.need,
     state,
@@ -180,7 +188,11 @@ async function render(json: boolean): Promise<string> {
     ));
     lines.push("");
     lines.push(...table(
-      ["SESSION", "PANE", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?"],
+      // PROVIDER sits next to ACCOUNT: identity in this tool is
+      // (provider, name), and an account name is only reused across
+      // providers, never within one — so a session's own credential is
+      // named by both cells together, not ACCOUNT alone.
+      ["SESSION", "PANE", "PROVIDER", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?"],
       sessions.map((s) => sessionRow(s, st)),
     ));
     return lines.join("\n") + "\n";

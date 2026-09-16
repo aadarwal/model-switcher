@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync, realpathSync, existsSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { stubDir, tempHome, run } from "./helpers.ts";
@@ -28,11 +28,18 @@ esac
 exit 0`;
 const HEALTHY_CLAUDE = `case "$1" in --version) echo "1.2.3 (Claude Code)" ;; esac
 exit 0`;
+// The tested range (spike record 2026-09-16): reporting a DIFFERENT minor
+// must still be a ✓ line (checkCodexBinary never fails on it), so this
+// fixture deliberately stays inside 0.153.x rather than proving that by
+// accident.
+const HEALTHY_CODEX = `case "$1" in --version) echo "codex-cli 0.153.4" ;; esac
+exit 0`;
 
 function stubHealthyBinaries(): { dir: string } {
   const { dir, stub } = stubDir();
   stub("tmux", HEALTHY_TMUX);
   stub("claude", HEALTHY_CLAUDE);
+  stub("codex", HEALTHY_CODEX);
   // Every doctor test that reaches the poll-grant check must never touch the
   // real keychain: absent (exit 44) unless a test stubs its own answer.
   stub("security", "exit 44");
@@ -67,6 +74,42 @@ function writeDueCredential(msHome: string, name: string, accessToken: string, r
 const account = (over: Partial<Account> = {}): Account => ({
   name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true, ...over,
 });
+
+const codexAccount = (over: Partial<Account> = {}): Account => ({
+  name: "codexacct", provider: "codex", label: "CodexAcct", orgId: null, shared: false, identityVerified: true, ...over,
+});
+
+/** A codex account's home, built the way `ensureCodexHome` itself builds one
+ *  (the account dir plus the shared store plus this home's own `sessions`
+ *  symlink), with a working `auth.json` (all four token fields, a fresh
+ *  `last_refresh` so no poller ever needs to refresh it) and its hooks
+ *  already installed — so `checkCodexAccount` reads as fully healthy without
+ *  a test having to hand-build a home that could drift from the real one. */
+async function writeHealthyCodexAccountFiles(msHome: string, name: string, accessToken = `at-${name}`): Promise<string> {
+  process.env.MS_HOME = msHome;
+  const { ensureCodexHome } = await import("../src/accounts-codex.ts");
+  const { installCodexHooks } = await import("../src/hooks/codex-install.ts");
+  const { msBinary } = await import("../src/paths.ts");
+  const dir = ensureCodexHome(name);
+  writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: `id-${name}`, access_token: accessToken, refresh_token: `rt-${name}`, account_id: `acct-${name}` },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+  installCodexHooks(dir, msBinary());
+  return dir;
+}
+
+/** A fetch stub answering `wham/usage` with a 200 for every bearer — used by
+ *  tests that don't care about the usage READING, only that the call
+ *  succeeds so hooks/link checks are exercised without hitting the network. */
+function stubCodexUsageOk(): void {
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ rate_limit: {} }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
+}
 
 // --- renderLine -----------------------------------------------------------
 
@@ -149,6 +192,59 @@ test("checkClaudeBinary: ok when present, fails when missing", async (t) => {
 
   process.env.PATH = "/nonexistent-empty-dir";
   assert.equal(checkClaudeBinary().ok, false);
+});
+
+// --- codex ---------------------------------------------------------------
+
+test("checkCodexBinary(true): ok, and reports the version, when in the tested 0.153.x range", async (t) => {
+  base();
+  const savedPath = process.env.PATH;
+  t.after(() => { process.env.PATH = savedPath; });
+  const { checkCodexBinary } = await import("../src/doctor.ts");
+  const { dir, stub } = stubDir();
+  stub("codex", 'case "$1" in --version) echo "codex-cli 0.153.4" ;; esac\nexit 0');
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  const r = checkCodexBinary(true);
+  assert.equal(r.ok, true);
+  assert.match(r.what, /0\.153\.4/);
+  assert.doesNotMatch(r.what, /different minor/);
+});
+
+test("checkCodexBinary(true): a different minor is still ok — never a failure — with a note in the line", async (t) => {
+  base();
+  const savedPath = process.env.PATH;
+  t.after(() => { process.env.PATH = savedPath; });
+  const { checkCodexBinary } = await import("../src/doctor.ts");
+  const { dir, stub } = stubDir();
+  stub("codex", 'case "$1" in --version) echo "codex-cli 0.160.2" ;; esac\nexit 0');
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  const r = checkCodexBinary(true);
+  assert.equal(r.ok, true);
+  assert.match(r.what, /0\.160\.2/);
+  assert.match(r.what, /different minor/);
+});
+
+test("checkCodexBinary(true): ✗ (bounded) when codex is missing", async (t) => {
+  base();
+  const savedPath = process.env.PATH;
+  t.after(() => { process.env.PATH = savedPath; });
+  const { checkCodexBinary } = await import("../src/doctor.ts");
+  process.env.PATH = "/nonexistent-empty-dir";
+  assert.equal(checkCodexBinary(true).ok, false);
+});
+
+test("checkCodexBinary(false): ok and never spawns codex at all — a Claude-only machine must never fail on a missing Codex CLI", async (t) => {
+  base();
+  const savedPath = process.env.PATH;
+  t.after(() => { process.env.PATH = savedPath; });
+  const { checkCodexBinary } = await import("../src/doctor.ts");
+  // No `codex` anywhere on PATH. If this spawned anyway, `runBounded` would
+  // report ENOENT and the result would be ✗ — so ok:true here is itself the
+  // proof that the spawn never happened.
+  process.env.PATH = "/nonexistent-empty-dir";
+  const r = checkCodexBinary(false);
+  assert.equal(r.ok, true);
+  assert.match(r.what, /not needed \(no codex accounts\)/);
 });
 
 // --- hooks -------------------------------------------------------------
@@ -282,6 +378,86 @@ test("checkStorePermissions: a clean store is one ✓ line", async () => {
   const r = checkStorePermissions(false);
   assert.equal(r.length, 1);
   assert.equal(r[0]!.ok, true);
+});
+
+// --- store permissions: the codex tree ------------------------------------
+
+test("checkStorePermissions: codex/<name>/auth.json and config.toml are checked (0600); --fix chmods both", async () => {
+  const { msHome } = base();
+  const { checkStorePermissions } = await import("../src/doctor.ts");
+  const dir = path.join(msHome, "codex", "codexacct");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(dir, "auth.json"), "{}", { mode: 0o644 });
+  writeFileSync(path.join(dir, "config.toml"), "", { mode: 0o644 });
+
+  const before = checkStorePermissions(false);
+  assert.ok(before.some((r) => !r.ok && r.what.endsWith("auth.json") && /0644.*0600/.test(r.why ?? "")), JSON.stringify(before));
+  assert.ok(before.some((r) => !r.ok && r.what.endsWith("config.toml") && /0644.*0600/.test(r.why ?? "")), JSON.stringify(before));
+
+  checkStorePermissions(true);
+  assert.equal(statSync(path.join(dir, "auth.json")).mode & 0o777, 0o600);
+  assert.equal(statSync(path.join(dir, "config.toml")).mode & 0o777, 0o600);
+});
+
+test("checkStorePermissions: the account dir (codex/<name>) is checked (0700); --fix chmods it", async () => {
+  const { msHome } = base();
+  const { checkStorePermissions } = await import("../src/doctor.ts");
+  const dir = path.join(msHome, "codex", "codexacct");
+  mkdirSync(dir, { recursive: true });
+  chmodSync(dir, 0o755);
+
+  const before = checkStorePermissions(false);
+  assert.ok(before.some((r) => !r.ok && /codexacct$/.test(r.what)), JSON.stringify(before));
+
+  checkStorePermissions(true);
+  assert.equal(statSync(dir).mode & 0o777, 0o700);
+});
+
+test("checkStorePermissions: the shared codex/sessions store is checked (0700) but its CONTENTS are never walked or chmod'ed — Codex owns them", async () => {
+  const { msHome } = base();
+  const { checkStorePermissions } = await import("../src/doctor.ts");
+  const sessionsDir = path.join(msHome, "codex", "sessions");
+  const rollout = path.join(sessionsDir, "2026", "09", "16");
+  mkdirSync(rollout, { recursive: true, mode: 0o755 });
+  const rolloutFile = path.join(rollout, "rollout-1.jsonl");
+  writeFileSync(rolloutFile, "{}\n", { mode: 0o644 });
+  chmodSync(sessionsDir, 0o755);
+
+  const before = checkStorePermissions(false);
+  assert.ok(before.some((r) => !r.ok && r.what.endsWith("codex/sessions") && /0755.*0700/.test(r.why ?? "")), JSON.stringify(before));
+  assert.ok(!before.some((r) => /rollout-1\.jsonl|2026|09|16/.test(r.what)), JSON.stringify(before));
+
+  checkStorePermissions(true);
+  assert.equal(statSync(sessionsDir).mode & 0o777, 0o700);
+  assert.equal(statSync(rolloutFile).mode & 0o777, 0o644, "codex's own rollout files must never be chmodded");
+});
+
+test("checkStorePermissions: codex/<name>/ is scoped — only auth.json and config.toml are checked BY NAME; the account home is never listed, so its 'sessions' symlink and any other file underneath are neither reported nor touched", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  const { ensureCodexHome } = await import("../src/accounts-codex.ts");
+  const dir = ensureCodexHome("codexacct"); // builds codex/sessions AND codex/codexacct/sessions -> a symlink to it
+
+  const link = path.join(dir, "sessions");
+  assert.ok(lstatSync(link).isSymbolicLink(), "fixture sanity: the per-home entry really is a symlink");
+
+  // A stray file that is neither of the two names this check knows about —
+  // proof the account home is never `readdirSync`'d, only probed by name.
+  const stray = path.join(dir, "notes.txt");
+  writeFileSync(stray, "hello", { mode: 0o644 });
+
+  const { checkStorePermissions } = await import("../src/doctor.ts");
+  const before = checkStorePermissions(false);
+  assert.ok(!before.some((x) => x.what.includes(path.relative(msHome, link))), JSON.stringify(before));
+  assert.ok(!before.some((x) => /symlink/i.test(x.why ?? "")), JSON.stringify(before));
+  assert.ok(!before.some((x) => /notes\.txt/.test(x.what)), JSON.stringify(before));
+  // The store is otherwise clean: one aggregate ✓ line, nothing else to report.
+  assert.equal(before.length, 1);
+  assert.equal(before[0]!.ok, true);
+
+  checkStorePermissions(true); // --fix must not touch either stray either
+  assert.ok(lstatSync(link).isSymbolicLink(), "the symlink must still be a symlink, never replaced");
+  assert.equal(statSync(stray).mode & 0o777, 0o644, "an unnamed file under an account home must never be chmodded");
 });
 
 // --- the registry itself ---------------------------------------------------
@@ -428,6 +604,309 @@ test("checkClaudeAccount: --fix on a dead grant reports ✗ with the auth reason
       assert.ok(!r.what.includes(TOKEN), `token leaked in what: ${r.what}`);
       assert.ok(!(r.why ?? "").includes(TOKEN), `token leaked in why: ${r.why}`);
     }
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+// --- codex accounts --------------------------------------------------------
+
+test("checkCodexAccount: a fully healthy account reports four ✓ lines, in order", async () => {
+  const { msHome } = base();
+  await writeHealthyCodexAccountFiles(msHome, "codexacct", "at-codexacct");
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const rs = await checkCodexAccount(codexAccount(), false);
+    assert.equal(rs.length, 4);
+    assert.ok(rs.every((r) => r.ok && !r.fixed), JSON.stringify(rs));
+    assert.deepEqual(rs.map((r) => r.what), [
+      "codex account codexacct: credentials readable",
+      "codex account codexacct: usage fetch ok",
+      "codex account codexacct: hooks installed",
+      "codex account codexacct: sessions store linked",
+    ]);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: no auth.json fails credentials readable + usage fetch ok, with the codex login remedy; hooks/link checks still run independently", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  const { ensureCodexHome } = await import("../src/accounts-codex.ts");
+  ensureCodexHome("orphan-codex"); // home + shared store + link, but no auth.json ever written
+  const { checkCodexAccount } = await import("../src/doctor.ts");
+  const rs = await checkCodexAccount(codexAccount({ name: "orphan-codex" }), false);
+  assert.equal(rs.length, 4);
+  const byWhat = (re: RegExp) => rs.find((r) => re.test(r.what))!;
+  assert.equal(byWhat(/credentials readable/).ok, false);
+  assert.match(byWhat(/credentials readable/).why ?? "", /ms accounts login orphan-codex --provider codex/);
+  assert.equal(byWhat(/usage fetch ok/).ok, false);
+  assert.equal(byWhat(/hooks installed/).ok, false); // ensureCodexHome never installs hooks
+  assert.equal(byWhat(/sessions store linked/).ok, true); // ensureCodexHome already links it
+});
+
+test("checkCodexAccount: a dead access token fails usage fetch as auth, with the codex login remedy — doctor never refreshes a Codex credential, --fix or not", async () => {
+  const { msHome } = base();
+  await writeHealthyCodexAccountFiles(msHome, "codexacct", "at-dead");
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("no", { status: 401 })) as typeof fetch;
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const rs = await checkCodexAccount(codexAccount(), true); // --fix: still no refresh call exists here
+    const usage = rs.find((r) => /usage fetch ok/.test(r.what))!;
+    assert.equal(usage.ok, false);
+    assert.match(usage.why ?? "", /auth/);
+    assert.match(usage.why ?? "", /ms accounts login codexacct --provider codex/);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: a 500 from wham/usage fails usage fetch as transient, not auth", async () => {
+  const { msHome } = base();
+  await writeHealthyCodexAccountFiles(msHome, "codexacct", "at-codexacct");
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("boom", { status: 500 })) as typeof fetch;
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const rs = await checkCodexAccount(codexAccount(), false);
+    const usage = rs.find((r) => /usage fetch ok/.test(r.what))!;
+    assert.equal(usage.ok, false);
+    assert.match(usage.why ?? "", /transient/);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: hooks not installed → ✗; --fix installs and reports fixed", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  const { ensureCodexHome } = await import("../src/accounts-codex.ts");
+  const dir = ensureCodexHome("codexacct");
+  writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id-codexacct", access_token: "at-codexacct", refresh_token: "rt-codexacct", account_id: "acct-codexacct" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const before = await checkCodexAccount(codexAccount(), false);
+    const hooksBefore = before.find((r) => /hooks installed/.test(r.what))!;
+    assert.equal(hooksBefore.ok, false);
+    assert.match(hooksBefore.why ?? "", /not installed/);
+
+    const after = await checkCodexAccount(codexAccount(), true);
+    const hooksAfter = after.find((r) => /hooks installed/.test(r.what))!;
+    assert.equal(hooksAfter.ok, true);
+    assert.equal(hooksAfter.fixed, true);
+
+    const { codexHooksInstalled } = await import("../src/hooks/codex-install.ts");
+    const { msBinary } = await import("../src/paths.ts");
+    assert.equal(codexHooksInstalled(dir, msBinary()), true);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: --fix on a config.toml it cannot safely rewrite surfaces the refusal verbatim, never 'nothing to do'", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  const { ensureCodexHome } = await import("../src/accounts-codex.ts");
+  const dir = ensureCodexHome("codexacct");
+  writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id-codexacct", access_token: "at-codexacct", refresh_token: "rt-codexacct", account_id: "acct-codexacct" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+  // A 'hooks' table shape this installer cannot classify — a refusal, not a guess.
+  writeFileSync(path.join(dir, "config.toml"), `[hooks]\nSessionStart = []\n`, { mode: 0o600 });
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const rs = await checkCodexAccount(codexAccount(), true);
+    const hooks = rs.find((r) => /hooks installed/.test(r.what))!;
+    assert.equal(hooks.ok, false);
+    assert.match(hooks.why ?? "", /a 'hooks' table this tool cannot read/);
+    assert.doesNotMatch(hooks.why ?? "", /nothing to do/i);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: the account's own sessions LINK is missing (the shared store already exists) → ✗; --fix recreates the LINK", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  // The shared store itself (normally created by `loadRegistry`'s own
+  // `ensureStore`, ahead of every account check in `runDoctor`) — created
+  // here explicitly since this test calls `checkCodexAccount` directly. No
+  // ensureCodexHome for the ACCOUNT home, though — build that one by hand,
+  // deliberately without its own `sessions` entry, so the "link missing,
+  // store present" branch is what gets exercised (distinct from "link
+  // present but dangling because the STORE is missing", tested separately).
+  const { ensureStore } = await import("../src/paths.ts");
+  ensureStore();
+  const dir = path.join(msHome, "codex", "codexacct");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const before = await checkCodexAccount(codexAccount(), false);
+    const linkBefore = before.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkBefore.ok, false);
+    assert.match(linkBefore.why ?? "", /is missing \(want a symlink/);
+    assert.doesNotMatch(linkBefore.why ?? "", /shared store missing/);
+
+    const after = await checkCodexAccount(codexAccount(), true);
+    const linkAfter = after.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkAfter.ok, true);
+    assert.equal(linkAfter.fixed, true);
+
+    const { p } = await import("../src/paths.ts");
+    assert.equal(lstatSync(p.codexSessionsLink("codexacct")).isSymbolicLink(), true);
+    assert.equal(realpathSync(p.codexSessionsLink("codexacct")), realpathSync(p.codexSessions()));
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: --fix never touches an existing real directory at the sessions path — only a missing entry is ever created", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  const dir = path.join(msHome, "codex", "codexacct");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+  const realSessions = path.join(dir, "sessions");
+  mkdirSync(realSessions, { recursive: true, mode: 0o700 });
+  const marker = path.join(realSessions, "keep-me.txt");
+  writeFileSync(marker, "real session data");
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const rs = await checkCodexAccount(codexAccount(), true);
+    const link = rs.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(link.ok, false);
+    assert.match(link.why ?? "", /real directory/);
+    assert.equal(lstatSync(realSessions).isDirectory(), true);
+    assert.equal(lstatSync(realSessions).isSymbolicLink(), false);
+    assert.equal(readFileSync(marker, "utf8"), "real session data");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: a symlink correctly pointing at the shared store, when the store itself is missing, reports 'shared store missing'; --fix recreates the STORE, not the link", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  const dir = path.join(msHome, "codex", "codexacct");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+  const { p } = await import("../src/paths.ts");
+  const target = p.codexSessions();
+  const link = path.join(dir, "sessions");
+  // The link is correct and pre-existing — pointing at the shared store by
+  // name — but nothing has ever created that store directory (never call
+  // ensureStore/ensureCodexHome in this fixture).
+  symlinkSync(target, link, "dir");
+  assert.ok(!existsSync(target), "fixture sanity: the shared store must not exist yet");
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const before = await checkCodexAccount(codexAccount(), false);
+    const linkBefore = before.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkBefore.ok, false);
+    assert.match(linkBefore.why ?? "", /shared store missing/);
+    assert.ok(lstatSync(link).isSymbolicLink(), "the link itself is untouched by a plain check");
+
+    const after = await checkCodexAccount(codexAccount(), true);
+    const linkAfter = after.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkAfter.ok, true);
+    assert.equal(linkAfter.fixed, true);
+    assert.equal(statSync(target).isDirectory(), true);
+    assert.equal(statSync(target).mode & 0o777, 0o700);
+    // The link itself was never recreated — same inode/target as before.
+    assert.equal(realpathSync(link), realpathSync(target));
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: a symlink pointing SOMEWHERE ELSE (not the shared store) is reported and left alone — --fix never touches it, even though it is technically 'broken'", async () => {
+  const { msHome } = base();
+  process.env.MS_HOME = msHome;
+  const dir = path.join(msHome, "codex", "codexacct");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+  const { ensureStore } = await import("../src/paths.ts"); // the shared store DOES exist here
+  ensureStore();
+  const elsewhere = path.join(msHome, "somewhere-else");
+  mkdirSync(elsewhere, { recursive: true, mode: 0o700 });
+  const link = path.join(dir, "sessions");
+  symlinkSync(elsewhere, link, "dir"); // deliberately the wrong target
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const before = await checkCodexAccount(codexAccount(), false);
+    const linkBefore = before.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkBefore.ok, false);
+    assert.match(linkBefore.why ?? "", /points elsewhere/);
+    assert.doesNotMatch(linkBefore.why ?? "", /shared store missing/);
+
+    const after = await checkCodexAccount(codexAccount(), true); // --fix too
+    const linkAfter = after.find((r) => /sessions store linked/.test(r.what))!;
+    assert.equal(linkAfter.ok, false);
+    assert.match(linkAfter.why ?? "", /points elsewhere/);
+    assert.equal(realpathSync(link), realpathSync(elsewhere), "never touched, --fix or not");
   } finally {
     globalThis.fetch = savedFetch;
   }
@@ -647,6 +1126,171 @@ test("runDoctor --fix: installs hooks and exits 0 on the healthy subset", async 
   assert.ok(after.results.some((r) => r.ok && r.fixed && /Claude hooks installed/.test(r.what)));
 });
 
+test("runDoctor: a Claude-only machine (no codex accounts, codex truly absent from PATH — not merely unstubbed) never fails on codex --version", async (t: TestContext) => {
+  const { home, msHome } = base();
+  // A self-contained PATH — no ambient fallback — with tmux/claude/security/ms
+  // stubbed and, deliberately, NO `codex` anywhere: if the fix regresses and
+  // this spawns `codex` anyway, it fails with ENOENT and this test catches it
+  // instead of silently passing off a real `codex` the host happens to have.
+  const { dir, stub } = stubDir();
+  stub("tmux", HEALTHY_TMUX);
+  stub("claude", HEALTHY_CLAUDE);
+  stub("security", "exit 44");
+  process.env.MS_BIN = path.join(home, "real-ms");
+  writeFileSync(process.env.MS_BIN, "#!/bin/sh\n");
+  chmodSync(process.env.MS_BIN, 0o755);
+  symlinkSync(process.env.MS_BIN, path.join(dir, "ms"));
+  process.env.PATH = dir;
+  t.after(() => { delete process.env.MS_BIN; });
+
+  writeHealthyAccountFiles(msHome, "gmail");
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  saveLaunchToken("gmail", "sk-ant-oat01-AbCdEfGh12345678_-ijklmnop0123456789");
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true }] }),
+    { mode: 0o600 },
+  );
+
+  const { runDoctor } = await import("../src/doctor.ts");
+  const before = await runDoctor(false);
+  assert.ok(before.results.some((r) => !r.ok && /Claude hooks installed/.test(r.what))); // the one real problem here
+  const codexBefore = before.results.find((r) => r.what.startsWith("codex --version"))!;
+  assert.equal(codexBefore.ok, true, JSON.stringify(codexBefore));
+  assert.match(codexBefore.what, /not needed \(no codex accounts\)/);
+
+  const after = await runDoctor(true);
+  assert.equal(after.exitCode, 0, after.lines.join("\n"));
+  const codexAfter = after.results.find((r) => r.what.startsWith("codex --version"))!;
+  assert.equal(codexAfter.ok, true);
+  assert.equal(codexAfter.fixed, undefined, "never 'fixed' — there was never anything to fix");
+});
+
+test("runDoctor --fix: Codex hooks land as TOML tables + trusted_hash (a pre-existing [projects.\"…\"] table survives), a missing sessions link is recreated, a 0644 auth.json is fixed to 0600, a hooks refusal is printed verbatim and still fails the run, the sessions symlink is never flagged as stray, and no token ever appears", async (t: TestContext) => {
+  const { home, msHome } = base();
+  stubHealthyBinaries(); // tmux/claude/codex/security all stubbed healthy
+  // ms itself on PATH too (same pattern as the sibling runDoctor tests) —
+  // without it, checkPathBinary's own ✗ would join codexbad's hooks line in
+  // the failing set and this test's "exactly one failure" assertion below
+  // would be proving nothing specific to Codex.
+  process.env.MS_BIN = path.join(home, "real-ms");
+  writeFileSync(process.env.MS_BIN, "#!/bin/sh\n");
+  chmodSync(process.env.MS_BIN, 0o755);
+  const { dir: msStubDir } = stubDir();
+  symlinkSync(process.env.MS_BIN, path.join(msStubDir, "ms"));
+  process.env.PATH = `${msStubDir}:${process.env.PATH}`;
+  t.after(() => { delete process.env.MS_BIN; });
+
+  const ACCESS_TOKEN = "SEKRET-CODEX-ACCESS-TOKEN-VALUE";
+
+  // codexok: hooks not yet installed; config.toml already carries a
+  // pre-existing [projects."…"] trust row (a launch's own write, Task 7)
+  // that the installer must leave untouched; auth.json is 0644 (a
+  // permission bug store-permissions should catch and --fix should repair);
+  // the account's own sessions symlink does not exist yet.
+  const okDir = path.join(msHome, "codex", "codexok");
+  mkdirSync(okDir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(okDir, "config.toml"), `[projects."/Users/human/work"]\ntrust_level = "trusted"\n`, { mode: 0o600 });
+  writeFileSync(
+    path.join(okDir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id-codexok", access_token: ACCESS_TOKEN, refresh_token: "rt-codexok", account_id: "acct-codexok" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o644 },
+  );
+
+  // codexbad: a 'hooks' table shape the installer refuses to guess about.
+  const badDir = path.join(msHome, "codex", "codexbad");
+  mkdirSync(badDir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(badDir, "config.toml"), `[hooks]\nSessionStart = []\n`, { mode: 0o600 });
+  writeFileSync(
+    path.join(badDir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "id-codexbad", access_token: "at-codexbad", refresh_token: "rt-codexbad", account_id: "acct-codexbad" },
+      last_refresh: new Date().toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: [
+        { name: "codexok", provider: "codex", label: "CodexOK", orgId: null, shared: false, identityVerified: true },
+        { name: "codexbad", provider: "codex", label: "CodexBad", orgId: null, shared: false, identityVerified: true },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk(); // the usage read itself is not this test's concern
+  try {
+    const { runDoctor } = await import("../src/doctor.ts");
+    const { results, lines, exitCode } = await runDoctor(true);
+
+    // codexbad's refusal keeps the whole run red — and is the ONLY thing
+    // wrong: everything else this fixture set up (or --fix repaired) reads
+    // ok, so the failing set is exactly that one line, not "1 or more".
+    assert.equal(exitCode, 1, lines.join("\n"));
+    const failing = results.filter((r) => !r.ok);
+    assert.equal(failing.length, 1, JSON.stringify(failing));
+    assert.equal(failing[0]!.what, "codex account codexbad: hooks installed");
+
+    // codexok: hooks installed as TOML tables with trusted_hash entries, and
+    // the pre-existing [projects."…"] table is untouched.
+    const okConfig = readFileSync(path.join(okDir, "config.toml"), "utf8");
+    assert.match(okConfig, /\[projects\."\/Users\/human\/work"\]/);
+    assert.match(okConfig, /trust_level = "trusted"/);
+    for (const table of ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]) {
+      assert.match(okConfig, new RegExp(`\\[\\[hooks\\.${table}\\]\\]`));
+    }
+    assert.match(okConfig, /trusted_hash = "sha256:[0-9a-f]{64}"/);
+    const { codexHooksInstalled } = await import("../src/hooks/codex-install.ts");
+    const { msBinary } = await import("../src/paths.ts");
+    assert.equal(codexHooksInstalled(okDir, msBinary()), true);
+    assert.ok(results.some((r) => r.ok && r.fixed && r.what === "codex account codexok: hooks installed"), JSON.stringify(results));
+
+    // codexok's sessions link was missing and is now recreated, resolving
+    // to the shared store.
+    const { p } = await import("../src/paths.ts");
+    assert.equal(lstatSync(p.codexSessionsLink("codexok")).isSymbolicLink(), true);
+    assert.equal(realpathSync(p.codexSessionsLink("codexok")), realpathSync(p.codexSessions()));
+    assert.ok(results.some((r) => r.ok && r.fixed && r.what === "codex account codexok: sessions store linked"), JSON.stringify(results));
+
+    // codexok's 0644 auth.json is reported (as a store-permission issue) and
+    // fixed to 0600 in the same --fix run.
+    assert.equal(statSync(path.join(okDir, "auth.json")).mode & 0o777, 0o600);
+    assert.ok(
+      results.some((r) => r.ok && r.fixed && r.what === "store permission: codex/codexok/auth.json"),
+      JSON.stringify(results),
+    );
+
+    // codexbad's refusal is printed VERBATIM — never folded into a generic
+    // "nothing to do" — and it is what keeps exitCode at 1.
+    const hooksBad = results.find((r) => r.what === "codex account codexbad: hooks installed")!;
+    assert.equal(hooksBad.ok, false);
+    assert.match(hooksBad.why ?? "", /a 'hooks' table this tool cannot read/);
+    assert.ok(lines.some((l) => l.includes("a 'hooks' table this tool cannot read")), lines.join("\n"));
+
+    // Neither account's own `sessions` symlink is ever reported as a stray
+    // symlink by the store-permission walk.
+    assert.ok(!results.some((r) => r.what.includes("codex/codexok/sessions") || r.what.includes("codex/codexbad/sessions")), JSON.stringify(results));
+
+    // No token text anywhere, in any result or any rendered line.
+    const rendered = lines.join("\n");
+    assert.ok(!rendered.includes(ACCESS_TOKEN), `token leaked in rendered lines: ${rendered}`);
+    for (const r of results) {
+      assert.ok(!r.what.includes(ACCESS_TOKEN), `token leaked in what: ${r.what}`);
+      assert.ok(!(r.why ?? "").includes(ACCESS_TOKEN), `token leaked in why: ${r.why}`);
+    }
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
 // --- CLI wiring ------------------------------------------------------------
 
 test("ms doctor is registered on the CLI and runs the real checks", async () => {
@@ -679,6 +1323,8 @@ test("ms doctor --fix: a due grant that fails to refresh never prints the poll g
   const { dir: stubBin, stub } = stubDir();
   stub("tmux", HEALTHY_TMUX);
   stub("claude", HEALTHY_CLAUDE);
+  stub("codex", HEALTHY_CODEX);
+  stub("security", "exit 44");
 
   // Loaded into the subprocess via --import: always fails the refresh, so
   // this proves a rejected credential is reported without ever echoing the

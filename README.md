@@ -1,189 +1,251 @@
 # model-switcher
 
-A single command, `ms`, that runs `claude` and `codex` on whichever of your
-subscription accounts has room, and — when a running session hits a usage wall
-— restarts that same session in the same tmux pane on the next account with
-room and tells it to continue. Nothing stays resident: every invocation reads
-its state, does its work, and exits.
+`ms` runs `claude` (Claude Code) and `codex` (OpenAI Codex CLI) on whichever of your
+subscription accounts still has usage room, and when a running session hits a usage wall it
+moves that tmux pane onto another account and resumes the same conversation there. It is for
+people who hold several Claude or ChatGPT subscriptions and lose working time to a limit.
+Nothing stays resident: the CLIs' own hooks are the trigger, tmux supervises, and every `ms`
+invocation reads its state, does one job and exits. All state is one directory, `MS_HOME`.
 
-Requires macOS, Node ≥ 22.15 (for `process.execve` and `node:sqlite`) and
-tmux ≥ 3.3. `ms doctor` checks all of it.
+## Requirements
 
-## Install
+macOS. Node ≥ 22.15 (for `process.execve` and `node:sqlite`). tmux ≥ 3.3. `claude`
+and `codex` are installed separately; `ms` needs only the ones your accounts name.
 
-```
-brew install aadarwal/tap/model-switcher
+## Quick start
+
+```bash
+brew tap aadarwal/tap
+brew install model-switcher
 ms setup
 ```
 
-`ms setup` is a resumable wizard: it registers your accounts, signs them in,
-installs the hooks that notice a usage wall, offers two optional integrations,
-and finishes with `ms doctor`. Everything it writes is listed under
-[What `ms setup` changes](#what-ms-setup-changes), and everything it writes can
-be undone.
+`ms setup` asks how many accounts of each provider you have, checks the prerequisites,
+signs each account in, installs the hooks, offers two opt-ins (both default to no), and
+ends with `ms doctor`. It marks each step as it finishes, so a run that stops resumes there.
+
+Then launch a CLI from any tmux pane:
+
+```bash
+ms claude
+ms codex
+```
 
 ## Commands
 
-### Launching
+### Launch
 
 ```
 ms claude [--as <account>] [--need any|fable] [-- <claude args>]
 ms codex  [--as <account>] [--need any|fable] [-- <codex args>]
-```
-
-Picks an account with room and launches that CLI in the current tmux pane,
-under that account's credential. `--as` names an account instead of choosing
-one; `--need fable` requires headroom in the Fable window as well; Codex refuses it,
-because it reports no such window. Anything after `--` goes to the CLI itself.
-
-```
 ms attach
 ```
 
-Adopt the CLI already running in this pane as a managed session, so a wall in
-it triggers a rotation.
+- `ms claude` / `ms codex` — pick an account with room and start that CLI in the current tmux pane under the account's credential. Everything after `--` goes to the CLI unchanged.
+- `--as <account>` — use the named account instead of choosing one. `--need fable` — also require room in the Fable window; `ms codex` rejects it, because Codex reports no such window.
+- `ms attach` — re-attach to the tool's own tmux server (`MS_HOME/tmux.sock`, session `ms`), where a launch from outside tmux puts the pane.
 
-### While a session is running
+### Running sessions
 
 ```
 ms status [--watch] [--json]
 ms rotate [<session|pane>] [--force]
 ms switch [<session|pane>] --to <account> [--continue] [--force]
 ms switch --all --to <account> [--continue] [--force] [--timeout <seconds>]
-ms stop   [<session|pane>]
+ms stop [<session|pane>]
 ms dashboard [--port N] [--no-open]
 ```
 
-`rotate` moves a session to the next account with room — the same move the
-wall would have triggered, on demand. `switch` moves it to one you name;
-`--continue` tells the resumed session to carry on with what it was doing.
-`--force` moves a session that is mid-turn. `stop` un-manages a session
-without touching the CLI running in it. `dashboard` serves a local page and
-exits about 90 s after the last request.
-
-With no argument, `rotate`/`switch`/`stop` act on the session in the current
-pane.
+- `ms status` — two tables: the account pool as usage sees it, and every managed session. `--watch` reprints every 5 s; `--json` prints the same rows as JSON.
+- `ms rotate` — move a session to the next account with room: the move a wall would have made, on demand. Always carries the unfinished work over.
+- `ms switch` — move a session to a named account. It carries the work over only when the pane reads as walled; `--continue` always carries it over.
+- `ms switch --all` — move every session of that account's provider that is not already on it, four at a time. `--timeout` bounds how long new moves are *started* (default 600 s); a move in flight is never cut off.
+- `ms stop` — stop managing a session. The CLI in the pane keeps running.
+- `ms dashboard` — serve the `ms status` tables on `127.0.0.1`, with rotate, switch and stop buttons. It prints its URL, opens it (unless `--no-open`), and exits about 90 s after the last request, so it is alive only while a tab polls it.
+- `--force` moves a session that is mid-turn; without it a busy session is refused. With no `<session|pane>`, `rotate`, `switch` and `stop` act on the current pane.
 
 ### Accounts
 
 ```
 ms accounts add <name> [--provider claude|codex] [--label L] [--shared]
-ms accounts login <name> [--provider P] [--device-auth]
+ms accounts login <name> [--provider P] [--device-auth] [--relogin]
 ms accounts verify <name> [--provider P]
 ms accounts remove <name> [--provider P]
 ms accounts token <name>
 ms accounts ls
 ```
 
-`add` registers a name with no credentials; `login` mints them; `verify`
-re-checks them and the identity behind them. `--device-auth` uses a device
-code instead of a browser redirect back to localhost, which is what you want
-over SSH. `--provider` is needed only when one name is held by both providers
-— names are unique per provider, so a Claude `work` and a Codex `work` are two
-different accounts.
+- `add` — register a name with no credentials yet. `--label` sets the display label; `--shared` marks an account other people also use, which loses ties in the chooser.
+- `login` — mint the credentials and record the account's identity. Claude opens two browser flows; `--device-auth` (Codex only) prints a device code instead of redirecting to localhost, which is what you want over SSH. `--relogin` forces a fresh sign-in even when a usable grant is already in place.
+- `verify` — re-check an account's credentials and the identity behind them. `remove` — delete the registry row and every credential it names.
+- `token` — print the Claude launch token on stdout. `ls` — one row per account: provider, label, org, poll grant, launch token, verified.
+- `--provider` is needed only when one name is registered under both. Names are unique per provider, so a Claude `work` and a Codex `work` are two accounts.
 
 ### Setup and health
 
 ```
 ms setup [--resume] [--reset] [--yes] [--repair] [--remove statusline|alias]
 ms doctor [--fix]
+ms --version
 ```
 
-| Flag | What it does |
+`ms doctor` checks the install and `--fix` repairs what is safe; see [Troubleshooting](#troubleshooting). `ms --help` prints the verb list.
+
+| `ms setup` flag | What it does |
 |---|---|
-| `--resume` | Continue at the first step not finished. The default whenever there is progress to resume. |
-| `--reset` | Forget how far setup got. Never an account, never a credential, never a hook — only the wizard's own memory. |
-| `--yes` | Accept every default and ask nothing. Both opt-ins default to No, so `--yes` installs neither. |
-| `--repair` | Re-install the hooks for the accounts already registered, and re-run the final check. No login, no questions. This is the one to run when something (a CLI upgrade, a dotfiles restore, a hand edit) has removed your hooks. |
-| `--remove statusline` / `--remove alias` | Undo an optional integration. Both may be given. Each prints what it removed and where the backup went. |
+| `--resume` | Continue at the first unfinished step. Already the default when there is progress. |
+| `--reset` | Forget how far setup got. Touches no account, credential or hook. |
+| `--yes` | Take every default and ask nothing. Both opt-ins default to no, so this installs neither. |
+| `--repair` | Re-install the hooks for the accounts already registered, then re-run the check. No login, no questions. |
+| `--remove statusline` / `--remove alias` | Undo an opt-in. Both may be given in one run. Not combinable with `--repair` or `--reset`. |
 
-`ms doctor` checks the runtime, tmux, the CLIs, the hooks, file permissions,
-the registry, every account's credentials, orphaned session state and the `ms`
-on your PATH. `--fix` repairs what is safe to repair — including re-pointing
-hooks that name an `ms` that has moved. A dead credential, a malformed
-registry and a stray `ms` shadowing this one are reported, never auto-fixed.
+## Concepts
 
-## The two credentials a Claude account needs
+### A Claude account holds two credentials
 
-A Claude account carries two independent credentials, and they are not
-interchangeable:
+- **Launch grant** — a one-year `claude setup-token`, stored 0600 at `MS_HOME/launch/<name>.token`. It runs Claude Code as that account. It is inference-scope only and cannot read usage limits.
+- **Poll grant** — OAuth profile credentials for `MS_HOME/claude/<name>`. They read the account's remaining usage, which is what lets the chooser rank accounts. On macOS `claude auth login` writes them to the login keychain under a service derived from that directory. When `ms` refreshes them it writes the result to `MS_HOME/claude/<name>/.credentials.json` (0600) and deletes the keychain item whose refresh token it just spent.
 
-* the **launch grant** — a `claude setup-token`, stored 0600 under
-  `MS_HOME/launch/<name>.token`. It runs Claude Code as that account. It is
-  inference-scope only and cannot read usage limits.
-* the **poll grant** — OAuth profile credentials in that account's own config
-  directory (`MS_HOME/claude/<name>`), which is what reads the account's
-  remaining usage so the chooser can rank accounts. On macOS `claude auth
-  login` puts it in your login keychain, under a service derived from that
-  directory; `ms` reads it there. When `ms` refreshes it, the refreshed grant
-  is written to `MS_HOME/claude/<name>/.credentials.json` (0600) — which is
-  where `ms` looks first — and the keychain item it came from, whose refresh
-  token the refresh has just spent, is deleted.
+One `ms accounts login` mints both, in two browser tabs. **Sign in as the same account
+in both.** Nothing downstream can detect that you did not, and an account whose two
+credentials belong to two subscriptions reports one's limits while running as the other.
 
-`ms accounts login` mints both, in two browser flows. **Sign in as the same
-account in both tabs** — nothing downstream can tell that you did not, and an
-account whose two credentials belong to two subscriptions reports one
-subscription's limits while running as another.
+A Codex account has one credential and no such split: `codex login` writes `auth.json`
+into that account's own `CODEX_HOME` (`MS_HOME/codex/<name>`), and `ms` hands the CLI the
+directory, never the credential. No secret is ever passed on a command line, put into a
+tmux command, logged or printed.
 
-A Codex account has one credential and no such split: `codex login` writes an
-`auth.json` inside that account's own `CODEX_HOME`
-(`MS_HOME/codex/<name>`), and `ms` points the CLI at the directory rather than
-ever reading the credential itself.
+### Credentials are per device
 
-No secret is ever passed on a command line, put in a tmux command, written to
-a log, or printed — including in an error message.
+The token endpoints rotate refresh tokens, so the first refresh on either machine
+invalidates a grant copied to the other. Never copy `MS_HOME` between machines; run
+`ms accounts login <name>` once per device.
 
-## What `ms setup` changes
+### A wall
 
-Everything below is backed up before it is changed (a timestamped copy beside
-the file it copied, never overwriting a previous backup), is idempotent on re-run,
-keeps every key and line it does not own, is written through a symlink so a
-dotfiles-managed file stays a symlink, and is refused outright if it does not
-look like something this tool wrote.
+A wall is a usage limit reported by the provider itself, never text read off a screen.
+For Claude it is Claude Code's `StopFailure` hook firing with `error: "rate_limit"`. For
+Codex it is the `task_complete` record in the session's rollout file carrying
+`codex_error_info: "usage_limit_exceeded"`, which `ms` tails. A pane that merely quotes
+wall text is not a wall.
+
+### What rotation does to a pane
+
+A short-lived worker, dispatched by tmux so it lives outside the walled CLI's process
+tree, takes the session lock and rechecks that the wall is still true, the generation has
+not moved and the pane still exists. It picks the next account with room, sends the CLI its
+own way out (`Escape` then `/exit` for Claude Code, Ctrl-C twice for Codex), and respawns
+the *same* pane on the new account running `claude --resume <id> "<continuation>"` (or
+`codex resume <id>`). The continuation is an argument to that invocation, never keystrokes
+typed into a shell. Four handoffs run at a time across the whole tmux server.
+
+Automatic recovery for Codex ships **off**: no live Codex wall has been observed yet, and
+`ms` will not move a session on a signal nobody has seen. Export `MS_CODEX_AUTOROTATE=1` in
+the shell that runs `codex` to enable it; `ms rotate`, `ms switch` and `ms stop` move a
+Codex session today regardless.
+
+### The chooser
+
+An account is out if its reading failed, if it has no weekly window, or if any window it
+needs is at 100 percent. The rest rank by earliest weekly reset, then most remaining, then
+solo before shared. No projections, no thresholds below 100.
+
+### What the wizard changes on your machine
+
+Every file below is backed up first (a timestamped copy beside it, never overwriting an
+earlier one), is idempotent on re-run, keeps every key and line `ms` does not own, is
+written through a symlink so a dotfiles-managed file stays a symlink, and is refused if it
+does not look like something `ms` wrote.
 
 | What | Where | Undo |
 |---|---|---|
-| Claude hooks (4 entries) | `~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` | Delete the four entries whose command ends in `_hook claude` |
-| Codex hooks + their trust hashes | `MS_HOME/codex/<account>/config.toml`, between `# ms-hooks-begin` and `# ms-hooks-end` | Delete that block |
-| Statusline badge (opt-in, default No) | `statusLine` in the same `settings.json` | `ms setup --remove statusline` |
-| Shell aliases (opt-in, default No) | `~/.zshrc`, or `~/.bash_profile`/`~/.bashrc`, between `# ms-alias-begin` and `# ms-alias-end` | `ms setup --remove alias` |
-| Its own progress | `MS_HOME/setup.json` | `ms setup --reset` |
+| Claude hooks: `SessionStart`, `UserPromptSubmit`, `StopFailure` (`rate_limit`), `SessionEnd` | `~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` | Delete the four entries whose command ends in `_hook claude` |
+| Codex hook tables and their computed trust hashes | `MS_HOME/codex/<account>/config.toml`, between `# ms-hooks-begin` and `# ms-hooks-end` | Delete that block |
+| Statusline wrapper (opt-in, default no) | `statusLine` in the same `settings.json` | `ms setup --remove statusline` |
+| Shell aliases for `claude` and `codex` (opt-in, default no) | `~/.zshrc`, or `~/.bash_profile` / `~/.bashrc`, between `# ms-alias-begin` and `# ms-alias-end` | `ms setup --remove alias` |
+| The wizard's own progress | `MS_HOME/setup.json` | `ms setup --reset` |
 
-The hooks are how a usage wall is noticed at all, so removing them turns
-rotation off. Re-install them with `ms setup --repair` or `ms doctor --fix`.
+The hooks are how a wall is noticed at all, so removing them turns rotation off. Put them
+back with `ms setup --repair` or `ms doctor --fix`; neither re-runs a login. A re-point
+after `brew upgrade` replaces this tool's hook entries rather than adding a second set
+beside them, and never touches another tool's hooks in the same file.
 
-Note that a re-point — after `brew upgrade`, or after moving from a checkout
-to a brew install — **replaces** this tool's hook entries rather than adding a
-second set beside them. Another tool's hooks in the same file, and another
-tool's command sharing an entry with ours, are never touched.
+## Configuration
 
-## Environment
+`MS_HOME` (default `~/.config/model-switcher`) holds everything: `accounts.json`,
+`state.sqlite`, `locks.sqlite`, `snapshot.json`, `last-pick.json`, launch tokens under
+`launch/`, per-account Claude config dirs under `claude/`, per-account Codex homes under
+`codex/` (each linked to the one shared rollout store `codex/sessions/`, so a resumed
+conversation can cross accounts), per-session event logs under `sessions/`, and the tool's
+own tmux socket. Directories are 0700 and files 0600.
 
 | Variable | Meaning |
 |---|---|
-| `MS_HOME` | Where all state lives. Default `~/.config/model-switcher`. Directories 0700, files 0600. Holds `accounts.json`, `state.sqlite`, `snapshot.json`, the per-account Claude config dirs and Codex homes, the launch tokens, and per-session event logs. |
-| `MS_BIN` | The absolute path to `ms` that gets written into hook commands, Codex trust hashes, the statusline wrapper and the alias block. The Homebrew shim sets it to `/opt/homebrew/opt/model-switcher/bin/ms` — the stable path, so everything written survives an upgrade. Set it yourself only if you are running `ms` from somewhere unusual. |
-| `MS_CODEX_AUTOROTATE` | `1` turns on unattended recovery for Codex sessions. Export it in the shell that runs `codex` (or `ms codex`): `ms` stores the gate from there, so the tmux-dispatched watchdog and recovery worker read it too, and `ms doctor` prints its state. It ships off until a real Codex wall handoff has been observed live. |
-| `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere this tool reads or writes that settings file. |
+| `MS_HOME` | Where all state lives. Default `~/.config/model-switcher`. |
+| `MS_BIN` | The absolute `ms` path written into hook commands, Codex trust hashes, the statusline wrapper and the alias block. The Homebrew shim sets it to `/opt/homebrew/opt/model-switcher/bin/ms` — the stable path, so everything the wizard wrote survives an upgrade. Set it yourself only when running `ms` from somewhere unusual. |
+| `MS_CODEX_AUTOROTATE` | `1` enables automatic recovery for Codex sessions. Export it in the shell that runs `codex`; `ms` mirrors it into the store so the tmux-dispatched watchdog and worker read it too. `ms doctor` prints its state. Ships off. |
+| `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere `ms` reads or writes that settings file. |
 | `MS_VERBOSE` | `1` prints what each invocation's start-of-run repair did. |
+| `MS_ENTRY` | `src` or `dist` — which entry point `bin/ms` runs. For development; the brew shim sets `dist`. |
 
-`MS_ACCOUNT`, `MS_SESSION`, `MS_GENERATION`, `MS_SOCKET` and `MS_PANE` are set
-by `ms` inside a managed pane. They identify the session to the hooks; setting
-them by hand is not useful.
+`MS_SESSION`, `MS_GENERATION`, `MS_SOCKET`, `MS_PANE` and `MS_ACCOUNT` are exported by `ms`
+into a managed pane, to identify the session to the hooks.
 
-## How rotation works
+## How it works
 
-1. `ms claude`/`ms codex` picks an account, records a session, and `execve`s
-   the CLI in the pane. Nothing of `ms` stays running.
-2. The CLI's own hooks call `ms _hook <cli>` on session start, on each prompt,
-   and when a turn fails.
-3. A failure that reads as a usage wall dispatches a short-lived recovery
-   worker, which picks the next account with room, exits the CLI cleanly,
-   relaunches it in the same pane resuming the same session, and tells it to
-   continue.
-4. Every public verb repairs stale state (a closed pane, a restarted tmux
-   server, a worker that died) before it does anything else.
+1. `ms claude` / `ms codex` reads every account's usage, ranks the pool, and picks one.
+2. It records the session, then `execve`s the CLI into the pane. No `ms` process stays running.
+3. The CLI's own hooks call `ms _hook <cli>` on session start, on each prompt, and when a turn fails.
+4. A first-party rate-limit report is written to the session's event log as a wall.
+5. The hook dispatches `ms _recover <session>` through tmux, outside the CLI's process tree.
+6. That worker takes the session lock, rechecks the wall, and picks the next account with room.
+7. It asks the CLI to exit, then respawns the same pane resuming the same conversation on the new account.
+8. If nothing has room, the session waits and a wake-up is scheduled.
+9. Every public verb first repairs stale state — a closed pane, a restarted tmux server, a dead worker.
+10. `ms status` and `ms dashboard` read that same store. No daemon, no background poller.
 
-## License
+## Troubleshooting
 
-MIT. See `LICENSE`.
+Start here. `ms doctor` checks the runtime, tmux, the CLIs, the hooks, store permissions,
+the registry, every account's credentials and usage reachability, orphaned session state,
+and whether the `ms` on your PATH is the one the hooks name.
+
+```bash
+ms doctor
+ms doctor --fix
+```
+
+`--fix` repairs only what is safe: hooks that name an `ms` that moved, a Claude poll grant
+due for refresh, store paths whose mode drifted, a missing Codex `sessions` link or shared
+store, and orphaned session state. It never repairs a dead credential, a malformed
+`accounts.json`, a symlink inside the store, or an `ms` on PATH that shadows this one.
+
+```bash
+ms setup --repair                     # hooks removed by a CLI upgrade or a dotfiles restore
+ms accounts login <name> --relogin    # a grant that is dead rather than stale
+ms setup --remove statusline          # undo the statusline opt-in
+ms setup --remove alias               # undo the shell aliases
+MS_VERBOSE=1 ms status                # show what the start-of-run repair did
+```
+
+A Claude account with no poll grant can launch but cannot be ranked; one with no launch
+token can be ranked but cannot be run. Both come from `ms accounts login`.
+
+## Development
+
+```bash
+npm test          # node:test over test/*.test.ts, against src/
+npm run typecheck # tsc --noEmit
+npm run build     # esbuild bundle to dist/ms.js, then verify it
+npm run release -- vX.Y.Z --dry-run
+npm run release -- vX.Y.Z --publish [--tap <path>]
+```
+
+The release script refuses a dirty tree, a version that does not match `package.json`, an
+existing tag, or a HEAD on no remote branch. It builds the tarball and prints its sha256;
+`--publish` also creates the GitHub release and commits the rendered formula into a local
+tap checkout. It never pushes.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

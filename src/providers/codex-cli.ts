@@ -25,8 +25,9 @@
 // this tool creates is never wider than the credential it sits next to. A
 // home the human keeps themselves is theirs, and nothing here widens it.
 
-import { mkdirSync, readFileSync, renameSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { writeAtomicThroughLink } from "../fsx.ts";
 import { p } from "../paths.ts";
 
 /** This account's CODEX_HOME. Re-exported from src/paths.ts so everything
@@ -232,18 +233,14 @@ function trustValue(rhs: string): string {
   return q ? q[2]! : v;
 }
 
-/** Atomic within the home (temp + rename), 0600 — the file sits beside
- *  `auth.json` in a 0700 directory this tool owns, and is never wider than
- *  the credential it sits next to. */
+/** Atomic (temp + rename), 0600 — the file sits beside `auth.json` in a 0700
+ *  directory this tool owns, and is never wider than the credential it sits
+ *  next to. Through any symlink, like every other writer to this same
+ *  `config.toml` (src/hooks/codex-install.ts): a home whose config is linked
+ *  into a dotfiles checkout must not have that link replaced by the next
+ *  launch's trust write, undoing what the installer was careful about. */
 function writeConfig(file: string, text: string): void {
-  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-  try {
-    writeFileSync(tmp, text, { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch (e) {
-    rmSync(tmp, { force: true });
-    throw e;
-  }
+  writeAtomicThroughLink(file, text, { forceMode: 0o600 });
 }
 
 /** What `ensureCodexTrust` decided. `problem` is a refusal the caller reports
@@ -282,6 +279,59 @@ export type TrustResult = { changed: boolean; problem?: string };
  *
  * Every other byte of the file is left exactly as it was found.
  */
+/**
+ * The inverse of `ensureCodexTrust`, for a directory that only ever existed
+ * to be probed in.
+ *
+ * `ms setup`'s hook check takes one real turn in a throwaway `mkdtemp`
+ * directory, and Codex's trust dialog is a modal — so the directory has to be
+ * trusted first, which leaves a `[projects."/tmp/ms-setup-probe-…"]` row in
+ * the account's `config.toml` naming a path that is deleted seconds later.
+ * One per probe attempt, for ever.
+ *
+ * It removes ONLY a table whose entire body is the one `trust_level =
+ * "trusted"` line this tool writes. A table the human has added anything else
+ * to is theirs, whatever the path says, and is left exactly as found —
+ * `changed: false`, no problem, because there is nothing here for a human to
+ * act on.
+ */
+export function removeCodexTrust(home: string, cwd: string): TrustResult {
+  let resolved: string;
+  try {
+    resolved = realpathSync(cwd);
+  } catch {
+    resolved = path.resolve(cwd);
+  }
+  const file = path.join(home, "config.toml");
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return { changed: false };
+  }
+
+  const lines = text.split("\n");
+  let start = -1;
+  let end = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripComment(lines[i]!);
+    if (!opensTable(line)) continue;
+    if (start >= 0) { end = i; break; }
+    if (classifyHeader(line, resolved) === "ours") start = i;
+  }
+  if (start < 0) return { changed: false };
+
+  const body = lines.slice(start + 1, end).map((l) => stripComment(l).trim()).filter((l) => l !== "");
+  if (body.length !== 1 || body[0] !== TRUSTED) return { changed: false };
+
+  const kept = [...lines.slice(0, start), ...lines.slice(end)].join("\n");
+  // The removed table took its own blank-line separator with it; collapse
+  // the run that leaves behind so the file keeps the one-blank-line shape
+  // every other writer here produces, and ends in exactly one newline.
+  writeConfig(file, kept.replace(/\n{3,}/g, "\n\n").replace(/\n*$/, "\n"));
+  return { changed: true };
+}
+
 export function ensureCodexTrust(home: string, cwd: string): TrustResult {
   let resolved: string;
   try {

@@ -33,9 +33,10 @@
 // to parse on either side of the round trip.
 
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { backupThroughLink, resolveTarget, shellQuote, writeAtomicThroughLink } from "../fsx.ts";
+import { claudeSettingsPath } from "../paths.ts";
 
 type Settings = Record<string, unknown> & { statusLine?: unknown };
 
@@ -59,28 +60,12 @@ function readSettings(settingsPath: string): Settings | null {
   return parsed as Settings;
 }
 
-function writeAtomic(file: string, text: string): void {
-  const mode = existsSync(file) ? statSync(file).mode & 0o777 : 0o600;
-  const tmp = `${file}.tmp-${process.pid}`;
-  try {
-    writeFileSync(tmp, text, { mode });
-    renameSync(tmp, file);
-  } catch (e) {
-    try {
-      if (existsSync(tmp)) unlinkSync(tmp);
-    } catch {
-      /* best effort */
-    }
-    throw e;
-  }
-}
-
 /** The command text this tool installs: `msBin`, single-quoted so a path
  * containing a space is still one shell word, followed by the verb. Never
  * carries the original command any more — the runtime side reads that back
  * out of `statusLine.msOriginal` itself. */
 function wrapperCommand(msBin: string): string {
-  return `'${msBin}' _statusline`;
+  return `${shellQuote(msBin)} _statusline`;
 }
 
 /** Ownership is this key's presence, never the shape of `command` — the
@@ -143,12 +128,11 @@ export function installStatusline(settingsPath: string, msBin: string): Statusli
 
   let backup: string | null = null;
   if (existing !== null) {
-    backup = `${settingsPath}.bak-ms-${Math.floor(Date.now() / 1000)}`;
-    copyFileSync(settingsPath, backup);
+    backup = backupThroughLink(settingsPath, "bak-ms-");
   } else {
-    mkdirSync(path.dirname(settingsPath), { recursive: true });
+    mkdirSync(path.dirname(resolveTarget(settingsPath)), { recursive: true });
   }
-  writeAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+  writeAtomicThroughLink(settingsPath, JSON.stringify(settings, null, 2) + "\n", { defaultMode: 0o600 });
   return { changed: true, backup };
 }
 
@@ -174,15 +158,6 @@ const STDIN_MAX = 1 << 20;
 /** Total budget for the wrapped command. SIGKILL, not a courtesy signal: a
  * statusline has no time to wait for a hung child to notice SIGTERM. */
 const WRAPPED_TIMEOUT_MS = 3_000;
-
-/** Where Claude Code keeps `settings.json` from THIS process's point of
- * view: `$CLAUDE_CONFIG_DIR` when set (also how tests point this at a
- * fixture without touching the real file), else `~/.claude`. */
-function claudeSettingsPath(): string {
-  const configDir = process.env.CLAUDE_CONFIG_DIR;
-  const dir = configDir && configDir.length > 0 ? configDir : path.join(process.env.HOME || homedir(), ".claude");
-  return path.join(dir, "settings.json");
-}
 
 /** The original command `installStatusline` captured into
  * `statusLine.msOriginal`, or `""` for "nothing to run" — a missing file, a
@@ -338,11 +313,16 @@ function runWrapped(cmd: string[], input: string, timeoutMs: number): Promise<st
 
 /**
  * Undo `installStatusline`: restore `statusLine.command` from
- * `statusLine.msOriginal` and drop that key — or, when `msOriginal` is `""`
- * (there was nothing before this tool ever ran), delete `statusLine`
- * entirely, since that is exactly what a fresh install added. A
- * `statusLine` with no `msOriginal` at all is not ours to touch:
- * `changed: false`, no backup.
+ * `statusLine.msOriginal` and drop that key.
+ *
+ * When `msOriginal` is `""` there was no command before this tool ever ran —
+ * but that does NOT mean there was no `statusLine`. A human can perfectly
+ * well have had `{ "type": "command", "padding": 0 }` and no command, and
+ * deleting the whole object (which this used to do) took their keys with it.
+ * So the removal is always the exact inverse of the install: drop the two
+ * keys this tool owns, put `command` back only when there was one, and
+ * delete `statusLine` itself only when what remains is nothing — or nothing
+ * but the `type: "command"` a fresh install added alongside its own keys.
  */
 export function removeStatusline(settingsPath: string): StatuslineResult {
   let existing: Settings | null;
@@ -360,16 +340,15 @@ export function removeStatusline(settingsPath: string): StatuslineResult {
   if (!isOurs(statusLine)) return { changed: false, backup: null };
   const original = statusLine.msOriginal as string;
 
-  const backup = `${settingsPath}.bak-ms-${Math.floor(Date.now() / 1000)}`;
-  copyFileSync(settingsPath, backup);
+  const backup = backupThroughLink(settingsPath, "bak-ms-");
 
-  if (original === "") {
-    delete settings.statusLine;
-  } else {
-    delete statusLine.msOriginal;
-    statusLine.command = original;
-    settings.statusLine = statusLine;
-  }
-  writeAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+  delete statusLine.msOriginal;
+  if (original === "") delete statusLine.command;
+  else statusLine.command = original;
+  const remaining = Object.keys(statusLine);
+  const onlyWhatWeAdded = remaining.length === 0 || (remaining.length === 1 && statusLine.type === "command");
+  if (original === "" && onlyWhatWeAdded) delete settings.statusLine;
+  else settings.statusLine = statusLine;
+  writeAtomicThroughLink(settingsPath, JSON.stringify(settings, null, 2) + "\n", { defaultMode: 0o600 });
   return { changed: true, backup };
 }

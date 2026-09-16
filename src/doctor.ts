@@ -20,7 +20,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync,
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
-import { msBinary, msHome, p } from "./paths.ts";
+import { claudeSettingsPath, msBinary, msHome, p } from "./paths.ts";
 import { claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
 import { codexConfigPath, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
 import { loadRegistry, type Account } from "./registry.ts";
@@ -101,8 +101,14 @@ export function checkTmux(): Result {
   return ok ? { ok: true, what: `${what} (found ${r.stdout.trim()})` } : { ok: false, what, why: `found ${r.stdout.trim()}` };
 }
 
-export function checkClaudeBinary(): Result {
+/** The Claude CLI's version — gated on there being a Claude account at all,
+ *  exactly as `checkCodexBinary` is gated on a Codex one. A ChatGPT-only
+ *  human has no reason to have Claude Code installed; failing their doctor
+ *  for ever over a binary this tool would never run for them is not a fault
+ *  report, it is noise that also makes `ms setup` unable to finish. */
+export function checkClaudeBinary(hasClaudeAccounts = true): Result {
   const what = "claude --version";
+  if (!hasClaudeAccounts) return { ok: true, what: `${what} — not needed (no claude accounts)` };
   const r = runBounded("claude", ["--version"], 10_000);
   return r.ok ? { ok: true, what: `${what} (${r.stdout.trim() || "ok"})` } : { ok: false, what, why: r.stderr };
 }
@@ -135,18 +141,23 @@ export function checkCodexBinary(hasCodexAccounts: boolean): Result {
 // --- Claude hooks ----------------------------------------------------------
 
 /** Claude Code's settings file — where its hooks and its statusline live.
- *  Exported because `ms setup` installs into the very file this checks, and
- *  two spellings of one path is how an installer and its check drift apart. */
-export function claudeSettingsPath(): string {
-  return path.join(process.env.HOME || homedir(), ".claude", "settings.json");
-}
+ *  Re-exported (it lives in ./paths.ts, beside every other path this tool
+ *  knows) because `ms setup` installs into the very file this checks, and two
+ *  spellings of one path is how an installer and its check drift apart. It
+ *  honours `CLAUDE_CONFIG_DIR` exactly as `ms _statusline` does. */
+export { claudeSettingsPath };
 
-export function checkHooks(fix: boolean): Result {
+export function checkHooks(fix: boolean, hasClaudeAccounts = true): Result {
   const what = "Claude hooks installed";
+  if (!hasClaudeAccounts) return { ok: true, what: `${what} — not needed (no claude accounts)` };
   const settingsPath = claudeSettingsPath();
   const msBin = msBinary();
   if (claudeHooksInstalled(settingsPath, msBin)) return { ok: true, what };
-  if (!fix) return { ok: false, what, why: `not all four present in ${settingsPath} for ${msBin}` };
+  // "for `msBin`" covers both halves of what installed now means: the four
+  // entries present, AND no OTHER `_hook claude` entry left behind by an `ms`
+  // that moved. `--fix` repairs either, by re-running the installer, which
+  // replaces every ms-owned entry rather than adding beside it.
+  if (!fix) return { ok: false, what, why: `not all four present (or a stale ms entry remains) in ${settingsPath} for ${msBin}` };
   try {
     installClaudeHooks(settingsPath, msBin);
   } catch (e) {
@@ -659,17 +670,19 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
   const results: Result[] = [];
   results.push(checkNode());
   results.push(checkTmux());
-  results.push(checkClaudeBinary());
-  results.push(checkHooks(fix));
 
-  // Codex: the binary, then every registered Codex account — the registry
-  // is read here, ahead of its own ✓/✗ line below, so (a) a Codex row still
-  // gets its checks even when this same registry later turns out to have an
-  // unrelated bad entry (checkRegistry reports that separately, by index),
-  // and (b) `checkCodexBinary` knows whether there is any Codex account to
-  // even ask the question for.
+  // The registry is read here, ahead of its own ✓/✗ line below, so (a) a
+  // Codex row still gets its checks even when this same registry later turns
+  // out to have an unrelated bad entry (checkRegistry reports that
+  // separately, by index), and (b) both CLI checks — and the Claude hook
+  // check, which writes into Claude Code's own settings file — know whether
+  // there is any account of that provider to ask the question for at all.
   const { registry, parseError, problems } = loadRegistry();
   const codexAccounts = registry.accounts.filter((a) => a.provider === "codex");
+  const claudeAccounts = registry.accounts.filter((a) => a.provider === "claude");
+
+  results.push(checkClaudeBinary(claudeAccounts.length > 0));
+  results.push(checkHooks(fix, claudeAccounts.length > 0));
   results.push(checkCodexBinary(codexAccounts.length > 0));
   // The Codex auto-recovery gate, stated rather than left to be guessed at:
   // it ships off, it is a stored setting (src/autorotate.ts) because the
@@ -687,7 +700,7 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
   results.push(...checkStorePermissions(fix));
 
   results.push(...checkRegistry(parseError, problems));
-  for (const a of registry.accounts.filter((a) => a.provider === "claude")) {
+  for (const a of claudeAccounts) {
     results.push(...(await checkClaudeAccount(a, fix)));
   }
 

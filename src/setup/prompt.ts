@@ -21,6 +21,16 @@ import * as readline from "node:readline/promises";
 export type Prompter = {
   ask(q: string, opts?: { default?: string; choices?: string[] }): Promise<string>;
   confirm(q: string, def: boolean): Promise<boolean>;
+  /** Release whatever the prompter is holding open. `readlinePrompter`
+   * attaches to the process's real stdin on its first question, and a
+   * readline interface keeps stdin — and therefore the event loop — alive
+   * for ever: `ms setup` computed its exit code and then simply never
+   * returned, so every interactive run ended in a ctrl-C (exit 130) with
+   * the 0-or-1 the doctor decided thrown away. The caller closes it on
+   * EVERY exit path, which is why this is part of the contract rather than
+   * a detail of the real implementation. A prompter with nothing to release
+   * (the test double) may leave it out. */
+  close?(): void;
 };
 
 /** A wizard asked for an answer `scriptedPrompter` had none left to give —
@@ -71,6 +81,20 @@ export function readlinePrompter(): Prompter {
   return {
     ask: (q, opts) => resolveAsk(() => iface().question(formatAsk(q, opts)), opts),
     confirm: (q, def) => resolveConfirm(() => iface().question(formatConfirm(q, def)), def),
+    close: () => {
+      // Both halves matter: `rl.close()` alone leaves the underlying stdin
+      // stream flowing and referenced (readline resumed it to read), so the
+      // process still does not exit. A run that never asked anything created
+      // no interface at all and has nothing to release.
+      rl?.close();
+      rl = undefined;
+      try {
+        process.stdin.pause();
+        process.stdin.unref();
+      } catch {
+        /* already gone */
+      }
+    },
   };
 }
 

@@ -35,13 +35,14 @@ import path from "node:path";
 
 import { cmdAdd, cmdLogin, cmdVerify } from "../accounts.ts";
 import { CODEX_RESERVED_NAMES, loginCodex, verifyCodex } from "../accounts-codex.ts";
-import { checkClaudeBinary, checkCodexBinary, checkNode, checkTmux, claudeSettingsPath, renderLine, runDoctor } from "../doctor.ts";
+import { checkClaudeBinary, checkCodexBinary, checkNode, checkTmux, renderLine, runDoctor } from "../doctor.ts";
 import { readEvents } from "../events.ts";
-import { installCodexHooks } from "../hooks/codex-install.ts";
+import { scrubProviderEnv } from "../exec.ts";
+import { codexConfigPath, installCodexHooks } from "../hooks/codex-install.ts";
 import { installClaudeHooks } from "../hooks/install.ts";
 import { readLaunchToken } from "../launch-credentials.ts";
-import { msBinary, p } from "../paths.ts";
-import { ensureCodexTrust } from "../providers/codex-cli.ts";
+import { claudeSettingsPath, msBinary, p } from "../paths.ts";
+import { ensureCodexTrust, removeCodexTrust } from "../providers/codex-cli.ts";
 import { findAccount, loadRegistry, NAME_PATTERN, type Provider } from "../registry.ts";
 import { status } from "../status.ts";
 import { installAlias, rcPathFor } from "./alias.ts";
@@ -113,6 +114,12 @@ export type Ctx = {
   ask(q: string, opts?: { default?: string; choices?: string[] }): Promise<string>;
   confirm(q: string, def: boolean): Promise<boolean>;
   say(line: string): void;
+  /** How many Claude accounts the human declared, once per RUN. `prereqs`
+   *  asks it for the same reason it asks the ChatGPT count — a missing
+   *  `claude` is only a fault when the answer is not zero, and a machine
+   *  that will run only Codex has no reason to have Claude Code installed —
+   *  and `claude-accounts` reuses the answer rather than asking twice. */
+  claudeCount: number | null;
   /** How many ChatGPT accounts the human declared, once per RUN. `prereqs`
    *  asks it (a missing `codex` is only a fault when the answer is not zero)
    *  and `codex-accounts` reuses the answer rather than asking twice. Null
@@ -135,6 +142,7 @@ export function makeCtx(prompter: Prompter, state: SetupState, yes: boolean): Ct
     ask: (q, opts) => (yes && opts?.default !== undefined ? Promise.resolve(opts.default) : prompter.ask(q, opts)),
     confirm: (q, def) => (yes ? Promise.resolve(def) : prompter.confirm(q, def)),
     say: (line) => process.stdout.write(`${line}\n`),
+    claudeCount: null,
     codexCount: null,
     deviceAuth: false,
     persist: () => {
@@ -162,6 +170,12 @@ async function askCount(ctx: Ctx, question: string, def: number): Promise<number
     if (Number.isInteger(n) && n >= 0 && n <= MAX_ACCOUNTS) return n;
     reask(ctx, `That is not a number of accounts I can use; answer with a whole number from 0 to ${MAX_ACCOUNTS}.`);
   }
+}
+
+/** The Claude account count, asked at most once per run (see `Ctx`). */
+async function claudeCount(ctx: Ctx): Promise<number> {
+  if (ctx.claudeCount === null) ctx.claudeCount = await askCount(ctx, "How many Claude accounts?", 1);
+  return ctx.claudeCount;
 }
 
 /** The ChatGPT account count, asked at most once per run (see `Ctx`). */
@@ -297,17 +311,25 @@ async function accountsStep(
 /**
  * The four things that must be true before anything is installed.
  *
- * The ChatGPT count is asked FIRST, and only for this: a machine with no
- * ChatGPT accounts has no reason to have the Codex CLI at all, so a missing
- * `codex` there is not a fault — and the wizard cannot know that until the
- * human says so. Nothing is written by this step, and nothing is installed
- * for the human: a ✗ is reported with the remedy the doctor itself gives, and
- * the run stops.
+ * BOTH account counts are asked first, and only for this: a machine with no
+ * ChatGPT accounts has no reason to have the Codex CLI at all, and one with
+ * no Claude accounts has none to have Claude Code — so a missing binary
+ * there is not a fault, and the wizard cannot know that until the human says
+ * so. (The Claude count used to be asked one step LATER, which is why a
+ * ChatGPT-only human was stopped here for a `claude` they were never going
+ * to use.) Both answers are remembered for the run, so the accounts steps
+ * reuse them rather than asking twice. Nothing is written by this step, and
+ * nothing is installed for the human: a ✗ is reported with the remedy the
+ * doctor itself gives, and the run stops.
  */
 async function prereqs(ctx: Ctx): Promise<void> {
   ctx.say("First, the tools ms needs, before anything at all is installed or changed.");
+  // The ChatGPT count first, then the Claude one — the order the wizard has
+  // always asked them in, so a resume that answered one already is not
+  // suddenly answering the other.
   const n = await codexCount(ctx);
-  const results = [checkNode(), checkTmux(), checkClaudeBinary(), checkCodexBinary(n > 0)];
+  const c = await claudeCount(ctx);
+  const results = [checkNode(), checkTmux(), checkClaudeBinary(c > 0), checkCodexBinary(n > 0)];
   for (const r of results) ctx.say(renderLine(r));
   if (results.some((r) => !r.ok)) {
     throw new SetupAbort("install what the ✗ lines above name, then run ms setup again");
@@ -328,7 +350,7 @@ async function prereqs(ctx: Ctx): Promise<void> {
  * defence there is.
  */
 async function claudeAccounts(ctx: Ctx): Promise<void> {
-  const n = await askCount(ctx, "How many Claude accounts?", 1);
+  const n = await claudeCount(ctx);
   if (n === 0) {
     ctx.say("No Claude accounts, so there is nothing to sign in to here.");
     return;
@@ -403,18 +425,33 @@ function probeCwd(): string {
  * it says; the exit status is not read either, because a usage wall is an
  * authenticated answer that still fires SessionStart.
  */
-function probe(session: string, cmd: string, args: string[], cwd: string, env: Record<string, string>): void {
+function probe(session: string, provider: Provider, cmd: string, args: string[], cwd: string, env: Record<string, string>, readsHooksFrom: string): void {
   try {
+    // Scrubbed exactly as `ms _exec` scrubs a real launch, and for the same
+    // reason: this is a real turn under a real credential, and an
+    // `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` (or an alternative backend) left
+    // in the wizard's own environment would make the probe answer as
+    // somebody other than the account whose hooks it is proving — and bill
+    // them for it. `env` and `probeEnv` are layered AFTER, so what this
+    // probe sets for itself can never be scrubbed.
+    const childEnv: NodeJS.ProcessEnv = { ...process.env };
+    scrubProviderEnv(childEnv, provider);
     const r = spawnSync(cmd, args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf8",
       timeout: PROBE_TIMEOUT_MS,
-      env: { ...process.env, ...env, ...probeEnv(session) },
+      env: { ...childEnv, ...env, ...probeEnv(session) },
     });
     if (r.error) throw new Error(`${cmd} could not be run (${r.error.message})`);
     if (!readEvents(session).some((e) => e.kind === "started")) {
-      throw new Error(`the ${cmd} probe turn fired no SessionStart hook, so nothing was written to ${p.eventsFile(session)}`);
+      // Naming the file the CLI reads its hooks FROM is the whole diagnosis:
+      // the common cause is an install that went into a different settings
+      // file than the one this turn read (a `CLAUDE_CONFIG_DIR` the human
+      // sets in their shell, a Codex home that is not this account's).
+      throw new Error(
+        `the ${cmd} probe turn fired no SessionStart hook (it reads its hooks from ${readsHooksFrom}), so nothing was written to ${p.eventsFile(session)}`,
+      );
     }
   } finally {
     rmSync(p.sessionDir(session), { recursive: true, force: true });
@@ -448,10 +485,15 @@ async function verifyClaudeHooks(ctx: Ctx, account: string): Promise<CheckResult
   const ok = await attempt(ctx, "the Claude hook check", () => {
     const cwd = probeCwd();
     try {
-      probe(probeId("claude"), "claude", ["-p", PROBE_PROMPT, "--model", PROBE_MODEL], cwd, {
-        CLAUDE_CODE_OAUTH_TOKEN: token,
-        MS_ACCOUNT: account,
-      });
+      probe(
+        probeId("claude"),
+        "claude",
+        "claude",
+        ["-p", PROBE_PROMPT, "--model", PROBE_MODEL],
+        cwd,
+        { CLAUDE_CODE_OAUTH_TOKEN: token, MS_ACCOUNT: account },
+        claudeSettingsPath(),
+      );
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -476,11 +518,26 @@ async function verifyCodexHooks(ctx: Ctx, account: string): Promise<CheckResult>
     try {
       const { problem } = ensureCodexTrust(home, cwd);
       if (problem) throw new Error(problem);
-      probe(probeId("codex"), "codex", ["exec", "--skip-git-repo-check", PROBE_PROMPT], cwd, {
-        CODEX_HOME: home,
-        MS_ACCOUNT: account,
-      });
+      probe(
+        probeId("codex"),
+        "codex",
+        "codex",
+        ["exec", "--skip-git-repo-check", PROBE_PROMPT],
+        cwd,
+        { CODEX_HOME: home, MS_ACCOUNT: account },
+        codexConfigPath(home),
+      );
     } finally {
+      // The trust row this probe had to write is the probe's own litter: a
+      // `[projects."/tmp/ms-setup-probe-…"]` table naming a directory that is
+      // about to be deleted. Removed BEFORE the directory goes, so the path
+      // still resolves the same way `ensureCodexTrust` resolved it, and only
+      // when the table holds nothing but the one line this tool wrote.
+      try {
+        removeCodexTrust(home, cwd);
+      } catch {
+        /* best effort: a probe's tidying never fails the check it just passed */
+      }
       rmSync(cwd, { recursive: true, force: true });
     }
   });
@@ -499,11 +556,18 @@ async function verifyCodexHooks(ctx: Ctx, account: string): Promise<CheckResult>
 async function hooks(ctx: Ctx): Promise<void> {
   const msBin = msBinary();
   const settings = claudeSettingsPath();
-  await attempt(ctx, "installing the Claude hooks", () => {
-    const r = installClaudeHooks(settings, msBin);
-    ctx.say(r.changed ? `The Claude hooks are now in ${settings}.` : `The Claude hooks were already in ${settings}.`);
-    if (r.backup) ctx.say(`The previous settings file was kept as ${r.backup}.`);
-  });
+  // Zero Claude accounts: there is nothing for a Claude hook to fire in, so
+  // writing four entries into the human's own `settings.json` would be this
+  // tool editing a file it has no business in. (It used to, unconditionally.)
+  if (ctx.state.claude.length === 0) {
+    ctx.say(`No Claude accounts, so ${settings} is left alone.`);
+  } else {
+    await attempt(ctx, "installing the Claude hooks", () => {
+      const r = installClaudeHooks(settings, msBin);
+      ctx.say(r.changed ? `The Claude hooks are now in ${settings}.` : `The Claude hooks were already in ${settings}.`);
+      if (r.backup) ctx.say(`The previous settings file was kept as ${r.backup}.`);
+    });
+  }
 
   for (const name of ctx.state.codex) {
     const home = p.codexHome(name);
@@ -589,6 +653,25 @@ async function finish(ctx: Ctx): Promise<void> {
   await status([]);
   if (exitCode !== 0) throw new SetupAbort("ms doctor is not green yet, so fix the ✗ lines above and run ms setup again");
   ctx.say("Setup is complete, and ms is ready to run claude and codex for you.");
+}
+
+/**
+ * Every account already registered, by provider.
+ *
+ * `ms setup --repair` works from the REGISTRY rather than from `setup.json`'s
+ * own memory of a run: the accounts are the durable fact (a row with two
+ * credentials), the wizard's `done` list is only a resume point, and a human
+ * repairing an install a year later may well be running a `ms setup` that
+ * never met these accounts. Throws a registry that cannot be read, which
+ * `attempt` turns into the usual Retry/Skip/Abort.
+ */
+export function registeredAccounts(): { claude: string[]; codex: string[] } {
+  const r = loadRegistry();
+  if (r.parseError) throw new Error(r.parseError);
+  return {
+    claude: r.registry.accounts.filter((a) => a.provider === "claude").map((a) => a.name),
+    codex: r.registry.accounts.filter((a) => a.provider === "codex").map((a) => a.name),
+  };
 }
 
 export const STEP_RUNNERS: Record<SetupStep, (ctx: Ctx) => Promise<void>> = {

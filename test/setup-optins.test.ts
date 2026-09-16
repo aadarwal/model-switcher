@@ -9,6 +9,11 @@ import { installAlias, removeAlias, rcPathFor } from "../src/setup/alias.ts";
 
 const MS = "/opt/homebrew/bin/ms";
 
+/** The exact block `installAlias` writes, as a plain string, so a test can
+ *  place it anywhere in a fixture file rather than only where install put it. */
+const installBlock = (bin: string) =>
+  ["# ms-alias-begin", `alias claude='${bin} claude'`, `alias codex='${bin} codex'`, "# ms-alias-end"].join("\n");
+
 /**
  * A brand-new executable's first-ever exec on this machine can take several
  * seconds — a one-time OS-level check on the file, unrelated to anything
@@ -43,7 +48,10 @@ test("install merges statusLine.command and preserves every other key, with no p
   const first = installStatusline(file, MS);
   assert.equal(first.changed, true);
   assert.ok(first.backup);
-  assert.match(path.basename(first.backup!), /^settings\.json\.bak-ms-\d+$/);
+  // Milliseconds, plus a `-N` counter when even that name is taken (fix wave
+  // B-M2). Unix SECONDS meant three re-points inside one second left ONE
+  // backup file — a backup that overwrites the previous backup is not one.
+  assert.match(path.basename(first.backup!), /^settings\.json\.bak-ms-\d+(-\d+)?$/);
   assert.equal(readFileSync(first.backup!, "utf8"), text, "the backup is the original, byte for byte");
 
   const after = JSON.parse(readFileSync(file, "utf8"));
@@ -102,7 +110,7 @@ test("removeStatusline restores the original command and only that key", () => {
   const r = removeStatusline(file);
   assert.equal(r.changed, true);
   assert.ok(r.backup);
-  assert.match(path.basename(r.backup!), /^settings\.json\.bak-ms-\d+$/);
+  assert.match(path.basename(r.backup!), /^settings\.json\.bak-ms-\d+(-\d+)?$/);
 
   const after = JSON.parse(readFileSync(file, "utf8"));
   assert.deepEqual(after, original, "round trip is exact: every key restored, msOriginal dropped");
@@ -375,7 +383,7 @@ test("installAlias appends to existing rc content, backs it up, and is idempoten
   const first = installAlias(rc, MS);
   assert.equal(first.changed, true);
   assert.ok(first.backup);
-  assert.match(path.basename(first.backup!), /^\.zshrc\.bak-ms-\d+$/);
+  assert.match(path.basename(first.backup!), /^\.zshrc\.bak-ms-\d+(-\d+)?$/);
   assert.equal(readFileSync(first.backup!, "utf8"), original, "the backup is the original, byte for byte");
 
   const afterFirst = readFileSync(rc, "utf8");
@@ -453,11 +461,90 @@ test("removeAlias refuses a hand-edited block rather than deleting it", () => {
   assert.equal(r3.changed, false);
   assert.match(r3.problem!, /hand-edited/);
 
-  // installAlias, in contrast, is free to REPLACE a hand-edited block.
+  // Fix wave B-I3: install refuses a hand-edited block too. It used to
+  // replace one silently, which is the same destruction removal refuses —
+  // "refuses a block it does not recognise as its own" is not a rule that
+  // only applies on the way out.
   writeFileSync(rc, handEdited);
   const r4 = installAlias(rc, "/usr/local/bin/ms");
-  assert.equal(r4.changed, true);
-  assert.ok(!readFileSync(rc, "utf8").includes("alias foo='bar'"));
+  assert.equal(r4.changed, false);
+  assert.equal(r4.backup, null);
+  assert.match(r4.problem!, /hand-edited/);
+  assert.match(r4.problem!, /# ms-alias-begin/);
+  assert.match(r4.problem!, new RegExp(rc.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.equal(readFileSync(rc, "utf8"), handEdited, "untouched");
+});
+
+test("B-I2: removing a block from the MIDDLE of a file keeps exactly one newline where it was", () => {
+  const { home } = tempHome();
+  const rc = path.join(home, ".zshrc");
+  const original = "export A=1\nsource ~/.fzf.zsh\n";
+  writeFileSync(rc, original);
+  installAlias(rc, MS);
+
+  // Ordinary rc hygiene: the human moves our block up, above their own
+  // sourcing line. `stripSep` used to eat the single newline that separated
+  // the two surrounding lines, welding them into `export A=1source …`.
+  const moved = ["export A=1", installBlock(MS), "source ~/.fzf.zsh", ""].join("\n");
+  writeFileSync(rc, moved);
+
+  const r = removeAlias(rc);
+  assert.equal(r.changed, true);
+  assert.ok(r.backup);
+  assert.equal(readFileSync(rc, "utf8"), original, "byte for byte: one newline where the block was");
+});
+
+test("B-I2: a mid-file block is re-pointed in place, and removed from there cleanly", () => {
+  const { home } = tempHome();
+  const rc = path.join(home, ".zshrc");
+  const other = "/usr/local/bin/ms";
+  const original = "export A=1\nexport B=2\n";
+  writeFileSync(rc, ["export A=1", installBlock(MS), "export B=2", ""].join("\n"));
+
+  const r = installAlias(rc, other);
+  assert.equal(r.changed, true);
+  const text = readFileSync(rc, "utf8");
+  assert.equal(text, ["export A=1", installBlock(other), "export B=2", ""].join("\n"), text);
+
+  assert.equal(removeAlias(rc).changed, true);
+  assert.equal(readFileSync(rc, "utf8"), original);
+});
+
+test("B-M4: two ms blocks are refused by BOTH install and removal, naming the file", () => {
+  const { home } = tempHome();
+  const rc = path.join(home, ".zshrc");
+  const doubled = ["export A=1", installBlock(MS), "export B=2", installBlock("/usr/local/bin/ms"), ""].join("\n");
+  writeFileSync(rc, doubled);
+
+  const r = installAlias(rc, MS);
+  assert.equal(r.changed, false);
+  assert.equal(r.backup, null);
+  assert.match(r.problem!, /more than one/);
+  assert.match(r.problem!, new RegExp(rc.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.equal(readFileSync(rc, "utf8"), doubled, "untouched");
+
+  const rr = removeAlias(rc);
+  assert.equal(rr.changed, false);
+  assert.equal(rr.backup, null);
+  assert.match(rr.problem!, /more than one/);
+  assert.equal(readFileSync(rc, "utf8"), doubled, "untouched — never manage only the first");
+});
+
+test("B-M3: removeStatusline keeps the human's other statusLine keys when there was no command to restore", () => {
+  const { home } = tempHome();
+  const file = path.join(home, "settings.json");
+  // A statusLine the human configured with no `command` of their own.
+  writeFileSync(file, JSON.stringify({ model: "opusplan", statusLine: { type: "command", padding: 0 } }, null, 2));
+
+  const i = installStatusline(file, MS);
+  assert.equal(i.changed, true);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).statusLine.msOriginal, "");
+
+  const r = removeStatusline(file);
+  assert.equal(r.changed, true);
+  const after = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(after.model, "opusplan");
+  assert.deepEqual(after.statusLine, { type: "command", padding: 0 }, "their own keys survive; only ours are removed");
 });
 
 test("removeAlias on a file with no block is a no-op", () => {

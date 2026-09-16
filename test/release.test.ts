@@ -52,6 +52,17 @@ function makeFixture(): string {
     const from = path.join(REAL_REPO, entry);
     if (existsSync(from)) execFileSync("cp", ["-R", from, path.join(dir, entry)]);
   }
+  // The cases below name `v0.1.0` throughout: pin the fixture's package.json
+  // (and lock) to that version, so the real repo's version can move on a
+  // release without touching every assertion here.
+  for (const f of ["package.json", "package-lock.json"]) {
+    const file = path.join(dir, f);
+    if (!existsSync(file)) continue;
+    const json = JSON.parse(readFileSync(file, "utf8"));
+    json.version = "0.1.0";
+    if (json.packages && json.packages[""]) json.packages[""].version = "0.1.0";
+    writeFileSync(file, JSON.stringify(json, null, 2) + "\n");
+  }
   mkdirSync(path.join(dir, ".superpowers"), { recursive: true });
   writeFileSync(path.join(dir, ".superpowers", "marker.md"), "a real, local, gitignored planning file\n");
 

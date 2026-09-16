@@ -1,6 +1,6 @@
 // `ms status`: read-only tables over the coalesced snapshot, the state
 // store and the event logs, cross-checked against a stubbed tmux. Pure
-// helpers (accountState, earliestWeeklyReset, localTime, sessionWalled) are
+// helpers (accountState, earliestWeeklyResetCli, localTimeCli, sessionWalled) are
 // exercised directly; the verb itself is exercised end to end through the
 // real `ms` binary (a subprocess, like launch.test.ts) so header/row
 // formatting, --json and --watch are all proven on stdout, not inferred.
@@ -70,15 +70,15 @@ test("accountState: stale (no error, not refreshed this round) vs ok", async () 
   assert.equal(accountState({ ...base, stale: false }, true), "ok");
 });
 
-test("earliestWeeklyReset: picks the earlier of weeklyAll/weeklyFable, ignores session, null when neither weekly window exists", async () => {
-  const { earliestWeeklyReset } = await import("../src/status.ts");
-  assert.equal(earliestWeeklyReset(null), null);
+test("earliestWeeklyResetCli: picks the earlier of weeklyAll/weeklyFable, ignores session, null when neither weekly window exists", async () => {
+  const { earliestWeeklyResetCli } = await import("../src/status.ts");
+  assert.equal(earliestWeeklyResetCli(null), null);
   assert.equal(
-    earliestWeeklyReset({ session: { usedPercent: 1, resetsAt: "2020-01-01T00:00:00Z" }, weeklyAll: null, weeklyFable: null }),
+    earliestWeeklyResetCli({ session: { usedPercent: 1, resetsAt: "2020-01-01T00:00:00Z" }, weeklyAll: null, weeklyFable: null }),
     null,
   );
   assert.equal(
-    earliestWeeklyReset({
+    earliestWeeklyResetCli({
       session: { usedPercent: 1, resetsAt: "2020-01-01T00:00:00Z" },
       weeklyAll: { usedPercent: 1, resetsAt: "2026-09-20T00:00:00Z" },
       weeklyFable: { usedPercent: 1, resetsAt: "2026-09-18T12:30:00Z" },
@@ -87,9 +87,9 @@ test("earliestWeeklyReset: picks the earlier of weeklyAll/weeklyFable, ignores s
   );
 });
 
-test("localTime: local YYYY-MM-DD HH:MM, not UTC/ISO", async () => {
-  const { localTime } = await import("../src/status.ts");
-  const s = localTime(Date.parse("2026-09-18T12:30:00Z"));
+test("localTimeCli: local YYYY-MM-DD HH:MM, not UTC/ISO", async () => {
+  const { localTimeCli } = await import("../src/status.ts");
+  const s = localTimeCli(Date.parse("2026-09-18T12:30:00Z"));
   assert.match(s, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
   const d = new Date(Date.parse("2026-09-18T12:30:00Z"));
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -160,7 +160,7 @@ const DIRK_OK = {
 
 /** wham/usage's own shape (`src/providers/codex-usage.ts`'s `toWindow`): no
  *  `primary_window` at all (its only window is the 168 h one, classified by
- *  comes back (the spike record) — so `fmtPercent` renders 5H as "—", not
+ *  comes back (the spike record) — so `fmtPercentCli` renders 5H as "—", not
  *  "0%". `weeklyFable` has no source field on Codex at all and is always
  *  null regardless of what the endpoint returns. */
 const CODEX_OK = {
@@ -312,7 +312,7 @@ const cells = (line: string): string[] => line.trim().split(/\s{2,}/);
 test("ms status: accounts table (NAME LABEL 5H WEEK FABLE RESETS STATE) and sessions table, with the unreported flag", async () => {
   const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
   await seedSessions(w);
-  const { localTime } = await import("../src/status.ts");
+  const { localTimeCli } = await import("../src/status.ts");
 
   const r = run(["status"], env());
   assert.equal(r.code, 0, r.stderr);
@@ -325,7 +325,7 @@ test("ms status: accounts table (NAME LABEL 5H WEEK FABLE RESETS STATE) and sess
   const dirkLine = lines.find((l) => l.startsWith("dirk"))!;
   assert.ok(dirkLine, r.stdout);
   assert.deepEqual(cells(dirkLine), [
-    "dirk", "Dirk", "42.5%", "10%", "33.3%", localTime(Date.parse("2026-09-18T12:30:00Z")), "ok",
+    "dirk", "Dirk", "42.5%", "10%", "33.3%", localTimeCli(Date.parse("2026-09-18T12:30:00Z")), "ok",
   ]);
 
   const gmailLine = lines.find((l) => l.startsWith("gmail"))!;

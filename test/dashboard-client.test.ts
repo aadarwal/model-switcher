@@ -24,6 +24,7 @@ import {
   accountRowHtml,
   sessionRowHtml,
   formatSwitchAll,
+  fleetCandidateIds,
   MAX_POLL_FAILURES,
   type PollState,
   type SessionRowView,
@@ -192,6 +193,38 @@ test("formatSwitchAll: a transport or server failure shows its own error, and an
   assert.equal(formatSwitchAll(0, { error: "TypeError: Failed to fetch" }), "TypeError: Failed to fetch");
   assert.equal(formatSwitchAll(502, null), "HTTP 502");
   assert.equal(formatSwitchAll(200, {}), "HTTP 200");
+});
+
+// --- rereview-C.md defect 3: which rows a fleet move disables --------------
+//
+// `moveBusy` (the "Go" button's own flag) never reached the per-row controls
+// — a click there mid-move queued a second, redundant handoff. The page's
+// `applyBusy()` now also busies every id `fleetCandidateIds` names, for as
+// long as the move is in flight.
+
+const FLEET_ROWS: SessionRowView[] = [
+  { id: "s1", pane: "%1", provider: "claude", account: "away", need: "any", state: "running", generation: 1, pending: null, wakeupAt: null, walled: "" },
+  { id: "s2", pane: "%2", provider: "claude", account: "away", need: "any", state: "running", generation: 1, pending: null, wakeupAt: null, walled: "" },
+  { id: "s3", pane: "%3", provider: "claude", account: "home", need: "any", state: "running", generation: 1, pending: null, wakeupAt: null, walled: "" },
+  { id: "s4", pane: "%4", provider: "codex", account: "away", need: "any", state: "running", generation: 1, pending: null, wakeupAt: null, walled: "" },
+];
+
+test("fleetCandidateIds: same provider, not already on the destination — the same two rules switchAll itself candidates on", () => {
+  assert.deepStrictEqual(fleetCandidateIds(FLEET_ROWS, "claude", "home"), ["s1", "s2"]);
+});
+
+test("fleetCandidateIds: a session already on the destination is never a candidate", () => {
+  assert.deepStrictEqual(fleetCandidateIds(FLEET_ROWS, "claude", "away"), ["s3"]);
+});
+
+test("fleetCandidateIds: a different provider's sessions are never candidates, whatever the destination", () => {
+  const only = fleetCandidateIds(FLEET_ROWS, "codex", "cdx");
+  assert.deepStrictEqual(only, ["s4"]);
+  assert.ok(!only.includes("s1") && !only.includes("s2") && !only.includes("s3"));
+});
+
+test("fleetCandidateIds: no sessions is no candidates, not a throw", () => {
+  assert.deepStrictEqual(fleetCandidateIds([], "claude", "home"), []);
 });
 
 // --- Finding C5: a row's chosen account survives the 5s re-render ----------

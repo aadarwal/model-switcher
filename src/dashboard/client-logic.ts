@@ -259,3 +259,29 @@ export function formatSwitchAll(status: number, json: SwitchAllJson): string {
   lines.push("moved " + moved + ", refused " + (results.length - moved));
   return lines.join("\n");
 }
+
+// --- Which rows a fleet move touches (rereview-C.md, defect 3) -------------
+
+/**
+ * Which session ids `POST /api/switch-all` would touch: same provider as the
+ * move, not already on the destination account — the same two of
+ * `switchAll`'s (src/manual.ts) own candidate rules the client can see from
+ * a session row (it never sees `desired`, so this can only ever be a
+ * superset of the server's real candidates, never a subset — safe, since a
+ * row wrongly marked busy is never a missed handoff, only a row disabled
+ * one poll longer than strictly necessary).
+ *
+ * The page uses this to disable exactly these rows' controls while a fleet
+ * move is in flight: without it, a click on a candidate row mid-move queues
+ * a second, redundant handoff for that session, for up to the whole `--all`
+ * budget — `moveBusy` alone (the "Go" button's own flag) never reached the
+ * per-row buttons at all.
+ */
+export function fleetCandidateIds(sessions: SessionRowView[], provider: string, to: string): string[] {
+  var out: string[] = [];
+  for (var i = 0; i < sessions.length; i++) {
+    var s = sessions[i]!;
+    if (s.provider === provider && s.account !== to) out.push(s.id);
+  }
+  return out;
+}

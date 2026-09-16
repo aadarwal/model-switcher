@@ -65,16 +65,28 @@ export function accountState(a: AccountUsage, hasToken: boolean): AccountState {
 }
 
 /** One decimal only when the value isn't integral (42, not 42.0; 42.5, not
- *  42.50); "—" for a window the account doesn't have. */
-function fmtPercent(w: Window | null | undefined): string {
+ *  42.50); "—" for a window the account doesn't have.
+ *
+ *  `Cli`-suffixed on purpose: src/dashboard/client-logic.ts has its own
+ *  `fmtPercent`, doing the same job for the dashboard page's <script>, whose
+ *  runtime source page.ts embeds by `fn.toString()` under that exact name.
+ *  Bundled into the same file (esbuild, scripts/build.mjs), two same-named
+ *  top-level functions collide and one gets silently renamed — which is
+ *  exactly the class of bug scripts/check-dist.mjs exists to catch (it did,
+ *  against this pair, before this rename). Never let this name collide with
+ *  client-logic.ts's again. */
+function fmtPercentCli(w: Window | null | undefined): string {
   if (!w || !Number.isFinite(w.usedPercent)) return DASH;
   const v = Math.round(w.usedPercent * 10) / 10;
   return `${Number.isInteger(v) ? v : v.toFixed(1)}%`;
 }
 
 /** The earliest of the account's WEEKLY resets — session/5h resets far more
- *  often and is not "the" reset a human waiting on this account cares about. */
-export function earliestWeeklyReset(u: AccountUsage["usage"]): string | null {
+ *  often and is not "the" reset a human waiting on this account cares about.
+ *  `Cli`-suffixed for the same reason as `fmtPercentCli` above: keeps this
+ *  file's own copy from colliding with client-logic.ts's `earliestWeeklyReset`
+ *  once both are bundled into dist/ms.js. */
+export function earliestWeeklyResetCli(u: AccountUsage["usage"]): string | null {
   if (!u) return null;
   const candidates = [u.weeklyAll?.resetsAt, u.weeklyFable?.resetsAt].filter((x): x is string => !!x);
   if (!candidates.length) return null;
@@ -82,8 +94,10 @@ export function earliestWeeklyReset(u: AccountUsage["usage"]): string | null {
 }
 
 /** Local wall-clock time, `YYYY-MM-DD HH:MM` — never UTC, never an ISO
- *  string a human has to convert in their head. */
-export function localTime(epochMs: number): string {
+ *  string a human has to convert in their head. `Cli`-suffixed for the same
+ *  reason as `fmtPercentCli` above: keeps this file's own copy from
+ *  colliding with client-logic.ts's `localTime`. */
+export function localTimeCli(epochMs: number): string {
   const d = new Date(epochMs);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -104,14 +118,14 @@ function computeAccount(a: AccountUsage, registry: Registry): AccountComputed {
 
 function accountRow(a: AccountUsage, registry: Registry): string[] {
   const c = computeAccount(a, registry);
-  const reset = earliestWeeklyReset(a.usage);
+  const reset = earliestWeeklyResetCli(a.usage);
   return [
     a.name,
     c.label,
-    fmtPercent(a.usage?.session ?? null),
-    fmtPercent(a.usage?.weeklyAll ?? null),
-    fmtPercent(a.usage?.weeklyFable ?? null),
-    reset ? localTime(Date.parse(reset)) : DASH,
+    fmtPercentCli(a.usage?.session ?? null),
+    fmtPercentCli(a.usage?.weeklyAll ?? null),
+    fmtPercentCli(a.usage?.weeklyFable ?? null),
+    reset ? localTimeCli(Date.parse(reset)) : DASH,
     c.state,
   ];
 }
@@ -193,7 +207,7 @@ function sessionRow(s: SessionRow, st: State): string[] {
     c.state,
     String(s.generation),
     c.pending ?? DASH,
-    s.wakeupAt != null ? localTime(s.wakeupAt * 1000) : DASH,
+    s.wakeupAt != null ? localTimeCli(s.wakeupAt * 1000) : DASH,
     c.walled,
   ];
 }

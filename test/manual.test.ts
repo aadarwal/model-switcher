@@ -19,7 +19,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import { hostname } from "node:os";
@@ -891,6 +891,10 @@ for a in "$@"; do
 done
 get() { grep "^$1=" "$st" 2>/dev/null | tail -1 | cut -d= -f2-; }
 put() { printf '%s=%s\n' "$1" "$2" >> "$st"; }
+# The one fault a test can inject from OUTSIDE the process: take the store's
+# permissions away while a fleet move is under way, so the sessions still
+# queued behind this pane throw where they open it.
+if [ -n "$MS_TMUX_BREAK_DB" ] && [ "$pane" = "$MS_TMUX_BREAK_DB" ]; then chmod 000 "$MS_HOME/state.sqlite"; fi
 case "$1" in
   list-panes) get panes | tr ' ' '\n' ;;
   display-message)
@@ -982,6 +986,7 @@ async function fleet(t: TestContext, sessions: FleetSession[]): Promise<Fleet> {
   process.env.MS_TMUX_SNAP = "";
   process.env.MS_TMUX_REVIVE = "";
   process.env.MS_TMUX_FAIL = "";
+  process.env.MS_TMUX_BREAK_DB = "";
   process.env.MS_POLL_MS = "20";
   // Wider than the single-pane world's: a barrier-held reporter may sit on a
   // respawned pane for up to five seconds before it opens the gate, and that
@@ -1221,7 +1226,7 @@ test("switch --all --timeout 0 moves nothing and says so", async (t) => {
   assert.deepEqual(logLines(w), [], "no pane was even asked a question");
   for (const id of ["s1", "s2", "s3"]) {
     assert.equal(row(id).account, "away");
-    assert.match(say(), new RegExp(`^ms: ${id} refused: not started`, "m"));
+    assert.match(say(), new RegExp(`^ms: ${id} refused: not started: the 0ms budget ran out$`, "m"));
   }
   assert.match(say(), /^ms: moved 0, refused 3$/m);
 });
@@ -1268,6 +1273,63 @@ test("--all refuses an account name two providers both claim", async (t) => {
   assert.equal(await switchVerb(["--all", "--to", "home"]), 1);
   assert.match(say(), /cannot tell which fleet you mean/);
   assert.deepEqual(logLines(w), [], "nothing was asked of tmux, let alone moved");
+  assert.equal(row("s1").account, "away");
+});
+
+test("the library refuses that name too, in the same words the verb prints", async (t) => {
+  // The verb is not the only caller. The dashboard's POST /api/switch-all calls
+  // `switchAll` directly, and `findAccount` with no provider returns the FIRST
+  // name match — so a guard that lived only in the verb would let the whole
+  // claude fleet move on a codex typo, from the same registry the CLI refuses.
+  const w = await fleet(t, FLEET);
+  writeFileSync(
+    path.join(w.msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: ["claude", "codex"].map((provider) => ({ name: "home", provider, label: "home", shared: false })),
+    }),
+    { mode: 0o600 },
+  );
+  const say = stderr(t);
+
+  const { results, code, message } = await switchAll("home", { force: false, continueAfter: "auto", timeoutMs: 60_000 });
+
+  assert.equal(code, 1);
+  assert.deepEqual(results, [], "the library moved nothing and started nothing");
+  assert.match(message ?? "", /cannot tell which fleet you mean/);
+  assert.deepEqual(logLines(w), [], "nothing was asked of tmux, let alone moved");
+  assert.equal(row("s1").account, "away");
+
+  // …and the refusal the verb prints is that message, once, with no summary
+  // under it: a move that never started has nothing to summarise.
+  assert.equal(await switchVerb(["--all", "--to", "home"]), 1);
+  assert.deepEqual(say().split("\n").filter(Boolean), [`ms switch: ${message}`]);
+});
+
+test("a switchOne that throws is that session's refusal, never the fleet's", async (t) => {
+  // `openState` is the one call in `switchOne` that is outside every guard the
+  // transaction has — the store either opens or it throws — so a store it
+  // cannot open is how a real throw reaches the pool. Left to reject, that
+  // throw takes `Promise.all` with it: the summary never prints, every
+  // sibling's result is lost with it, and the workers still running keep
+  // driving handoffs while the process unwinds.
+  const w = await fleet(t, fleetSessions(3));
+  // The first pane's own tmux call takes the store away, which is after s1 has
+  // resolved itself and before s2 and s3 resolve theirs.
+  process.env.MS_TMUX_BREAK_DB = "%1";
+  const say = stderr(t);
+
+  const code = await switchVerb(["--all", "--to", "home"]);
+  chmodSync(path.join(w.msHome, "state.sqlite"), 0o600);
+
+  assert.equal(code, 1);
+  for (const id of ["s1", "s2", "s3"]) {
+    assert.match(say(), new RegExp(`^ms: ${id} refused: \\S`, "m"), `${id}'s result went missing`);
+  }
+  for (const id of ["s2", "s3"]) {
+    assert.match(say(), new RegExp(`^ms: ${id} refused: .*(EACCES|permission denied)`, "m"), `${id} did not carry the throw's own reason`);
+  }
+  assert.match(say(), /^ms: moved 0, refused 3$/m, "the summary is what a caught throw keeps");
   assert.equal(row("s1").account, "away");
 });
 

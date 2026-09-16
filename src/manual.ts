@@ -278,6 +278,11 @@ export const HANDOFF_REPORTED = "the handoff did not happen (the reason is above
 /** How long `--all` keeps starting new moves for, when nobody says. */
 const ALL_TIMEOUT_SECONDS = 600;
 
+/** A budget said back to the human in the units they wrote it in. Rounding to
+ * seconds would report `--timeout 0.4` as "the 0s budget ran out" — a budget
+ * they never set, and one that reads as a bug rather than as a short deadline. */
+const budgetSaid = (ms: number): string => (ms >= 1000 ? `${Math.round(ms / 1000)}s` : `${ms}ms`);
+
 /**
  * Move ONE session to `to`: the whole of `ms switch`'s per-session path, minus
  * the printing and the process's exit code.
@@ -289,7 +294,11 @@ const ALL_TIMEOUT_SECONDS = 600;
  */
 export async function switchOne(sessionId: string, to: string, opts: SwitchOneOptions): Promise<{ code: number; message: string }> {
   const found = withSession(sessionId);
-  if ("error" in found) return { code: found.code, message: found.error };
+  // `resolveSession` speaks the CLI's exit codes, and 2 there means "the
+  // command line is wrong" — which is never what a named session is. A library
+  // that returned it would have its caller print a usage line for a session id
+  // it was handed, so every non-zero answer from here is a refusal.
+  if ("error" in found) return { code: EXIT_REFUSED, message: found.error };
   const session = found.session;
 
   // The typo-catchers first, because they need no tmux at all: a mistyped
@@ -345,13 +354,24 @@ export async function switchOne(sessionId: string, to: string, opts: SwitchOneOp
 export async function switchAll(
   to: string,
   opts: { force: boolean; continueAfter: boolean | "auto"; timeoutMs: number; onResult?: (r: SwitchResult) => void },
-): Promise<{ results: SwitchResult[]; code: number }> {
-  // Which fleet `to` names. The CLI has already refused an account nobody
-  // registered (and one whose name two providers claim); this is the library
-  // path's own guard, and it moves nothing rather than guessing a provider.
-  const { registry } = loadRegistry();
-  const account = findAccount(registry, to);
-  if (!account) return { results: [], code: EXIT_REFUSED };
+): Promise<{ results: SwitchResult[]; code: number; message: string | null }> {
+  // Which fleet `to` names, and the three ways that question has no answer.
+  // They live HERE rather than in the verb because the verb is not the only
+  // caller — the dashboard's `POST /api/switch-all` calls this function — and
+  // `findAccount` with no provider returns the FIRST name match: a guard the
+  // verb kept to itself would let a `home` that two providers both claim move
+  // the whole claude fleet on a codex typo, out of the very registry the CLI
+  // refuses. `message` is what a caller says in its own voice; nothing was
+  // started, so there is nothing to summarise under it.
+  const { registry, parseError } = loadRegistry();
+  if (parseError) return { results: [], code: EXIT_REFUSED, message: `cannot read the registry: ${parseError}` };
+  const named = registry.accounts.filter((a) => a.name === to);
+  if (!named.length) return { results: [], code: EXIT_REFUSED, message: `no such account '${to}'` };
+  if (named.length > 1) {
+    const which = named.map((a) => `a ${a.provider}`).join(" and ");
+    return { results: [], code: EXIT_REFUSED, message: `'${to}' names ${which} account; --all cannot tell which fleet you mean` };
+  }
+  const account = named[0]!;
 
   const st = openState();
   let candidates: SessionRow[];
@@ -366,15 +386,33 @@ export async function switchAll(
   const results: SwitchResult[] = new Array(candidates.length);
   const deadline = performance.now() + opts.timeoutMs;
   let next = 0;
+  /**
+   * One candidate's answer, whatever happened — including a throw.
+   *
+   * `switchOne` returns its refusals, but `openState` is outside every guard
+   * the transaction has: a store it cannot open throws past all of them. Left
+   * to reject, that throw takes `Promise.all` with it — the summary never
+   * prints, every sibling's result is lost with it, and the workers still
+   * running keep driving handoffs while the process unwinds. One session's bad
+   * luck is that session's refusal, never the fleet's. The message is the
+   * error's own; none of the paths that reach here carry a credential in one.
+   */
+  const attempt = async (session: SessionRow): Promise<SwitchResult> => {
+    if (performance.now() >= deadline) {
+      return { session: session.id, code: EXIT_REFUSED, message: `not started: the ${budgetSaid(opts.timeoutMs)} budget ran out` };
+    }
+    try {
+      return { session: session.id, ...(await switchOne(session.id, to, { continueAfter: opts.continueAfter, force: opts.force })) };
+    } catch (e) {
+      return { session: session.id, code: EXIT_REFUSED, message: (e as Error)?.message || String(e) };
+    }
+  };
   const worker = async (): Promise<void> => {
     for (;;) {
       const i = next++;
       const session = candidates[i];
       if (!session) return;
-      const result: SwitchResult =
-        performance.now() >= deadline
-          ? { session: session.id, code: EXIT_REFUSED, message: `not started: the ${Math.round(opts.timeoutMs / 1000)}s budget ran out` }
-          : { session: session.id, ...(await switchOne(session.id, to, { continueAfter: opts.continueAfter, force: opts.force })) };
+      const result = await attempt(session);
       results[i] = result;
       opts.onResult?.(result);
     }
@@ -382,7 +420,7 @@ export async function switchAll(
   // `next++` needs no lock: one event loop, and nothing awaits between the read
   // and the increment.
   await Promise.all(Array.from({ length: Math.min(HANDOFF_SLOTS, candidates.length) }, worker));
-  return { results, code: results.some((r) => r.code !== EXIT_OK) ? EXIT_REFUSED : EXIT_OK };
+  return { results, code: results.some((r) => r.code !== EXIT_OK) ? EXIT_REFUSED : EXIT_OK, message: null };
 }
 
 /** `ms switch --all --to <account>`: the fleet move, and its summary. */
@@ -393,24 +431,17 @@ async function switchAllVerb(parsed: Options): Promise<number> {
   if (!parsed.to) return usage("switch", "--all needs --to <account>");
   const to = parsed.to;
 
-  const { registry, parseError } = loadRegistry();
-  if (parseError) return refuse("switch", `cannot read the registry: ${parseError}`);
-  // Which sessions are the fleet depends on the destination's PROVIDER, so a
-  // name two providers both claim has no answer here. Refusing is the only one
-  // that does not silently move somebody's claude fleet on a codex typo.
-  const named = registry.accounts.filter((a) => a.name === to);
-  if (!named.length) return refuse("switch", `no such account '${to}'`);
-  if (named.length > 1) {
-    return refuse("switch", `'${to}' names ${named.map((a) => `a ${a.provider}`).join(" and ")} account; --all cannot tell which fleet you mean`);
-  }
-
-  const { results, code } = await switchAll(to, {
+  const { results, code, message } = await switchAll(to, {
     force: parsed.force,
     continueAfter: parsed.continueAfter || "auto",
     timeoutMs: (parsed.timeoutSeconds ?? ALL_TIMEOUT_SECONDS) * 1000,
     onResult: (r) =>
       process.stderr.write(r.code === EXIT_OK ? `ms: ${r.session} moved → ${to}\n` : `ms: ${r.session} refused: ${r.message}\n`),
   });
+  // A destination that is no destination: `switchAll` refused before it started
+  // anything, and this verb says so in its own name. No summary follows — a
+  // move that never began has nothing to count.
+  if (message) return refuse("switch", message);
   const moved = results.filter((r) => r.code === EXIT_OK).length;
   process.stderr.write(`ms: moved ${moved}, refused ${results.length - moved}\n`);
   return code;

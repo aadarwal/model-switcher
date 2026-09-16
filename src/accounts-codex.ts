@@ -27,7 +27,7 @@
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import path from "node:path";
-import { redact } from "./accounts.ts";
+import { mightCarryToken, redact } from "./accounts.ts";
 import { ensureStore, p } from "./paths.ts";
 import { type Account, findAccount, loadRegistry, saveRegistry } from "./registry.ts";
 import { probeCodexUsage, readCodexAuth } from "./providers/codex-probe.ts";
@@ -93,7 +93,7 @@ export function ensureCodexHome(name: string): string {
   const dir = p.codexHome(name);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700); // mkdir's mode is masked by umask; the store's is not a suggestion
-  const link = path.join(dir, "sessions");
+  const link = p.codexSessionsLink(name);
   try {
     lstatSync(link);
   } catch {
@@ -150,8 +150,14 @@ async function runCodexLogin(name: string, dir: string, argv: string[]): Promise
         forward(`${pending[which].slice(0, i)}\n`);
         pending[which] = pending[which].slice(i + 1);
       }
-      if (pending[which]) {
-        forward(pending[which]); // an unterminated prompt: the human needs it NOW
+      // What is left has no newline yet. A fragment that could be carrying a
+      // token — or could become one when the next chunk lands — waits for it,
+      // because redaction only works on text it can see whole and a chunk
+      // boundary falls wherever the pipe says. Everything else goes out at
+      // once: a device-code prompt nobody sees is a hang. Exactly the Claude
+      // mint's rule, and the same helper, so neither can drift from the other.
+      if (pending[which] && !mightCarryToken(pending[which])) {
+        forward(pending[which]);
         pending[which] = "";
       }
     };
@@ -241,6 +247,10 @@ export async function loginCodex(name: string, opts: { deviceAuth?: boolean } = 
   // Identity (and the duplicate refusal) before anything is written: a refused
   // account keeps its unverified row and its home, and claims nothing.
   const { accountId, email } = identifyOrRefuse(name, dir);
+  // `identityVerified` says WHOSE account this is — the login's own id_token
+  // proved that, and nothing later can unprove it. Whether the credential still
+  // WORKS is the probe's separate answer below, and its refusal exits without
+  // taking the identity back.
   update(name, { orgId: accountId, identityVerified: true, identityMethod: "codex-login" });
   await proveOrRefuse(name, dir);
   report(name, accountId, email);

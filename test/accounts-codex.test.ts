@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, readFileSync, readlinkSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { run, stubDir, tempHome } from "./helpers.ts";
@@ -22,6 +22,9 @@ const ACCESS = "codex-at-1";
  *  this tool makes may ever carry it. Distinctive on purpose. */
 const REFRESH = "codex-rt-DO-NOT-SEND";
 const DEVICE_LINE = "Open https://auth.openai.com/device and enter code WXYZ-1234";
+/** Codex prints no credential of its own, so this is a CLI that started to:
+ *  token-shaped, and never allowed onto the human's terminal whole. */
+const LEAK = "sk-ant-oat01-NOTREALLYATOKENbutshaped_-123456";
 
 const b64url = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
 /** A JWT-shaped id_token: only the middle segment is ever read. */
@@ -49,6 +52,13 @@ const CODEX_STUB = `
 printf '%s\\t%s\\n' "$*" "$CODEX_HOME" >> "$MS_TEST_CODEX_LOG"
 if [ "$1" = "login" ]; then
   [ -n "$CODEX_HOME" ] || { echo "no CODEX_HOME" >&2; exit 9; }
+  if [ "$MS_TEST_LOGIN_SPLIT" = "1" ]; then
+    # Two writes that straddle the token prefix EXACTLY: the first carries no
+    # secret and nothing for a redaction to match, the second carries the body.
+    printf 'code is sk-ant-oat01-'
+    sleep 0.3
+    printf '%s and done\\n' "\${MS_TEST_LEAK#sk-ant-oat01-}"
+  fi
   [ -n "$MS_TEST_LOGIN_STDOUT" ] && printf '%s\\n' "$MS_TEST_LOGIN_STDOUT"
   [ -n "$MS_TEST_LOGIN_STDERR" ] && printf '%s\\n' "$MS_TEST_LOGIN_STDERR" >&2
   if [ "$MS_TEST_LOGIN_EXIT" != "0" ]; then exit "$MS_TEST_LOGIN_EXIT"; fi
@@ -58,13 +68,18 @@ fi
 exit 3
 `;
 
+// Start and end are logged separately so a test can replay the log and see how
+// many requests were ever in flight at once, not just how many were made.
 const FETCH_STUB = `import { appendFileSync } from "node:fs";
 const log = process.env.MS_TEST_FETCH_LOG;
 const status = Number(process.env.MS_TEST_FETCH_STATUS || "200");
+const delay = Number(process.env.MS_TEST_FETCH_DELAY_MS || "0");
 globalThis.fetch = async (input, init = {}) => {
   const headers = {};
   new Headers(init.headers || {}).forEach((v, k) => { headers[k] = v; });
-  appendFileSync(log, JSON.stringify({ url: String(input), headers }) + "\\n");
+  appendFileSync(log, JSON.stringify({ event: "start", url: String(input), headers }) + "\\n");
+  if (delay) await new Promise((r) => setTimeout(r, delay));
+  appendFileSync(log, JSON.stringify({ event: "end" }) + "\\n");
   if (status === 0) throw new TypeError("fetch failed");
   return new Response(JSON.stringify({ usage: {} }), { status, headers: { "content-type": "application/json" } });
 };
@@ -78,6 +93,10 @@ type Opts = {
   loginStderr?: string;
   /** 0 makes `fetch` itself throw, the network-is-down case. */
   fetchStatus?: number;
+  /** How long each request stays in flight — the only way to observe overlap. */
+  fetchDelayMs?: number;
+  /** `codex login` splits a token-shaped string across two writes. */
+  loginSplit?: boolean;
 };
 
 type CodexCall = { argv: string[]; env: { CODEX_HOME: string } };
@@ -100,6 +119,9 @@ function scene(opts: Opts = {}) {
     MS_TEST_CODEX_LOG: codexLog,
     MS_TEST_FETCH_LOG: fetchLog,
     MS_TEST_FETCH_STATUS: String(opts.fetchStatus ?? 200),
+    MS_TEST_FETCH_DELAY_MS: String(opts.fetchDelayMs ?? 0),
+    MS_TEST_LOGIN_SPLIT: opts.loginSplit ? "1" : "0",
+    MS_TEST_LEAK: LEAK,
     MS_TEST_AUTH_JSON: opts.authJson ?? authFixture(),
     MS_TEST_NO_AUTH_JSON: opts.noAuthJson ? "1" : "0",
     MS_TEST_LOGIN_EXIT: String(opts.loginExit ?? 0),
@@ -119,8 +141,21 @@ function scene(opts: Opts = {}) {
           const [argv, CODEX_HOME] = l.split("\t");
           return { argv: argv.split(" ").filter(Boolean), env: { CODEX_HOME } };
         }),
-    fetchCalls: (): { url: string; headers: Record<string, string> }[] =>
+    fetchEvents: (): { event: string; url?: string; headers?: Record<string, string> }[] =>
       readFileSync(fetchLog, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)),
+    fetchCalls(): { url: string; headers: Record<string, string> }[] {
+      return this.fetchEvents().filter((e) => e.event === "start") as { url: string; headers: Record<string, string> }[];
+    },
+    /** The high-water mark of requests in flight at the same moment. */
+    maxInFlight(): number {
+      let inFlight = 0;
+      let max = 0;
+      for (const e of this.fetchEvents()) {
+        if (e.event === "start") max = Math.max(max, ++inFlight);
+        else inFlight--;
+      }
+      return max;
+    },
     accounts: (): Record<string, unknown>[] => {
       const f = path.join(msHome, "accounts.json");
       return existsSync(f) ? JSON.parse(readFileSync(f, "utf8")).accounts : [];
@@ -214,13 +249,29 @@ test("login forwards the device code and URL to the human", () => {
 });
 
 test("login never lets a token-shaped string through, wherever codex printed it", () => {
-  const leak = "sk-ant-oat01-NOTREALLYATOKENbutshaped_-123456";
-  const s = scene({ loginStdout: `here is a token ${leak} oops` });
+  const s = scene({ loginStdout: `here is a token ${LEAK} oops` });
   s.ms(["add", "work", "--provider", "codex"]);
   const r = s.ms(["login", "work"]);
   assert.equal(r.code, 0, r.stderr);
-  assert.equal((r.stdout + r.stderr).includes(leak), false, r.stderr);
+  assert.equal((r.stdout + r.stderr).includes(LEAK), false, r.stderr);
   assert.match(r.stderr, /sk-ant-oat01-<redacted>/);
+});
+
+test("login holds back an unterminated fragment that could still become a token", () => {
+  // The chunk boundary falls EXACTLY on the prefix: the first write has nothing
+  // for the redaction to match and leaves no prefix for the second write to
+  // match either, so forwarding each fragment as it lands would put the whole
+  // token on the human's terminal in two halves, each one innocent. The Claude
+  // mint holds such a fragment for its newline (`mightCarryToken`); so does
+  // this, with that same helper.
+  const s = scene({ loginSplit: true, loginStdout: "" });
+  s.ms(["add", "work", "--provider", "codex"]);
+  const r = s.ms(["login", "work"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal((r.stdout + r.stderr).includes(LEAK), false, r.stderr);
+  assert.match(r.stderr, /sk-ant-oat01-<redacted>/);
+  // ...and the prose around it still reached the human, whole.
+  assert.match(r.stderr, /code is sk-ant-oat01-<redacted> and done/);
 });
 
 test("login fails when codex login leaves no auth.json, and when it exits non-zero", () => {
@@ -261,6 +312,14 @@ test("login proves the credential with one bounded usage fetch: 401 fails it, a 
   const d = dead.ms(["login", "work"]);
   assert.equal(d.code, 1);
   assert.match(d.stderr, /ms accounts login work --provider codex/);
+  // The row it leaves behind still knows WHOSE account this is: the id_token
+  // proved that, and a usage endpoint refusing the credential does not unprove
+  // it. `identityVerified` is identity, not usability — the POLL column is
+  // where "does it still work" is answered, and it will read `no`.
+  assert.equal(dead.row("work").orgId, "acct-1");
+  assert.equal(dead.row("work").identityVerified, true);
+  assert.equal(dead.row("work").identityMethod, "codex-login");
+  assert.match(dead.ms(["ls"]).stdout, /work\s+codex\s+work\s+acct-1\s+no\s+n\/a\s+yes/);
 
   const flaky = scene({ fetchStatus: 500 });
   flaky.ms(["add", "work", "--provider", "codex"]);
@@ -308,13 +367,26 @@ test("verify fails when the account has never logged in", () => {
 
 // --- token, ls, remove -------------------------------------------------
 
-test("token on a codex row says there is none, and never touches the claude token store", () => {
+test("token on a codex row refuses, and never reaches the claude row of the same name", () => {
   const s = scene();
-  s.ms(["add", "work", "--provider", "codex"]);
-  const r = s.ms(["token", "work"]);
+  // A claude `work` WITH a launch token sits beside the codex `work`. The
+  // refusal has to be a refusal: a fallback, or a lookup that forgot the
+  // provider, would print one account's credential when asked for another's.
+  assert.equal(s.ms(["add", "work"]).code, 0);
+  const CLAUDE_TOKEN = "sk-ant-oat01-CLAUDEtoken1234567890_-abcdefgh";
+  mkdirSync(path.join(s.msHome, "launch"), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(s.msHome, "launch", "work.token"), `${CLAUDE_TOKEN}\n`, { mode: 0o600 });
+  assert.equal(s.ms(["add", "work", "--provider", "codex"]).code, 0);
+
+  const r = s.ms(["token", "work", "--provider", "codex"]);
   assert.equal(r.code, 1);
   assert.equal(r.stdout, "");
   assert.match(r.stderr, /codex accounts have no launch token; the CLI reads CODEX_HOME/);
+  assert.equal((r.stdout + r.stderr).includes(CLAUDE_TOKEN), false, r.stderr);
+  // ...and the claude row still hands over its own, when it is the one asked.
+  const ok = s.ms(["token", "work", "--provider", "claude"]);
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.equal(ok.stdout, `${CLAUDE_TOKEN}\n`);
 });
 
 test("ls shows POLL yes / TOKEN n/a for a Codex row, beside the Claude rows", () => {
@@ -349,6 +421,20 @@ test("ls says `unknown`, not `no`, when the usage endpoint could not be reached"
   const r = s.ms(["ls"]);
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, /work\s+codex\s+work\s+acct-1\s+unknown\s+n\/a\s+yes/);
+});
+
+test("ls probes at most four codex rows at once", () => {
+  // Six credentialed rows, each request held open long enough to overlap: the
+  // book must not fire all six at one endpoint the instant someone types `ls`.
+  const s = scene({ fetchDelayMs: 150 });
+  for (let i = 1; i <= 6; i++) {
+    assert.equal(s.ms(["add", `c${i}`, "--provider", "codex"]).code, 0);
+    writeFileSync(path.join(s.codexHome(`c${i}`), "auth.json"), authFixture(`acct-${i}`));
+  }
+  const r = s.ms(["ls"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(s.fetchCalls().length, 6, "not every row was probed");
+  assert.equal(s.maxInFlight(), 4, "the probe pool is not capped at four");
 });
 
 test("remove deletes the home but not the shared sessions store", () => {

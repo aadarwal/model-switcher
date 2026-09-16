@@ -2,11 +2,20 @@ import { existsSync, readFileSync, writeFileSync, renameSync, rmSync } from "nod
 import { ensureStore, p } from "./paths.ts";
 
 export type Provider = "claude" | "codex";
-/** `identityMethod` names HOW `identityVerified` was earned — today always
- * `"both-usable"` (the poll grant was read and the launch token's own probe
- * ran, in the same `login`/`verify`), set only when `identityVerified` is
- * true. It is optional so a registry written before this field existed keeps
- * loading unchanged. */
+/** `identityMethod` names HOW `identityVerified` was earned, and there is one
+ * value per provider because the two prove identity by different means:
+ *
+ *   `"both-usable"`  (claude) the poll grant was read AND the launch token's
+ *                    own probe ran, in the same `login`/`verify` — two
+ *                    credentials, both answering for one organisation.
+ *   `"codex-login"`  (codex) the ChatGPT account id came out of the id_token
+ *                    that `codex login` itself minted into this account's
+ *                    CODEX_HOME. It says whose account this is; whether the
+ *                    credential still WORKS is the usage probe's separate
+ *                    answer, and a probe that fails does not unsay the id.
+ *
+ * Set only when `identityVerified` is true. It is optional so a registry
+ * written before this field existed keeps loading unchanged. */
 export type Account = {
   name: string;
   provider: Provider;

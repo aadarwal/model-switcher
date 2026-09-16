@@ -25,6 +25,10 @@ export const p = {
    *  account. Sharing the directory — and never an account's name — is what
    *  lets `codex resume <id>` cross accounts. */
   codexSessions: () => sub("codex", "sessions"),
+  /** Where that store is reached from inside ONE account's home: the symlink
+   *  `add` creates and `remove` unlinks. Named here so the two sides of the
+   *  link are one edit, and so nothing has to rebuild the path by hand. */
+  codexSessionsLink: (name: string) => sub("codex", name, "sessions"),
   hooksDir: () => sub("hooks"),
 };
 export function ensureStore(): void {

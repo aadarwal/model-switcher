@@ -142,8 +142,12 @@ export function redact(s: string): string {
  *  to match, and `…is sk-ant-` is the same trap one character earlier. So a
  *  fragment carrying the prefix, or ending in any part of it, waits for its
  *  newline; everything else — a prompt with no newline, which the human needs
- *  to SEE while the mint waits — goes straight out. */
-function mightCarryToken(fragment: string): boolean {
+ *  to SEE while the mint waits — goes straight out.
+ *
+ *  Exported for src/accounts-codex.ts alongside `redact`: `codex login` streams
+ *  a device code the same way, and the holdback rule has to be the SAME rule on
+ *  both sides, or one of them leaks on a chunk boundary the other survives. */
+export function mightCarryToken(fragment: string): boolean {
   if (fragment.includes(TOKEN_PREFIX)) return true;
   for (let n = Math.min(fragment.length, TOKEN_PREFIX.length - 1); n > 0; n--) {
     if (fragment.endsWith(TOKEN_PREFIX.slice(0, n))) return true;
@@ -706,6 +710,30 @@ function tokenCell(name: string): string {
   return existsSync(p.launchToken(name)) ? "unreadable" : "no";
 }
 
+/** At most this many usage probes in flight at once while `ls` fills the POLL
+ *  column. A book of codex accounts is a book of bounded HTTP reads, and firing
+ *  all of them at one endpoint the instant someone types `ls` is how a listing
+ *  earns a 429 — the very answer that would then read `unknown`. Four keeps the
+ *  table fast without making the request pattern a burst. */
+const LS_PROBE_CONCURRENCY = 4;
+
+/**
+ * `items.map(work)`, with at most `limit` of them running at once.
+ *
+ * A fixed set of workers pulling from one shared cursor: no dependency, no
+ * queue, and each result lands back at its own index, so the caller still gets
+ * an array in input order however the work interleaved.
+ */
+async function mapLimit<T, R>(items: T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < items.length; i = next++) out[i] = await work(items[i]);
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return out;
+}
+
 /**
  * Every account, in registry order, under one set of columns.
  *
@@ -716,21 +744,19 @@ function tokenCell(name: string): string {
  *
  * The cells themselves are per-provider (`codexCells`, and the Claude pair
  * below), because the same word means a different check on each side. Codex
- * rows are probed in PARALLEL: each is one bounded HTTP read, and a book of
- * them must not cost the sum of their timeouts.
+ * rows are probed CONCURRENTLY — a book of them must not cost the sum of their
+ * timeouts — but never more than `LS_PROBE_CONCURRENCY` of them at a time.
  */
 async function cmdLs(): Promise<number> {
   const r = load();
-  const cells = await Promise.all(
-    r.registry.accounts.map(async (a) =>
-      a.provider === "codex"
-        ? await codexCells(a)
-        : {
-            poll: hasPollGrant(a.name) ? "yes" : "no",
-            token: tokenCell(a.name),
-            verified: a.identityVerified ? "yes" : "no",
-          },
-    ),
+  const cells = await mapLimit(r.registry.accounts, LS_PROBE_CONCURRENCY, async (a) =>
+    a.provider === "codex"
+      ? await codexCells(a)
+      : {
+          poll: hasPollGrant(a.name) ? "yes" : "no",
+          token: tokenCell(a.name),
+          verified: a.identityVerified ? "yes" : "no",
+        },
   );
   const rows = [["NAME", "PROVIDER", "LABEL", "ORG", "POLL", "TOKEN", "VERIFIED"]];
   r.registry.accounts.forEach((a, i) => {

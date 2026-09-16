@@ -326,11 +326,22 @@ function codexRefreshDue(auth: CodexAuth): boolean {
 }
 
 /** The session states in which a `codex` process is actually holding this
- *  account's `auth.json`. `parked` and `waiting` are NOT among them — both
- *  are sessions with nothing running — and counting them as live is how one
- *  lingering parked row used to block every refresh for an account until its
- *  token died and the account read `auth`. (`stopped` was never counted.) */
-const CODEX_LIVE_STATES: ReadonlySet<string> = new Set(["running", "continuing", "resuming", "stopping"]);
+ *  account's `auth.json`. `launching` (a pane about to start `codex` against
+ *  this grant) and `walled` (a CLI sitting at its wall, not yet handed off)
+ *  both still hold the file, exactly like `running`/`continuing`/`resuming`/
+ *  `stopping` — fix-A-report.md's A-I3 flag. `parked` and `waiting` are NOT
+ *  among them — both are sessions with nothing running — and counting them
+ *  as live is how one lingering parked row used to block every refresh for
+ *  an account until its token died and the account read `auth`. (`stopped`
+ *  was never counted.) */
+const CODEX_LIVE_STATES: ReadonlySet<string> = new Set([
+  "running",
+  "continuing",
+  "resuming",
+  "stopping",
+  "launching",
+  "walled",
+]);
 
 /** True when no managed Codex session for this account is still using its
  *  grant. A state read that fails (locked db, anything) answers false — the

@@ -460,6 +460,38 @@ test("checkStorePermissions: codex/<name>/auth.json and config.toml are checked 
   assert.equal(statSync(path.join(dir, "config.toml")).mode & 0o777, 0o600);
 });
 
+test("checkStorePermissions: a codex account's config.toml.bak-ms-* backups are swept too (fix-A-report.md A-M4's other half); --fix chmods a 0644 one to 0600", async () => {
+  // `backupThroughLink` (src/fsx.ts) already chmods every NEW backup 0600 at
+  // creation — A-M4's "done" half — but a backup written before that landed,
+  // or one some other tool touched afterward, is not fixed by anything. Named
+  // by pattern only (`config.toml.bak-ms-*`), never a full `readdirSync` of
+  // the account home — an unrelated stray file must still go untouched,
+  // proven below alongside it.
+  const { msHome } = base();
+  const { checkStorePermissions } = await import("../src/doctor.ts");
+  const dir = path.join(msHome, "codex", "codexacct");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(dir, "auth.json"), "{}", { mode: 0o600 });
+  writeFileSync(path.join(dir, "config.toml"), "", { mode: 0o600 });
+  const backup = path.join(dir, "config.toml.bak-ms-1699999999999");
+  writeFileSync(backup, "# old config\n", { mode: 0o644 });
+  // A stray file that merely starts with "config.toml" but is not one of
+  // this tool's own backups — never reported, never touched.
+  const stray = path.join(dir, "config.toml.orig");
+  writeFileSync(stray, "not ours", { mode: 0o644 });
+
+  const before = checkStorePermissions(false);
+  assert.ok(
+    before.some((r) => !r.ok && r.what.endsWith("config.toml.bak-ms-1699999999999") && /0644.*0600/.test(r.why ?? "")),
+    JSON.stringify(before),
+  );
+  assert.ok(!before.some((r) => r.what.endsWith("config.toml.orig")), JSON.stringify(before));
+
+  checkStorePermissions(true);
+  assert.equal(statSync(backup).mode & 0o777, 0o600);
+  assert.equal(statSync(stray).mode & 0o777, 0o644, "a file that is not one of our own backups must never be chmodded");
+});
+
 test("checkStorePermissions: the account dir (codex/<name>) is checked (0700); --fix chmods it", async () => {
   const { msHome } = base();
   const { checkStorePermissions } = await import("../src/doctor.ts");

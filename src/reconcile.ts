@@ -188,6 +188,16 @@ function paneIsDead(servers: Servers, s: SessionRow): boolean {
   return servers.tmux(s.socket).paneDead(s.pane) === true;
 }
 
+/**
+ * The exit status of whatever left this pane a corpse, when tmux gave one —
+ * `#{pane_dead_status}` (src/tmux.ts). Null is "no number to read": a tmux we
+ * could not ask, or a field that is empty. Never inferred, never defaulted to
+ * zero, because zero is itself a claim (it exited cleanly).
+ */
+function deadStatus(servers: Servers, s: SessionRow): number | null {
+  return servers.tmux(s.socket).paneDeadStatus(s.pane);
+}
+
 /** One durable line in the session's own log, for repairs the human will want
  * an account of later (a park is a decision, not a detail). Best effort: a log
  * that cannot be written must not cost the repair itself. */
@@ -294,18 +304,28 @@ function abandonedStopping(st: State, servers: Servers, s: SessionRow, presence:
  * without this rule a declined delivery leaves a dead pane and a store that
  * says `running` forever.
  *
- * The session's own record decides. An `ended` event for THIS generation is the
- * human leaving (`/exit`, logout, a `/clear` that restarts the CLI) — give the
- * pane back as their login shell. No `ended` is a death: append `died`, park,
- * and leave the corpse, because its last screen is the only evidence of why and
- * the human decides what to do with it. A `desired` of `stopped` is the promise
- * `ms stop` made and outranks both.
+ * The session's own record decides — with the pane's exit status over it. An
+ * `ended` event for THIS generation is the human leaving (`/exit`, logout, a
+ * `/clear` that restarts the CLI) — give the pane back as their login shell. No
+ * `ended` is a death: append `died`, park, and leave the corpse, because its
+ * last screen is the only evidence of why and the human decides what to do with
+ * it. A `desired` of `stopped` is the promise `ms stop` made and outranks both.
+ *
+ * The status is what keeps the `ended` reading honest. A CLI that fails on
+ * arrival — `--resume` on an id with no transcript, a credential it will not
+ * take — still runs its own SessionEnd hook on the way out, so the event log
+ * says `ended` for a launch that crashed within the second. Live, that turned a
+ * broken handoff into "the human exited": shell back, session `stopped`, no
+ * `died` event, nothing left saying anything had gone wrong. A non-zero
+ * `#{pane_dead_status}` is a death whatever the log says.
  */
 function settleDeadPane(st: State, servers: Servers, s: SessionRow, presence: Presence): string[] {
   if (s.state === "stopping") return abandonedStopping(st, servers, s, presence);
   const events = readEvents(s.id).filter((e) => e.generation === s.generation);
   const normalEnd = events[events.length - 1]?.kind === "ended";
-  if (s.desired === "stopped" || normalEnd) {
+  const status = deadStatus(servers, s);
+  const crashed = status !== null && status !== 0;
+  if (s.desired === "stopped" || (normalEnd && !crashed)) {
     // Close the row out BEFORE the respawn: a pending recovery would otherwise
     // find a live pane (the shell we are about to put there) and respawn claude
     // over the human's prompt.
@@ -315,11 +335,18 @@ function settleDeadPane(st: State, servers: Servers, s: SessionRow, presence: Pr
     return [`session ${s.id}: pane ended, login shell restored, marked stopped`];
   }
   try {
-    appendEvent({ t: nowSeconds(), kind: "died", session: s.id, generation: s.generation, cliSessionId: s.cliSessionId });
+    appendEvent({
+      t: nowSeconds(),
+      kind: "died",
+      session: s.id,
+      generation: s.generation,
+      cliSessionId: s.cliSessionId,
+      ...(crashed ? { kindDetail: `exit ${status}` } : {}),
+    });
   } catch {
     /* the park below is the load-bearing record */
   }
-  return [park(st, s, "pane died with no ended event")];
+  return [park(st, s, crashed ? `pane died with exit status ${status}` : "pane died with no ended event")];
 }
 
 /**

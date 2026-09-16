@@ -46,6 +46,7 @@ case "$verb" in
   display-message)
     if [ "\${MS_TMUX_NO_SERVER:-0}" = "1" ]; then echo "no server running" >&2; exit 1; fi
     case "$*" in
+      *"#{pane_dead_status}"*) echo "\${MS_TMUX_DEAD_STATUS:-0}" ;;
       *"#{pane_dead}"*)
         if [ -f "$deadfile" ]; then cat "$deadfile"; else echo "\${MS_TMUX_PANE_DEAD:-0}"; fi ;;
       *) echo "\${MS_TMUX_IDENTITY}" ;;
@@ -79,6 +80,7 @@ function world(): World {
   delete process.env.MS_TMUX_NO_SERVER;
   delete process.env.MS_TMUX_LIST_FAILS;
   delete process.env.MS_TMUX_PANE_DEAD;
+  delete process.env.MS_TMUX_DEAD_STATUS;
   delete process.env.MS_TMUX_ON_RUNSHELL;
   delete process.env.MS_VERBOSE;
   return { home, msHome, log };
@@ -731,6 +733,45 @@ test("_pane_died: no ended event for this generation appends died, parks, and le
     assert.equal(last.kind, "died", id);
     assert.equal(last.generation, 2, id);
   }
+});
+
+test("_pane_died: a launch that exited non-zero is a death, whatever its own hook wrote", async () => {
+  // Live matrix case 3. The replacement CLI exited 1 within a second —
+  // `--resume` on an id with no transcript — and Claude Code's SessionEnd hook
+  // still fired on the way out, so the newest event for this generation reads
+  // `ended`. Taken at its word that is the human typing `/exit`: shell back,
+  // session `stopped`, no `died` event, nothing anywhere saying the handoff
+  // broke. tmux had the fact: `#{pane_dead_status}` was 1.
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  process.env.MS_TMUX_DEAD_STATUS = "1";
+  withState((st) => st.createSession({ id: "s-crashed", ...base, state: "resuming", generation: 2 }));
+  appendEvent({ t: nowSec() - 2, kind: "ended", session: "s-crashed", generation: 2, cliSessionId: "c1", kindDetail: "other" });
+
+  assert.equal(await paneDied(["s-crashed"]), 0);
+
+  assert.equal(stateOf("s-crashed"), "parked", "a crash is for the human to look at, not a clean exit");
+  assert.deepEqual(respawns(w), [], "and its pane is left as evidence, not handed back as a shell");
+  const last = readEvents("s-crashed").at(-1)!;
+  assert.equal(last.kind, "died");
+  assert.equal(last.generation, 2);
+  assert.equal(last.kindDetail, "exit 1", "the status is on the record, not just in the decision");
+  assert.match(readFileSync(path.join(w.msHome, "sessions", "s-crashed", "recover.log"), "utf8"), /exit status 1/);
+});
+
+test("_pane_died: the stop the human asked for outranks a non-zero exit", async () => {
+  // `ms stop` promised the pane back as a shell. How the CLI it killed happened
+  // to exit does not change that promise.
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  process.env.MS_TMUX_DEAD_STATUS = "1";
+  withState((st) => st.createSession({ id: "s-stopped", ...base, desired: "stopped" }));
+
+  assert.equal(await paneDied(["s-stopped"]), 0);
+
+  assert.deepEqual(respawns(w), [`-S ${SOCK} respawn-pane -k -c /tmp/work -t %7 '${SHELL}' '-l'`]);
+  assert.equal(stateOf("s-stopped"), "stopped");
+  assert.ok(!readEvents("s-stopped").some((e) => e.kind === "died"), "a stop that worked is not a death");
 });
 
 test("_pane_died: a late callback for a generation that is over does nothing", async () => {

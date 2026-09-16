@@ -9,7 +9,14 @@ import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
-import { tempHome } from "./helpers.ts";
+import { stubDir, tempHome } from "./helpers.ts";
+
+// An account with no credentials file falls back to its scoped keychain item,
+// so `security` is stubbed on PATH for the whole file: 44 is
+// errSecItemNotFound, and nothing here may reach the real keychain.
+const keychainStub = stubDir();
+keychainStub.stub("security", "exit 44");
+process.env.PATH = `${keychainStub.dir}:${process.env.PATH}`;
 
 const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const HOUR = 3_600_000;

@@ -24,6 +24,8 @@
 
 import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { userInfo } from "node:os";
 import path from "node:path";
 import { p } from "../paths.ts";
 import type { Window } from "../pick.ts";
@@ -39,9 +41,11 @@ export const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const USER_AGENT = "claude-code/2.1.220";
 /** The OAuth beta header both endpoints and the token endpoint require. */
 const OAUTH_BETA = "oauth-2025-04-20";
-/** The keychain service Claude Code stores its OAuth credentials under
- *  (data/lib/keychain.ts; spec §12). */
-const KEYCHAIN_SERVICE = "Claude Code-credentials";
+/** The service Claude Code stores the operator's OWN, unscoped login under.
+ *  It is named here only so that nothing can ever ask `security` for it: that
+ *  item is the human's ordinary `~/.claude` credential, and this tool has no
+ *  business reading, writing or deleting it (`runSecurity` refuses). */
+const UNSCOPED_KEYCHAIN_SERVICE = "Claude Code-credentials";
 /** `security` can block forever on a locked keychain — a GUI prompt nobody
  *  will answer. Bounded exactly as data/lib/keychain.ts bounds it: a call that
  *  has not answered in time reads as "no keychain credential". */
@@ -100,6 +104,131 @@ export type PollCredentials = {
 export type Usage = { session: Window | null; weeklyAll: Window | null; weeklyFable: Window | null };
 export type Profile = { email: string; orgId: string; orgName: string; tier: string | null };
 
+// --- The scoped keychain item -----------------------------------------
+//
+// A `claude auth login` run with CLAUDE_CONFIG_DIR=<dir> writes NO
+// `.credentials.json` in that dir: on macOS it stores the OAuth credential in
+// the login keychain, as a generic password whose SERVICE is derived from the
+// config dir and whose ACCOUNT is the macOS username. Verified live on this
+// machine (2026-09-15): a login into `<MS_HOME>/claude/tulp` produced service
+// `Claude Code-credentials-4f3610a9`, account `aadarwal`, and a `.claude.json`
+// carrying the `oauthAccount` object beside it.
+//
+// So there is nothing to guess and nothing to attribute: the service NAMES the
+// config dir, and this tool's config dirs are its own. A scoped service can
+// never be the human's own item, and the unscoped service is never queried.
+
+/** The scoped service for a config dir: the unscoped service name, a hyphen,
+ *  and the first 8 lower-case hex characters of sha256 of the dir's absolute
+ *  path — hashed exactly as the path is handed to CLAUDE_CONFIG_DIR (absolute,
+ *  no trailing slash). Pure, and the one place this derivation exists. */
+export function keychainServiceFor(configDir: string): string {
+  return `${UNSCOPED_KEYCHAIN_SERVICE}-${createHash("sha256").update(configDir).digest("hex").slice(0, 8)}`;
+}
+
+/** The generic-password item one account's poll grant lives in. */
+export type KeychainItem = { service: string; account: string };
+
+/** Is this service one of ours? Only a scoped one can be. The unscoped
+ *  service is the human's own login; a service that is not scoped is never
+ *  queried, written or deleted by this tool. */
+export function isScopedKeychainService(service: string): boolean {
+  return service.startsWith(`${UNSCOPED_KEYCHAIN_SERVICE}-`) && service.length > UNSCOPED_KEYCHAIN_SERVICE.length + 1;
+}
+
+/** Where `ms accounts login` records the item it found, so every reader, the
+ *  refresh write-back and `remove` address exactly the same one. */
+const keychainNoteFile = (dir: string) => path.join(dir, "keychain-item.json");
+
+/** The recorded item for this config dir, or null. A note naming the unscoped
+ *  service is not a note: it is refused HERE rather than at the call, so no
+ *  file on disk can ever point a reader at the human's own credential. */
+export function readKeychainNote(dir: string): KeychainItem | null {
+  try {
+    const j = JSON.parse(readFileSync(keychainNoteFile(dir), "utf8")) as Partial<KeychainItem>;
+    if (typeof j.service !== "string" || typeof j.account !== "string" || !j.account) return null;
+    if (!isScopedKeychainService(j.service)) return null;
+    return { service: j.service, account: j.account };
+  } catch {
+    return null;
+  }
+}
+
+/** Record it, 0600. Best-effort: a note that could not be written costs
+ *  nothing, because the same pair is derivable from the dir. */
+export function writeKeychainNote(dir: string, item: KeychainItem): boolean {
+  try {
+    writeFileSync(keychainNoteFile(dir), `${JSON.stringify(item)}\n`, { mode: 0o600 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The item this account's poll grant lives in: what `login` recorded, else
+ *  the derivation. Never the unscoped service, by construction. */
+export function keychainItemFor(name: string): KeychainItem {
+  const dir = p.claudeConfigDir(name);
+  return readKeychainNote(dir) ?? { service: keychainServiceFor(dir), account: userInfo().username };
+}
+
+/** Every `security` call this tool makes goes through here, so the service is
+ *  checked exactly once: addressing the unscoped item is a programming error,
+ *  not a runtime condition, and throws rather than quietly reading the human's
+ *  own login. Bounded like every other call here — a locked keychain puts up a
+ *  GUI prompt nobody will answer. A secret only ever travels on stdin; argv is
+ *  world-readable through `ps`. */
+function runSecurity(verb: string, item: KeychainItem, extra: string[] = [], input?: string) {
+  if (!isScopedKeychainService(item.service)) {
+    throw new Error(`refusing to address the keychain service "${item.service}": it is not scoped to a config dir`);
+  }
+  const argv =
+    verb === "add-generic-password"
+      ? [verb, "-U", "-a", item.account, "-s", item.service, ...extra]
+      : [verb, "-s", item.service, "-a", item.account, ...extra];
+  const opts = { encoding: "utf8" as const, timeout: KEYCHAIN_TIMEOUT_MS };
+  return input === undefined
+    ? spawnSync("security", argv, { ...opts, stdio: ["ignore", "pipe", "pipe"] })
+    : spawnSync("security", argv, { ...opts, input });
+}
+
+/** `security`'s errSecItemNotFound — the ONLY status that means absent. */
+const KEYCHAIN_NOT_FOUND = 44;
+
+/** Tri-state on purpose: a spawn failure, or a timeout on a locked keychain,
+ *  is "could not tell", which is not the same answer as "there is no item". */
+export type KeychainProbe = "present" | "absent" | "unknown";
+
+/** Is there an item? An EXISTENCE probe: no `-w`, so the secret is never asked
+ *  for and never lands in this process. */
+export function probeKeychainItem(item: KeychainItem): KeychainProbe {
+  const r = runSecurity("find-generic-password", item);
+  if (r.error) return "unknown";
+  if (r.status === 0) return "present";
+  if (r.status === KEYCHAIN_NOT_FOUND) return "absent";
+  return "unknown";
+}
+
+/** The boolean the readers want: only a definite "present" is an item. */
+export function keychainItemExists(item: KeychainItem): boolean {
+  return probeKeychainItem(item) === "present";
+}
+
+/** The item's stored value, or null when it cannot be read. */
+function readKeychainBlob(item: KeychainItem): string | null {
+  const r = runSecurity("find-generic-password", item, ["-w"]);
+  if (r.status !== 0 || !r.stdout?.trim()) return null;
+  return r.stdout.trim();
+}
+
+/** Delete the scoped item — `ms accounts remove`'s last piece of cleanup.
+ *  Best-effort: an item that was not there is not a failure to report. And it
+ *  can only ever be this account's own item, never the human's login. */
+export function deleteKeychainItem(item: KeychainItem): boolean {
+  const r = runSecurity("delete-generic-password", item);
+  return !r.error && r.status === 0;
+}
+
 // --- Reading the credential -------------------------------------------
 
 function parseCredFile(txt: string): PollCredentials | null {
@@ -113,14 +242,15 @@ function parseCredFile(txt: string): PollCredentials | null {
 
 const credFile = (name: string) => path.join(p.claudeConfigDir(name), ".credentials.json");
 
-/** The poll grant for `name`: the credentials file first, then the keychain.
+/** The poll grant for `name`: the credentials file first, then the SCOPED
+ *  keychain item.
  *
- *  On macOS a custom CLAUDE_CONFIG_DIR keeps its credentials in a keychain
- *  item keyed to that dir (spec §12), so there is no account string to guess:
- *  `ms accounts login` (Task 10) records the real one in
- *  `claude/<name>/keychain-account` when it mints the grant. No such file ⇒
- *  the keychain is not tried at all. Returns null — never throws — when there
- *  is nothing usable; a present-but-unusable file is "no credential", not a
+ *  A login into a custom CLAUDE_CONFIG_DIR writes no file on macOS — the
+ *  credential is a generic password whose service is derived from that dir
+ *  (`keychainServiceFor`) and whose account is the macOS username. Both are
+ *  derived, so there is no account string to guess and no way to read the
+ *  human's own unscoped item. Returns null — never throws — when there is
+ *  nothing usable; a present-but-unusable file is "no credential", not a
  *  reason to go looking elsewhere (the tool owns that dir). */
 export function readPollCredentials(name: string): PollCredentials | null {
   const dir = p.claudeConfigDir(name);
@@ -132,23 +262,10 @@ export function readPollCredentials(name: string): PollCredentials | null {
       return null;
     }
   }
-  const accFile = path.join(dir, "keychain-account");
-  if (!existsSync(accFile)) return null;
-  let acct: string;
+  const blob = readKeychainBlob(keychainItemFor(name));
+  if (!blob) return null;
   try {
-    acct = readFileSync(accFile, "utf8").trim();
-  } catch {
-    return null;
-  }
-  if (!acct) return null;
-  const r = spawnSync(
-    "security",
-    ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct, "-w"],
-    { encoding: "utf8", timeout: KEYCHAIN_TIMEOUT_MS },
-  );
-  if (r.status !== 0 || !r.stdout?.trim()) return null;
-  try {
-    const c = parseCredFile(r.stdout.trim());
+    const c = parseCredFile(blob);
     return c ? { ...c, source: "keychain" } : null;
   } catch {
     return null;
@@ -188,17 +305,6 @@ function writeBack(name: string, c: PollCredentials): boolean {
   return writeCredFile(name, c);
 }
 
-/** The keychain account this config dir's item is stored under, as
- *  `ms accounts login` recorded it. No note ⇒ nothing to write to. */
-function keychainAccount(name: string): string | null {
-  try {
-    const acct = readFileSync(path.join(p.claudeConfigDir(name), "keychain-account"), "utf8").trim();
-    return acct || null;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Update the account's keychain item in place, keeping every other key in it
  * (Claude Code owns the rest of that blob). Returns whether it landed.
@@ -212,18 +318,14 @@ function keychainAccount(name: string): string | null {
  * make is an ordinary answer (the file is the fallback), never a hang.
  */
 function writeKeychain(name: string, c: PollCredentials): boolean {
-  const acct = keychainAccount(name);
-  if (!acct) return false;
-  const find = spawnSync("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct, "-w"], {
-    encoding: "utf8",
-    timeout: KEYCHAIN_TIMEOUT_MS,
-  });
+  const item = keychainItemFor(name);
+  const current = readKeychainBlob(item);
   // No readable item is no item to update: writing our three fields over it
   // would drop whatever else Claude Code keeps in that blob.
-  if (find.status !== 0 || !find.stdout?.trim()) return false;
+  if (!current) return false;
   let blob: string;
   try {
-    const parsed: unknown = JSON.parse(find.stdout.trim());
+    const parsed: unknown = JSON.parse(current);
     const j = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
     const prev = (j.claudeAiOauth ?? {}) as Record<string, unknown>;
     j.claudeAiOauth = { ...prev, accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt };
@@ -231,13 +333,9 @@ function writeKeychain(name: string, c: PollCredentials): boolean {
   } catch {
     return false;
   }
-  const r = spawnSync("security", ["add-generic-password", "-U", "-a", acct, "-s", KEYCHAIN_SERVICE, "-w"], {
-    // The value and its confirmation, one line each: that is what the prompt
-    // asks for, in that order.
-    input: `${blob}\n${blob}\n`,
-    encoding: "utf8",
-    timeout: KEYCHAIN_TIMEOUT_MS,
-  });
+  // The value and its confirmation, one line each: that is what the prompt
+  // asks for, in that order, and it goes in on stdin — never on argv.
+  const r = runSecurity("add-generic-password", item, ["-w"], `${blob}\n${blob}\n`);
   return r.status === 0;
 }
 

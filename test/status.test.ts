@@ -150,6 +150,10 @@ globalThis.fetch = async (url, init = {}) => {
  *  answers from a per-pane screen file. */
 function tmuxStub(panes: string[], screens: Record<string, string>): { dir: string; env: Record<string, string> } {
   const { dir, stub } = stubDir();
+  // An account with no credentials file falls back to its scoped keychain
+  // item, so `security` is stubbed too: 44 is errSecItemNotFound, and these
+  // tests must never reach the real keychain.
+  stub("security", "exit 44");
   const screenFiles: Record<string, string> = {};
   for (const [pane, text] of Object.entries(screens)) {
     const f = path.join(dir, `screen-${pane.replace(/[^a-zA-Z0-9]/g, "_")}.txt`);

@@ -1,22 +1,29 @@
-// Keychain account form: the poll grant for a custom CLAUDE_CONFIG_DIR keeps
-// its credentials under the keychain service "Claude Code-credentials" with a
-// dir-specific `acct` value (spec §12, "Claude keychain"). The exact form of
-// that account string is NOT probed here: spike S0 (a live `claude auth login`
-// against a throwaway config dir) needs a browser login by the human and is
-// deferred. It is confirmed instead at `ms accounts login` time (Task 10),
-// which reads the account back off the freshly-minted item and records it in
-// `claude/<name>/keychain-account`, and again in the live matrix. So this
-// module never guesses an account form: the file is tried first, and the
-// keychain only when that recorded file exists. These tests stub `security` on
-// PATH and `globalThis.fetch`; they never touch the real keychain, `~/.claude`,
-// or the network. Every test restores fetch, PATH, HOME and MS_HOME in its own
-// teardown, so nothing leaks into the next test or out of the file.
+// The keychain item: a `claude auth login` run with CLAUDE_CONFIG_DIR=<dir>
+// stores its OAuth credential as a generic password whose SERVICE is
+// "Claude Code-credentials-<first 8 hex of sha256(<dir>)>" and whose ACCOUNT is
+// the macOS username — verified live on the author's Mac, 2026-09-15. Both are
+// derived, so this module guesses nothing: the credentials file is tried first,
+// then that one scoped item. The UNSCOPED service ("Claude Code-credentials")
+// is the human's own ordinary login and is never queried, written or deleted —
+// the test below asserts that on the recorded argv. These tests stub `security`
+// on PATH and `globalThis.fetch`; they never touch the real keychain,
+// `~/.claude`, or the network. Every test restores fetch, PATH, HOME and
+// MS_HOME in its own teardown, so nothing leaks into the next test or out of
+// the file.
 
 import { test, after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync, readFileSync, statSync } from "node:fs";
+import { userInfo } from "node:os";
 import path from "node:path";
 import { stubDir, tempHome } from "./helpers.ts";
+
+const USER = userInfo().username;
+/** The unscoped item: the operator's own Claude Code login. No command may
+ *  ever name it on a `security` argv. */
+const UNSCOPED = "Claude Code-credentials";
+const queriedTheUnscopedItem = (argv: string) => new RegExp(`-s ${UNSCOPED}(?=\\s|$)`, "m").test(argv);
 
 type Saved = { fetch: typeof globalThis.fetch; HOME?: string; MS_HOME?: string; PATH?: string };
 const save = (): Saved => ({
@@ -58,22 +65,75 @@ test("readPollCredentials prefers the credentials file", async (t) => {
   assert.equal(readPollCredentials("gmail")!.accessToken, "at-1");
 });
 
-test("readPollCredentials falls back to the keychain account recorded at login", async (t) => {
-  const { dir } = env(t);
-  writeFileSync(path.join(dir, "keychain-account"), "aadarwal-abc123\n");
+// The one verified pair, pinned. Measured live on macOS, 2026-09-15:
+//   printf '%s' "/Users/aadarwal/.config/model-switcher/claude/tulp" \
+//     | openssl dgst -sha256   →  4f3610a9…
+// (the path exactly as it is handed to CLAUDE_CONFIG_DIR: absolute, no
+// trailing slash). If this ever fails, the derivation moved — not the test.
+test("keychainServiceFor derives the service Claude Code actually used", async (t) => {
+  env(t);
+  const { keychainServiceFor } = await import("../src/providers/claude-usage.ts");
+  assert.equal(
+    keychainServiceFor("/Users/aadarwal/.config/model-switcher/claude/tulp"),
+    "Claude Code-credentials-4f3610a9",
+  );
+  // A different dir is a different item, and neither is the unscoped service.
+  assert.notEqual(
+    keychainServiceFor("/Users/aadarwal/.config/model-switcher/claude/gmail"),
+    "Claude Code-credentials-4f3610a9",
+  );
+  assert.match(keychainServiceFor("/tmp/x"), /^Claude Code-credentials-[0-9a-f]{8}$/);
+});
+
+/** A `security` that answers for exactly one item and logs every argv. */
+function securityStub(t: TestContext, service: string, account: string, value: string) {
   const { stub, dir: bin } = stubDir();
+  const argv = path.join(mkdtempArgvDir(), "security-argv.log");
+  writeFileSync(argv, "");
   process.env.PATH = `${bin}:${process.env.PATH}`;
-  stub("security", `case "$*" in *"-a aadarwal-abc123"*) printf '%s' '${JSON.stringify(cred)}' ;; *) exit 44 ;; esac`);
-  const { readPollCredentials } = await import("../src/providers/claude-usage.ts");
+  process.env.MS_TEST_SECURITY_ARGV = argv;
+  t.after(() => delete process.env.MS_TEST_SECURITY_ARGV);
+  stub(
+    "security",
+    `printf '%s\\n' "$*" >> "$MS_TEST_SECURITY_ARGV"
+case "$*" in *"-s ${service} -a ${account}"*) printf '%s' '${value}' ;; *) exit 44 ;; esac`,
+  );
+  return { argv: () => readFileSync(argv, "utf8") };
+}
+const mkdtempArgvDir = () => tempHome().home;
+
+test("readPollCredentials falls back to the scoped keychain item derived from the config dir", async (t) => {
+  const { dir } = env(t);
+  const { keychainServiceFor, readPollCredentials } = await import("../src/providers/claude-usage.ts");
+  const s = securityStub(t, keychainServiceFor(dir), USER, JSON.stringify(cred));
   assert.equal(readPollCredentials("gmail")!.source, "keychain");
   // Proves it came from the stub, not from anything on the real keychain.
   assert.equal(readPollCredentials("gmail")!.accessToken, "at-1");
+  assert.equal(queriedTheUnscopedItem(s.argv()), false, s.argv());
 });
 
-test("readPollCredentials is null with neither a file nor a recorded keychain account", async (t) => {
-  env(t);
+test("a recorded item is what the reader addresses; a note naming the unscoped service is ignored", async (t) => {
+  const { dir } = env(t);
+  const { readPollCredentials } = await import("../src/providers/claude-usage.ts");
+  const recorded = "Claude Code-credentials-deadbeef";
+  writeFileSync(path.join(dir, "keychain-item.json"), JSON.stringify({ service: recorded, account: "someone" }));
+  const s = securityStub(t, recorded, "someone", JSON.stringify(cred));
+  assert.equal(readPollCredentials("gmail")!.accessToken, "at-1");
+
+  // A note pointing at the human's own login is not a note: the reader falls
+  // back to the derived scoped item, which this stub does not serve.
+  writeFileSync(path.join(dir, "keychain-item.json"), JSON.stringify({ service: UNSCOPED, account: USER }));
+  assert.equal(readPollCredentials("gmail"), null);
+  assert.equal(queriedTheUnscopedItem(s.argv()), false, s.argv());
+});
+
+test("readPollCredentials is null with neither a file nor a keychain item", async (t) => {
+  const { dir } = env(t);
+  const { keychainServiceFor } = await import("../src/providers/claude-usage.ts");
+  const s = securityStub(t, keychainServiceFor(dir), "nobody-at-all", "{}");
   const { readPollCredentials } = await import("../src/providers/claude-usage.ts");
   assert.equal(readPollCredentials("gmail"), null);
+  assert.equal(queriedTheUnscopedItem(s.argv()), false, s.argv());
 });
 
 test("fetchUsage maps the three windows raw and classifies errors", async (t) => {
@@ -218,7 +278,6 @@ test("refreshPollCredentials keeps unrelated keys in the credentials file", asyn
  *  argv line is logged so a test can prove no secret was ever on it. */
 function keychainScene(t: TestContext, opts: { writeFails?: boolean } = {}) {
   const { dir } = env(t);
-  writeFileSync(path.join(dir, "keychain-account"), "aadarwal-abc123\n");
   const { stub, dir: bin } = stubDir();
   const vault = path.join(dir, "vault.json");
   const argv = path.join(dir, "security-argv.log");
@@ -233,18 +292,20 @@ function keychainScene(t: TestContext, opts: { writeFails?: boolean } = {}) {
     delete process.env.MS_TEST_SECURITY_ARGV;
     delete process.env.MS_TEST_KEYCHAIN_WRITE_FAILS;
   });
+  // The item this config dir's login would have written, and no other.
+  const service = `Claude Code-credentials-${createHash("sha256").update(dir).digest("hex").slice(0, 8)}`;
   stub(
     "security",
     `printf '%s\\n' "$*" >> "$MS_TEST_SECURITY_ARGV"
 case "$1" in
-  find-generic-password) case "$*" in *"-a aadarwal-abc123"*) cat "$MS_TEST_VAULT" ;; *) exit 44 ;; esac ;;
+  find-generic-password) case "$*" in *"-s ${service} -a ${USER}"*) cat "$MS_TEST_VAULT" ;; *) exit 44 ;; esac ;;
   add-generic-password)
     [ "$MS_TEST_KEYCHAIN_WRITE_FAILS" = "1" ] && exit 1
     head -1 > "$MS_TEST_VAULT" ;;
 esac
 exit 0`,
   );
-  return { dir, vault, argv: () => readFileSync(argv, "utf8") };
+  return { dir, vault, service, argv: () => readFileSync(argv, "utf8") };
 }
 
 test("a refreshed keychain-sourced credential is written back to the keychain, never onto argv", async (t) => {
@@ -276,7 +337,9 @@ test("a refreshed keychain-sourced credential is written back to the keychain, n
   const argv = scene.argv();
   assert.equal(argv.includes("rt-2"), false, argv);
   assert.equal(argv.includes("at-2"), false, argv);
-  assert.match(argv, /add-generic-password -U -a aadarwal-abc123 -s Claude Code-credentials -w$/m);
+  assert.match(argv, new RegExp(`add-generic-password -U -a ${USER} -s ${scene.service} -w$`, "m"));
+  // ...and the human's own unscoped login is never named on any of them.
+  assert.equal(queriedTheUnscopedItem(argv), false, argv);
 });
 
 test("a keychain write that fails leaves the refreshed credential in the file the poller prefers", async (t) => {

@@ -21,12 +21,14 @@
 //     `ms accounts token` is the single verb that puts a token on stdout,
 //     because that is its whole job;
 //   * a credential is never *attributed* to an account it was not minted for:
-//     see `locatePollCredential`, which is the delicate part of this file.
+//     the poll grant is addressed by a keychain service derived from this
+//     account's own config dir (src/providers/claude-usage.ts), so the
+//     operator's ordinary `~/.claude` login — which lives under the UNSCOPED
+//     service — is never read, bound, written or deleted here.
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir, userInfo } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { withLock } from "./lock.ts";
 import { ensureStore, p } from "./paths.ts";
@@ -34,11 +36,15 @@ import { type Account, findAccount, loadRegistry, NAME_PATTERN, saveRegistry } f
 import { deleteLaunchToken, looksLikeSetupToken, readLaunchToken, saveLaunchToken } from "./launch-credentials.ts";
 import {
   AuthError,
+  deleteKeychainItem,
   fetchProfile,
+  keychainItemExists,
+  keychainItemFor,
   type PollCredentials,
   type Profile,
   readPollCredentials,
   refreshPollCredentials,
+  writeKeychainNote,
 } from "./providers/claude-usage.ts";
 
 // --- Bounds ------------------------------------------------------------
@@ -48,9 +54,6 @@ const INTERACTIVE_TIMEOUT_MS = 600_000;
 const PROBE_TIMEOUT_MS = 90_000;
 /** `claude auth status --json` is a local read. */
 const AUTH_STATUS_TIMEOUT_MS = 15_000;
-/** `security` can block forever on a locked keychain (a GUI prompt nobody
- *  will answer); bounded exactly as src/providers/claude-usage.ts bounds it. */
-const KEYCHAIN_TIMEOUT_MS = 3_000;
 /** The two HTTP reads (profile, and a refresh before it if needed). */
 const HTTP_TIMEOUT_MS = 20_000;
 /** A grant that would expire mid-flight is refreshed rather than 401'd —
@@ -60,8 +63,6 @@ const REFRESH_SKEW_MS = 60_000;
  *  Test-tunable, like manual.ts's bounds; nothing else depends on the value. */
 const lockWaitMs = (): number => Number(process.env.MS_LOCK_WAIT_MS) || HTTP_TIMEOUT_MS;
 
-/** The keychain service Claude Code stores its OAuth credentials under. */
-const KEYCHAIN_SERVICE = "Claude Code-credentials";
 /** The cheapest model that can answer the probe — the brief's `<cheapest>`.
  *  One constant so the live matrix is one edit. */
 const CHEAPEST_MODEL = "haiku";
@@ -69,21 +70,6 @@ const PROBE_PROMPT = "Reply with the single word ok.";
 /** The launch token's fixed prefix, used to hold back a half-arrived token
  *  and to redact one that shares a line with something else. */
 const TOKEN_PREFIX = "sk-ant-oat01-";
-
-/** The candidate forms of the keychain `acct` string Claude Code uses for a
- *  custom CLAUDE_CONFIG_DIR. The true form is confirmed by the live matrix;
- *  until then every known shape is probed and the one that answers is recorded
- *  in `claude/<name>/keychain-account`. THIS LIST IS THE ONE EDIT POINT.
- *
- *  `scoped` is the safety property, not a detail: a scoped form embeds this
- *  account's own config dir, so an item answering under it can only be this
- *  account's. A form that does NOT (the bare macOS username) is exactly the
- *  account string the operator's ordinary `~/.claude` login already uses, so
- *  it is accepted only when it did not answer before this login created it. */
-const KEYCHAIN_ACCOUNT_FORMS: { scoped: boolean; build: (user: string, dir: string) => string }[] = [
-  { scoped: false, build: (user) => user },
-  { scoped: true, build: (user, dir) => `${user}-${createHash("sha256").update(dir).digest("hex").slice(0, 8)}` },
-];
 
 /** Where `claude auth status --json` may name the organisation. Also a single
  *  edit point: the CLI's JSON shape is not a contract we control. */
@@ -372,100 +358,26 @@ function organisationFromLaunchToken(token: string, scratch: string): string | n
 
 // --- The poll grant ----------------------------------------------------
 
-const keychainNoteFile = (dir: string) => path.join(dir, "keychain-account");
-
-function readKeychainNote(dir: string): string | null {
-  const f = keychainNoteFile(dir);
-  if (!existsSync(f)) return null;
-  try {
-    return readFileSync(f, "utf8").trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-/** Is there an item under this account string? An EXISTENCE probe: no `-w`,
- *  so the secret is never asked for and never lands in this process.
- *
- *  Tri-state on purpose. `security` exits 44 for "the specified item could not
- *  be found in the keychain" — the only answer that actually means absent. A
- *  spawn failure, a timeout on a locked keychain, or any other status means we
- *  COULD NOT TELL, and the difference matters: see snapshotAmbientAccounts. */
-type KeychainProbe = "present" | "absent" | "unknown";
-/** `security`'s errSecItemNotFound. */
-const KEYCHAIN_NOT_FOUND = 44;
-
-function probeKeychainItem(acct: string): KeychainProbe {
-  const r = spawnSync("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct], {
-    stdio: ["ignore", "pipe", "pipe"],
-    encoding: "utf8",
-    timeout: KEYCHAIN_TIMEOUT_MS,
-  });
-  if (r.error) return "unknown";
-  if (r.status === 0) return "present";
-  if (r.status === KEYCHAIN_NOT_FOUND) return "absent";
-  return "unknown";
-}
-
-/** The boolean the readers want: only a definite "present" is an item. An
- *  unreadable probe is not an item to bind to, adopt or report. */
-function keychainItemExists(acct: string): boolean {
-  return probeKeychainItem(acct) === "present";
-}
-
-function candidateAccounts(dir: string): { acct: string; scoped: boolean }[] {
-  const user = userInfo().username;
-  const all = KEYCHAIN_ACCOUNT_FORMS.map((f) => ({ acct: f.build(user, dir), scoped: f.scoped }));
-  // Scoped forms first: an item that names this dir is attributable outright,
-  // so it should win over one that merely appeared at the right moment.
-  return [...all.filter((c) => c.scoped), ...all.filter((c) => !c.scoped)];
-}
-
-/** Which UNATTRIBUTABLE candidates already answer, taken BEFORE
- *  `claude auth login`. The bare-username form is the same account string the
- *  operator's own default Claude Code login uses: without this snapshot a new
- *  account would silently bind to that pre-existing credential — polling the
- *  wrong organisation's usage, or being refused as a duplicate of an account
- *  it has nothing to do with. */
-function snapshotAmbientAccounts(dir: string): Set<string> {
-  const seen = new Set<string>();
-  for (const c of candidateAccounts(dir)) {
-    if (c.scoped) continue;
-    // Anything but a definite "absent" counts as already there. This snapshot
-    // exists to answer "did THIS login create it?", and a probe that merely
-    // failed cannot say no — failing open here would hand the account the
-    // operator's own default credential on nothing more than a flaky read.
-    if (probeKeychainItem(c.acct) !== "absent") seen.add(c.acct);
-  }
-  return seen;
-}
-
 /** Point this account at the credential its login actually produced.
  *
- *  `ambient` is the pre-login snapshot (null when no login was run, as in
- *  `verify`). A candidate is accepted when it is scoped to this config dir,
- *  or when it did not answer before this login and does now. An existing note
- *  that still answers is honoured untouched — it may record a form the live
- *  CLI uses that `KEYCHAIN_ACCOUNT_FORMS` does not know. */
-function locatePollCredential(name: string, dir: string, ambient: Set<string> | null): void {
+ *  There is nothing to attribute any more: the keychain SERVICE is derived
+ *  from this account's own config dir (`keychainServiceFor`), so an item
+ *  answering under it was written by a login into that dir and can only be
+ *  this account's. The human's ordinary Claude Code login lives under the
+ *  unscoped service, which this tool never queries. An existing note that
+ *  still answers is honoured untouched — it may record an item this
+ *  derivation would not have produced. */
+function locatePollCredential(name: string, dir: string): void {
   if (existsSync(path.join(dir, ".credentials.json"))) return;
-  const note = readKeychainNote(dir);
-  if (note && keychainItemExists(note)) return;
-  let unattributable: string | null = null;
-  for (const c of candidateAccounts(dir)) {
-    if (!keychainItemExists(c.acct)) continue;
-    if (c.scoped || (ambient !== null && !ambient.has(c.acct))) {
-      writeFileSync(keychainNoteFile(dir), `${c.acct}\n`, { mode: 0o600 });
-      return;
-    }
-    unattributable ??= c.acct;
+  const item = keychainItemFor(name);
+  if (keychainItemExists(item)) {
+    writeKeychainNote(dir, item);
+    return;
   }
-  const why = unattributable
-    ? `the only keychain item that answered under "${KEYCHAIN_SERVICE}" (account ${unattributable}) ` +
-      `already existed before this login, so it cannot be attributed to ${dir} — it is almost certainly ` +
-      `your ordinary Claude Code login, and binding ${name} to it would poll the wrong account`
-    : `neither ${path.join(dir, ".credentials.json")} nor any known keychain account under "${KEYCHAIN_SERVICE}"`;
-  throw new Error(`could not locate the poll credential for ${name} — ${why}`);
+  throw new Error(
+    `could not locate the poll credential for ${name} — neither ${path.join(dir, ".credentials.json")} ` +
+      `nor a keychain item under the service a login into ${dir} writes ("${item.service}")`,
+  );
 }
 
 /** Is there a poll grant on disk for this account? Existence only — `ls` has
@@ -475,10 +387,26 @@ function hasPollGrant(name: string): boolean {
   try {
     if (statSync(path.join(dir, ".credentials.json")).isFile()) return true;
   } catch {
-    /* no file; try the recorded keychain account */
+    /* no file; the scoped keychain item is the other place it can be */
   }
-  const note = readKeychainNote(dir);
-  return note !== null && keychainItemExists(note);
+  return keychainItemExists(keychainItemFor(name));
+}
+
+/** Does this account ALREADY hold a usable poll grant? `claude auth status`
+ *  under the account's own config dir, with any ambient launch token removed
+ *  from the environment so the answer can only describe the credential in that
+ *  dir. Cheap, bounded, and read-only — and it saves the human a second
+ *  browser flow for a login they already did (`cmdLogin`). */
+function pollGrantUsable(name: string, dir: string): boolean {
+  if (!hasPollGrant(name)) return false;
+  const { CLAUDE_CODE_OAUTH_TOKEN: _launchToken, ...env } = process.env;
+  const r = spawnSync("claude", ["auth", "status", "--json"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+    env: { ...env, CLAUDE_CONFIG_DIR: dir },
+    timeout: AUTH_STATUS_TIMEOUT_MS,
+  });
+  return !r.error && r.status === 0;
 }
 
 /**
@@ -620,12 +548,18 @@ function cmdAdd(args: string[]): number {
 async function cmdLogin(name: string): Promise<number> {
   mustFind(name);
   const { dir, created } = claudeConfigDir(name);
-  // Before the login, so "which keychain item is new?" is answerable after it.
-  const ambient = snapshotAmbientAccounts(dir);
   let profile: Profile;
   try {
-    runAuthLogin(name, dir);
-    locatePollCredential(name, dir, ambient);
+    // A poll grant already in this dir is the login: sending the human back
+    // through a browser flow they completed this morning is repeating work,
+    // not confirming it. `login` is still the verb that mints the LAUNCH
+    // token, so the rest of it runs either way.
+    if (pollGrantUsable(name, dir)) {
+      out(`${name}: a usable poll grant is already in place — skipping claude auth login\n`);
+    } else {
+      runAuthLogin(name, dir);
+    }
+    locatePollCredential(name, dir);
     // Identity (and the duplicate refusal) before a token is ever minted: a
     // refused account must leave nothing behind.
     profile = await identifyOrRefuse(name);
@@ -635,8 +569,7 @@ async function cmdLogin(name: string): Promise<number> {
     // would report a poll grant for an account that was turned away. Only a
     // dir this run created is ours to delete. (A keychain-held credential
     // survives: deleting the item could revoke the very grant the OTHER
-    // account polls with — the recorded `keychain-account` note goes, which
-    // is what makes it unreadable here.)
+    // account polls with — the dir, and the note in it, go.)
     if (e instanceof DuplicateOrganisation && created) rmSync(dir, { recursive: true, force: true });
     throw e;
   }
@@ -657,12 +590,10 @@ async function cmdLogin(name: string): Promise<number> {
 async function cmdVerify(name: string): Promise<number> {
   mustFind(name);
   // Step 2's check, re-run: where the credential lives can change under us
-  // (Claude Code re-minting it into the keychain, a lost `keychain-account`
-  // note), and repairing that here is the whole point of `verify`. No dir is
-  // created, and with no login to bracket there is no ambient snapshot — so
-  // only a dir-scoped form, or a note that still answers, is acceptable.
+  // (Claude Code re-minting it into the keychain, a lost note), and repairing
+  // that here is the whole point of `verify`. No dir is created.
   const dir = p.claudeConfigDir(name);
-  if (existsSync(dir)) locatePollCredential(name, dir, null);
+  if (existsSync(dir)) locatePollCredential(name, dir);
   const profile = await identifyOrRefuse(name);
   const token = readLaunchToken(name);
   if (!token) throw new Error(`no launch token for ${name} — run: ms accounts login ${name}`);
@@ -680,8 +611,11 @@ function cmdRemove(name: string): number {
   const i = r.registry.accounts.findIndex((a) => a.name === name && a.provider === "claude");
   if (i < 0) throw new UsageError(`no such Claude account: ${name}`);
   // Credentials first: a row is what NAMES them, so dropping the row before
-  // the files could strand a token and a config dir nothing points at.
+  // the files could strand a token and a config dir nothing points at. The
+  // keychain item goes before the dir, because the dir is what names it — and
+  // it is this account's own scoped item, never the human's own login.
   deleteLaunchToken(name);
+  deleteKeychainItem(keychainItemFor(name));
   rmSync(p.claudeConfigDir(name), { recursive: true, force: true });
   r.registry.accounts.splice(i, 1);
   saveRegistry(r.registry, r);

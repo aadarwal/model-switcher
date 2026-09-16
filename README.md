@@ -146,7 +146,9 @@ one recovery per fresh turn, an exclusive session lock, each candidate account t
 once per wall, at most three account changes per session per ten minutes (the fourth parks
 it for a human), and a pause until the earliest reset when nothing has room, never a spin.
 Export `MS_CODEX_AUTOROTATE=0` in the shell that runs `codex` to turn it off; `ms rotate`,
-`ms switch` and `ms stop` move a Codex session either way.
+`ms switch` and `ms stop` move a Codex session either way. Their moves DO count towards the
+three-changes window — what is capped is how often a conversation is torn down and brought
+back, not who asked — but the cap never refuses a person: it parks only the automatic path.
 
 ### The chooser
 
@@ -187,7 +189,7 @@ own tmux socket. Directories are 0700 and files 0600.
 |---|---|
 | `MS_HOME` | Where all state lives. Default `~/.config/model-switcher`. |
 | `MS_BIN` | The absolute `ms` path written into hook commands, Codex trust hashes, the statusline wrapper and the alias block. The Homebrew shim sets it to `/opt/homebrew/opt/model-switcher/bin/ms` — the stable path, so everything the wizard wrote survives an upgrade. Set it yourself only when running `ms` from somewhere unusual. |
-| `MS_CODEX_AUTOROTATE` | `0` disables automatic recovery for Codex sessions; anything else, unset included, leaves it on. Export it in the shell that runs `codex`; `ms` mirrors it into the store so the tmux-dispatched watchdog and worker read it too. `ms doctor` prints its state. Ships on. |
+| `MS_CODEX_AUTOROTATE` | Automatic recovery for Codex sessions. Unset, empty, or exactly `1` is **on**; **every other value reads as off** — `0`, but `false`, `no` and a typo too, because only `1` is read as yes. Export it in the shell that runs `codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched watchdog and worker read it too. A mirrored `off` is a stored row and outlives the variable — unsetting it later does not turn recovery back on; export `MS_CODEX_AUTOROTATE=1` (and run an `ms codex`, which mirrors) to do that. `ms doctor` prints the state it will act on. Ships on. |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere `ms` reads or writes that settings file. |
 | `MS_VERBOSE` | `1` prints what each invocation's start-of-run repair did. |
 | `MS_ENTRY` | `src` or `dist` — which entry point `bin/ms` runs. For development; the brew shim sets `dist`. |

@@ -89,9 +89,16 @@ export const CONTINUATION =
  * tmux SERVER's global environment — never the shell that exported
  * `MS_CODEX_AUTOROTATE`. Reading `process.env` here read the wrong
  * environment, and the symptom was silence.
+ *
+ * Which is also why the remedy this prints is an EXPORT and never "unset it".
+ * The gate is off here because something mirrored a "0" into the store, and a
+ * stored row outlives the variable that wrote it: `syncCodexAutorotate`
+ * returns early on an absent variable, so unsetting changes nothing, and no
+ * verb clears the row. Only exporting `1` — in a shell that runs an `ms` which
+ * mirrors — puts it back.
  */
 const CODEX_AUTOROTATE_MESSAGE =
-  "codex automatic recovery is turned off here (unset MS_CODEX_AUTOROTATE, or export MS_CODEX_AUTOROTATE=1, in the shell that runs codex)";
+  "codex automatic recovery is turned off here — export MS_CODEX_AUTOROTATE=1 in the shell that runs codex (ms mirrors it into the store)";
 
 /** One recovery at a time per session; a second worker is a duplicate. */
 const SESSION_LOCK_WAIT_MS = 5_000;

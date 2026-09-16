@@ -1,10 +1,13 @@
 # The Codex wall drill — observing a real wall without spending a subscription
 
-`ms`'s automatic recovery for Codex ships **off**, for one reason and one only:
-no live Codex wall has ever been observed end to end (spike verdict G1:
-PARTIAL; `src/autorotate.ts`, README "What rotation does to a pane"). The gate
-is honest — the tool will not move a human's session on a signal nobody has
-seen — but it can only be lifted by seeing one.
+`ms`'s automatic recovery for Codex shipped **off** while no live Codex wall
+had ever been observed end to end (spike verdict G1: PARTIAL). This drill is
+what closed that gap, and **since 0.2.4 the gate is ON by default**
+(`src/autorotate.ts`, README "What rotation does to a pane"): running the drill
+as written on 0.2.4 will therefore **rotate the scratch account onto a real
+one** at §5 and spend real quota on the continuation. §5 says how to keep it
+inert (`MS_CODEX_AUTOROTATE=0`) when that is not what you want. Everything else
+below stands as it was recorded.
 
 Seeing one the ordinary way costs a subscription's weekly quota. This drill
 gets the same evidence in about a minute, by making exactly one thing fake: the
@@ -221,9 +224,20 @@ it.
 
 ## 5. Run it
 
+**Decide first whether you want the rotation.** On 0.2.4 the automatic path is
+on by default, so a wall recorded here hands the conversation to whichever real
+account the chooser ranks first — a real handoff, on real quota. Pick one:
+
 ```bash
-ms codex --as wallscratch
+MS_CODEX_AUTOROTATE=0 ms codex --as wallscratch   # observe only: the wall is
+                                                  # recorded, nothing moves
+ms codex --as wallscratch                         # the whole chain, ending on
+                                                  # a REAL account
 ```
+
+The `0` is mirrored into the store on the way past, which is what makes it
+reach the tmux-dispatched `_codex_watch` and `_recover` — and which is why §8
+has to put it back deliberately.
 
 Type anything. Within one round trip:
 
@@ -284,10 +298,11 @@ means the pane rendered the wall but the watcher did not see the record.
 Two timing notes. The watchdog is **one timer for the whole tmux server**, armed
 45 s out by `UserPromptSubmit` and re-armed while any Codex turn is in flight
 (`src/hooks/codex-hook.ts`), so give it up to a minute before calling it a miss.
-And `parseTaskComplete` matches the literal `task_complete` only — the v2 alias
-`turn_complete` is accepted on the wire (`protocol/src/protocol.rs:1413-1415`)
-but is not matched here. If a future Codex writes the v2 spelling, this drill is
-how you will find out: the wall renders, and `ms status` says `unreported`.
+And since 0.2.4 `parseTaskComplete` matches **both** spellings — `task_complete`
+and the v2 alias `turn_complete` (`protocol/src/protocol.rs:1413-1415`) — so a
+Codex that writes either one is read the same way. (Before that it matched the
+literal `task_complete` only, and a v2 rollout would have rendered the wall
+while `ms status` said `unreported`.)
 
 **The screen classifier.** `src/wall.ts` labels a wall's *kind* for `ms status`
 only; it never triggers a rotation. `wallKindFromText` now accepts the Codex
@@ -300,24 +315,27 @@ prefixed `Error running remote compact task: `
 and will not match — deliberately, because allowing an arbitrary `…: ` prefix
 would re-open the quoted-prose false positive the file exists to prevent.
 
-**Rotation.** Automatic recovery is gated off (`src/autorotate.ts`). With the
-gate closed, the expected outcome is: the wall recorded, `ms status` showing it,
-and **nothing moved**. Then:
+**Rotation.** What to expect depends on which §5 command you ran.
+
+With the gate closed (`MS_CODEX_AUTOROTATE=0`): the wall recorded, `ms status`
+showing it, and **nothing moved**. The manual move is always available:
 
 ```bash
-ms rotate                      # the manual move, always available
+ms rotate                      # the human's own verb, never gated
 ```
 
-To exercise the automatic path, open the gate in the shell that runs `codex`:
+On the shipped default (nothing exported): the automatic path runs. Within
+about a minute the recovery log reads `handing wallscratch → <account> (session
+wall)`, the pane is respawned on a **real** account running `codex resume <id>
+"<continuation>"`, and that account answers the continuation — the sequence the
+2026-09-16 live matrix recorded. Bounded, on that path, by the caps: one
+recovery per fresh turn, the session lock, each candidate once per wall, three
+account changes per session per ten minutes, and a pause until the earliest
+reset when nothing has room.
 
-```bash
-MS_CODEX_AUTOROTATE=1 ms codex --as wallscratch
-```
-
-The variable is mirrored into the store on the way past, so the
-tmux-dispatched `_codex_watch` and `_recover` see it too — they are run with
-the tmux *server's* environment, not your shell's, which is the whole reason
-the gate is a stored row (`src/autorotate.ts`).
+Either way the answer reaches `_codex_watch` and `_recover` through the STORE,
+not your environment: those two are run with the tmux *server's* environment,
+which is the whole reason the gate is a stored row (`src/autorotate.ts`).
 
 **The recovery log.** `$MS_HOME/sessions/<session-id>/recover.log`
 (`src/paths.ts`'s `p.recoverLog`). Expect the worker to take the session lock,
@@ -378,9 +396,15 @@ $EDITOR "$MS_HOME/codex/wallscratch/config.toml"
 #            openai_base_url. LEAVE the [projects."…"] table and everything
 #            between # ms-hooks-begin / # ms-hooks-end — those are ms's.
 
-# 3. Close the gate again, if you opened it.
-unset MS_CODEX_AUTOROTATE      # and clear the mirrored row:
-ms doctor                      # prints its state
+# 3. Put the gate back, if you moved it. `unset` is NOT enough: the mirrored
+#    row outlives the variable (syncCodexAutorotate returns early on an absent
+#    one) and no verb clears it, so a drill that exported 0 leaves automatic
+#    recovery off for good until something mirrors a 1 back.
+unset MS_CODEX_AUTOROTATE
+ms doctor                      # PRINTS the state; it does not change it
+#    If it still says `off`, mirror the default back with any launch:
+MS_CODEX_AUTOROTATE=1 ms codex --as wallscratch   # then exit the pane
+ms doctor                      # now reads `codex auto-recovery: on`
 
 # 4. Remove the scratch account: the registry row and every credential it names.
 ms accounts remove wallscratch --provider codex
@@ -397,7 +421,9 @@ subsumes step 2 if you are not keeping the account.
 
 If all of §5, §6 and §7 hold, the record shows: a real `codex` binary produced a
 real `usage_limit_exceeded` rollout record; ms's watcher saw it; `ms status`
-reported it; `ms rotate` carried the conversation to another account; and a
-merely-transient 429 did none of those things. That is the observation the
-`MS_CODEX_AUTOROTATE` gate has been waiting for, and the case for changing its
-default belongs in the same commit as the record of this run.
+reported it; the conversation was carried to another account; and a
+merely-transient 429 did none of those things. That was the observation the
+`MS_CODEX_AUTOROTATE` gate had been waiting for. It arrived
+(`2026-09-16-live-matrix-codex-wall.md`), and 0.2.4 turned the default on with
+the caps that bound an unattended rotation; re-running this drill is how you
+check that the chain still holds.

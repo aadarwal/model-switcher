@@ -69,9 +69,11 @@ test("the stored gate WINS over the environment whenever there is one", () => {
 test("the environment is the fallback only while nothing has been stored", () => {
   withEnv("1", () => assert.equal(codexAutorotateEnabled(store()), true));
   withEnv("0", () => assert.equal(codexAutorotateEnabled(store()), false));
-  // Only an explicit "off" turns it off. Anything else somebody exported —
-  // including a typo — leaves the default where it is rather than disabling
-  // recovery on a value nobody meant as a gate.
+  // Only "1" is yes, so every other exported value is off — `false` and `no`
+  // as intended, but a typo too. Somebody who exports MS_CODEX_AUTOROTATE=true
+  // to be explicit turns the feature OFF, and the mirror writes that down.
+  // That is the rule `codexAutorotateEnv` states, and the README's env table
+  // says it in those words rather than "anything else leaves it on".
   withEnv("true", () => assert.equal(codexAutorotateEnabled(store()), false, "not '1' is off, exactly as codexAutorotateEnv reads it"));
   // A value the gate does not recognise is not a gate: fall back, do not guess.
   withEnv("1", () => assert.equal(codexAutorotateEnabled(store({ [CODEX_AUTOROTATE_KEY]: "yes" })), true));

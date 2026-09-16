@@ -30,7 +30,15 @@ const OPEN_TIMEOUT_MS = 5_000;
  *  not a working limit. */
 const MAX_BODY_BYTES = 64 * 1024;
 
-const DEFAULT_IDLE_MS = 30_000;
+/** Review round 1, finding 4 (supersedes the brief's "within 30 s"): a
+ *  background/hidden tab's own JS timers are throttled by the browser
+ *  starting around 60 s, so a 30 s idle default could let the dashboard exit
+ *  under a human's nose while the tab is still open, just backgrounded. 90 s
+ *  gives the 5 s poll two full throttled cycles of slack; the page's own
+ *  `visibilitychange` handler (src/dashboard/page.ts) re-polls immediately
+ *  the moment the tab is foregrounded again, so a human who switches back
+ *  sees a fresh read well before this would ever fire. */
+export const DEFAULT_IDLE_MS = 90_000;
 
 export type DashboardOptions = { port?: number; open?: boolean; idleMs?: number };
 export type Dashboard = { url: string; close(): void; waitUntilIdle(): Promise<void> };
@@ -134,12 +142,37 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
   const { port = 0, open = true, idleMs = DEFAULT_IDLE_MS } = opts;
 
   let lastActivity = Date.now();
+  // Review round 1, finding 3: `touch()` at arrival alone is not enough — a
+  // slow request (a slow client trickling its body, a slow `handle()` call)
+  // can outlive a short `idleMs`, and `waitUntilIdle()` would resolve while
+  // that request is still being answered. `close()` then tears the socket
+  // down mid-response, and the browser never learns whether its own rotate/
+  // switch/stop actually happened. `inFlight` makes the idle clock refuse to
+  // fire at all while any request is still open, on top of `touch()` also
+  // running again when it finishes (so the idle window starts counting from
+  // the response, not the request).
+  let inFlight = 0;
   const touch = (): void => {
     lastActivity = Date.now();
   };
 
   const server = createServer((req, res) => {
     touch();
+    inFlight++;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      inFlight = Math.max(0, inFlight - 1);
+      touch();
+    };
+    // Both fire for a normal completed response; `close` alone fires if the
+    // client (or we) abandon the connection early. Either way the request is
+    // no longer in flight — `released` makes the decrement happen exactly
+    // once regardless of which combination fires.
+    res.on("finish", release);
+    res.on("close", release);
+
     void (async () => {
       try {
         const url = new URL(req.url ?? "/", "http://dashboard.local");
@@ -188,6 +221,12 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
     return new Promise((resolve) => {
       const POLL_MS = 250;
       const check = (): void => {
+        if (inFlight > 0) {
+          // A request is still open; the idle clock does not even start
+          // counting down until it finishes (release() calls touch() again).
+          setTimeout(check, POLL_MS);
+          return;
+        }
         const remaining = idleMs - (Date.now() - lastActivity);
         if (remaining <= 0) {
           resolve();

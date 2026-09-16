@@ -19,11 +19,12 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tempHome, stubDir, run } from "./helpers.ts";
 import { openState } from "../src/state.ts";
-import { startDashboard } from "../src/dashboard/server.ts";
+import { startDashboard, DEFAULT_IDLE_MS } from "../src/dashboard/server.ts";
 
 const PANE = "%7";
 const SOCKET = "/tmp/ms-dashboard-server-test.sock";
@@ -173,6 +174,34 @@ async function world(t: TestContext): Promise<World> {
 
 const logLines = (w: World): string[] => readFileSync(w.log, "utf8").split("\n").filter((l) => l.trim());
 
+/**
+ * A POST whose body arrives in two halves, with a real delay between them —
+ * so the SERVER genuinely has a request in flight for `splitDelayMs`, not a
+ * simulated one. Reproduces review round 1's finding 3 proof scenario
+ * ("a POST finishing 1.5s late") without needing to fake `handle()` itself
+ * being slow: a client that trickles its body is enough to keep `readBody()`
+ * — and therefore the whole request — open for exactly this long.
+ */
+function slowPost(url: string, body: string, splitDelayMs: number): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = httpRequest(
+      { hostname: u.hostname, port: u.port, path: u.pathname, method: "POST", headers: { "content-type": "application/json" } },
+      (res) => {
+        let text = "";
+        res.on("data", (c: Buffer) => {
+          text += c;
+        });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
+      },
+    );
+    req.on("error", reject);
+    const mid = Math.max(1, Math.floor(body.length / 2));
+    req.write(body.slice(0, mid));
+    setTimeout(() => req.end(body.slice(mid)), splitDelayMs);
+  });
+}
+
 // --- GET / -----------------------------------------------------------
 
 test("startDashboard binds 127.0.0.1 and GET / returns HTML with both table headers and the move-all control", async (t) => {
@@ -299,6 +328,45 @@ test("waitUntilIdle resolves within ~1s of the last request, and the server actu
   await assert.rejects(() => fetch(`${dash.url}/api/state`), "a request after close() must fail");
 });
 
+// --- Review round 1, finding 3: idle clock vs. in-flight requests --------
+
+test("review round 1, finding 3: the idle clock never fires while a request is still in flight", async (t) => {
+  await world(t);
+  const dash = await startDashboard({ port: 0, open: false, idleMs: 400 });
+  t.after(() => dash.close());
+
+  const SPLIT_DELAY_MS = 1500;
+  const slow = slowPost(`${dash.url}/api/rotate`, JSON.stringify({ session: "no-such-session" }), SPLIT_DELAY_MS);
+
+  const start = Date.now();
+  let idleAt: number | null = null;
+  dash.waitUntilIdle().then(() => {
+    idleAt = Date.now() - start;
+  });
+
+  // Well past the naive "touch on arrival only" bug window (idleMs=400ms
+  // alone would have fired here already), well before the slow request's
+  // body actually finishes arriving.
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(idleAt, null, "waitUntilIdle resolved while a request was still in flight");
+
+  const res = await slow; // let the slow request actually finish
+  assert.equal(res.status, 200);
+
+  // Idle window (400ms) plus slack, measured from when the request truly
+  // completed — this is what close() destroying the socket mid-response
+  // would have broken (finding 3's exact failure mode).
+  await new Promise((r) => setTimeout(r, 700));
+  assert.ok(idleAt !== null, "waitUntilIdle never resolved after the in-flight request completed");
+  assert.ok(idleAt! >= SPLIT_DELAY_MS, `resolved too early relative to when the request actually finished: ${idleAt}ms`);
+});
+
+// --- Review round 1, finding 4: the idle default -------------------------
+
+test("review round 1, finding 4: the default idle timeout is 90s, not 30s (hidden-tab timers throttle starting around 60s)", () => {
+  assert.equal(DEFAULT_IDLE_MS, 90_000);
+});
+
 test("a request received while waiting resets the idle clock", async (t) => {
   await world(t);
   const dash = await startDashboard({ port: 0, open: false, idleMs: 300 });
@@ -341,8 +409,11 @@ test("startDashboard spawns `open <url>` only when open is not false", async (t)
   const withOpen = await startDashboard({ port: 0, open: true });
   t.after(() => withOpen.close());
   const afterEnabled = readFileSync(openLog, "utf8").trim();
-  assert.ok(afterEnabled.length > 0, "open was never spawned with open: true");
-  assert.ok(afterEnabled.includes(withOpen.url), `open was not given the dashboard's own url: ${afterEnabled}`);
+  // Review round 1, finding 7: pin the EXACT argv, not just "the url shows up
+  // somewhere in it" — `["open", "-a", "Safari", url]` would have passed a
+  // looser `.includes(url)` check while silently changing which browser (or
+  // profile, or window flags) the dashboard opens in.
+  assert.equal(afterEnabled, withOpen.url, `open must be called with exactly [url], nothing else: ${afterEnabled}`);
 
   writeFileSync(openLog, "");
   const withoutOpen = await startDashboard({ port: 0, open: false });

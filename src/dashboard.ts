@@ -5,20 +5,25 @@
 // use. It prints its own URL exactly once, opens it (unless told not to —
 // `startDashboard`'s own `open` gate, src/dashboard/server.ts), and then
 // stays up for exactly as long as the page keeps polling it: `waitUntilIdle()`
-// resolves the moment nobody has asked the server anything for `idleMs`, and
-// this verb exits 0 the moment it does. Alive only while open.
+// resolves the moment nobody has asked the server anything for `idleMs` (90 s
+// by default — review round 1, finding 4), and this verb exits 0 the moment
+// it does. Alive only while open.
 
 import type { Verb } from "./cli.ts";
 import { startDashboard } from "./dashboard/server.ts";
 
-const USAGE = "usage: ms dashboard [--port N] [--no-open]";
-const DEFAULT_IDLE_MS = 30_000;
+const USAGE =
+  "usage: ms dashboard [--port N] [--no-open]\n" +
+  "  exits on its own ~90s after the last request — an open tab polling it keeps it alive";
 
 /** Test-tunable the same way manual.ts's `settleMs()`/`lockWaitMs()` and
- *  status.ts's `MS_WATCH_MS` are — a real 30 s wait would make a CLI-level
- *  test of "the process exits once idle" unbearably slow. */
-function idleMs(): number {
-  return Number(process.env.MS_DASHBOARD_IDLE_MS) || DEFAULT_IDLE_MS;
+ *  status.ts's `MS_WATCH_MS` are — a real 90 s wait would make a CLI-level
+ *  test of "the process exits once idle" unbearably slow. `undefined` (the
+ *  env var unset) lets `startDashboard`'s own default apply, rather than
+ *  this file keeping a second copy of that constant to drift out of sync. */
+function idleMs(): number | undefined {
+  const raw = process.env.MS_DASHBOARD_IDLE_MS;
+  return raw ? Number(raw) : undefined;
 }
 
 type Parsed = { port: number; open: boolean } | { error: string };

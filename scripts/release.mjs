@@ -8,6 +8,12 @@
 // sha256. Refuses to run against a dirty tree or a version that does not
 // match `package.json`.
 //
+// Before building anything it refuses: a dirty tree, a version that does not
+// match `package.json`, a tag that already exists (locally or on origin), and
+// a HEAD that is on no remote branch — the last three because `gh release
+// create` tags the REMOTE DEFAULT BRANCH's head unless it is given
+// `--target <sha>`, which it now always is.
+//
 // `--publish` additionally: creates the GitHub release with `gh release
 // create` (notes are the commit subjects since the previous tag), then
 // renders `packaging/model-switcher.rb` into a local checkout of the tap
@@ -133,13 +139,16 @@ function buildTarball(repoRoot, tag) {
 
     const tarArgs = ["-cf", "-", "--uid", "0", "--gid", "0", "--numeric-owner", "-C", scratch, ...TARBALL_ENTRIES.map((rel) => path.join(versionDir, rel))];
     const tarResult = runBuffer("tar", tarArgs, { timeout: 60_000 });
-    if (!tarResult.ok) fail(`tar failed: ${tarResult.stderr}`);
+    // THROW, never `fail()`: `fail` calls process.exit, which skips the
+    // `finally` below and leaks the scratch directory on every tar/gzip
+    // failure. main() turns this back into the same one-line exit.
+    if (!tarResult.ok) throw new Error(`tar failed: ${tarResult.stderr}`);
 
     // -n: no original name/timestamp in the gzip header — the other half of
     // reproducibility (tar's own entry headers carry the pinned mtime above;
     // gzip's OUTER wrapper has its own, separate timestamp field).
     const gzResult = runBuffer("gzip", ["-n"], { input: tarResult.stdout, timeout: 60_000 });
-    if (!gzResult.ok) fail(`gzip failed: ${gzResult.stderr}`);
+    if (!gzResult.ok) throw new Error(`gzip failed: ${gzResult.stderr}`);
 
     writeFileSync(tarballPath, gzResult.stdout);
     return tarballPath;
@@ -183,10 +192,48 @@ function main() {
     fail(`working tree is dirty — commit or stash first:\n${status.stdout}`);
   }
 
+  // The commit the tarball is built FROM. Every check below, and
+  // `--target` at the end, is about this one sha: a release whose tag names
+  // a different commit than the artefact's sha256 describes is a release
+  // nobody can reproduce.
+  const headRev = git(REPO_ROOT, ["rev-parse", "HEAD"]);
+  if (!headRev.ok) fail(`git rev-parse HEAD failed: ${headRev.stderr}`);
+  const head = headRev.stdout.trim();
+
+  // The tag must not exist yet — locally OR on origin. `gh release create`
+  // against an existing tag fails deep into the run, after the tarball is
+  // built and (worse) after `gh` has already been reached; and a tag that
+  // exists only on origin is invisible to `git tag --list`.
+  const localTag = git(REPO_ROOT, ["rev-parse", "-q", "--verify", `refs/tags/${tag}`]);
+  if (localTag.ok) fail(`${tag} already exists locally (${localTag.stdout.trim()}) — bump the version or delete the tag`);
+  // The two checks that need `origin` run only on the real publish path: a
+  // `--dry-run` is explicitly the offline, inspect-the-artefact mode (and a
+  // throwaway checkout with no remote is exactly how it is used), so it must
+  // not reach the network to build a tarball nobody is publishing.
+  if (publish && !dryRun) {
+    const remoteTags = git(REPO_ROOT, ["ls-remote", "--tags", "origin", `refs/tags/${tag}`]);
+    if (!remoteTags.ok) fail(`git ls-remote failed: ${remoteTags.stderr}`);
+    if (remoteTags.stdout.trim() !== "") fail(`${tag} already exists on origin — bump the version`);
+
+    // HEAD must be ON a remote branch. `gh release create --target <sha>`
+    // cannot tag a commit GitHub has never seen, and without `--target` it
+    // silently tags the remote default branch's head instead — so the
+    // formula's sha256 would describe a tarball the tag does not contain.
+    const onRemote = git(REPO_ROOT, ["branch", "--remotes", "--contains", head]);
+    if (!onRemote.ok || onRemote.stdout.trim() === "") {
+      fail(`HEAD (${head.slice(0, 12)}) is on no remote branch — push it first, or the release would tag a different commit`);
+    }
+  }
+
   const build = run("npm", ["run", "build"], { cwd: REPO_ROOT, timeout: 180_000 });
   if (!build.ok) fail(`npm run build failed:\n${build.stdout}${build.stderr}`);
 
-  const tarballPath = buildTarball(REPO_ROOT, tag);
+  let tarballPath;
+  try {
+    tarballPath = buildTarball(REPO_ROOT, tag);
+  } catch (e) {
+    fail(e.message);
+  }
   const sha256 = sha256File(tarballPath);
   process.stdout.write(`release: wrote ${tarballPath}\n`);
   process.stdout.write(`sha256  ${sha256}\n`);
@@ -202,7 +249,18 @@ function main() {
   const notesFile = path.join(notesDir, "notes.md");
   writeFileSync(notesFile, notes + "\n");
 
-  const ghArgs = ["release", "create", tag, tarballPath, "--title", `model-switcher ${tag}`, "--notes-file", notesFile];
+  // The tarball was built from `head`; refuse if anything has moved HEAD
+  // since (a commit, a checkout, a rebase in another window).
+  const headNow = git(REPO_ROOT, ["rev-parse", "HEAD"]);
+  if (!headNow.ok || headNow.stdout.trim() !== head) {
+    rmSync(notesDir, { recursive: true, force: true });
+    fail(`HEAD moved from ${head.slice(0, 12)} to ${headNow.stdout.trim().slice(0, 12)} while the tarball was being built — re-run the release`);
+  }
+
+  // `--target <sha>`: without it `gh release create` tags the REMOTE DEFAULT
+  // BRANCH's head, whatever that is right now — not the commit this tarball
+  // was built from.
+  const ghArgs = ["release", "create", tag, tarballPath, "--target", head, "--title", `model-switcher ${tag}`, "--notes-file", notesFile];
   const ghResult = run("gh", ghArgs, { cwd: REPO_ROOT, timeout: 120_000 });
   rmSync(notesDir, { recursive: true, force: true });
   if (!ghResult.ok) fail(`gh release create failed:\n${ghResult.stdout}${ghResult.stderr}`);

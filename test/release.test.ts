@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -59,10 +59,26 @@ function makeFixture(): string {
   symlinkSync(realpathSync(nm), path.join(dir, "node_modules"));
 
   const env = { ...process.env, ...GIT_ENV };
-  execFileSync("git", ["init", "-q"], { cwd: dir, env });
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir, env });
   execFileSync("git", ["add", "-A"], { cwd: dir, env });
   execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "fixture"], { cwd: dir, env });
+  // A LOCAL bare `origin`, pushed to: the release script's publish path
+  // refuses a tag that already exists on origin and a HEAD that is on no
+  // remote branch (B-I9), and both questions have to be answerable without
+  // touching the network. A bare repo on disk is a real remote for every
+  // git command involved (`ls-remote`, `branch --remotes`).
+  const originPath = `${dir}-origin.git`;
+  execFileSync("git", ["init", "-q", "--bare", originPath], { env });
+  execFileSync("git", ["remote", "add", "origin", originPath], { cwd: dir, env });
+  execFileSync("git", ["push", "-q", "origin", "main"], { cwd: dir, env });
+  execFileSync("git", ["fetch", "-q", "origin"], { cwd: dir, env });
   return dir;
+}
+
+/** The bare `origin` `makeFixture` pushed to, for a test that needs to put
+ *  something there (a tag that already exists) before the release runs. */
+function originOf(dir: string): string {
+  return `${dir}-origin.git`;
 }
 
 function runRelease(cwd: string, args: string[], env: Record<string, string | undefined> = {}) {
@@ -174,8 +190,21 @@ test("renderFormula substitutes all three fields and leaves no placeholder", () 
   // MS_BIN must travel alongside MS_ENTRY=dist in the shim: msBinary()
   // (src/paths.ts) honours MS_BIN, and without it the doctor's "ms on PATH
   // is msBinary()" check resolves the wrong path against a real keg (see
-  // task-4-report.md, fix round 1).
-  assert.ok(out.includes('MS_BIN="#{bin}/ms"'), out);
+  // task-4-report.md, fix round 1). It must be `opt_bin`, NOT `bin`: during
+  // `def install` Homebrew's `bin` is the versioned keg path, which the next
+  // `brew upgrade` deletes — taking every hook command, trust hash,
+  // statusline wrapper and alias line that baked it in (B-C2).
+  assert.ok(out.includes('MS_BIN="#{opt_bin}/ms"'), out);
+  assert.ok(!/MS_BIN="#\{bin\}\/ms"/.test(out), out);
+  // The shim must run the real launcher, and on Homebrew's own node (B-C1,
+  // B-I8). `dist/ms.js` only EXPORTS `main`.
+  assert.ok(out.includes('"#{libexec}/bin/ms"'), out);
+  assert.ok(!/node" "#\{libexec\}\/dist\/ms\.js"/.test(out), out);
+  assert.ok(out.includes('"#{Formula["node"].opt_bin}/node"'), out);
+  assert.ok(out.includes('libexec.install "bin"'), out);
+  // A `test do` that would actually catch a no-op shim.
+  assert.ok(out.includes("ms --version"), out);
+  assert.ok(out.includes("usage: ms"), out);
 });
 
 // --- reproducibility ---------------------------------------------------------
@@ -260,4 +289,163 @@ test("--publish records `gh release create`, writes+commits the formula into the
     const argv = line.split(" ");
     assert.ok(!argv.includes("push"), `a git call ran push: ${line}`);
   }
+});
+
+// --- B-I9: the release pre-checks ------------------------------------------
+
+test("a tag that already exists locally is refused before anything is built", () => {
+  const dir = makeFixture();
+  execFileSync("git", ["tag", "v0.1.0"], { cwd: dir, env: { ...process.env, ...GIT_ENV } });
+  const r = runRelease(dir, ["v0.1.0", "--dry-run"]);
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /already exists locally/);
+  assert.ok(!existsSync(path.join(dir, "release")), "must refuse before building anything");
+});
+
+test("a tag that exists only on origin is refused on the publish path", () => {
+  const dir = makeFixture();
+  const env = { ...process.env, ...GIT_ENV };
+  // On the remote and NOT locally — invisible to `git tag --list`, which is
+  // exactly why `git ls-remote` has to be asked.
+  execFileSync("git", ["tag", "v0.1.0"], { cwd: dir, env });
+  execFileSync("git", ["push", "-q", "origin", "v0.1.0"], { cwd: dir, env });
+  execFileSync("git", ["tag", "-d", "v0.1.0"], { cwd: dir, env });
+
+  const gh = stubDir();
+  const ghLog = path.join(gh.dir, "gh.log");
+  gh.stub("gh", `echo "$@" >> "${ghLog}"\nexit 0\n`);
+  const tap = mkdtempSync(path.join(tmpdir(), "ms-release-tap-"));
+
+  const r = runRelease(dir, ["v0.1.0", "--publish", "--tap", tap], { PATH: `${gh.dir}:${process.env.PATH}` });
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /already exists on origin/);
+  assert.ok(!existsSync(ghLog), "gh must never be reached once a pre-check has failed");
+  assert.ok(!existsSync(path.join(dir, "release")), "must refuse before building anything");
+});
+
+test("a HEAD that is on no remote branch is refused on the publish path", () => {
+  const dir = makeFixture();
+  const env = { ...process.env, ...GIT_ENV };
+  writeFileSync(path.join(dir, "NOTES.md"), "an unpushed commit\n");
+  execFileSync("git", ["add", "-A"], { cwd: dir, env });
+  execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "unpushed"], { cwd: dir, env });
+
+  const gh = stubDir();
+  const ghLog = path.join(gh.dir, "gh.log");
+  gh.stub("gh", `echo "$@" >> "${ghLog}"\nexit 0\n`);
+  const tap = mkdtempSync(path.join(tmpdir(), "ms-release-tap-"));
+
+  const r = runRelease(dir, ["v0.1.0", "--publish", "--tap", tap], { PATH: `${gh.dir}:${process.env.PATH}` });
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /on no remote branch/);
+  assert.ok(!existsSync(ghLog), "gh must never be reached once a pre-check has failed");
+});
+
+test("`gh release create` carries --target with the sha the tarball was built from", () => {
+  const dir = makeFixture();
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8", env: { ...process.env, ...GIT_ENV } }).trim();
+
+  const gh = stubDir();
+  const ghLog = path.join(gh.dir, "gh.log");
+  gh.stub("gh", `echo "$@" >> "${ghLog}"\nexit 0\n`);
+  const tap = mkdtempSync(path.join(tmpdir(), "ms-release-tap-"));
+  const env = { ...process.env, ...GIT_ENV };
+  execFileSync("git", ["init", "-q"], { cwd: tap, env });
+  execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "tap init"], { cwd: tap, env });
+
+  const r = runRelease(dir, ["v0.1.0", "--publish", "--tap", tap], { PATH: `${gh.dir}:${process.env.PATH}` });
+  assert.equal(r.status, 0, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+  const call = readFileSync(ghLog, "utf8").trim();
+  // Without --target, `gh` tags the REMOTE DEFAULT BRANCH's head — not this
+  // commit — so the formula's sha256 would describe a tarball the tag does
+  // not contain.
+  assert.match(call, new RegExp(`--target ${head}\\b`), call);
+});
+
+test("buildTarball leaves no scratch directory behind when tar fails", () => {
+  const dir = makeFixture();
+  const before = readdirSync(tmpdir()).filter((n) => n.startsWith("ms-release-stage-"));
+  const broken = stubDir();
+  broken.stub("tar", `echo "no tar for you" >&2\nexit 3\n`);
+
+  const r = runRelease(dir, ["v0.1.0", "--dry-run"], { PATH: `${broken.dir}:${process.env.PATH}` });
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /tar failed/);
+  const after = readdirSync(tmpdir()).filter((n) => n.startsWith("ms-release-stage-"));
+  assert.deepEqual(after, before, `a scratch directory leaked: ${after.filter((n) => !before.includes(n)).join(", ")}`);
+});
+
+// --- B-C1/B-C2: the shim, run against a real unpacked tarball --------------
+
+test("the formula's own shim command line runs `main` out of a real tarball", () => {
+  const dir = makeFixture();
+  const r = runRelease(dir, ["v0.1.0", "--dry-run"]);
+  assert.equal(r.status, 0, r.stderr);
+  const tarballPath = extractTarballPath(r.stdout);
+
+  // Unpack it the way `brew install` would, then lay out the keg exactly as
+  // `def install` does: libexec/{dist,bin,package.json}, a versioned keg, the
+  // stable `opt` link at it, and the shim in `<prefix>/bin`.
+  const keg = mkdtempSync(path.join(tmpdir(), "ms-keg-"));
+  const unpacked = path.join(keg, "unpacked");
+  mkdirSync(unpacked, { recursive: true });
+  execFileSync("tar", ["-xzf", tarballPath, "-C", unpacked]);
+  const src = path.join(unpacked, "model-switcher-v0.1.0");
+  assert.ok(existsSync(path.join(src, "bin", "ms")), "the tarball must ship bin/ms — `files` in package.json decides");
+  assert.ok(existsSync(path.join(src, "bin", "resolve-entry.mjs")));
+
+  const cellar = path.join(keg, "Cellar", "model-switcher", "0.1.0");
+  const libexec = path.join(cellar, "libexec");
+  mkdirSync(path.join(cellar, "bin"), { recursive: true });
+  mkdirSync(path.join(keg, "opt"), { recursive: true });
+  mkdirSync(libexec, { recursive: true });
+  execFileSync("cp", ["-R", path.join(src, "dist"), path.join(libexec, "dist")]);
+  execFileSync("cp", ["-R", path.join(src, "bin"), path.join(libexec, "bin")]);
+  execFileSync("cp", [path.join(src, "package.json"), path.join(libexec, "package.json")]);
+  symlinkSync(cellar, path.join(keg, "opt", "model-switcher"));
+
+  const optBin = path.join(keg, "opt", "model-switcher", "bin", "ms");
+  const shim = path.join(cellar, "bin", "ms");
+  // The shim is taken FROM THE FORMULA, not retyped here — a copy would
+  // prove only that this test's idea of a shim works. Homebrew's own
+  // interpolations are filled in against the keg laid out above; this
+  // process's node stands in for Homebrew's.
+  const formulaText = readFileSync(path.join(REAL_REPO, "packaging", "model-switcher.rb"), "utf8");
+  const heredoc = /\(bin\/"ms"\)\.write <<~SHIM\n([\s\S]*?)\n\s*SHIM\n/.exec(formulaText);
+  assert.ok(heredoc, `no SHIM heredoc in the formula:\n${formulaText}`);
+  const shimBody = heredoc![1]!
+    .split("\n")
+    .map((l) => l.replace(/^\s{6}/, "")) // <<~ strips the common indent
+    .join("\n")
+    .replaceAll('#{opt_bin}', path.dirname(optBin))
+    .replaceAll("#{libexec}", libexec)
+    .replaceAll('#{Formula["node"].opt_bin}/node', process.execPath);
+  assert.ok(!shimBody.includes("#{"), `an interpolation this test does not know about: ${shimBody}`);
+  writeFileSync(shim, `${shimBody}\n`, { mode: 0o755 });
+
+  const msHome = mkdtempSync(path.join(tmpdir(), "ms-keg-home-"));
+  const runShim = (args: string[]) =>
+    spawnSync(shim, args, {
+      encoding: "utf8",
+      timeout: 60_000,
+      env: { ...process.env, HOME: msHome, MS_HOME: path.join(msHome, "store"), MS_BIN: undefined, NODE_OPTIONS: "--disable-warning=ExperimentalWarning" },
+    });
+
+  // This is the check the old shim could never pass: `node dist/ms.js` only
+  // EXPORTS main, so every verb printed nothing and exited 0.
+  const version = runShim(["--version"]);
+  assert.equal(version.status, 0, `stdout:${version.stdout} stderr:${version.stderr}`);
+  assert.equal(version.stdout.trim(), "0.1.0", `an empty --version is the silent no-op shim: ${JSON.stringify(version.stdout)}`);
+  assert.equal(version.stderr, "", version.stderr);
+
+  const help = runShim(["--help"]);
+  assert.equal(help.status, 0);
+  assert.match(help.stderr, /usage: ms/);
+
+  // And `msBinary()` inside the real bundle resolves to the stable opt path
+  // the shim exported — the exact string every hook command, trust hash,
+  // statusline wrapper and alias line is written with (B-C2).
+  const doctor = runShim(["doctor"]);
+  assert.match(`${doctor.stdout}${doctor.stderr}`, new RegExp(optBin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), doctor.stdout + doctor.stderr);
+  assert.ok(!/Cellar/.test(doctor.stdout.split("\n").filter((l) => /msBinary/.test(l)).join("\n")), doctor.stdout);
 });

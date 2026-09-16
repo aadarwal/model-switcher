@@ -436,15 +436,22 @@ export async function stopPane(tmux: Tmux, session: SessionRow, generation: numb
   return true;
 }
 
-type Ready = "ok" | "resume-broken" | "timeout";
+type Ready = "ok" | "resume-broken" | "timeout" | "dead";
 
 /**
  * The resumed CLI reports itself through Claude Code's own SessionStart hook —
  * we never scrape the screen for readiness. The same CLI session id means the
  * conversation survived; a different one means `--resume` silently started a
  * new conversation, which is a broken handoff, not a successful one.
+ *
+ * The pane is watched alongside the log, every tick. A launch that dies on
+ * arrival will never write a report, and waiting out the full minute for a
+ * silence tmux could have explained in one call is a minute of a human's
+ * session sitting dead for no reason — live, the worker waited 60 s after its
+ * CLI had exited at +1 s. `paneDead` is null when tmux could not be asked,
+ * which is not a death and never ends the wait (src/tmux.ts).
  */
-async function waitForReady(id: string, generation: number, cliSessionId: string): Promise<Ready> {
+async function waitForReady(id: string, generation: number, cliSessionId: string, tmux: Tmux, pane: string): Promise<Ready> {
   const deadline = performance.now() + readyMs();
   for (;;) {
     for (const e of readEvents(id)) {
@@ -453,6 +460,9 @@ async function waitForReady(id: string, generation: number, cliSessionId: string
       if (e.cliSessionId === cliSessionId) return "ok";
       if (e.cliSessionId) return "resume-broken";
     }
+    // After the log, not before it: a CLI that reported itself and then exited
+    // has still resumed, and the report is the thing this step is waiting for.
+    if (tmux.paneDead(pane) === true) return "dead";
     const left = deadline - performance.now();
     if (left <= 0) return "timeout";
     await sleep(Math.min(pollMs(), left));
@@ -879,9 +889,13 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   st.updateSession(id, { account: to, generation: next, state: "resuming" });
   logLine(id, next, `respawned pane ${session.pane} on ${to} (launch ${launchId}${forced ? ", forced exit" : ""})`);
 
-  // 8. Readiness, from the hook's own report.
-  const ready = await waitForReady(id, next, session.cliSessionId!);
+  // 8. Readiness, from the hook's own report — or from the pane, when the
+  //    launch died before it could make one.
+  const ready = await waitForReady(id, next, session.cliSessionId!, tmux, session.pane);
   if (ready !== "ok") {
+    // The exit status first: it is the one fact that says WHY, and it is gone
+    // the moment anything respawns over the corpse.
+    const status = ready === "dead" ? tmux.paneDeadStatus(session.pane) : null;
     for (const line of lastNonBlank(safeCapture(tmux, session.pane), 8)) logLine(id, next, `screen| ${line}`);
     st.addAttempt({ recoveryId: rec.id, account: to, outcome: "resume-broken", note: ready });
     // Terminal. The conversation did not come back, and that is not something
@@ -893,9 +907,11 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
       id,
       rec.id,
       next,
-      ready === "timeout"
-        ? `no resume report within ${Math.round(readyMs() / 1000)}s; ${id} is parked`
-        : `the resume started a new conversation; ${id} is parked`,
+      ready === "dead"
+        ? `the resumed CLI exited (pane_dead_status ${status ?? "unknown"}) before reporting; ${id} is parked`
+        : ready === "timeout"
+          ? `no resume report within ${Math.round(readyMs() / 1000)}s; ${id} is parked`
+          : `the resume started a new conversation; ${id} is parked`,
     );
   }
 

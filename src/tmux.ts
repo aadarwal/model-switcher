@@ -40,6 +40,25 @@ export class Tmux {
     const v = r.stdout.trim();
     return v === "1" ? true : v === "0" ? false : null;
   }
+  /**
+   * `#{pane_dead_status}` — the exit status of the command whose corpse a dead
+   * pane is holding. Null means "no number to read": tmux did not answer, or
+   * the pane is alive and the field is empty. Only a number is evidence, and
+   * only a NON-ZERO one says the thing that died did so by failing.
+   *
+   * A CLI that exits 1 a second after a respawn (`--resume` on an id with no
+   * transcript, a credential the CLI refuses) still fires its own SessionEnd
+   * hook on the way out, so the event log alone reads that crash as the human
+   * typing `/exit`. This is the field that tells the two apart.
+   */
+  paneDeadStatus(pane: string): number | null {
+    const r = this.run(["display-message", "-p", "-t", pane, "#{pane_dead_status}"]);
+    if (r.code !== 0) return null;
+    const v = r.stdout.trim();
+    if (!v) return null;
+    const n = Number(v);
+    return Number.isInteger(n) ? n : null;
+  }
   setPaneOption(pane: string, name: string, value: string): void { this.must(["set-option", "-p", "-t", pane, name, value]); }
   unsetPaneOption(pane: string, name: string): void { this.run(["set-option", "-pu", "-t", pane, name]); }
   paneOptions(pane: string): Record<string, string> {

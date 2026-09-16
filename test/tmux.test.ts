@@ -12,6 +12,7 @@ function setup() {
 case "$*" in
   *"#{pid}:#{start_time}"*) echo "4242:1789000000" ;;
   *"#{pane_pid}"*) echo "777	2.1.272	0	/tmp/work" ;;
+  *"#{pane_dead_status}"*) printf '%s\\n' "$MS_TMUX_DEAD_STATUS" ;;
   *"#{pane_dead}"*) printf '%s\\n' "$MS_TMUX_DEAD" ;;
   *"show-options -p"*) printf '%s\\n' '@ms_session s1' '@ms_generation 3' '@ms_note "has \\"quotes\\" inside"' '@ms_path "/tmp/a b"' '@ms_bs "x\\\\"' ;;
   *capture-pane*) printf 'line one\\nline two\\n' ;;
@@ -84,4 +85,22 @@ test("paneDead answers 1/0, and null when tmux could not say", async () => {
   process.env.MS_TMUX_DEAD = "boom";
   assert.equal(t.paneDead("%5"), null);
   delete process.env.MS_TMUX_DEAD;
+});
+
+test("paneDeadStatus answers the exit status, and null when there is none to read", async () => {
+  setup();
+  const { Tmux } = await import("../src/tmux.ts");
+  const t = new Tmux(null);
+  process.env.MS_TMUX_DEAD_STATUS = "1";
+  assert.equal(t.paneDeadStatus("%5"), 1);
+  process.env.MS_TMUX_DEAD_STATUS = "0";
+  assert.equal(t.paneDeadStatus("%5"), 0, "zero is an answer: whatever died did so cleanly");
+  // A LIVE pane's field is empty, and so is the answer of a tmux that could not
+  // be asked. Neither is evidence about how anything exited, and a caller that
+  // parks a session on the strength of it must be able to tell.
+  process.env.MS_TMUX_DEAD_STATUS = "";
+  assert.equal(t.paneDeadStatus("%5"), null);
+  process.env.MS_TMUX_DEAD_STATUS = "boom";
+  assert.equal(t.paneDeadStatus("%5"), null);
+  delete process.env.MS_TMUX_DEAD_STATUS;
 });

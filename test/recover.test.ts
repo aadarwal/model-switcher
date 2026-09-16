@@ -46,10 +46,15 @@ get() { grep "^$1=" "$st" 2>/dev/null | tail -1 | cut -d= -f2-; }
 put() { printf '%s=%s\n' "$1" "$2" >> "$st"; }
 case "$1" in
   list-panes) get panes ;;
-  display-message) printf '%s\t%s\t%s\t%s\n' "$(get pane_pid)" "$(get command)" "$(get pane_dead)" "$(get cwd)" ;;
+  display-message)
+    case "$*" in
+      *pane_pid*) printf '%s\t%s\t%s\t%s\n' "$(get pane_pid)" "$(get command)" "$(get pane_dead)" "$(get cwd)" ;;
+      *pane_dead_status*) get pane_dead_status ;;
+      *) get pane_dead ;;
+    esac ;;
   capture-pane) cat "$MS_TMUX_SCREEN" 2>/dev/null ;;
   send-keys) case "$*" in */exit*) put pane_dead 1 ;; esac ;;
-  respawn-pane) put pane_dead 0 ;;
+  respawn-pane) put pane_dead "$MS_TMUX_RESPAWN_DEAD"; put pane_dead_status "$MS_TMUX_DEAD_STATUS" ;;
 esac
 exit 0`;
 
@@ -136,6 +141,9 @@ type WorldOptions = {
   failOn?: string;
   /** Raw accounts.json content, for the unreadable-registry case. */
   registry?: string;
+  /** The launched CLI dies on arrival: the respawned pane comes back DEAD,
+   * holding this exit status. */
+  respawnDead?: number;
 };
 
 async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
@@ -152,7 +160,7 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   writeFileSync(screen, opts.screen ?? WALLED_SCREEN);
   writeFileSync(
     state,
-    [`panes=${opts.panes ?? PANE}`, `pane_pid=${pid}`, "command=claude", "pane_dead=0", `cwd=${cwd}`, ""].join("\n"),
+    [`panes=${opts.panes ?? PANE}`, `pane_pid=${pid}`, "command=claude", "pane_dead=0", "pane_dead_status=0", `cwd=${cwd}`, ""].join("\n"),
   );
   writeFileSync(
     path.join(msHome, "accounts.json"),
@@ -171,6 +179,10 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   process.env.MS_TMUX_STATE = state;
   process.env.MS_TMUX_SCREEN = screen;
   process.env.MS_TMUX_FAIL = opts.failOn ?? "";
+  // What the pane looks like after `respawn-pane`: alive, unless the test is
+  // about a launch that died on arrival.
+  process.env.MS_TMUX_RESPAWN_DEAD = opts.respawnDead === undefined ? "0" : "1";
+  process.env.MS_TMUX_DEAD_STATUS = String(opts.respawnDead ?? 0);
   // The stub's synchronous injection hook: a test sets these to run a shell
   // command the instant the worker makes a particular tmux call. Every tmux
   // call is a `spawnSync`, so this is the only way to land something in the
@@ -588,6 +600,31 @@ test("a resume that falls back to a new conversation parks the session", async (
   assert.match(recoverLog(w), /screen\| /);
   // Named for what it is — a new conversation, not merely a silent resume.
   assert.match(recoverLog(w), /the resume started a new conversation; s1 is parked/);
+});
+
+test("a launch that dies on arrival is noticed at once, not waited out", async (t) => {
+  // Live matrix case 3: the respawned CLI exited at +1 s and the worker went on
+  // waiting the full 60 s for a report that could never come, with the session
+  // dead on the human's screen throughout. tmux knew: `#{pane_dead}` was 1 and
+  // `#{pane_dead_status}` was 1.
+  const w = await world(t, { respawnDead: 1 });
+  process.env.MS_READY_MS = "10000"; // generous on purpose: the PANE is what ends this
+
+  const started = Date.now();
+  assert.equal(await recoverSession("s1"), 1);
+  assert.ok(Date.now() - started < 5_000, "the worker waited out its readiness budget over a pane tmux would have called dead");
+
+  const s = session(w);
+  assert.equal(s.state, "parked");
+  assert.equal(s.generation, 3, "the respawn did happen; it is the launch that died");
+  assert.equal(s.wakeupAt, null, "a parked session waits for a person, not for a window");
+  const attempt = rows(w, "attempts").at(-1)!;
+  assert.equal(attempt.outcome, "resume-broken");
+  assert.equal(attempt.note, "dead", "and not `timeout`: this is a death, not a silence");
+  assert.equal(rows(w, "recoveries")[0].status, "failed", "terminal: nothing may retry onto a dead pane");
+  // The evidence a human needs: what the pane last said, and how it exited.
+  assert.match(recoverLog(w), /screen\| /);
+  assert.match(recoverLog(w), /the resumed CLI exited \(pane_dead_status 1\) before reporting; s1 is parked/);
 });
 
 test("a resume that never reports parks the session too", async (t) => {

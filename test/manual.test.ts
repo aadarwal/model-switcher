@@ -59,6 +59,8 @@ case "$1" in
           if [ "$n" -ge 2 ]; then put pane_dead 0; put pane_pid "$MS_TMUX_REVIVE"; fi
         fi
         printf '%s\t%s\t%s\t%s\n' "$(get pane_pid)" "$(get command)" "$(get pane_dead)" "$(get cwd)" ;;
+      *pane_dead_status*) get pane_dead_status ;;
+      *pane_dead*) get pane_dead ;;
       *) get identity ;;
     esac ;;
   capture-pane) cat "$MS_TMUX_SCREEN" 2>/dev/null ;;

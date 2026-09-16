@@ -1336,8 +1336,11 @@ test("a switchOne that throws is that session's refusal, never the fleet's", asy
 test("a refusal from the transaction itself is reported once, by whoever asked", async (t) => {
   // `recoverSession` has already said why — on stderr, and in the session's own
   // log — by the time it returns non-zero. The single-session verb therefore
-  // adds nothing to it, and the fleet line names the session instead of
-  // repeating a reason the human has just read.
+  // adds nothing to it (byte-identical to before fix-R), and the fleet line
+  // now carries the transaction's OWN reason (fix-R, fix-C-report.md item 2)
+  // instead of a generic "the reason is above" pointer — on the dashboard,
+  // where the transaction's stderr is captured and discarded, "above" would
+  // point at nothing.
   const w = await fleet(t, fleetSessions(1));
   rmSync(path.join(w.msHome, "launch", "home.token"));
   const say = stderr(t);
@@ -1351,7 +1354,14 @@ test("a refusal from the transaction itself is reported once, by whoever asked",
   );
 
   assert.equal(await switchVerb(["--all", "--to", "home"]), 1);
-  assert.match(say(), /^ms: s1 refused: the handoff did not happen/m);
+  // The same words `ms _recover:` used, not the old boilerplate ("the
+  // handoff did not happen…") that pointed at a reason the reader had to go
+  // find elsewhere.
+  assert.match(say(), /^ms: s1 refused: no candidate account has a launch token \(run: ms accounts login <name>\)$/m);
+  assert.ok(
+    !say().includes("the handoff did not happen"),
+    "the fleet refusal line carries the reason itself, not a pointer to it",
+  );
   assert.match(say(), /^ms: moved 0, refused 1$/m);
   assert.equal(row("s1").account, "away", "a session whose handoff failed is left where it was");
 });

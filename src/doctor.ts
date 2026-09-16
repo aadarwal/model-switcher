@@ -279,16 +279,29 @@ function checkClaudeTree(home: string, fix: boolean, issues: PermIssue[]): void 
   }
 }
 
+/** The name `fsx.ts`'s `backupThroughLink(file, "bak-ms-")` gives a
+ *  `config.toml` backup: the target's own name, the family suffix, and a
+ *  millisecond timestamp (plus a `-<n>` counter on a same-millisecond
+ *  collision). Matched by this PREFIX only — never a full listing of the
+ *  account home, and never a suffix/extension guess — so a human's own
+ *  `config.toml.orig` or similar is never swept in by accident. */
+const CODEX_CONFIG_BACKUP_PREFIX = "config.toml.bak-ms-";
+
 /** `codex/`: the directory itself (0700), the shared rollout store
  *  `codex/sessions` (0700 — its CONTENTS are never walked or chmod'ed;
  *  Codex owns them, exactly as `claude/<name>/` is not walked above), and
- *  each `codex/<name>` account home (0700). Inside an account home, exactly
- *  two entries are checked BY NAME — `auth.json` and `config.toml`, both
- *  0600 — and nothing else under it is ever examined: this is not a
- *  `readdirSync`'d walk of the account home the way `codex/sessions`'
- *  parent or an ms-owned dir (`walkOwnedDir`) is, so an account home is
- *  never listed and a third file placed inside one (by a human, or by
- *  Codex itself) is neither reported nor touched.
+ *  each `codex/<name>` account home (0700). Inside an account home, two
+ *  entries are checked BY NAME — `auth.json` and `config.toml`, both 0600 —
+ *  plus, by PREFIX (`CODEX_CONFIG_BACKUP_PREFIX`, fix-A-report.md A-M4's
+ *  "not done" half; fix-R), every `config.toml.bak-ms-*` backup this tool
+ *  itself wrote there (`installCodexHooks`'s `composeCodexHooks`, via
+ *  `backupThroughLink`) — new ones are already 0600 at creation, but one
+ *  written before that landed, or touched by something else afterward, is
+ *  fixed by nothing else. Nothing else under an account home is ever
+ *  examined: unlike `codex/sessions`' parent or an ms-owned dir
+ *  (`walkOwnedDir`), this is not a full `readdirSync`'d WALK — a third file
+ *  placed inside one (by a human, or by Codex itself) that does not match a
+ *  known name or this one prefix is neither reported nor touched.
  *
  *  A home's own `sessions` entry is ALWAYS a symlink — `ensureCodexHome`
  *  (src/accounts-codex.ts) puts it there on purpose, pointing at the shared
@@ -323,7 +336,18 @@ function checkCodexTree(home: string, fix: boolean, issues: PermIssue[]): void {
     checkEntry(path.join(accountDir, "auth.json"), 0o600, issues);
     checkEntry(path.join(accountDir, "config.toml"), 0o600, issues);
     // accountDir/sessions is the per-home symlink — intentionally never
-    // checked; see the doc comment above.
+    // checked; see the doc comment above. The one thing this DOES still read
+    // the account home's own listing for: our own config.toml backups, named
+    // by prefix only, so a stray file with any other name is still untouched.
+    let acctEntries: string[];
+    try {
+      acctEntries = readdirSync(accountDir);
+    } catch {
+      continue;
+    }
+    for (const name of acctEntries) {
+      if (name.startsWith(CODEX_CONFIG_BACKUP_PREFIX)) checkEntry(path.join(accountDir, name), 0o600, issues);
+    }
   }
 }
 

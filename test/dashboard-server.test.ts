@@ -588,6 +588,38 @@ test("finding C4: the page's own POST — its Origin, its Sec-Fetch-Site, its co
   assert.ok(logLines(w).some((l) => l.includes("send-keys")), "the page's own request did not reach the verb");
 });
 
+test("fix-R: a loopback bind is not one hostname — 127.0.0.1, localhost and [::1] are all accepted at the server's OWN port", async (t) => {
+  // A human who reaches the dashboard at http://localhost:<port> instead of
+  // the http://127.0.0.1:<port> the tool prints and opens (fix-C-report.md
+  // item 4's flagged deviation) gets refused on every action today, even
+  // though a page served from localhost:<ourport> IS our page. The PORT is
+  // still what makes it ours — this must never widen into accepting any
+  // loopback host at ANY port.
+  await world(t);
+  const dash = await startDashboard({ port: 0, open: false });
+  t.after(() => dash.close());
+  const port = new URL(dash.url).port;
+  const body = JSON.stringify({ session: "nope" });
+
+  for (const origin of [`http://127.0.0.1:${port}`, `http://localhost:${port}`, `http://[::1]:${port}`]) {
+    const res = await rawPost(dash.url, "/api/rotate", { "content-type": "application/json", origin }, body);
+    assert.equal(res.status, 200, `Origin ${origin} at the server's own port was refused: ${res.text}`);
+  }
+});
+
+test("fix-R: a DIFFERENT port on a loopback host is still refused, whichever loopback hostname it names", async (t) => {
+  await world(t);
+  const dash = await startDashboard({ port: 0, open: false });
+  t.after(() => dash.close());
+  const port = Number(new URL(dash.url).port);
+  const body = JSON.stringify({ session: "nope" });
+
+  for (const origin of [`http://127.0.0.1:${port + 1}`, `http://localhost:${port + 1}`]) {
+    const res = await rawPost(dash.url, "/api/rotate", { "content-type": "application/json", origin }, body);
+    assert.equal(res.status, 403, `Origin ${origin}, a different port, was accepted`);
+  }
+});
+
 test("finding C4: GETs are unchanged, and no CORS header is ever sent (the browser is what blocks a cross-origin read)", async (t) => {
   await world(t);
   const dash = await startDashboard({ port: 0, open: false });

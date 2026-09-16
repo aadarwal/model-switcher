@@ -801,6 +801,34 @@ test("a parked or waiting codex session does not block a refresh a poll needs", 
   }
 });
 
+test("fix-R: a launching or walled codex session still blocks a refresh — a live `codex` holds auth.json in both (fix-A-report.md A-I3 flag)", async () => {
+  // Unlike parked/waiting (nothing running), a `launching` pane is about to
+  // start a `codex` process against this grant and a `walled` one is a CLI
+  // sitting at its wall — both are a live `codex` holding auth.json, exactly
+  // the condition CODEX_LIVE_STATES exists to protect: spending the one-shot
+  // refresh token under a process that is still holding the old one is worse
+  // than polling one more round on a slightly stale access token.
+  for (const state of ["launching", "walled"] as const) {
+    const { msHome } = env([{ name: "work", provider: "codex" }]);
+    codexGrant(msHome, "work", { expiresIn: 30 }); // inside the 60 s skew: due for refresh
+    const { openState } = await import("../src/state.ts");
+    const st = openState();
+    st.createSession({
+      id: `sess-${state}`, provider: "codex", cliSessionId: null, cwd: "/tmp", socket: "s", pane: "%1",
+      serverStart: "1", need: "any", account: "work", generation: 1, state,
+      desired: "running", flags: [],
+    });
+    st.close();
+
+    const calls = stubFetch((url) => (url === CODEX_USAGE_URL ? codexOk() : new Response("must not be called", { status: 500 })));
+    const { getSnapshot } = await load();
+    const s = await getSnapshot({ maxAgeMs: 0 });
+    assert.deepEqual(calls.map((c) => c.url), [CODEX_USAGE_URL], `no token-endpoint call while ${state}`);
+    assert.equal(bearerTok(calls[0]!.auth), "cat-work", `polled with the stored, unrefreshed access token (${state})`);
+    assert.equal(byName(s, "work").error, null, state);
+  }
+});
+
 // The outside `codexRefreshDue && codexRefreshAllowed` check runs BEFORE the
 // credential lock is even requested — it is a cheap pre-filter, not the
 // decision. A session can start in the gap between that check and actually

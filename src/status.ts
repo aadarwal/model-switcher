@@ -210,9 +210,15 @@ function table(headers: string[], rows: string[][]): string[] {
  *  `SessionRow` is present unchanged, plus the words the text table
  *  computes and this JSON didn't use to carry (review round 1, finding 1:
  *  LABEL/PENDING/WALLED? were rendering as placeholders on the dashboard
- *  page because they simply weren't in this JSON at all). */
+ *  page because they simply weren't in this JSON at all).
+ *
+ *  `state` overrides `SessionRow`'s own (narrower) `SessionState` — it is
+ *  `computeSession`'s COMPUTED state (`SessionComputed`, above), which adds
+ *  the live `gone` override `SessionState` has no room for, so this is the
+ *  same word `ms status`'s text table prints, not the store's raw column
+ *  (fix-C-report.md item 1 / fix-R). */
 export type StatusAccountRow = AccountUsage & AccountComputed;
-export type StatusSessionRow = SessionRow & { pending: string | null; walled: Walled };
+export type StatusSessionRow = Omit<SessionRow, "state"> & { state: string; pending: string | null; walled: Walled };
 export type StatusJson = { accounts: StatusAccountRow[]; sessions: StatusSessionRow[]; takenAt: number | null };
 
 /**
@@ -233,7 +239,7 @@ export async function statusJson(): Promise<StatusJson> {
     const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry) }));
     const sessions = st.listSessions().map((s) => {
       const c = computeSession(s, st);
-      return { ...s, pending: c.pending, walled: c.walled };
+      return { ...s, state: c.state, pending: c.pending, walled: c.walled };
     });
     return { accounts, sessions, takenAt: snapshot.takenAt };
   } finally {

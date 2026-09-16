@@ -11,6 +11,8 @@ const configOf = (home: string) => path.join(home, "config.toml");
 const read = (home: string) => readFileSync(configOf(home), "utf8");
 /** How many times a pattern occurs — the test for "one table, one key". */
 const count = (s: string, re: RegExp) => s.match(new RegExp(re.source, `${re.flags.replace("g", "")}g`))?.length ?? 0;
+/** A literal path inside a RegExp: a temp dir can hold `.` and `+`. */
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // --- the command -------------------------------------------------------
 
@@ -126,17 +128,101 @@ test("an existing project table is added to, never duplicated", () => {
   assert.deepEqual(ensureCodexTrust(home, cwd), { changed: false });
 });
 
-test("a project the human marked untrusted is corrected, not doubled", () => {
+test("a project the human marked untrusted is honoured, not overruled", () => {
   const home = tempDir("ms-codex-trust-");
   const cwd = tempDir("ms-codex-cwd-");
   const real = realpathSync(cwd);
-  writeFileSync(configOf(home), `[projects.${JSON.stringify(real)}]\ntrust_level = "untrusted"\n`, { mode: 0o600 });
+  const before = `[projects.${JSON.stringify(real)}]\ntrust_level = "untrusted"\n`;
+  writeFileSync(configOf(home), before, { mode: 0o600 });
 
+  // A `trust_level` a human set is an ANSWER about their own directory. The
+  // tool reports it and launches nothing; it does not quietly promote itself.
+  assert.deepEqual(ensureCodexTrust(home, cwd), {
+    changed: false,
+    problem: `${real} is marked untrusted in ${configOf(home)}; edit it or launch elsewhere`,
+  });
+  assert.equal(read(home), before, "a refusal writes nothing at all");
+});
+
+test("the refusal names the value as written, whatever it is", () => {
+  const home = tempDir("ms-codex-trust-");
+  const cwd = tempDir("ms-codex-cwd-");
+  const real = realpathSync(cwd);
+  writeFileSync(configOf(home), `[projects.${JSON.stringify(real)}]\ntrust_level = 'ask'  # for now\n`, { mode: 0o600 });
+
+  const r = ensureCodexTrust(home, cwd);
+  assert.equal(r.changed, false);
+  assert.match(r.problem!, /is marked ask in /);
+});
+
+test("a header with a trailing comment is the SAME table, not a second one", () => {
+  const home = tempDir("ms-codex-trust-");
+  const cwd = tempDir("ms-codex-cwd-");
+  const real = realpathSync(cwd);
+  writeFileSync(
+    configOf(home),
+    `[projects.${JSON.stringify(real)}]   # trusted by hand, 2026-09-01\ntrust_level = "trusted"\n`,
+    { mode: 0o600 },
+  );
+
+  // Before the comment was stripped, this header did not match and a SECOND
+  // [projects."…"] table was appended — a duplicate table, invalid TOML, and
+  // Codex answers an invalid config.toml by dropping the whole file: the hook
+  // tables and every trust already granted, gone.
+  assert.deepEqual(ensureCodexTrust(home, cwd), { changed: false });
+  assert.equal(count(read(home), /^\[projects\./m), 1);
+});
+
+test("a comment is not stripped out of a path that contains a #", () => {
+  const home = tempDir("ms-codex-trust-");
+  const base = realpathSync(tempDir("ms-codex-cwd-"));
+  const hashed = path.join(base, "a#b");
+  mkdirSync(hashed);
+
+  assert.deepEqual(ensureCodexTrust(home, hashed), { changed: true });
+  assert.ok(read(home).includes(`[projects.${JSON.stringify(hashed)}]`), read(home));
+  assert.deepEqual(ensureCodexTrust(home, hashed), { changed: false });
+});
+
+// --- the refusals ------------------------------------------------------
+//
+// Each of these is a `projects` definition the scanner cannot attribute.
+// Appending beside one would define the same table twice; the whole config
+// then fails to parse and Codex reads NONE of it.
+
+for (const [what, body] of [
+  ["a root-level inline table", `projects = { "/a/b" = { trust_level = "trusted" } }\n`],
+  ["a root-level dotted assignment", `projects."/a/b".trust_level = "trusted"\n`],
+  ["a bare [projects] super-table", `[projects]\n"/a/b" = { trust_level = "trusted" }\n`],
+  ["an array of projects tables", `[[projects."/a/b"]]\ntrust_level = "trusted"\n`],
+  ["a header with an unreadable key", `[projects.somebarekey]\ntrust_level = "trusted"\n`],
+  ["a header with two key segments", `[projects."/a"."b"]\ntrust_level = "trusted"\n`],
+] as const) {
+  test(`${what} is refused, and nothing is written`, () => {
+    const home = tempDir("ms-codex-trust-");
+    const cwd = tempDir("ms-codex-cwd-");
+    // The definition comes FIRST: a `projects = { … }` written after a table
+    // header would belong to that table, not to the root, and this writer is
+    // right to ignore one that does.
+    const before = `${body}\n[[hooks.Stop]]\nhooks = []\n`;
+    writeFileSync(configOf(home), before, { mode: 0o600 });
+
+    const r = ensureCodexTrust(home, cwd);
+    assert.equal(r.changed, false, what);
+    assert.match(r.problem!, new RegExp(`^${esc(configOf(home))} already defines 'projects'`), what);
+    assert.match(r.problem!, /this tool will not edit/, what);
+    assert.equal(read(home), before, `${what}: a refusal writes nothing at all`);
+  });
+}
+
+test("a hooks table named like a project is not mistaken for one", () => {
+  const home = tempDir("ms-codex-trust-");
+  const cwd = tempDir("ms-codex-cwd-");
+  writeFileSync(configOf(home), `[hooks.state."/x/config.toml:session_start:0:0"]\ntrusted_hash = "sha256:abc"\n`, { mode: 0o600 });
+
+  // Only `projects` tables concern this writer; everything else is a boundary.
   assert.deepEqual(ensureCodexTrust(home, cwd), { changed: true });
-
-  const text = read(home);
-  assert.equal(count(text, /^trust_level/m), 1, "a duplicate key would be a TOML error");
-  assert.match(text, /^trust_level = "trusted"$/m);
+  assert.match(read(home), /^trust_level = "trusted"$/m);
 });
 
 test("another project's table is not mistaken for this one", () => {
@@ -149,4 +235,16 @@ test("another project's table is not mistaken for this one", () => {
   const text = read(home);
   assert.equal(count(text, /^\[projects\./m), 2);
   assert.equal(count(text, /^trust_level = "trusted"$/m), 2);
+});
+
+test("a 'projects' key inside somebody else's table is not a projects definition", () => {
+  const home = tempDir("ms-codex-trust-");
+  const cwd = tempDir("ms-codex-cwd-");
+  // `projects` here is `hooks.Stop.projects`, which has nothing to do with
+  // the root table this writer adds to — refusing on it would be a launch
+  // lost to a word.
+  writeFileSync(configOf(home), `[[hooks.Stop]]\nprojects = { x = 1 }\n`, { mode: 0o600 });
+
+  assert.deepEqual(ensureCodexTrust(home, cwd), { changed: true });
+  assert.match(read(home), /^trust_level = "trusted"$/m);
 });

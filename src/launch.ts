@@ -282,18 +282,28 @@ function planFor(provider: Provider, parsed: Parsed): ProviderPlan {
       // it is a question about a window that does not exist.
       need: parsed.need === "fable" ? { error: "codex has no fable window" } : "any",
       credential: (account) =>
-        // Existence only: `auth.json` is the whole credential, and `_exec`
-        // hands the CLI the DIRECTORY, never a byte of the file.
-        readCodexAuth(p.codexHome(account))
+        // Existence of a USABLE credential, and nothing more: the value stays
+        // in the module that read it, and `_exec` hands the CLI the
+        // DIRECTORY, never a byte of the file. A present-but-empty `auth.json`
+        // — a login that was interrupted, a file someone truncated — is not a
+        // credential, and answering "yes" for it would put the modal-free
+        // launch in front of a CLI that cannot authenticate.
+        readCodexAuth(p.codexHome(account))?.accessToken
           ? null
           : { error: `no codex credential for account '${account}' (run: ms accounts login ${account} --provider codex)` },
       prepare: (account, cwd) => {
         // Trust is per home and the dialog is a modal: an unattended launch
         // that met it would sit there forever. Verified on Codex 0.153.4.
+        //
+        // A `problem` is the writer refusing to touch a config.toml it cannot
+        // add to safely, or a `trust_level` the human set themselves — both
+        // are reported verbatim, because both already name the file and the
+        // directory, and both are answered by a human editing that file
+        // rather than by anything this tool could do next.
         const home = p.codexHome(account);
         try {
-          ensureCodexTrust(home, cwd);
-          return null;
+          const { problem } = ensureCodexTrust(home, cwd);
+          return problem ? { error: problem } : null;
         } catch (e) {
           return { error: `cannot record directory trust for '${account}' in ${home}: ${(e as Error).message}` };
         }

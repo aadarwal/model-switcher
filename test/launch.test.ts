@@ -869,3 +869,53 @@ test("a home that cannot be written is a named refusal, not a silent modal", asy
   assert.equal((await readState(w)).sessions.length, 0);
   rmSync(configToml(w.msHome, "home"), { recursive: true, force: true });
 });
+
+test("an auth.json with no access token is no credential: exit 1, and no fallback", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  // A login that was interrupted, or a file someone truncated. It parses; it
+  // authenticates nothing.
+  writeFileSync(path.join(w.msHome, "codex", "home", "auth.json"), "{}", { mode: 0o600 });
+
+  const r = run(["codex"], w.env());
+
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /^ms codex: no codex credential for account 'home' \(run: ms accounts login home --provider codex\)$/m);
+  assert.equal(r.stderr.trim().split("\n").length, 1);
+  assert.equal((await readState(w)).sessions.length, 0);
+  assert.equal(existsSync(path.join(w.msHome, "last-pick.json")), false, "a pick that never ran must not become the fallback");
+  assert.equal(existsSync(configToml(w.msHome, "home")), false, "an account that cannot launch trusts nothing");
+});
+
+test("a cwd the human marked untrusted stops the launch; the tool does not overrule them", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const config = configToml(w.msHome, "home");
+  const before = `[projects.${JSON.stringify(realpathSync(CWD))}]\ntrust_level = "untrusted"\n`;
+  writeFileSync(config, before, { mode: 0o600 });
+
+  const r = run(["codex"], w.env());
+
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, new RegExp(`^ms codex: ${esc(realpathSync(CWD))} is marked untrusted in ${esc(config)}; edit it or launch elsewhere$`, "m"));
+  assert.equal(readFileSync(config, "utf8"), before);
+  assert.equal((await readState(w)).sessions.length, 0);
+  // The refusal comes before the first tmux call, so there is not even a log:
+  // nothing was created, respawned or recorded on the human's behalf.
+  assert.equal(existsSync(w.log), false, "nothing was started");
+});
+
+test("a config.toml this tool cannot add to safely stops the launch, naming the file", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const config = configToml(w.msHome, "home");
+  // Appending beside this would define `projects` twice — invalid TOML, at
+  // which point Codex drops the WHOLE file: the hook tables and every
+  // directory already trusted with them.
+  const before = `projects = { "/a/b" = { trust_level = "trusted" } }\n\n[[hooks.Stop]]\nhooks = []\n`;
+  writeFileSync(config, before, { mode: 0o600 });
+
+  const r = run(["codex"], w.env());
+
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, new RegExp(`^ms codex: ${esc(config)} already defines 'projects'`, "m"));
+  assert.equal(readFileSync(config, "utf8"), before, "a refusal writes nothing at all");
+  assert.equal((await readState(w)).sessions.length, 0);
+});

@@ -91,8 +91,15 @@ const codexAutorotate = (): boolean => process.env.MS_CODEX_AUTOROTATE === "1";
 /** One recovery at a time per session; a second worker is a duplicate. */
 const SESSION_LOCK_WAIT_MS = 5_000;
 /** A counting bound on simultaneous handoffs across ALL sessions: four slots,
- * taken without waiting. A fleet that walls at once must not respawn at once. */
-const HANDOFF_SLOTS = 4;
+ * taken without waiting. A fleet that walls at once must not respawn at once.
+ *
+ * Exported because it is a shared bound, not an implementation detail: `ms
+ * switch --all` runs its own handoffs through a pool of exactly this size, so
+ * that a fleet move never asks for a slot that cannot be there — a worker that
+ * finds none free stands down and re-dispatches itself through tmux, which is
+ * the right answer for an automatic rotation and the wrong one for a human
+ * waiting on the command they just typed. */
+export const HANDOFF_SLOTS = 4;
 /** How long a worker that found no free slot waits before trying again. */
 const REDISPATCH_SECONDS = 30;
 /** How long the CLI is given to leave on its own after `/exit`. */

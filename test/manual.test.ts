@@ -19,7 +19,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import { hostname } from "node:os";
@@ -27,7 +27,8 @@ import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
 import { appendEvent } from "../src/events.ts";
 import { openState, type SessionRow } from "../src/state.ts";
-import { rotateVerb, stopVerb, switchVerb } from "../src/manual.ts";
+import { rotateVerb, stopVerb, switchAll, switchVerb } from "../src/manual.ts";
+import { HANDOFF_SLOTS } from "../src/recover.ts";
 
 const CONTINUATION =
   "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions. If the last user message was already answered, or needs nothing more, say so in one line and wait for the user; do not start new work.";
@@ -263,7 +264,7 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 const rx = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const logLines = (w: World): string[] => readFileSync(w.log, "utf8").split("\n").filter((l) => l.trim());
+const logLines = (w: { log: string }): string[] => readFileSync(w.log, "utf8").split("\n").filter((l) => l.trim());
 const respawnLine = (w: World): string | undefined => logLines(w).find((l) => l.includes("respawn-pane"));
 const typedAnything = (w: World): boolean => logLines(w).some((l) => l.includes("send-keys"));
 const recoverLog = (w: World): string => {
@@ -866,4 +867,491 @@ test("rotate, switch and stop are registered verbs", async (t) => {
     assert.equal(r.code, 2, `ms ${verb} with no argument is a usage error`);
     assert.match(r.stderr, new RegExp(`usage: ms ${verb}`));
   }
+});
+
+// --- the fleet: ms switch --all ----------------------------------------
+//
+// A second world, because everything above is one session in one pane and a
+// fleet move is the opposite: several panes, each with its own screen and its
+// own life. The stub tmux therefore keys its pane state BY PANE (`dead%3`,
+// `pid%3`) and reads each pane's screen from its own file, so one session's
+// `/exit` cannot be read as another's — the single-pane stub above would have
+// made every concurrent handoff answer for whichever pane wrote last.
+
+const FLEET_SOCKET = "/tmp/ms-fleet-test.sock";
+
+const FLEET_STUB = String.raw`printf '%s\n' "$*" >> "$MS_TMUX_LOG"
+if [ "$1" = "-S" ]; then shift 2; fi
+st="$MS_TMUX_STATE"
+pane=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-t" ]; then pane="$a"; fi
+  prev="$a"
+done
+get() { grep "^$1=" "$st" 2>/dev/null | tail -1 | cut -d= -f2-; }
+put() { printf '%s=%s\n' "$1" "$2" >> "$st"; }
+# The one fault a test can inject from OUTSIDE the process: take the store's
+# permissions away while a fleet move is under way, so the sessions still
+# queued behind this pane throw where they open it.
+if [ -n "$MS_TMUX_BREAK_DB" ] && [ "$pane" = "$MS_TMUX_BREAK_DB" ]; then chmod 000 "$MS_HOME/state.sqlite"; fi
+case "$1" in
+  list-panes) get panes | tr ' ' '\n' ;;
+  display-message)
+    case "$*" in
+      *pane_pid*) printf '%s\t%s\t%s\t%s\n' "$(get "pid$pane")" claude "$(get "dead$pane")" "$(get cwd)" ;;
+      *pane_dead_status*) printf '\n' ;;
+      *pane_dead*) get "dead$pane" ;;
+      *) get identity ;;
+    esac ;;
+  capture-pane) cat "$MS_TMUX_SCREENS/$pane" 2>/dev/null ;;
+  send-keys) case "$*" in */exit*) put "dead$pane" 1 ;; esac ;;
+  respawn-pane) put "dead$pane" 0 ;;
+esac
+exit 0`;
+
+type FleetSession = {
+  id: string;
+  pane: string;
+  account: string;
+  provider?: "claude" | "codex";
+  screen?: string;
+  state?: SessionRow["state"];
+  desired?: SessionRow["desired"];
+};
+type Fleet = { home: string; msHome: string; log: string; state: string; screens: string; cwd: string; sessions: FleetSession[] };
+
+/** Four sessions on two accounts, and three that are not the fleet at all:
+ *  `ms switch --all --to home` moves s1–s3 and must leave the rest alone.
+ *  s4 is already home, s5 is not a claude session, s6 is over, and s7 has
+ *  been told to stop. */
+const FLEET: FleetSession[] = [
+  { id: "s1", pane: "%1", account: "away" },
+  { id: "s2", pane: "%2", account: "away" },
+  { id: "s3", pane: "%3", account: "away" },
+  { id: "s4", pane: "%4", account: "home" },
+  { id: "s5", pane: "%5", account: "cdx", provider: "codex" },
+  { id: "s6", pane: "%6", account: "away", state: "stopped" },
+  { id: "s7", pane: "%7", account: "away", state: "stopping", desired: "stopped" },
+];
+
+/** N claude sessions, all on `away`, for the tests that only count handoffs. */
+const fleetSessions = (n: number): FleetSession[] =>
+  Array.from({ length: n }, (_, i) => ({ id: `s${i + 1}`, pane: `%${i + 1}`, account: "away" }));
+
+async function fleet(t: TestContext, sessions: FleetSession[]): Promise<Fleet> {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  stub("tmux", FLEET_STUB);
+  const log = path.join(dir, "tmux.log");
+  const state = path.join(dir, "tmux.state");
+  const screens = path.join(dir, "screens");
+  mkdirSync(screens, { recursive: true });
+  const pid = liveProcess(t);
+  const cwd = home;
+
+  writeFileSync(log, "");
+  writeFileSync(
+    state,
+    [
+      `panes=${sessions.map((s) => s.pane).join(" ")}`,
+      ...sessions.map((s) => `pid${s.pane}=${pid}`),
+      ...sessions.map((s) => `dead${s.pane}=0`),
+      `cwd=${cwd}`,
+      `identity=${IDENTITY}`,
+      "",
+    ].join("\n"),
+  );
+  for (const s of sessions) writeFileSync(path.join(screens, s.pane), s.screen ?? IDLE_SCREEN);
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: [
+        { name: "home", provider: "claude", label: "home", shared: false },
+        { name: "away", provider: "claude", label: "away", shared: false },
+        { name: "cdx", provider: "codex", label: "cdx", shared: false },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+
+  process.env.HOME = home;
+  process.env.MS_HOME = msHome;
+  process.env.MS_BIN = MS_BIN;
+  process.env.MS_TMUX_LOG = log;
+  process.env.MS_TMUX_STATE = state;
+  process.env.MS_TMUX_SCREENS = screens;
+  process.env.MS_TMUX_SCREEN = "";
+  process.env.MS_TMUX_SNAP = "";
+  process.env.MS_TMUX_REVIVE = "";
+  process.env.MS_TMUX_FAIL = "";
+  process.env.MS_TMUX_BREAK_DB = "";
+  process.env.MS_POLL_MS = "20";
+  // Wider than the single-pane world's: a barrier-held reporter may sit on a
+  // respawned pane for up to five seconds before it opens the gate, and that
+  // must stay comfortably inside the readiness budget it is eating into.
+  process.env.MS_READY_MS = "20000";
+  process.env.MS_SETTLE_MS = "";
+  process.env.MS_LOCK_WAIT_MS = "";
+  process.env.SHELL = SHELL;
+  process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
+  delete process.env.TMUX;
+  delete process.env.TMUX_PANE;
+
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  for (const name of ["home", "away"]) saveLaunchToken(name, `sk-ant-oat01-${name}0123456789abcdefghij`);
+  writeSnapshot(msHome, { home: { session: 10, weekly: 20 }, away: { session: 100, weekly: 40 } });
+
+  const st = openState();
+  try {
+    for (const s of sessions) {
+      st.createSession({
+        id: s.id,
+        provider: s.provider ?? "claude",
+        cliSessionId: `c-${s.id}`,
+        cwd,
+        socket: FLEET_SOCKET,
+        pane: s.pane,
+        serverStart: IDENTITY,
+        need: "any",
+        account: s.account,
+        generation: 2,
+        state: s.state ?? "running",
+        desired: s.desired ?? "running",
+        flags: [],
+      });
+    }
+  } finally {
+    st.close();
+  }
+  // Distinct creation times: candidate order is the store's `ORDER BY
+  // createdAt`, and four rows written in the same second would leave the
+  // order this asserts to the sorter rather than to the rule.
+  const db = new DatabaseSync(path.join(msHome, "state.sqlite"));
+  try {
+    sessions.forEach((s, i) => db.prepare("UPDATE sessions SET createdAt=? WHERE id=?").run(1_700_000_000 + i, s.id));
+  } finally {
+    db.close();
+  }
+  for (const s of sessions) {
+    appendEvent({ t: nowSeconds() - 60, kind: "started", session: s.id, generation: 1, cliSessionId: `c-${s.id}` });
+    appendEvent({ t: nowSeconds() - 20, kind: "activity", session: s.id, generation: 2, cliSessionId: `c-${s.id}` });
+  }
+  return { home, msHome, log, state, screens, cwd, sessions };
+}
+
+/** One session row by id — the fleet tests watch several at once. */
+function row(id: string): SessionRow {
+  const st = openState();
+  try {
+    return st.getSession(id)!;
+  } finally {
+    st.close();
+  }
+}
+
+type FleetReporter = { stop: () => void; peak: () => number };
+
+/**
+ * Claude Code's SessionStart hook for a whole fleet: report each pane's resume
+ * as soon as the stub tmux shows that pane respawned.
+ *
+ * `barrier` is what makes concurrency observable. Held back, a respawned pane
+ * cannot finish its handoff — readiness is this report and nothing else — so
+ * the number of panes waiting at once IS the number of handoffs in flight, and
+ * `peak()` is the high-water mark. The reporter opens the gate once that many
+ * are waiting (or once 3 s pass with nothing new respawning, so a pool that is
+ * too SMALL fails the assertion instead of hanging the test).
+ *
+ * `reverse` then releases them one at a time, newest first, which is how the
+ * fleet finishes in a different order than it started.
+ */
+function reportFleet(w: Fleet, opts: { barrier?: number; reverse?: boolean } = {}): FleetReporter {
+  const paneOf = new Map(w.sessions.map((s) => [s.pane, s.id]));
+  const pending = new Map<string, string>();
+  const done = new Set<string>();
+  let peak = 0;
+  let armed = !opts.barrier;
+  let lastNew = Date.now();
+  let tick = 0;
+  const release = (pane: string, id: string): void => {
+    appendEvent({ t: nowSeconds(), kind: "resumed", session: id, generation: 3, cliSessionId: `c-${id}` });
+    pending.delete(pane);
+    done.add(pane);
+  };
+  const timer = setInterval(() => {
+    tick++;
+    for (const line of logLines(w)) {
+      if (!line.includes("respawn-pane")) continue;
+      const m = line.match(/ -t (%\d+) /);
+      const pane = m?.[1];
+      if (!pane || done.has(pane) || pending.has(pane) || !paneOf.has(pane)) continue;
+      pending.set(pane, paneOf.get(pane)!);
+      lastNew = Date.now();
+    }
+    peak = Math.max(peak, pending.size);
+    // The escape hatch never fires before a single pane has respawned: under a
+    // loaded machine the first handoff can take seconds, and a gate that opened
+    // on that silence would measure a pool that had not started yet.
+    if (!armed && (pending.size >= opts.barrier! || (pending.size > 0 && Date.now() - lastNew > 5_000))) armed = true;
+    if (!armed) return;
+    if (opts.reverse) {
+      // One per five ticks (~75 ms), newest first: far enough apart that the
+      // 20 ms readiness polls cannot reorder them.
+      if (tick % 5) return;
+      const last = [...pending].at(-1);
+      if (last) release(last[0], last[1]);
+      return;
+    }
+    for (const [pane, id] of [...pending]) release(pane, id);
+  }, 15);
+  return { stop: () => clearInterval(timer), peak: () => peak };
+}
+
+test("switch --all moves every session that is not already on the account", async (t) => {
+  const w = await fleet(t, FLEET);
+  const say = stderr(t);
+  const rep = reportFleet(w);
+  t.after(rep.stop);
+
+  assert.equal(await switchVerb(["--all", "--to", "home"]), 0, say());
+
+  for (const id of ["s1", "s2", "s3"]) {
+    assert.equal(row(id).account, "home", `${id} did not move`);
+    assert.equal(row(id).generation, 3);
+    assert.equal(row(id).state, "running", "an idle screen carries nothing over unless asked");
+    assert.match(say(), new RegExp(`^ms: ${id} moved → home$`, "m"));
+  }
+  const s4 = row("s4");
+  assert.equal(s4.generation, 2, "the session already on home was not touched");
+  assert.ok(!logLines(w).some((l) => l.includes("-t %4")), "…and its pane was never even asked a question");
+  const s5 = row("s5");
+  assert.deepEqual([s5.account, s5.generation], ["cdx", 2], "a codex session is not part of a claude account's fleet");
+  assert.ok(!logLines(w).some((l) => l.includes("-t %5")));
+  // A session that is over, and one the human has already told to leave, are
+  // not the fleet either: moving them would fail for a reason that has nothing
+  // to do with accounts, and s6's pane is not even the tool's any more.
+  assert.equal(row("s6").generation, 2, "a stopped session was dragged into the fleet move");
+  assert.equal(row("s7").generation, 2, "a session on its way out was dragged into the fleet move");
+  for (const pane of ["%6", "%7"]) assert.ok(!logLines(w).some((l) => l.includes(`-t ${pane}`)), `${pane} was touched`);
+  assert.match(say(), /^ms: moved 3, refused 0$/m);
+  assert.doesNotMatch(say(), /refused:/);
+});
+
+test("switch --all refuses the session that is mid-turn and moves the rest", async (t) => {
+  const w = await fleet(t, [
+    { id: "s1", pane: "%1", account: "away" },
+    { id: "s2", pane: "%2", account: "away", screen: BUSY_SCREEN },
+    { id: "s3", pane: "%3", account: "away" },
+  ]);
+  const say = stderr(t);
+  const rep = reportFleet(w);
+  t.after(rep.stop);
+
+  assert.equal(await switchVerb(["--all", "--to", "home"]), 1, "one refusal fails the fleet move");
+
+  assert.equal(row("s1").account, "home");
+  assert.equal(row("s3").account, "home");
+  assert.equal(row("s2").account, "away", "a mid-turn session is left exactly where it was");
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys -t %2")), "a mid-turn pane is never typed into");
+  assert.match(say(), /^ms: s2 refused: s2 is mid-turn/m);
+  assert.match(say(), /^ms: moved 2, refused 1$/m);
+
+  // And the deliberate override moves the one that was left — the two that
+  // already arrived are no longer candidates at all.
+  assert.equal(await switchVerb(["--all", "--to", "home", "--force"]), 0, say());
+  assert.equal(row("s2").account, "home");
+  assert.equal(row("s1").generation, 3, "a session already on the account is not moved twice");
+  assert.match(say(), /^ms: moved 1, refused 0$/m);
+});
+
+test("switch --all --continue carries every session's unfinished work over", async (t) => {
+  const w = await fleet(t, fleetSessions(2));
+  const rep = reportFleet(w);
+  t.after(rep.stop);
+
+  assert.equal(await switchVerb(["--all", "--to", "home", "--continue"]), 0);
+  assert.equal(row("s1").state, "continuing");
+  assert.equal(row("s2").state, "continuing");
+});
+
+test("a fleet move never runs more handoffs at once than there are handoff slots", async (t) => {
+  const w = await fleet(t, fleetSessions(6));
+  const say = stderr(t);
+  const rep = reportFleet(w, { barrier: HANDOFF_SLOTS });
+  t.after(rep.stop);
+
+  assert.equal(await switchVerb(["--all", "--to", "home"]), 0, say());
+
+  assert.equal(rep.peak(), HANDOFF_SLOTS, "the pool did not fill, or overflowed, the handoff slots");
+  assert.match(say(), /^ms: moved 6, refused 0$/m);
+  for (const s of w.sessions) assert.equal(row(s.id).account, "home");
+  // The slots are a counting bound the transaction itself enforces: a worker
+  // that finds none free re-dispatches itself through tmux. The pool exists so
+  // that never happens — a fleet move that queued in tmux would finish minutes
+  // later, under the automatic worker's rules rather than the human's.
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "a handoff was pushed back into tmux");
+});
+
+test("switchAll reports every candidate in the store's order, as each one finishes", async (t) => {
+  const w = await fleet(t, FLEET);
+  const rep = reportFleet(w, { barrier: 3, reverse: true });
+  t.after(rep.stop);
+
+  const finished: string[] = [];
+  const { results, code } = await switchAll("home", {
+    force: false,
+    continueAfter: "auto",
+    timeoutMs: 60_000,
+    onResult: (r) => finished.push(r.session),
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(finished, ["s3", "s2", "s1"], "the caller hears about each session as it completes");
+  assert.deepEqual(
+    results.map((r) => r.session),
+    ["s1", "s2", "s3"],
+    "…and the results keep candidate order, whatever order they finished in",
+  );
+  assert.deepEqual(results.map((r) => r.code), [0, 0, 0]);
+});
+
+test("switch --all --timeout 0 moves nothing and says so", async (t) => {
+  const w = await fleet(t, FLEET);
+  const say = stderr(t);
+
+  assert.equal(await switchVerb(["--all", "--to", "home", "--timeout", "0"]), 1);
+
+  assert.deepEqual(logLines(w), [], "no pane was even asked a question");
+  for (const id of ["s1", "s2", "s3"]) {
+    assert.equal(row(id).account, "away");
+    assert.match(say(), new RegExp(`^ms: ${id} refused: not started: the 0ms budget ran out$`, "m"));
+  }
+  assert.match(say(), /^ms: moved 0, refused 3$/m);
+});
+
+test("--all needs an account, takes no session, and only it takes --timeout", async (t) => {
+  const w = await fleet(t, FLEET);
+  const say = stderr(t);
+
+  assert.equal(await switchVerb(["--all"]), 2, "--all without --to");
+  assert.equal(await switchVerb(["--all", "s1", "--to", "home"]), 2, "--all and one session are different commands");
+  assert.equal(await switchVerb(["s1", "--to", "home", "--timeout", "5"]), 2, "--timeout bounds a fleet move");
+  assert.equal(await switchVerb(["--all", "--to", "home", "--timeout", "soon"]), 2, "a timeout that is not a number of seconds");
+  assert.equal(await switchVerb(["--all", "--to", "home", "--timeout"]), 2, "a forgotten timeout");
+  assert.match(say(), /usage: ms switch/);
+  assert.deepEqual(logLines(w), [], "a command line that did not parse never reaches a pane");
+  assert.equal(row("s1").account, "away");
+});
+
+test("switch --all to an account nobody registered is refused without touching a pane", async (t) => {
+  const w = await fleet(t, FLEET);
+  const say = stderr(t);
+
+  assert.equal(await switchVerb(["--all", "--to", "nobody"]), 1);
+  assert.match(say(), /no such account 'nobody'/);
+  assert.deepEqual(logLines(w), []);
+  assert.equal(row("s1").account, "away");
+});
+
+test("--all refuses an account name two providers both claim", async (t) => {
+  // Which sessions the fleet IS depends on the destination's provider, so a
+  // name with two of them has no answer here — and guessing would move a whole
+  // claude fleet on a codex typo.
+  const w = await fleet(t, FLEET);
+  writeFileSync(
+    path.join(w.msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: ["claude", "codex"].map((provider) => ({ name: "home", provider, label: "home", shared: false })),
+    }),
+    { mode: 0o600 },
+  );
+  const say = stderr(t);
+
+  assert.equal(await switchVerb(["--all", "--to", "home"]), 1);
+  assert.match(say(), /cannot tell which fleet you mean/);
+  assert.deepEqual(logLines(w), [], "nothing was asked of tmux, let alone moved");
+  assert.equal(row("s1").account, "away");
+});
+
+test("the library refuses that name too, in the same words the verb prints", async (t) => {
+  // The verb is not the only caller. The dashboard's POST /api/switch-all calls
+  // `switchAll` directly, and `findAccount` with no provider returns the FIRST
+  // name match — so a guard that lived only in the verb would let the whole
+  // claude fleet move on a codex typo, from the same registry the CLI refuses.
+  const w = await fleet(t, FLEET);
+  writeFileSync(
+    path.join(w.msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: ["claude", "codex"].map((provider) => ({ name: "home", provider, label: "home", shared: false })),
+    }),
+    { mode: 0o600 },
+  );
+  const say = stderr(t);
+
+  const { results, code, message } = await switchAll("home", { force: false, continueAfter: "auto", timeoutMs: 60_000 });
+
+  assert.equal(code, 1);
+  assert.deepEqual(results, [], "the library moved nothing and started nothing");
+  assert.match(message ?? "", /cannot tell which fleet you mean/);
+  assert.deepEqual(logLines(w), [], "nothing was asked of tmux, let alone moved");
+  assert.equal(row("s1").account, "away");
+
+  // …and the refusal the verb prints is that message, once, with no summary
+  // under it: a move that never started has nothing to summarise.
+  assert.equal(await switchVerb(["--all", "--to", "home"]), 1);
+  assert.deepEqual(say().split("\n").filter(Boolean), [`ms switch: ${message}`]);
+});
+
+test("a switchOne that throws is that session's refusal, never the fleet's", async (t) => {
+  // `openState` is the one call in `switchOne` that is outside every guard the
+  // transaction has — the store either opens or it throws — so a store it
+  // cannot open is how a real throw reaches the pool. Left to reject, that
+  // throw takes `Promise.all` with it: the summary never prints, every
+  // sibling's result is lost with it, and the workers still running keep
+  // driving handoffs while the process unwinds.
+  const w = await fleet(t, fleetSessions(3));
+  // The first pane's own tmux call takes the store away, which is after s1 has
+  // resolved itself and before s2 and s3 resolve theirs.
+  process.env.MS_TMUX_BREAK_DB = "%1";
+  const say = stderr(t);
+
+  const code = await switchVerb(["--all", "--to", "home"]);
+  chmodSync(path.join(w.msHome, "state.sqlite"), 0o600);
+
+  assert.equal(code, 1);
+  for (const id of ["s1", "s2", "s3"]) {
+    assert.match(say(), new RegExp(`^ms: ${id} refused: \\S`, "m"), `${id}'s result went missing`);
+  }
+  for (const id of ["s2", "s3"]) {
+    assert.match(say(), new RegExp(`^ms: ${id} refused: .*(EACCES|permission denied)`, "m"), `${id} did not carry the throw's own reason`);
+  }
+  assert.match(say(), /^ms: moved 0, refused 3$/m, "the summary is what a caught throw keeps");
+  assert.equal(row("s1").account, "away");
+});
+
+test("a refusal from the transaction itself is reported once, by whoever asked", async (t) => {
+  // `recoverSession` has already said why — on stderr, and in the session's own
+  // log — by the time it returns non-zero. The single-session verb therefore
+  // adds nothing to it, and the fleet line names the session instead of
+  // repeating a reason the human has just read.
+  const w = await fleet(t, fleetSessions(1));
+  rmSync(path.join(w.msHome, "launch", "home.token"));
+  const say = stderr(t);
+
+  assert.equal(await switchVerb(["s1", "--to", "home"]), 1);
+  assert.match(say(), /^ms _recover: no candidate account has a launch token/m);
+  assert.deepEqual(
+    say().split("\n").filter((l) => l.startsWith("ms switch:")),
+    [],
+    "the verb repeated a reason the transaction had already given",
+  );
+
+  assert.equal(await switchVerb(["--all", "--to", "home"]), 1);
+  assert.match(say(), /^ms: s1 refused: the handoff did not happen/m);
+  assert.match(say(), /^ms: moved 0, refused 1$/m);
+  assert.equal(row("s1").account, "away", "a session whose handoff failed is left where it was");
 });

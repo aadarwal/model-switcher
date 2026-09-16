@@ -238,6 +238,28 @@ function readKeychainBlob(item: KeychainItem): string | null {
   return r.stdout.trim();
 }
 
+/**
+ * A fingerprint of the scoped item's VALUE — enough to tell whether something
+ * replaced it, and nothing else.
+ *
+ * `ms accounts login` has to answer "did the browser login I just ran write
+ * this item?", and existence cannot answer it: on macOS a login overwrites the
+ * item in place, so an item that was there before and an item the login just
+ * replaced look identical to a probe. A refusal that deletes on existence
+ * alone therefore destroys a pre-existing grant whenever the login wrote
+ * nothing — which is a documented live path.
+ *
+ * The blob never leaves this function: it is read, hashed, and dropped. The
+ * digest is a fact ABOUT a credential, so it is never logged, never printed
+ * and never put in an error message either — it is only ever compared. `null`
+ * means "nothing readable there", which is not the same answer as a hash and
+ * must never be treated as one.
+ */
+export function stampKeychainItem(name: string): string | null {
+  const blob = readKeychainBlob(keychainItemFor(name));
+  return blob === null ? null : createHash("sha256").update(blob).digest("hex").slice(0, 16);
+}
+
 /** Delete the scoped item — `ms accounts remove`'s last piece of cleanup.
  *  Best-effort: an item that was not there is not a failure to report. And it
  *  can only ever be this account's own item, never the human's login. */

@@ -60,6 +60,8 @@ import {
   fetchProfile,
   keychainItemExists,
   keychainItemFor,
+  type KeychainProbe,
+  probeKeychainItem,
   type PollCredentials,
   type Profile,
   readPollCredentials,
@@ -67,6 +69,7 @@ import {
   refreshPollCredentials,
   restorePollGrantFile,
   stampCredFile,
+  stampKeychainItem,
   writeKeychainNote,
 } from "./providers/claude-usage.ts";
 import { wallKindFromText } from "./wall.ts";
@@ -532,13 +535,20 @@ async function identifyOrRefuse(name: string): Promise<Profile> {
  * the only question that makes a discard safe.
  */
 type SignIn = {
-  /** Did this run open a browser login? Only then is the poll grant on disk
-   *  this run's to discard at all. */
+  /** Did a browser login RUN AND RETURN in this process? Only then is the
+   *  poll grant on disk this run's to discard at all — a `claude auth login`
+   *  that failed or that the human cancelled wrote nothing, and the grant that
+   *  was already there is not its doing. */
   ran: boolean;
   /** The credentials file as it stood before that login. */
   cred: CredFileStamp;
-  /** Was there a scoped keychain item before it? */
-  keychain: boolean;
+  /** Was there a scoped keychain item before it? Tri-state on purpose: a
+   *  locked keychain answers "unknown", which is not "absent". */
+  keychainProbe: KeychainProbe;
+  /** And what was IN it — a fingerprint, never a value, never logged. On
+   *  macOS a login overwrites the item in place, so existence cannot tell an
+   *  item this login wrote from one it left alone; only the content can. */
+  keychainStamp: string | null;
   /** Did this run create the config dir? */
   dirCreated: boolean;
   /** The working grant a `--relogin` is deliberately replacing, read before
@@ -551,6 +561,29 @@ type SignIn = {
  *  does not own. */
 function discardedNote(name: string): string {
   return `the sign-in was discarded; run ms accounts login ${name} --provider claude and sign in as the ${name} account`;
+}
+
+/**
+ * Did the login this run ran actually WRITE the scoped keychain item?
+ *
+ * Positive evidence only, because the alternative deletes credentials that
+ * were working before `ms` was invoked. The item appeared where the probe said
+ * there was none, or its content is demonstrably not the content that was
+ * there. Everything else — a locked keychain, a `security` that timed out, an
+ * item we could not read either side of the login — is "could not tell", and a
+ * grant we cannot PROVE this run wrote is never this run's to delete.
+ *
+ * "Where does `readPollGrant` read from now?" is not this question and cannot
+ * stand in for it: a login that exits 0 minting nothing (the documented live
+ * path) leaves the keychain answering exactly as it did before, and a refusal
+ * for some quite different reason — a transient profile read, a 5xx — would
+ * take the account's only credential with it.
+ */
+function loginWroteKeychainItem(before: SignIn, now: string | null): boolean {
+  if (now === null) return false; // nothing readable there to attribute
+  if (before.keychainProbe === "absent") return true; // it appeared
+  if (before.keychainStamp === null) return false; // could not tell what was there
+  return now !== before.keychainStamp; // demonstrably replaced
 }
 
 /**
@@ -568,25 +601,23 @@ function discardedNote(name: string): string {
  *
  *   * the credentials file, when the login wrote or replaced it — a file
  *     whose stamp has not moved is one the login never touched;
- *   * the keychain item, when the login minted it, or replaced one that was
- *     already there. "Replaced" is exactly the case where the grant just
- *     refused came OUT of the keychain: the service is derived from this
- *     account's own config dir (src/providers/claude-usage.ts), so the item
- *     can only ever be this account's — never the other account's, and never
- *     the operator's own unscoped login;
+ *   * the keychain item, when this login demonstrably WROTE it — see
+ *     `loginWroteKeychainItem`. The service is derived from this account's own
+ *     config dir (src/providers/claude-usage.ts), so the item can only ever be
+ *     this account's — never the other account's, and never the operator's own
+ *     unscoped login;
  *   * the config dir, when this run created it.
  *
  * And a grant a `--relogin` deliberately replaced is put back, so a refused
  * re-login leaves the account exactly as usable as it was before it.
  */
 function discardSignIn(name: string, dir: string, before: SignIn): boolean {
-  if (!before.ran) return false; // nothing this run minted; nothing to undo
-  const read = readPollGrant(name);
-  const fromKeychain = read.state === "ok" && read.cred.source === "keychain";
+  if (!before.ran) return false; // no login returned; nothing this run minted
   let discarded = false;
   if (discardFreshCredFile(name, before.cred)) discarded = true;
-  const item = keychainItemFor(name);
-  if ((!before.keychain || fromKeychain) && keychainItemExists(item) && deleteKeychainItem(item)) discarded = true;
+  if (loginWroteKeychainItem(before, stampKeychainItem(name)) && deleteKeychainItem(keychainItemFor(name))) {
+    discarded = true;
+  }
   if (before.dirCreated) rmSync(dir, { recursive: true, force: true });
   if (before.held) restorePollGrantFile(name, before.held);
   return discarded;
@@ -692,7 +723,14 @@ export function cmdAdd(args: string[]): number {
 export async function cmdLogin(name: string, opts: { relogin?: boolean } = {}): Promise<number> {
   mustFind(name);
   const { dir, created } = claudeConfigDir(name);
-  const before: SignIn = { ran: false, cred: null, keychain: false, dirCreated: created, held: null };
+  const before: SignIn = {
+    ran: false,
+    cred: null,
+    keychainProbe: "unknown",
+    keychainStamp: null,
+    dirCreated: created,
+    held: null,
+  };
   let profile: Profile;
   try {
     // A poll grant already in this dir is the login: sending the human back
@@ -733,9 +771,17 @@ export async function cmdLogin(name: string, opts: { relogin?: boolean } = {}): 
       // grant's fault (no `claude` on PATH, an `auth status` that errors), so
       // this is a live path, not a theoretical one.
       before.cred = stampCredFile(name);
-      before.keychain = keychainItemExists(keychainItemFor(name));
-      before.ran = true;
+      before.keychainProbe = probeKeychainItem(keychainItemFor(name));
+      // The value is only read when there IS one: a first login costs no
+      // credential read at all, and what is read is hashed, compared and
+      // dropped (`stampKeychainItem`).
+      before.keychainStamp = before.keychainProbe === "present" ? stampKeychainItem(name) : null;
       runAuthLogin(name, dir);
+      // Only NOW. A login that threw — exited non-zero, timed out, or was
+      // cancelled in the browser — wrote nothing, so nothing on disk is this
+      // run's doing and the refusal below must not touch the grant that was
+      // already there.
+      before.ran = true;
       if (keychainItemExists(keychainItemFor(name))) discardStaleCredFile(name, before.cred);
     }
     locatePollCredential(name, dir);
@@ -768,10 +814,16 @@ export async function cmdLogin(name: string, opts: { relogin?: boolean } = {}): 
   const { verified, probe, mismatchOrg } = checkLaunchToken(name, token, profile);
   update(name, { identityVerified: verified, identityMethod: verified ? "both-usable" : undefined });
   if (!probe.ok) {
-    // The token is KEPT: a probe that did not answer says the credential does
-    // not work, not that it belongs to someone else, and `ls` should report
-    // what is on disk. The row already says unverified.
-    throw new Error(`the launch token for ${name} did not answer the headless check (${probe.detail})`);
+    // A token is KEPT here: a probe that did not answer says the credential
+    // does not work, not that it belongs to someone else, and `ls` should
+    // report what is on disk. The row already says unverified. But a mint that
+    // failed its probe must not cost the account the WORKING token it
+    // overwrote — that one goes back, and it is still a token on disk.
+    if (heldToken) saveLaunchToken(name, heldToken);
+    throw new Error(
+      `the launch token for ${name} did not answer the headless check (${probe.detail})` +
+        `${heldToken ? " — the launch token it replaced is back" : ""}`,
+    );
   }
   if (mismatchOrg) {
     // This one IS an identity refusal: the token names another organisation

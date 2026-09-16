@@ -80,6 +80,9 @@ logcfg() { printf '%s\\t%s\\n' "$1" "$CLAUDE_CONFIG_DIR" >> "$MS_TEST_CFGDIR"; }
 if [ "$1" = "auth" ] && [ "$2" = "login" ]; then
   logcfg login
   [ -n "$CLAUDE_CONFIG_DIR" ] || { echo "no CLAUDE_CONFIG_DIR" >&2; exit 9; }
+  # A login the human cancelled, or that the CLI failed: nothing is written
+  # and nothing is marked — which is the whole point of the exit status.
+  [ "$MS_TEST_LOGIN_EXIT" = "0" ] || exit "$MS_TEST_LOGIN_EXIT"
   : > "$MS_TEST_MARKER"
   if [ "$MS_TEST_NO_CRED_FILE" != "1" ]; then printf '%s' "$MS_TEST_CRED" > "$CLAUDE_CONFIG_DIR/.credentials.json"; fi
   exit 0
@@ -185,7 +188,9 @@ done <<EOF
 $ok
 EOF
 [ "$match" = 1 ] || exit 44
-if [ "$1" = "find-generic-password" ] && [ "$wflag" = 1 ]; then printf '%s' "$MS_TEST_CRED"; fi
+val="$MS_TEST_CRED"
+if [ -f "$MS_TEST_MARKER" ] && [ -n "$MS_TEST_CRED_AFTER" ]; then val="$MS_TEST_CRED_AFTER"; fi
+if [ "$1" = "find-generic-password" ] && [ "$wflag" = 1 ]; then printf '%s' "$val"; fi
 exit 0
 `;
 
@@ -195,6 +200,8 @@ type Opts = {
   noCredFile?: boolean;
   /** What the keychain stub serves for this account's item. */
   cred?: string;
+  /** And what it serves once a login has run — an item the login REPLACED. */
+  credAfter?: string;
   keychainOk?: string[];
   keychainAfter?: string[];
   pollStatusOk?: boolean;
@@ -245,6 +252,8 @@ function scene(opts: Opts = {}) {
     MS_TEST_PROMPT_HOLD: opts.promptHold ?? "",
     MS_TEST_TOKEN_ONLINE: opts.tokenOnline ?? "",
     MS_TEST_CRED: opts.cred ?? CRED,
+    MS_TEST_CRED_AFTER: opts.credAfter ?? "",
+    MS_TEST_LOGIN_EXIT: "0",
     MS_TEST_NO_CRED_FILE: opts.noCredFile ? "1" : "0",
     MS_TEST_KEYCHAIN_OK: (opts.keychainOk ?? []).join("\n"),
     MS_TEST_KEYCHAIN_AFTER: (opts.keychainAfter ?? []).join("\n"),
@@ -270,6 +279,9 @@ function scene(opts: Opts = {}) {
         .map((l) => l.split("\t"))
         .find(([t]) => t === tag)?.[1],
     configDir: (n: string) => path.join(msHome, "claude", n),
+    /** Forget that any login has run. The stub's marker is scene-wide, so
+     *  without this a second account inherits the first's "logged in" state. */
+    clearMarker: () => rmSync(path.join(home, "logged-in.marker"), { force: true }),
     /** The keychain service a `claude auth login` into this account's config
      *  dir writes its credential under. */
     scopedService(n: string) {
@@ -730,7 +742,7 @@ test("a refused sign-in discards the credentials file that login wrote, config d
   assert.equal(s.row("work").identityVerified, true);
 });
 
-test("a refused sign-in discards the keychain item that login wrote, and never another account's", () => {
+test("a refused sign-in discards a keychain item this login MINTED, and never another account's", () => {
   // The macOS shape, and the one that actually bit: the grant is a generic
   // password under a service derived from THIS account's config dir, so
   // removing the dir leaves it answering for ever.
@@ -740,6 +752,7 @@ test("a refused sign-in discards the keychain item that login wrote, and never a
   s.ms(["add", "work"]);
   assert.equal(s.ms(["login", "work"], { MS_TEST_KEYCHAIN_AFTER: workSvc }).code, 0);
   s.ms(["add", "gmail"]);
+  s.clearMarker(); // gmail has no item of its own until ITS login writes one
   s.truncateSecurity();
 
   const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_OK: workSvc, MS_TEST_KEYCHAIN_AFTER: gmailSvc });
@@ -782,6 +795,135 @@ test("a refusal never discards a grant this run did not mint", () => {
   // and the skip says how to sign in again, which is the whole way out of it
   assert.match(r.stdout, /skipping claude auth login/);
   assert.match(r.stdout, /--relogin/);
+});
+
+test("a claude auth login that failed discards nothing at all", () => {
+  // `claude auth status` erroring (a CLI upgrade, a timeout) is enough to send
+  // `login` to the browser past a perfectly good keychain grant. If the human
+  // then closes the tab, `claude auth login` exits non-zero having written
+  // nothing — and a login that never happened cannot have produced anything
+  // for a refusal to take away.
+  const s = scene({ noCredFile: true });
+  const svc = s.scopedService("gmail");
+  s.ms(["add", "gmail"]);
+  s.truncateSecurity();
+
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_OK: svc, MS_TEST_LOGIN_EXIT: "1" });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /claude auth login exited 1/);
+  assert.equal(
+    s.securityLog().includes("delete-generic-password"),
+    false,
+    `a login that never happened deleted the grant:\n${s.securityLog()}`,
+  );
+  assert.equal(/the sign-in was discarded/.test(r.stderr), false, r.stderr);
+  // and the grant is still there to be read
+  assert.match(s.ms(["ls"], { MS_TEST_KEYCHAIN_OK: svc }).stdout, /gmail\s+claude\s+gmail\s+-\s+yes\s+no\s+no/);
+});
+
+test("a --relogin whose login failed does not move the grant it was holding", () => {
+  // `before.ran` is set only once `claude auth login` has RETURNED. Set any
+  // earlier, a login that failed counts as this run's work: the refusal path
+  // runs, and the grant held for the restore is written into the credentials
+  // file \u2014 the account's credential moved out of the keychain, and its
+  // config dir was removed, because of a login that never happened.
+  const s = scene({ noCredFile: true });
+  const svc = s.scopedService("gmail");
+  s.ms(["add", "gmail"]);
+  const cred = path.join(s.configDir("gmail"), ".credentials.json");
+
+  const r = s.ms(["login", "gmail", "--relogin"], { MS_TEST_KEYCHAIN_OK: svc, MS_TEST_LOGIN_EXIT: "1" });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /claude auth login exited 1/);
+  assert.equal(existsSync(cred), false, "a login that never happened moved the account's credential");
+  assert.equal(s.securityLog().includes("delete-generic-password"), false, s.securityLog());
+  assert.equal(/the sign-in was discarded/.test(r.stderr), false, r.stderr);
+  // the keychain grant is exactly where it was
+  assert.match(s.ms(["ls"], { MS_TEST_KEYCHAIN_OK: svc }).stdout, /gmail\s+claude\s+gmail\s+-\s+yes\s+no\s+no/);
+});
+
+test("a refusal that is not the login's doing leaves the keychain grant alone", () => {
+  // The login exits 0 and mints nothing — the path `discardStaleCredFile`'s own
+  // comment calls live — and then the profile read fails transiently. Nothing
+  // on disk moved, so nothing on disk is this run's to delete. Asking instead
+  // "where does readPollGrant read from now?" answers "the keychain" here, and
+  // would take the account's only credential over a 5xx.
+  const s = scene({ noCredFile: true });
+  const svc = s.scopedService("gmail");
+  s.ms(["add", "gmail"]);
+  s.truncateSecurity();
+
+  const r = s.ms(["login", "gmail"], { MS_TEST_KEYCHAIN_OK: svc, MS_TEST_PROFILE: "<html>a proxy said no</html>" });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /non-JSON body/);
+  assert.equal(
+    s.securityLog().includes("delete-generic-password"),
+    false,
+    `a transient read failure deleted a working grant:\n${s.securityLog()}`,
+  );
+  assert.equal(/the sign-in was discarded/.test(r.stderr), false, r.stderr);
+  assert.match(s.ms(["ls"], { MS_TEST_KEYCHAIN_OK: svc }).stdout, /gmail\s+claude\s+gmail\s+-\s+yes\s+no\s+no/);
+});
+
+test("a refused sign-in discards a keychain item this login REPLACED, not merely found", () => {
+  // The other half of "did this login write it?": on macOS a login overwrites
+  // the item in place, so the only thing that tells the new grant from the old
+  // one is what is inside it.
+  const s = scene({ noCredFile: true, credAfter: CRED });
+  const workSvc = s.scopedService("work");
+  const gmailSvc = s.scopedService("gmail");
+  s.ms(["add", "work"]);
+  assert.equal(s.ms(["login", "work"], { MS_TEST_KEYCHAIN_AFTER: workSvc }).code, 0);
+  s.ms(["add", "gmail"]);
+  s.clearMarker(); // gmail's item holds MS_TEST_CRED until its own login runs
+  s.truncateSecurity();
+
+  const r = s.ms(["login", "gmail"], {
+    MS_TEST_CRED: OLD_CRED,
+    MS_TEST_KEYCHAIN_OK: [workSvc, gmailSvc].join("\n"),
+    MS_TEST_KEYCHAIN_AFTER: gmailSvc,
+  });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /gmail resolves to the same organisation as work/);
+  assert.match(r.stderr, /the sign-in was discarded/);
+  assert.ok(
+    s.securityLog().split("\n").includes(`delete-generic-password -s ${gmailSvc} -a ${BARE}`),
+    `the item this login replaced was never deleted:\n${s.securityLog()}`,
+  );
+});
+
+test("a refusal leaves a credentials file the login never touched", () => {
+  // The Linux shape, and the whole of the stamp comparison in
+  // `discardFreshCredFile`: a login that writes nothing has replaced nothing,
+  // so the file that was already there is not this run's to delete.
+  const s = scene({ noCredFile: true });
+  const workSvc = s.scopedService("work");
+  s.ms(["add", "work"]);
+  assert.equal(s.ms(["login", "work"], { MS_TEST_KEYCHAIN_AFTER: workSvc }).code, 0);
+  s.ms(["add", "gmail"]);
+  mkdirSync(s.configDir("gmail"), { recursive: true, mode: 0o700 });
+  const cred = path.join(s.configDir("gmail"), ".credentials.json");
+  writeFileSync(cred, OLD_CRED, { mode: 0o600 });
+  s.clearMarker();
+
+  const r = s.ms(["login", "gmail"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /gmail resolves to the same organisation as work/);
+  assert.ok(existsSync(cred), "a file the login never wrote is not this run's to delete");
+  assert.equal(readFileSync(cred, "utf8"), OLD_CRED, "and it was not rewritten either");
+  assert.equal(/the sign-in was discarded/.test(r.stderr), false, r.stderr);
+});
+
+test("a probe that fails keeps a token on disk, but never at the cost of the one it replaced", () => {
+  const s = scene({ pollStatusOk: true });
+  s.ms(["add", "gmail"]);
+  assert.equal(s.ms(["login", "gmail"], { MS_TEST_TOKEN: OLD_TOKEN }).code, 0);
+
+  const r = s.ms(["login", "gmail"], { MS_TEST_PROBE_OUT: "I am sorry, I cannot do that." });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /did not answer the headless check/);
+  assert.ok(existsSync(s.tokenFile("gmail")), "`ls` should still have something to report");
+  assert.equal(readFileSync(s.tokenFile("gmail"), "utf8").trim(), OLD_TOKEN, "the working token it overwrote is back");
 });
 
 // --- --relogin ----------------------------------------------------------

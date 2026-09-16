@@ -895,8 +895,10 @@ test("checkClaudeAccount: no other account claims an organisation, so nothing is
     ]);
     const id = rs.find((r) => /identity/.test(r.what))!;
     assert.equal(id.ok, true);
-    assert.equal(id.what, "claude account gmail: identity verified");
     assert.equal(calls, 0, "a book with nothing to collide with must cost no network call");
+    // And the line says so: nothing was re-checked here, so it must not borrow
+    // the authority of a check that never ran.
+    assert.equal(id.what, "claude account gmail: identity verified at login (not re-checked)");
   } finally {
     globalThis.fetch = savedFetch;
   }

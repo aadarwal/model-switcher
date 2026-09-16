@@ -441,9 +441,11 @@ function checkRegistry(parseError: string | null, problems: string[]): Result[] 
 async function checkClaudeIdentity(a: Account, book: Account[], cred: PollCredentials | null): Promise<Result> {
   const tag = `claude account ${a.name}`;
   const rivals = book.filter((x) => x.provider === "claude" && x.name !== a.name && x.orgId);
+  let checked = false;
   if (cred && rivals.length > 0 && cred.expiresAt - Date.now() > REFRESH_DUE_MS) {
     try {
       const profile = await fetchProfile(cred, AbortSignal.timeout(IDENTITY_TIMEOUT_MS));
+      checked = true;
       const other = profile.orgId ? organisationClaimedBy(rivals, a.name, profile.orgId) : null;
       if (other) {
         return {
@@ -456,9 +458,16 @@ async function checkClaudeIdentity(a: Account, book: Account[], cred: PollCreden
       /* could not tell — never a collision, and never a ✓ this run did not earn */
     }
   }
+  // A line says what was actually CHECKED. When the grant was read, "identity
+  // verified" is this run's own finding. When it was not — nothing to collide
+  // with, an access token inside the refresh window, a read that failed — the
+  // only thing true is the verdict `login`/`verify` recorded, and the line
+  // must not borrow the authority of a check that never ran. That overclaim is
+  // how the live dirk case read ✓ beside a `verify` that was failing.
+  const what = `${tag}: identity ${checked ? "verified" : "verified at login (not re-checked)"}`;
   return a.identityVerified
-    ? { ok: true, what: `${tag}: identity verified` }
-    : { ok: false, what: `${tag}: identity verified`, why: "identityVerified is false in the registry" };
+    ? { ok: true, what }
+    : { ok: false, what, why: "identityVerified is false in the registry" };
 }
 
 export async function checkClaudeAccount(a: Account, fix: boolean, book: Account[] = []): Promise<Result[]> {

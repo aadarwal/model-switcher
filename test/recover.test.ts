@@ -303,6 +303,12 @@ function rows(w: World, table: "recoveries" | "attempts"): Record<string, unknow
   }
 }
 
+/** Write the Codex auto-recovery gate the way the hook does. */
+function setGate(value: string): void {
+  const st = openState();
+  try { st.setKv("codexAutorotate", value); } finally { st.close(); }
+}
+
 function session(w: World): SessionRow {
   const st = openState();
   try {
@@ -1603,6 +1609,37 @@ test("without MS_CODEX_AUTOROTATE nothing automatic moves a codex session — an
   assert.equal(session(w).account, "home");
   assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-5"]);
   assert.deepEqual(sendKeys(w), [`send-keys -t ${PANE} C-c`, `send-keys -t ${PANE} C-c`]);
+});
+
+test("the codex gate is a STORED setting: kv acts with nothing in the environment, and kv wins over it", async (t) => {
+  // A-I2. `ms _recover` is dispatched by `tmux run-shell`, which runs it with
+  // the tmux SERVER's global environment — not the shell that exported the
+  // flag. Reading `process.env` here read the wrong environment, so a wall
+  // inside an existing tmux was recorded and nothing opened. The gate the
+  // worker reads is the row the hook writes.
+  const w = await codexWorld(t, { autorotate: false });
+  assert.equal(process.env.MS_CODEX_AUTOROTATE, undefined, "nothing in this process's environment");
+  setGate("1");
+
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0, "the stored gate is the whole authority");
+  assert.equal(session(w).account, "home");
+  assert.equal(rows(w, "recoveries")[0].status, "done");
+});
+
+test("a stored 'off' wins over an exported MS_CODEX_AUTOROTATE=1", async (t) => {
+  // The hook keeps the store current from the shell that actually runs codex,
+  // so whatever some other environment still carries does not overrule it.
+  const w = await codexWorld(t, { autorotate: false });
+  setGate("0");
+  process.env.MS_CODEX_AUTOROTATE = "1";
+  t.after(() => { delete process.env.MS_CODEX_AUTOROTATE; });
+
+  assert.equal(await recoverSession("s1"), 1);
+  assert.match(recoverLog(w), /codex automatic recovery is disabled until a live wall is observed/);
+  assert.ok(!respawnLine(w), "nothing is respawned");
+  assert.equal(rows(w, "recoveries")[0].status, "pending", "and the wall is left for the human's own verb");
 });
 
 test("a codex conversation nobody has typed into is resumed, but not asked to continue", async (t) => {

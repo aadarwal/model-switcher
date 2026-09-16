@@ -35,10 +35,12 @@
 
 import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readdirSync, statSync } from "node:fs";
+
 import { hostname } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
+import { codexAutorotateEnabled } from "./autorotate.ts";
 import { readEvents } from "./events.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
@@ -81,12 +83,16 @@ export const CONTINUATION =
  * The human's own verbs are never gated by this — `ms rotate`, `ms switch`
  * and `ms stop` move a Codex session today. What is gated is the automatic
  * claim, which is the one path with no person in front of it.
+ *
+ * The gate itself is `codexAutorotateEnabled` (src/autorotate.ts): a row in
+ * the store with the environment variable in front of it. It has to be. This
+ * module runs as `ms _recover`, which `tmux run-shell` dispatches with the
+ * tmux SERVER's global environment — never the shell that exported
+ * `MS_CODEX_AUTOROTATE`. Reading `process.env` here read the wrong
+ * environment, and the symptom was silence.
  */
 const CODEX_AUTOROTATE_MESSAGE =
   "codex automatic recovery is disabled until a live wall is observed (set MS_CODEX_AUTOROTATE=1)";
-/** Exactly "1": a variable somebody exported as "0" or "false" to turn this
- *  OFF must never read as on. */
-const codexAutorotate = (): boolean => process.env.MS_CODEX_AUTOROTATE === "1";
 
 /** One recovery at a time per session; a second worker is a duplicate. */
 const SESSION_LOCK_WAIT_MS = 5_000;
@@ -1011,7 +1017,7 @@ function claimAutomatic(st: State, session: SessionRow, tmux: Tmux): Claim {
   // exactly as its trigger wrote it: `ms status` still shows the wall, and
   // the human's own `ms rotate` — which never comes through here — can pick
   // that same row up and move the session on their say-so.
-  if (session.provider === "codex" && !codexAutorotate()) return { why: CODEX_AUTOROTATE_MESSAGE };
+  if (session.provider === "codex" && !codexAutorotateEnabled(st)) return { why: CODEX_AUTOROTATE_MESSAGE };
   const rec = st.pendingRecovery(session.id);
   if (!rec) return { why: "no pending recovery" };
   if (!st.ownRecovery(rec.id, owner())) return { why: `recovery ${rec.id} is already owned by ${rec.owner ?? "another worker"}` };

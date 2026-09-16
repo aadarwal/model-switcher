@@ -299,3 +299,39 @@ test("_hook with no provider, or one we do not run, exits 2 rather than pretendi
   }
   assert.equal(eventsExist(msHome), false);
 });
+
+test("an exported MS_CODEX_AUTOROTATE is written into the store, which is what the dispatched processes read", async () => {
+  // A-I2. `ms _codex_watch` and `ms _recover` are dispatched with `tmux
+  // run-shell`, which runs them with the tmux SERVER's global environment —
+  // never the shell that typed `export MS_CODEX_AUTOROTATE=1`. The hook is one
+  // of the few `ms` processes that DOES see the human's own environment, so it
+  // carries the gate into the store on its way past.
+  const { DatabaseSync } = await import("node:sqlite");
+  const gate = (msHome: string): string | null => {
+    const db = new DatabaseSync(path.join(msHome, "state.sqlite"));
+    try { return ((db.prepare("SELECT v FROM kv WHERE k=?").get("codexAutorotate") as { v: string } | undefined)?.v) ?? null; } finally { db.close(); }
+  };
+
+  const on = setup();
+  await seedSession(on.env);
+  assert.equal(run(["_hook", "codex"], { ...on.env, MS_CODEX_AUTOROTATE: "1" }, JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-1" })).code, 0);
+  assert.equal(gate(on.msHome), "1", "every event carries it, not only the ones that open a store already");
+
+  // Turning it off travels the same way.
+  assert.equal(run(["_hook", "codex"], { ...on.env, MS_CODEX_AUTOROTATE: "0" }, JSON.stringify({ hook_event_name: "SessionEnd", session_id: "cx-7" })).code, 0);
+  assert.equal(gate(on.msHome), "0");
+
+  // A shell with no export says nothing: "I was not told" must never read as
+  // "turn it off", or one unflagged `ms` would undo the human's setting.
+  assert.equal(run(["_hook", "codex"], { ...on.env, MS_CODEX_AUTOROTATE: "1" }, JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-2" })).code, 0);
+  assert.equal(run(["_hook", "codex"], { ...on.env, MS_CODEX_AUTOROTATE: "" }, JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-3" })).code, 0);
+  assert.equal(gate(on.msHome), "1");
+
+  // And an unmanaged pane still writes nothing at all — the identity gate
+  // comes first, so a Codex the human launched by hand cannot set this.
+  const bare = setup();
+  const anon = { ...bare.env, MS_CODEX_AUTOROTATE: "1" } as Record<string, string>;
+  delete anon.MS_SESSION;
+  assert.equal(run(["_hook", "codex"], { ...anon, MS_SESSION: "" }, JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-1" })).code, 0);
+  assert.equal(existsSync(path.join(bare.msHome, "state.sqlite")), false, "no store is even opened");
+});

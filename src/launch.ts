@@ -33,6 +33,7 @@ import { ensureStore, msBinary, msHome, p } from "./paths.ts";
 import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import { parseNeed, pickAccounts, type Need, type PickInput } from "./pick.ts";
+import { syncCodexAutorotate } from "./autorotate.ts";
 import { openState } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
@@ -421,6 +422,15 @@ async function launchWith(provider: Provider, argv: string[]): Promise<number> {
 
   const st = openState();
   try {
+    // `ms codex` runs in the human's own shell, which is where
+    // `MS_CODEX_AUTOROTATE` is exported — and where the processes that READ
+    // the gate (`ms _recover`, `ms _codex_watch`, both dispatched by `tmux
+    // run-shell`) never run. Carry it into the store on the way past, so
+    // exporting it works inside an existing tmux server too, not only when
+    // this launch happened to start the server itself.
+    if (provider === "codex") {
+      try { syncCodexAutorotate(st); } catch { /* the gate is not worth failing a launch over */ }
+    }
     if (inside) {
       const pane = currentPane()!;
       const serverStart = tmux.serverIdentity();

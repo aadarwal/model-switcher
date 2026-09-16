@@ -197,6 +197,22 @@ test("a resume report adopts a session whose worker never came back to it", asyn
     stFresh.close();
   }
 
+  // A `started` under a DIFFERENT id is a `--resume` that landed a new
+  // conversation (resume-broken): the id is recorded, but the row must stay
+  // `resuming` so the worker (or reconciliation) parks it instead of the hook
+  // marking a lost conversation healthy.
+  const stray = setup();
+  const openStray = await seedSession(stray.env, { state: "resuming" });
+  assert.equal(run(["_hook", "claude"], stray.env, JSON.stringify({ hook_event_name: "SessionStart", source: "startup", session_id: "c-NEW" })).code, 0);
+  const stStray = openStray();
+  try {
+    const s = stStray.getSession("s1")!;
+    assert.equal(s.state, "resuming", "a started under a new id is not an adoption");
+    assert.equal(s.cliSessionId, "c-NEW", "the id is still recorded");
+  } finally {
+    stStray.close();
+  }
+
   // Only from `resuming`. Every other state belongs to somebody else — a stop,
   // a park, the worker itself — and a late report may not overwrite it.
   for (const state of ["running", "stopping", "parked"] as const) {

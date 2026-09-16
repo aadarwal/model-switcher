@@ -153,7 +153,11 @@ async function noteSessionStart(session: string, gen: number, kind: EventKind, c
     // `noteActivity` rescues `continuing` and nothing else, and
     // reconciliation's stuck rule reads that `started` as "it came back" and
     // leaves the row alone for ever.
-    if (s.state === "resuming" && (kind === "resumed" || kind === "started")) {
+    // A `started` adopts only when it carries the row's own id: a `--session-id`
+    // relaunch always does, while a `--resume` that silently landed a NEW
+    // conversation (resume-broken) must stay `resuming` for the worker to park.
+    const sameId = !cliSessionId || cliSessionId === s.cliSessionId;
+    if (s.state === "resuming" && (kind === "resumed" || (kind === "started" && sameId))) {
       patch.state = kind === "resumed" ? "continuing" : "running";
       patch.wakeupAt = null;
     }

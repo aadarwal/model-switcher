@@ -144,7 +144,10 @@ function toWindow(w: RawWindow): Window {
 }
 
 /** The two windows `wham/usage` reports, mapped onto this tool's three-window
- *  `Usage`: `primary_window` → session, `secondary_window` → weeklyAll.
+ *  `Usage`: windows are classified by their DURATION, never by position —
+ *  a Pro plan reports only one window (168 h) and it arrives as
+ *  `primary_window` (verified live 2026-09-16): under 24 h → session, else
+ *  weeklyAll; with two of one class, the shorter is the session.
  *  Codex has no Fable-scoped window, so `weeklyFable` is always null.
  *  Never sends the refresh token — only `access_token` (bearer) and
  *  `account_id` (the `ChatGPT-Account-Id` header) leave this function. */
@@ -180,8 +183,8 @@ export async function fetchCodexUsage(auth: CodexAuth, signal: AbortSignal): Pro
 
   const rl = data.rate_limit;
   return {
-    session: rl?.primary_window ? toWindow(rl.primary_window) : null,
-    weeklyAll: rl?.secondary_window ? toWindow(rl.secondary_window) : null,
+    session: classify(rl).session,
+    weeklyAll: classify(rl).weeklyAll,
     weeklyFable: null,
   };
 }
@@ -257,4 +260,13 @@ export async function refreshCodexCredentials(
   };
   writeCodexCredentials(dir, next);
   return next;
+}
+
+/** Sort the reported windows into `session` (under a day) and `weeklyAll`
+ *  (a day or longer) by `limit_window_seconds`; position is meaningless. */
+function classify(rl: { primary_window?: RawWindow | null; secondary_window?: RawWindow | null } | undefined): { session: Window | null; weeklyAll: Window | null } {
+  const raws = [rl?.primary_window, rl?.secondary_window].filter((w): w is RawWindow => !!w);
+  const short = raws.filter((w) => (w.limit_window_seconds ?? 0) < 86_400).sort((a, b) => (a.limit_window_seconds ?? 0) - (b.limit_window_seconds ?? 0));
+  const long = raws.filter((w) => (w.limit_window_seconds ?? 0) >= 86_400).sort((a, b) => (a.limit_window_seconds ?? 0) - (b.limit_window_seconds ?? 0));
+  return { session: short[0] ? toWindow(short[0]) : null, weeklyAll: long[0] ? toWindow(long[0]) : null };
 }

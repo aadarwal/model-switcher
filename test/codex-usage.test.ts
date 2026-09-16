@@ -79,3 +79,15 @@ test("a refresh rejection is auth for invalid_grant/400/401 and transient for 5x
   globalThis.fetch = (async () => new Response("down", { status: 502 })) as typeof fetch;
   await assert.rejects(refreshCodexCredentials(d, readCodexCredentials(d)!, AbortSignal.timeout(5000)), TransientError);
 });
+
+test("windows are classified by duration: a Pro plan's single 168 h primary window is the weekly one", async () => {
+  globalThis.fetch = (async () => new Response(JSON.stringify({ rate_limit: { primary_window: { used_percent: 27, reset_at: 1790000000, reset_after_seconds: 400000, limit_window_seconds: 604800 } } }), { status: 200 })) as typeof fetch;
+  const u = await fetchCodexUsage(readCodexCredentials(home(AUTH))!, AbortSignal.timeout(5000));
+  assert.equal(u.session, null);
+  assert.equal(u.weeklyAll?.usedPercent, 27);
+  // And the reverse order of a two-window plan still lands each in its class.
+  globalThis.fetch = (async () => new Response(JSON.stringify({ rate_limit: { primary_window: { used_percent: 7, reset_at: 1790000000, reset_after_seconds: 400000, limit_window_seconds: 604800 }, secondary_window: { used_percent: 42, reset_at: 1789600000, reset_after_seconds: 3000, limit_window_seconds: 18000 } } }), { status: 200 })) as typeof fetch;
+  const v = await fetchCodexUsage(readCodexCredentials(home(AUTH))!, AbortSignal.timeout(5000));
+  assert.equal(v.session?.usedPercent, 42);
+  assert.equal(v.weeklyAll?.usedPercent, 7);
+});

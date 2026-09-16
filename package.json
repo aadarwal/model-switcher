@@ -1,11 +1,21 @@
 {
   "name": "model-switcher",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run claude and codex on whichever of your accounts has room; rotate a walled session in place.",
   "type": "module",
-  "bin": { "ms": "bin/ms" },
-  "engines": { "node": ">=22.15" },
-  "files": ["dist/ms.js", "bin/ms", "bin/resolve-entry.mjs", "LICENSE", "README.md"],
+  "bin": {
+    "ms": "bin/ms"
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "files": [
+    "dist/ms.js",
+    "bin/ms",
+    "bin/resolve-entry.mjs",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "build": "node scripts/build.mjs && node scripts/check-dist.mjs",
     "test": "MS_ENTRY=src node --disable-warning=ExperimentalWarning --import tsx --test test/*.test.ts",

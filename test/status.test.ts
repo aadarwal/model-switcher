@@ -159,13 +159,13 @@ const DIRK_OK = {
 };
 
 /** wham/usage's own shape (`src/providers/codex-usage.ts`'s `toWindow`): no
- *  `primary_window` at all, the way a Pro plan's session-less usage read
+ *  `primary_window` at all (its only window is the 168 h one, classified by
  *  comes back (the spike record) — so `fmtPercent` renders 5H as "—", not
  *  "0%". `weeklyFable` has no source field on Codex at all and is always
  *  null regardless of what the endpoint returns. */
 const CODEX_OK = {
   rate_limit: {
-    secondary_window: { used_percent: 12.5, reset_at: Math.floor(Date.parse("2026-09-20T00:00:00Z") / 1000) },
+    secondary_window: { used_percent: 12.5, reset_at: Math.floor(Date.parse("2026-09-20T00:00:00Z") / 1000), reset_after_seconds: 300000, limit_window_seconds: 604800 },
   },
 };
 

@@ -92,6 +92,59 @@ function readBody(req: IncomingMessage): Promise<Buffer | "too-large"> {
   });
 }
 
+/**
+ * Whole-branch review, area C, finding C4: why a loopback bind is not, by
+ * itself, an access control.
+ *
+ * A cross-origin `fetch(url, { method: "POST", body })` with the default
+ * `text/plain` content type is a CORS *simple* request: the browser sends it
+ * with no preflight, and the missing `Access-Control-Allow-Origin` on the
+ * answer only stops the ATTACKER from reading the reply — the verb has
+ * already run. So any page the human had open could stop a session or move a
+ * fleet for as long as the dashboard was up, and the ephemeral port is
+ * scannable from JS in a loop.
+ *
+ * Two rules, and each one alone would be enough for the common case:
+ *
+ *   * `application/json` is NOT a simple content type, so a cross-origin POST
+ *     carrying it must preflight with `OPTIONS` — which this server answers
+ *     with a plain 404 and no CORS headers, so the real request is never
+ *     sent. A POST that arrives without it is refused 415 before the body is
+ *     even parsed.
+ *   * An `Origin` header that is present and is not this server's own origin
+ *     is somebody else's page, and `Sec-Fetch-Site` saying so is the same
+ *     answer from the other direction. Browsers attach both to a POST
+ *     themselves, and neither can be set by the page's own JavaScript.
+ *
+ * GET is deliberately untouched: the page's own poll must not be made to
+ * carry headers a plain browser navigation would not, and no route here ever
+ * sends a CORS header, so a cross-origin READ still cannot see the answer.
+ */
+function refuseUnsafePost(req: IncomingMessage, selfOrigin: string): { status: number; error: string } | null {
+  const method = req.method ?? "GET";
+  if (method === "GET" || method === "HEAD") return null;
+
+  // `none` is a user's own navigation (a typed URL, a bookmark); `same-origin`
+  // is the page this server served. Anything else — `cross-site`, and
+  // `same-site`, which loopback has no honest version of — is another site.
+  const site = String(req.headers["sec-fetch-site"] ?? "").toLowerCase();
+  if (site && site !== "same-origin" && site !== "none") {
+    return { status: 403, error: `refused: a ${site} request` };
+  }
+
+  const origin = req.headers.origin;
+  if (typeof origin === "string" && origin !== selfOrigin) {
+    return { status: 403, error: "refused: this request came from another origin" };
+  }
+
+  // The media type only; a browser may append `; charset=utf-8`.
+  const contentType = String(req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
+  if (contentType !== "application/json") {
+    return { status: 415, error: "refused: POST requires content-type: application/json" };
+  }
+  return null;
+}
+
 function sendJson(res: ServerResponse, status: number, json: unknown): void {
   const body = JSON.stringify(json);
   res.writeHead(status, { "content-type": "application/json" });
@@ -108,8 +161,17 @@ function sendJson(res: ServerResponse, status: number, json: unknown): void {
  * never invents a 400 of its own for bad JSON, it just gives `handle()`
  * nothing to work with.
  */
-async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
+async function handleApi(req: IncomingMessage, res: ServerResponse, path: string, selfOrigin: string): Promise<void> {
   const method = req.method ?? "GET";
+  const unsafe = refuseUnsafePost(req, selfOrigin);
+  if (unsafe) {
+    // Drain rather than destroy: the same reasoning as the 413 above — a
+    // socket torn down mid-request races the answer, and the client sees a
+    // reset connection instead of the refusal it should read.
+    req.resume();
+    sendJson(res, unsafe.status, { error: unsafe.error });
+    return;
+  }
   let body: unknown;
   if (method !== "GET" && method !== "HEAD") {
     const raw = await readBody(req);
@@ -155,6 +217,12 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
   const touch = (): void => {
     lastActivity = Date.now();
   };
+  // Filled in below, the moment the OS tells us which port we got — nothing
+  // can reach `handleApi` before `listen()` resolves, so there is no window in
+  // which a POST is judged against an empty origin. It starts as a string no
+  // header can equal rather than "": an `Origin: ` header is impossible, but a
+  // guard whose default matched something would be the wrong kind of default.
+  let selfOrigin = "\u0000unbound";
 
   const server = createServer((req, res) => {
     touch();
@@ -184,7 +252,7 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
           return;
         }
         if (pathName.startsWith("/api/")) {
-          await handleApi(req, res, pathName);
+          await handleApi(req, res, pathName, selfOrigin);
           return;
         }
         sendJson(res, 404, { error: `no such route: ${req.method} ${pathName}` });
@@ -214,6 +282,9 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
     throw new Error(`dashboard: refused to report a URL for a non-loopback bind (${address.address})`);
   }
   const url = `http://127.0.0.1:${address.port}`;
+  // The exact string a browser puts in `Origin` for a page served from this
+  // URL — scheme, host and port, no path, no trailing slash.
+  selfOrigin = url;
 
   if (open) openInBrowser(url);
 

@@ -774,6 +774,25 @@ export function flagsForResume(flags: string[]): string[] {
   return out;
 }
 
+/**
+ * How a transaction that gave up without a handoff puts the recovery DOWN.
+ *
+ * An automatic worker releases it. The wall is still true, nothing was touched,
+ * and the row is exactly what the next worker picks up — the one this failure
+ * dispatches, or reconciliation's orphan rule if that dispatch never lands.
+ *
+ * A manual move must close it instead. There is no next worker it would be
+ * right to send: reconciliation's orphan rule (45 s, for a `pending` row with
+ * no owner and no timer) would dispatch an AUTOMATIC rotation minutes after a
+ * human was told their move failed — choosing an account they never named and
+ * handing it a continuation they may have declined. A human who asked and was
+ * refused gets the refusal, and nothing else.
+ */
+function standDownFrom(st: State, rec: RecoveryRow, manual: ManualRecovery | undefined): void {
+  if (manual) st.finishRecovery(rec.id, "obsolete");
+  else st.releaseRecovery(rec.id);
+}
+
 /** Steps 3–8: pick, leave, respawn, and wait to be told it worked. */
 async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: Tmux, opts: RecoverOptions): Promise<RecoverCode> {
   const id = session.id;
@@ -804,7 +823,10 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
       // for a manual move: the human is right there, and a worker dispatched on
       // their behalf would run as an AUTOMATIC rotation — a different account
       // from the one they named, and a continuation they may have declined.
-      st.releaseRecovery(rec.id);
+      // Which is also why a manual move CLOSES the row rather than releasing
+      // it: an ownerless `pending` row is the same unasked-for rotation, sent
+      // by reconciliation's orphan rule instead of by us.
+      standDownFrom(st, rec, manual);
       if (!manual) redispatch(tmux, id, g);
       return fail(id, g, `cannot read the registry: ${found.registryError}`);
     }
@@ -871,7 +893,7 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     // Nothing has been touched yet: keep the recovery open on this generation
     // and send one more worker, in case a token lands in the meantime — but
     // only for an automatic rotation (see the registry path above).
-    st.releaseRecovery(rec.id);
+    standDownFrom(st, rec, manual);
     if (!manual) redispatch(tmux, id, g);
     return fail(id, g, `no candidate account has a launch token (run: ms accounts login <name>)`);
   }

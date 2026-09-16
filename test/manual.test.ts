@@ -19,7 +19,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import { hostname } from "node:os";
@@ -413,6 +413,33 @@ test("rotate takes over at once from a worker that was killed mid-handoff", asyn
   assert.match(say(), /^ms: s1 rotated → gmail$/m);
   assert.equal(session(w).account, "gmail");
   assert.equal(rows(w, "recoveries")[0].status, "done");
+});
+
+test("a rotate that fails leaves nothing behind for an automatic worker to pick up", async (t) => {
+  // The human asked, and every candidate turned out to be unlaunchable. What
+  // the transaction must NOT leave is an ownerless `pending` recovery:
+  // reconciliation's orphan rule dispatches one of those 45 seconds later as an
+  // AUTOMATIC rotation — a different account, chosen by the chooser, and a
+  // continuation the human never asked for — long after they read the refusal.
+  const w = await world(t, { wall: true, recovery: true, session: { state: "walled" } });
+  for (const name of ["gmail", "work"]) rmSync(path.join(w.msHome, "launch", `${name}.token`));
+  const say = stderr(t);
+
+  assert.equal(await rotateVerb(["s1"]), 1);
+
+  assert.deepEqual(
+    rows(w, "recoveries").filter((r) => r.status === "pending" || r.status === "owned"),
+    [],
+    "no open recovery row survives a manual move that failed",
+  );
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  assert.equal(session(w).wakeupAt, null, "and nothing is timed to come back for it either");
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "no worker is dispatched behind the human's back");
+  assert.ok(!typedAnything(w), "and the pane was never touched");
+  assert.equal(session(w).account, "dirk");
+  // The refusal is the whole of what the human got — and it names the verb that
+  // actually mints a launch token, which is `login`, not `add`.
+  assert.match(say(), /no candidate account has a launch token \(run: ms accounts login <name>\)/);
 });
 
 test("rotate refuses a busy pane that shows no wall, and forces past it with --force", async (t) => {

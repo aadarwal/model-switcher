@@ -1052,7 +1052,10 @@ test("a failed manual move never dispatches an automatic one behind the human's 
   assert.equal(s.account, "dirk");
   assert.equal(s.state, "walled");
   assert.deepEqual(rows(w, "attempts").map((a) => [a.account, a.outcome]), [["work", "auth"]]);
-  assert.equal(rows(w, "recoveries")[0].status, "pending", "what it claimed is released");
+  // Closed, not released. An ownerless `pending` row is the same unasked-for
+  // rotation by another road: reconciliation's orphan rule dispatches one 45
+  // seconds later, to an account the human never named.
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
   assert.match(recoverLog(w), /ms accounts login <name>/, "`login` is the verb that mints a launch token; `add` only writes the registry row");
 });
 

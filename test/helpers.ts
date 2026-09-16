@@ -1,13 +1,25 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+/**
+ * `src/paths.ts`'s `msHome()` now canonicalises `MS_HOME` with `realpathSync`
+ * once the directory exists (fixing a symlinked store, e.g. one made with
+ * `ln -s`, losing its Codex hook trust — see that file). On macOS `os.tmpdir()`
+ * is itself `/tmp`, a symlink to `/private/tmp`, so every temp dir this helper
+ * hands out is exactly that scenario: without resolving here too, a test that
+ * sets `MS_HOME` to this literal path and then compares it against a value the
+ * tool derived internally (e.g. `CODEX_HOME`) would see them diverge — not a
+ * real bug, just this helper handing out an unresolved alias of the same
+ * directory the tool itself resolves. Resolving both `home` and `msHome` here
+ * keeps every such comparison exact.
+ */
 export function tempHome(): { home: string; msHome: string } {
-  const home = mkdtempSync(path.join(tmpdir(), "ms-test-"));
+  const home = realpathSync(mkdtempSync(path.join(tmpdir(), "ms-test-")));
   const msHome = path.join(home, ".config", "model-switcher");
   mkdirSync(msHome, { recursive: true, mode: 0o700 });
-  return { home, msHome };
+  return { home, msHome: realpathSync(msHome) };
 }
 
 /** A directory of fake executables; `stub(name, script)` writes a bash script. */

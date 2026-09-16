@@ -1,10 +1,24 @@
-import { mkdirSync, chmodSync, existsSync } from "node:fs";
+import { mkdirSync, chmodSync, existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+/**
+ * The one place `MS_HOME` is resolved — canonicalised here so every derived
+ * path (the registry, CODEX_HOME, the Codex hook's trust-hash key, …) is the
+ * real path, not a symlink to it. Codex keys hook trust on the config path
+ * IT sees, which is the real path; deriving ours from an un-canonicalised
+ * `MS_HOME` (e.g. a symlink to the real store) would silently disagree with
+ * Codex about that path, so `ms doctor` reports hooks as not installed and
+ * Codex can refuse hooks `ms` believes it installed.
+ *
+ * `realpathSync` only when the target exists — before the first `ms setup`
+ * creates it, there is nothing to resolve, so the literal path is used (and
+ * `ensureStore` below creates that same literal path, 0700, as today).
+ */
 export function msHome(): string {
-  return process.env.MS_HOME || path.join(process.env.HOME || homedir(), ".config", "model-switcher");
+  const raw = process.env.MS_HOME || path.join(process.env.HOME || homedir(), ".config", "model-switcher");
+  return existsSync(raw) ? realpathSync(raw) : raw;
 }
 const sub = (...s: string[]) => path.join(msHome(), ...s);
 export const p = {

@@ -28,6 +28,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { stubDir, tempHome } from "./helpers.ts";
+import { ran } from "../src/setup/steps.ts";
 
 /** The fixture launch token. Asserted ABSENT from every byte the wizard and
  *  its children write; distinctive so the assertion cannot pass by accident. */
@@ -54,10 +55,14 @@ const AUTH_JSON = JSON.stringify({
 });
 
 const CLAUDE_STUB = `
-printf '%s\\n' "$*" >> "$MS_TEST_CLAUDE_LOG"
+printf '%s\\t%s\\t%s\\n' "$*" "$CLAUDE_CONFIG_DIR" "$(pwd -P)" >> "$MS_TEST_CLAUDE_LOG"
 fire() {
   [ "$MS_TEST_NO_HOOK" = "1" ] && return 0
-  grep -q '_hook claude' "$HOME/.claude/settings.json" 2>/dev/null || return 0
+  # Where Claude Code itself reads its settings: the config dir when one is
+  # named, and ~/.claude otherwise. A probe that points the CLI at an empty
+  # scratch dir therefore has no hooks to fire, and must fail this check.
+  settings="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+  grep -q '_hook claude' "$settings" 2>/dev/null || return 0
   printf '%s' '{"hook_event_name":"SessionStart","source":"startup","session_id":"probe-cli-1"}' \\
     | "$MS_BIN" _hook claude >/dev/null 2>&1
 }
@@ -101,6 +106,10 @@ if [ "$1" = "login" ]; then
   exit 0
 fi
 if [ "$1" = "exec" ]; then
+  # What the trust table said the moment the turn started — Codex's trust
+  # dialog is a modal, so a turn in an untrusted directory would never return.
+  c=$(grep -c 'trust_level = "trusted"' "$CODEX_HOME/config.toml" 2>/dev/null)
+  printf '%s\\t%s\\n' "$(pwd -P)" "\${c:-0}" >> "$MS_TEST_TRUST_LOG"
   if [ "$MS_TEST_NO_HOOK" != "1" ] && grep -q '_hook codex' "$CODEX_HOME/config.toml" 2>/dev/null; then
     printf '%s' '{"hook_event_name":"SessionStart","source":"startup","session_id":"probe-cli-2"}' \\
       | "$MS_BIN" _hook codex >/dev/null 2>&1
@@ -173,7 +182,14 @@ function scene(opts: Opts = {}) {
   stub("security", "exit 44");
   // The `ms` the hooks are installed as, and the one `ms doctor` expects to
   // find on PATH. A shell trampoline into this very checkout.
-  stub("ms", `exec ${JSON.stringify(process.execPath)} --import tsx ${JSON.stringify(path.join(repo, "bin/ms"))} "$@"`);
+  // `cd` into the checkout first: `--import tsx` is a BARE specifier, which
+  // node resolves against the CWD — and a hook fired from a probe turn runs in
+  // that turn's own temp directory, where nothing resolves. (Production has no
+  // such trampoline: `bin/ms` registers tsx from its own module URL.)
+  stub(
+    "ms",
+    `cd ${JSON.stringify(repo)} || exit 1\nexec ${JSON.stringify(process.execPath)} --import tsx ${JSON.stringify(path.join(repo, "bin/ms"))} "$@"`,
+  );
   const msBin = path.join(bin, "ms");
 
   // A CLOSED PATH: the stub directory and the system directories a bash stub
@@ -193,8 +209,9 @@ function scene(opts: Opts = {}) {
   writeFileSync(driver, DRIVER(repo));
   const claudeLog = path.join(home, "claude.log");
   const codexLog = path.join(home, "codex.log");
+  const trustLog = path.join(home, "trust.log");
   const asked = path.join(home, "asked.json");
-  for (const f of [claudeLog, codexLog]) writeFileSync(f, "");
+  for (const f of [claudeLog, codexLog, trustLog]) writeFileSync(f, "");
   writeFileSync(asked, "[]");
 
   const env: Record<string, string> = {
@@ -206,6 +223,7 @@ function scene(opts: Opts = {}) {
     NODE_OPTIONS: `--disable-warning=ExperimentalWarning --import=${pathToFileURL(fetchStub).href}`,
     MS_TEST_CLAUDE_LOG: claudeLog,
     MS_TEST_CODEX_LOG: codexLog,
+    MS_TEST_TRUST_LOG: trustLog,
     MS_TEST_ASKED: asked,
     MS_TEST_TOKEN: TOKEN,
     MS_TEST_ORG: ORG,
@@ -235,7 +253,11 @@ function scene(opts: Opts = {}) {
       return a;
     },
     asked: (): string[] => JSON.parse(readFileSync(asked, "utf8")),
-    claudeCalls: (): string[] => readFileSync(claudeLog, "utf8").split("\n").filter(Boolean),
+    /** Every `claude` invocation, as [argv, CLAUDE_CONFIG_DIR, cwd]. */
+    claudeCalls: (): string[][] => readFileSync(claudeLog, "utf8").split("\n").filter(Boolean).map((l) => l.split("\t")),
+    /** Every `codex exec`, as [cwd, how many trusted projects config.toml
+     *  held at the moment the turn started]. */
+    trustCalls: (): string[][] => readFileSync(trustLog, "utf8").split("\n").filter(Boolean).map((l) => l.split("\t")),
     sessionDirs: () => {
       const d = path.join(msHome, "sessions");
       return existsSync(d) ? readdirSync(d) : [];
@@ -289,7 +311,26 @@ test("a full run with one Claude and one Codex account finishes every step, veri
 
   // Three headless `claude -p` turns, which is what login + verify + the hook
   // probe cost: drop the `verify` and this is two.
-  assert.equal(s.claudeCalls().filter((l) => l.startsWith("-p ")).length, 3, s.claudeCalls().join(" | "));
+  const turns = s.claudeCalls().filter((c) => c[0].startsWith("-p "));
+  assert.equal(turns.length, 3, JSON.stringify(s.claudeCalls()));
+
+  // The hook probe is the ONE turn with no CLAUDE_CONFIG_DIR: it has to read
+  // the settings file the hooks were just installed into, which is the human's
+  // own — the account book's two launch-token probes are the scratch-dir ones.
+  const hookTurns = turns.filter((c) => c[1] === "");
+  assert.equal(hookTurns.length, 1, `expected exactly one probe with no CLAUDE_CONFIG_DIR: ${JSON.stringify(turns)}`);
+  assert.match(hookTurns[0][2], /ms-setup-probe-/, "the hook probe did not run in a throwaway cwd");
+  assert.equal(turns.filter((c) => c[1] !== "").length, 2, "the account book's own probes lost their scratch config dir");
+
+  // The Codex turn was trusted for its own cwd BEFORE it started.
+  const trust = s.trustCalls();
+  assert.equal(trust.length, 1, JSON.stringify(trust));
+  assert.ok(Number(trust[0][1]) >= 1, `codex exec started in an untrusted directory: ${JSON.stringify(trust)}`);
+  assert.match(trust[0][0], /ms-setup-probe-/, "the Codex probe did not run in a throwaway cwd");
+  assert.ok(
+    readFileSync(s.codexConfig("codex-1"), "utf8").includes(`[projects."${trust[0][0]}"]`),
+    `config.toml does not trust the probe's own cwd: ${readFileSync(s.codexConfig("codex-1"), "utf8")}`,
+  );
 
   // The one line that guards the two-browser-flow login is really printed.
   assert.match(r.stdout, /Sign in as the SAME account in both browser tabs\./);
@@ -423,6 +464,63 @@ test("a prerequisite the machine does not have stops the run before anything is 
   assert.ok(!existsSync(s.settingsFile), "a failed prereqs step touched Claude Code's settings");
 });
 
+test("a reserved Codex account name is re-asked, not fatal", () => {
+  const s = scene();
+  // `sessions` is the shared rollout store, not an account home: `add` would
+  // refuse it outright, so the wizard must never let it get that far.
+  const r = s.run(["1", "1", "", "n", "sessions", "codex-1", "n", "n"]);
+  assert.equal(r.code, 0, r.all);
+  assert.match(r.stdout, /sessions is reserved/);
+  assert.deepEqual(s.setupState().codex, ["codex-1"]);
+  assert.equal(s.accounts().filter((a) => a.provider === "codex").length, 1);
+  // The name question was asked twice: the first answer was turned down.
+  assert.equal(s.asked().filter((q) => /Name for codex account 1/.test(q)).length, 2);
+});
+
+test("a registry that cannot be read fails the account with Retry/Skip/Abort rather than crashing the run", () => {
+  const s = scene({ noCodex: true });
+  // Registering is part of the attempt, so an unreadable accounts.json is a
+  // failure the human is offered the same three answers about.
+  writeFileSync(path.join(s.msHome, "accounts.json"), "{ this is not json");
+
+  const r = s.run(["0", "1", "", "skip", "n", "n"]);
+  assert.match(r.stdout, /setting up claude-1 failed:/);
+  assert.deepEqual(s.setupState().claude, []);
+  // The run carried on through every later step rather than dying here.
+  assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts", "codex-accounts", "hooks", "statusline", "alias"]);
+  // ...and ended honestly: the doctor will not call an unreadable registry green.
+  assert.equal(r.code, 1, r.all);
+});
+
+test("a hook check the human skips says so, and does not claim nothing was ready", () => {
+  const s = scene({ noCodex: true, noHook: true });
+  const r = s.run(["0", "1", "", "skip", "n", "n"]);
+  assert.equal(r.code, 0, r.all);
+  assert.match(r.stdout, /hook check skipped \(claude\)/);
+  assert.ok(!/No account was ready/.test(r.stdout), "a skipped check reported itself as nothing being ready");
+  assert.deepEqual(s.setupState().done, ALL_STEPS);
+});
+
+test("a run interrupted at the statusline resumes straight into the opt-ins, re-running no hook check", () => {
+  const s = scene({ noCodex: true });
+  const first = s.run(["0", "1", ""]);
+  assert.equal(first.code, 70, first.all);
+  assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts", "codex-accounts", "hooks"]);
+  const turnsAfterFirst = s.claudeCalls().filter((c) => c[0].startsWith("-p ")).length;
+  assert.equal(turnsAfterFirst, 3);
+
+  const second = s.run(["y", "n"]);
+  assert.equal(second.code, 0, second.all);
+  assert.deepEqual(s.setupState().done, ALL_STEPS);
+  assert.deepEqual(s.setupState().optIns, { statusline: true, alias: false });
+  assert.match(second.stdout, /Skipping the hooks/);
+  // The hooks step really did not run again: no fourth headless turn.
+  assert.equal(s.claudeCalls().filter((c) => c[0].startsWith("-p ")).length, turnsAfterFirst);
+  assert.ok(!/hooks verified/.test(second.stdout), "the resume re-ran the hook check");
+  // The opt-ins were the only thing it asked about.
+  assert.deepEqual(s.asked(), ["Show the account name in Claude Code's statusline?", "Add shell aliases so plain claude and codex go through ms?"]);
+});
+
 test("a Codex home the hook installer refuses is reported in the installer's own words", () => {
   const s = scene();
   // A begin marker with no end: `installCodexHooks` refuses rather than
@@ -435,6 +533,16 @@ test("a Codex home the hook installer refuses is reported in the installer's own
   assert.equal(r.code, 1, r.all);
   assert.match(r.stdout, /a '# ms-hooks-begin' marker with no '# ms-hooks-end'/);
   assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts", "codex-accounts"]);
+});
+
+test("a verb that answers with a non-zero exit code is a failure, not a success", async () => {
+  // Every account verb the wizard calls returns 0 or throws today. This is
+  // what keeps that true from the wizard's side, so a verb that ever starts
+  // reporting failure by exit code cannot be read as a step that worked.
+  await ran("ms accounts login work", 0);
+  await ran("ms accounts verify work", Promise.resolve(0));
+  await assert.rejects(() => ran("ms accounts login work", 3), /ms accounts login work exited 3/);
+  await assert.rejects(() => ran("ms accounts verify work", Promise.resolve(2)), /ms accounts verify work exited 2/);
 });
 
 test("the verb rejects an option it does not have", () => {

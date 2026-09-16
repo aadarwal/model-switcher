@@ -34,13 +34,14 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 import { cmdAdd, cmdLogin, cmdVerify } from "../accounts.ts";
-import { loginCodex, verifyCodex } from "../accounts-codex.ts";
-import { checkClaudeBinary, checkCodexBinary, checkNode, checkTmux, renderLine, runDoctor } from "../doctor.ts";
+import { CODEX_RESERVED_NAMES, loginCodex, verifyCodex } from "../accounts-codex.ts";
+import { checkClaudeBinary, checkCodexBinary, checkNode, checkTmux, claudeSettingsPath, renderLine, runDoctor } from "../doctor.ts";
 import { readEvents } from "../events.ts";
 import { installCodexHooks } from "../hooks/codex-install.ts";
 import { installClaudeHooks } from "../hooks/install.ts";
 import { readLaunchToken } from "../launch-credentials.ts";
 import { msBinary, p } from "../paths.ts";
+import { ensureCodexTrust } from "../providers/codex-cli.ts";
 import { findAccount, loadRegistry, NAME_PATTERN, type Provider } from "../registry.ts";
 import { status } from "../status.ts";
 import { installAlias, rcPathFor } from "./alias.ts";
@@ -178,12 +179,25 @@ async function askName(ctx: Ctx, provider: Provider, slot: number, taken: string
       reask(ctx, "An account name is lower-case letters, digits, '-' and '_', up to 32 characters.");
       continue;
     }
+    if (provider === "codex" && CODEX_RESERVED_NAMES.includes(name)) {
+      reask(ctx, `${name} is reserved: MS_HOME/codex/${name} is the shared rollout store, not an account home.`);
+      continue;
+    }
     if (taken.includes(name)) {
       reask(ctx, `This run already set up an account called ${name}, so pick another name.`);
       continue;
     }
     return name;
   }
+}
+
+/** A verb that answers with an EXIT CODE rather than an exception. Every one
+ *  the wizard calls returns 0 or throws today, and this is what keeps that
+ *  true from the wizard's side: a non-zero code is a failure, treated exactly
+ *  like a throw, rather than a step that quietly reports success. */
+export async function ran(what: string, code: number | Promise<number>): Promise<void> {
+  const c = await code;
+  if (c !== 0) throw new Error(`${what} exited ${c}`);
 }
 
 type Decision = "retry" | "skip" | "abort";
@@ -228,26 +242,18 @@ async function attempt(ctx: Ctx, what: string, work: () => Promise<void> | void)
 
 // --- Shared places --------------------------------------------------------
 
-/** Claude Code's own settings file, where its hooks and its statusline live.
- *  `HOME` (not `homedir()` alone) so a test's temp home is honoured, exactly
- *  as src/doctor.ts resolves it. */
-function claudeSettingsPath(): string {
-  return path.join(process.env.HOME || homedir(), ".claude", "settings.json");
-}
-
 /** Register `name` unless it is already registered. Adopting an existing row
  *  rather than refusing is what makes an interrupted run resumable: a wizard
  *  that died between `add` and `login` left a real row behind, and the human
  *  typing that same name again means "finish it", not "start a duplicate". */
-function ensureRow(ctx: Ctx, name: string, provider: Provider): void {
+async function ensureRow(ctx: Ctx, name: string, provider: Provider): Promise<void> {
   const r = loadRegistry();
   if (r.parseError) throw new Error(r.parseError);
   if (findAccount(r.registry, name, provider)) {
     ctx.say(`${name} is already registered, so the wizard signs in to it rather than adding it again.`);
     return;
   }
-  const code = cmdAdd(provider === "codex" ? [name, "--provider", "codex"] : [name]);
-  if (code !== 0) throw new Error(`could not register ${name}`);
+  await ran(`ms accounts add ${name}`, cmdAdd(provider === "codex" ? [name, "--provider", "codex"] : [name]));
 }
 
 /**
@@ -269,8 +275,14 @@ async function accountsStep(
   if (already) ctx.say(`${already} ${provider} account${already === 1 ? "" : "s"} from an earlier run ${already === 1 ? "is" : "are"} already signed in.`);
   for (let slot = already + 1; slot <= count; slot++) {
     const name = await askName(ctx, provider, slot, recorded);
-    ensureRow(ctx, name, provider);
-    const ok = await attempt(ctx, `the sign-in for ${name}`, () => login(name));
+    // Registering is INSIDE the attempt: an unreadable registry, or an `add`
+    // that refuses, is a failure with the same three answers as a failed
+    // login — and re-running it on Retry is safe, because a row that is
+    // already there is adopted rather than added twice.
+    const ok = await attempt(ctx, `setting up ${name}`, async () => {
+      await ensureRow(ctx, name, provider);
+      await login(name);
+    });
     if (ok) {
       recorded.push(name);
       ctx.persist();
@@ -323,8 +335,8 @@ async function claudeAccounts(ctx: Ctx): Promise<void> {
   }
   await accountsStep(ctx, "claude", n, ctx.state.claude, async (name) => {
     ctx.say("Sign in as the SAME account in both browser tabs.");
-    await cmdLogin(name);
-    await cmdVerify(name);
+    await ran(`ms accounts login ${name}`, cmdLogin(name));
+    await ran(`ms accounts verify ${name}`, cmdVerify(name));
   });
 }
 
@@ -347,8 +359,8 @@ async function codexAccounts(ctx: Ctx): Promise<void> {
   }
   ctx.deviceAuth = await ctx.confirm("Sign in to Codex with a device code instead of a browser redirect?", false);
   await accountsStep(ctx, "codex", n, ctx.state.codex, async (name) => {
-    await loginCodex(name, { deviceAuth: ctx.deviceAuth });
-    await verifyCodex(name);
+    await ran(`ms accounts login ${name} --provider codex`, loginCodex(name, { deviceAuth: ctx.deviceAuth }));
+    await ran(`ms accounts verify ${name} --provider codex`, verifyCodex(name));
   });
 }
 
@@ -360,12 +372,21 @@ function probeId(provider: Provider): string {
   return `ms-setup-probe-${provider}-${randomBytes(4).toString("hex")}`;
 }
 
-/** The `MS_*` identity a hook requires before it writes anything. Without all
- *  four, both hooks return 0 having done nothing — which is exactly how a pane
- *  the tool did not launch stays untouched, and exactly why a probe has to set
- *  them. */
+/** The `MS_*` identity a hook requires before it writes anything, exactly as
+ *  `ms _exec` exports it into a real pane. Without all four of SESSION,
+ *  GENERATION, SOCKET and PANE both hooks return 0 having done nothing —
+ *  which is how a pane the tool did not launch stays untouched, and why a
+ *  probe has to set them. */
 function probeEnv(session: string): Record<string, string> {
-  return { MS_SESSION: session, MS_GENERATION: "1", MS_SOCKET: PROBE_SOCKET, MS_PANE: PROBE_PANE };
+  return { MS_SESSION: session, MS_GENERATION: "1", MS_SOCKET: PROBE_SOCKET, MS_PANE: PROBE_PANE, MS_BIN: msBinary() };
+}
+
+/** A throwaway working directory for one probe turn. The human's own project
+ *  directory is not this tool's to take a turn in: it carries project-scoped
+ *  settings, and for Codex it is a directory whose TRUST is a decision the
+ *  human owns. An empty temp directory carries neither. */
+function probeCwd(): string {
+  return mkdtempSync(path.join(tmpdir(), "ms-setup-probe-"));
 }
 
 /**
@@ -382,9 +403,10 @@ function probeEnv(session: string): Record<string, string> {
  * it says; the exit status is not read either, because a usage wall is an
  * authenticated answer that still fires SessionStart.
  */
-function probe(session: string, cmd: string, args: string[], env: Record<string, string>): void {
+function probe(session: string, cmd: string, args: string[], cwd: string, env: Record<string, string>): void {
   try {
     const r = spawnSync(cmd, args, {
+      cwd,
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf8",
       timeout: PROBE_TIMEOUT_MS,
@@ -399,36 +421,70 @@ function probe(session: string, cmd: string, args: string[], env: Record<string,
   }
 }
 
-/** The Claude probe: one headless turn under the account's launch token, in a
- *  scratch config dir so an ambient login cannot answer in its place. */
-async function verifyClaudeHooks(ctx: Ctx, account: string): Promise<boolean> {
+/** How a hook check ended: proved, declined by the human, or never run at all
+ *  because there was nothing to run it with. The three are different things to
+ *  say, and saying "nothing was ready" over a check the human SKIPPED would be
+ *  the wizard telling them something they know to be untrue. */
+type CheckResult = "ok" | "skipped" | "unavailable";
+
+/**
+ * The Claude probe: one headless turn under the account's launch token, run
+ * the way `ms _exec` runs a real session.
+ *
+ * In particular it does NOT point the CLI at a scratch `CLAUDE_CONFIG_DIR`.
+ * That was the bug this check existed to catch and could not: Claude Code
+ * reads its hooks from the config dir it is given, so a turn in an empty one
+ * has no hooks to fire and the check could only ever have failed (or, worse,
+ * passed against a stub). The hooks just installed live in the config dir the
+ * HUMAN uses, so that is the one the probe must read — the token in the
+ * environment is what makes the turn the account's, exactly as in a pane.
+ */
+async function verifyClaudeHooks(ctx: Ctx, account: string): Promise<CheckResult> {
   const token = readLaunchToken(account);
   if (!token) {
     ctx.say(`There is no launch token for ${account}, so the Claude hooks could not be proved by a real turn.`);
-    return false;
+    return "unavailable";
   }
-  return await attempt(ctx, "the Claude hook check", () => {
-    const scratch = mkdtempSync(path.join(tmpdir(), "ms-setup-probe-"));
+  const ok = await attempt(ctx, "the Claude hook check", () => {
+    const cwd = probeCwd();
     try {
-      probe(probeId("claude"), "claude", ["-p", PROBE_PROMPT, "--model", PROBE_MODEL], {
+      probe(probeId("claude"), "claude", ["-p", PROBE_PROMPT, "--model", PROBE_MODEL], cwd, {
         CLAUDE_CODE_OAUTH_TOKEN: token,
-        CLAUDE_CONFIG_DIR: scratch,
+        MS_ACCOUNT: account,
       });
     } finally {
-      rmSync(scratch, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
+  return ok ? "ok" : "skipped";
 }
 
-/** The Codex probe: `codex exec`, which fires SessionStart eagerly — unlike
- *  the TUI, which fires it lazily on the first turn and would prove nothing
- *  here. */
-async function verifyCodexHooks(ctx: Ctx, account: string): Promise<boolean> {
-  return await attempt(ctx, "the Codex hook check", () => {
-    probe(probeId("codex"), "codex", ["exec", "--skip-git-repo-check", PROBE_PROMPT], {
-      CODEX_HOME: p.codexHome(account),
-    });
+/**
+ * The Codex probe: `codex exec`, which fires SessionStart eagerly — unlike the
+ * TUI, which fires it lazily on the first turn and would prove nothing here.
+ *
+ * The probe's cwd is trusted first, exactly as `src/launch.ts` trusts a pane's
+ * cwd before launching into it: Codex's trust dialog is a MODAL, so an
+ * unattended turn in an untrusted directory does not fail, it waits for ever.
+ * A refusal from the trust writer is raised so the human gets its own words
+ * and the Retry/Skip/Abort choice.
+ */
+async function verifyCodexHooks(ctx: Ctx, account: string): Promise<CheckResult> {
+  const ok = await attempt(ctx, "the Codex hook check", () => {
+    const home = p.codexHome(account);
+    const cwd = probeCwd();
+    try {
+      const { problem } = ensureCodexTrust(home, cwd);
+      if (problem) throw new Error(problem);
+      probe(probeId("codex"), "codex", ["exec", "--skip-git-repo-check", PROBE_PROMPT], cwd, {
+        CODEX_HOME: home,
+        MS_ACCOUNT: account,
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
+  return ok ? "ok" : "skipped";
 }
 
 /**
@@ -461,14 +517,16 @@ async function hooks(ctx: Ctx): Promise<void> {
     });
   }
 
-  const verified: string[] = [];
-  if (ctx.state.claude.length && (await verifyClaudeHooks(ctx, ctx.state.claude[0]))) verified.push("claude");
-  if (ctx.state.codex.length && (await verifyCodexHooks(ctx, ctx.state.codex[0]))) verified.push("codex");
-  if (verified.length === 0) {
+  const results: [Provider, CheckResult][] = [];
+  if (ctx.state.claude.length) results.push(["claude", await verifyClaudeHooks(ctx, ctx.state.claude[0])]);
+  if (ctx.state.codex.length) results.push(["codex", await verifyCodexHooks(ctx, ctx.state.codex[0])]);
+  const verified = results.filter(([, r]) => r === "ok").map(([n]) => n);
+  const skipped = results.filter(([, r]) => r === "skipped").map(([n]) => n);
+  if (verified.length) ctx.say(`hooks verified (${verified.join(", ")})`);
+  if (skipped.length) ctx.say(`hook check skipped (${skipped.join(", ")})`);
+  if (!verified.length && !skipped.length) {
     ctx.say("No account was ready to run a hook check, so the hooks are installed but unproven.");
-    return;
   }
-  ctx.say(`hooks verified (${verified.join(", ")})`);
 }
 
 // --- 5. statusline --------------------------------------------------------

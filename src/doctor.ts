@@ -133,7 +133,10 @@ export function checkCodexBinary(hasCodexAccounts: boolean): Result {
 
 // --- Claude hooks ----------------------------------------------------------
 
-function claudeSettingsPath(): string {
+/** Claude Code's settings file — where its hooks and its statusline live.
+ *  Exported because `ms setup` installs into the very file this checks, and
+ *  two spellings of one path is how an installer and its check drift apart. */
+export function claudeSettingsPath(): string {
   return path.join(process.env.HOME || homedir(), ".claude", "settings.json");
 }
 

@@ -12,8 +12,14 @@
 // relays whatever ONE line a verb wrote to its own stderr.
 
 import type { Verb } from "../cli.ts";
-import { rotateVerb, stopVerb, switchVerb } from "../manual.ts";
+import { rotateVerb, stopVerb, switchAll, switchVerb } from "../manual.ts";
 import { statusJson } from "../status.ts";
+
+// The CLI's own `--timeout` default (`ALL_TIMEOUT_SECONDS` in src/manual.ts,
+// 600 s) for a request that never names one — the same 10-minute budget for
+// STARTING handoffs, whether the fleet move comes from `ms switch --all` or
+// from here.
+const DEFAULT_SWITCH_ALL_TIMEOUT_MS = 600_000;
 
 export type ApiRequest = { method: string; path: string; body?: unknown };
 export type ApiResponse = { status: number; json: unknown };
@@ -74,11 +80,14 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 function isBool(v: unknown): v is boolean {
   return typeof v === "boolean";
 }
+function isPositiveNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0;
+}
 
 type RotateBody = { session: string; force: boolean };
 type SwitchBody = { session: string; to: string; continue: boolean; force: boolean };
 type StopBody = { session: string };
-type SwitchAllBody = { to: string; force: boolean };
+type SwitchAllBody = { to: string; force: boolean; timeoutMs: number };
 
 function parseRotateBody(body: unknown): RotateBody | null {
   if (!isRecord(body) || typeof body.session !== "string") return null;
@@ -98,7 +107,8 @@ function parseStopBody(body: unknown): StopBody | null {
 function parseSwitchAllBody(body: unknown): SwitchAllBody | null {
   if (!isRecord(body) || typeof body.to !== "string") return null;
   if (body.force !== undefined && !isBool(body.force)) return null;
-  return { to: body.to, force: body.force === true };
+  if (body.timeoutMs !== undefined && !isPositiveNumber(body.timeoutMs)) return null;
+  return { to: body.to, force: body.force === true, timeoutMs: (body.timeoutMs as number | undefined) ?? DEFAULT_SWITCH_ALL_TIMEOUT_MS };
 }
 
 function badBody(expected: string): ApiResponse {
@@ -160,11 +170,25 @@ export async function handle(req: ApiRequest): Promise<ApiResponse> {
 
   if (method === "POST" && path === "/api/switch-all") {
     const parsed = parseSwitchAllBody(body);
-    if (!parsed) return badBody("{ to: string, force?: boolean }");
-    // Task 3 lands `switchAll` (rotate every walled session onto `to`,
-    // src/manual.ts or a sibling module) and this route calls it, returning
-    // `{ results: [{ session, code, message }] }`. Until then it is a stub.
-    return { status: 501, json: { error: "not yet" } };
+    if (!parsed) return badBody("{ to: string, force?: boolean, timeoutMs?: number }");
+    // `switchAll` (src/manual.ts, Task 3) IS the fleet move — this route calls
+    // it in-process, the same way every other route here calls a verb
+    // function directly rather than shelling out. `continueAfter: "auto"`
+    // matches the CLI's own default (`ms switch --all`, no `--continue`):
+    // a walled screen carries its unfinished work over on its own; an idle
+    // one does not. `message` is non-null only when `to` itself had no
+    // answer (unreadable registry, unregistered, or an account name two
+    // providers both claim) — nothing was started, and `results` is empty.
+    try {
+      const { results, code, message } = await switchAll(parsed.to, {
+        force: parsed.force,
+        continueAfter: "auto",
+        timeoutMs: parsed.timeoutMs,
+      });
+      return { status: 200, json: { code, message, results } };
+    } catch (e) {
+      return { status: 500, json: { error: (e as Error).message } };
+    }
   }
 
   return { status: 404, json: { error: `no such route: ${method} ${path}` } };

@@ -95,7 +95,9 @@ to the same organisation as one already registered — the grant that login just
 wrote is removed (the keychain item, the credentials file, or both) and the
 account is left exactly as it was, rather than polling an organisation it does
 not own. A credential that was already there and was not replaced is never
-touched.
+touched: the keychain item goes only when it appeared where there was none or
+its content demonstrably changed, and a `claude auth login` that failed or that
+you cancelled discards nothing at all.
 
 ### Setup and health
 
@@ -118,7 +120,9 @@ on your PATH. Its identity line runs the same organisation check `ms accounts
 verify` runs — asked of the grant on disk, not of the flag beside it — so the
 two can never disagree about one credential; a grant that resolves to another
 registered account's organisation is reported with the `--relogin` that fixes
-it. `--fix` repairs what is safe to repair — including re-pointing hooks that
+it. Where the check could not run — nothing to collide with, an access token
+inside the refresh window, a read that failed — the line says `identity
+verified at login (not re-checked)` instead. `--fix` repairs what is safe to repair — including re-pointing hooks that
 name an `ms` that has moved. A dead credential, an identity, a malformed
 registry and a stray `ms` shadowing this one are reported, never auto-fixed.
 

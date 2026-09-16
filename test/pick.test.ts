@@ -69,6 +69,18 @@ test("a non-finite usedPercent is malformed, not eligible", () => {
   assert.equal(pickAccounts([fableBad], "any").picks.length, 1);
 });
 
+// A Codex row's `weeklyFable` is always null (Codex has no Fable-scoped
+// window): out for need=fable, in for need=any — never gated by a window
+// that provider simply does not have.
+test("a null weeklyFable is out for need=fable and in for need=any", () => {
+  const a = [acct("cdx", { provider: "codex", weeklyFable: null })];
+  const fable = pickAccounts(a, "fable");
+  assert.deepEqual(fable.out, [{ name: "cdx", why: "no fable window" }]);
+  const any = pickAccounts(a, "any");
+  assert.equal(any.picks.length, 1);
+  assert.equal(any.picks[0]?.name, "cdx");
+});
+
 test("parseNeed", () => {
   assert.equal(parseNeed(undefined), "any"); assert.equal(parseNeed("fable"), "fable"); assert.equal(parseNeed("fabel"), null);
 });

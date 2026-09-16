@@ -872,6 +872,34 @@ test("with every handoff slot taken the recovery stands down and re-dispatches i
   assert.ok(Math.abs(wakeup - (nowSeconds() + 30)) < 5, `wakeup ${wakeup} is not ~30s out`);
 });
 
+// Whole-branch review, area C, finding C1: the same no-slot path taken by a
+// HUMAN. An automatic worker stands down and comes back; a manual move that
+// did the same would be the human asking for one account and getting,
+// thirty seconds later and unattended, an AUTOMATIC rotation to whichever
+// account the chooser ranked first — `claimAutomatic` owning the row this
+// worker left `pending`, `handoff()` picking for itself. So: close the row,
+// arm nothing, and say why in a line the human can act on.
+test("a MANUAL move that finds no free handoff slot is a plain refusal: no re-dispatch, no wake-up, no pending row", async (t) => {
+  const w = await world(t);
+  const { acquire } = await import("../src/lock.ts");
+  const held = [0, 1, 2, 3].map((k) => acquire(`handoff-${k}`));
+  assert.ok(held.every(Boolean), "the test could not fill the handoff slots");
+  t.after(() => held.forEach((r) => r?.()));
+
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "gmail", continueAfter: true } }), 1);
+
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "a move that cannot happen must not disturb the pane");
+  assert.ok(!respawnLine(w));
+  // The two halves of "nobody comes back for this": no tmux timer, and no
+  // `pending` row for reconciliation's orphan rule (45 s) to dispatch on.
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "a refused manual move must never arm an automatic rotation");
+  const rec = rows(w, "recoveries")[0];
+  assert.equal(rec.status, "obsolete", "the row a human was refused on is closed, not left owed to the next worker");
+  assert.ok(!["pending", "owned"].includes(rec.status as string), "nothing is left for another worker to pick up");
+  assert.equal(session(w).wakeupAt, null, "a wake-up would put the same unasked-for rotation on ms status");
+  assert.match(recoverLog(w), /handoff slots are busy/);
+});
+
 test("ms _recover is a registered verb and needs a session id", async (t) => {
   const w = await world(t);
   const { run } = await import("./helpers.ts");

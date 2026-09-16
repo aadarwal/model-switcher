@@ -7,7 +7,7 @@
   "engines": { "node": ">=22.15" },
   "files": ["dist/ms.js", "bin/ms", "bin/resolve-entry.mjs", "LICENSE", "README.md"],
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "build": "node scripts/build.mjs && node scripts/check-dist.mjs",
     "test": "MS_ENTRY=src node --disable-warning=ExperimentalWarning --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit -p .",
     "release": "node scripts/release.mjs"

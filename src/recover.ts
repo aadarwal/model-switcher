@@ -978,7 +978,20 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
 
     const slot = takeHandoffSlot();
     if (!slot) {
-      st.releaseRecovery(rec.id);
+      // Whole-branch review, area C, finding C1. Only an AUTOMATIC worker may
+      // come back for this. A manual move that stood down the same way would
+      // leave a `pending` row and a 30 s timer behind the human's refusal —
+      // and thirty seconds later `claimAutomatic` owns that row and
+      // `handoff()` picks through the chooser: the human asked for one
+      // account and got another, unattended, with a continuation they may
+      // have declined. (`workedPastWall` does not save an idle session from
+      // it; there is no activity after the row's own createdAt to stand the
+      // worker down on.) So a manual move closes the row — an ownerless
+      // `pending` one is the same unasked-for rotation, sent by
+      // reconciliation's orphan rule instead of by a timer — arms nothing,
+      // and is refused in terms the human can act on: wait for a slot.
+      standDownFrom(st, rec, opts.manual);
+      if (opts.manual) return fail(id, g, `all ${HANDOFF_SLOTS} handoff slots are busy; try again in a moment`);
       logLine(id, g, `too many handoffs in flight; retrying in ${REDISPATCH_SECONDS}s`);
       // Record the wake-up before arming the delayed re-dispatch: without
       // this, `ms status` shows nothing waiting and reconciliation's orphan

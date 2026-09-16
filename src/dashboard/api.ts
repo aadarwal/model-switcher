@@ -13,6 +13,7 @@
 
 import type { Verb } from "../cli.ts";
 import { rotateVerb, stopVerb, switchAll, switchVerb } from "../manual.ts";
+import { reconcile } from "../reconcile.ts";
 import { statusJson } from "../status.ts";
 
 // The CLI's own `--timeout` default (`ALL_TIMEOUT_SECONDS` in src/manual.ts,
@@ -41,7 +42,19 @@ export type ApiResponse = { status: number; json: unknown };
  */
 let chain: Promise<unknown> = Promise.resolve();
 
-export function captureVerb(fn: Verb, argv: string[]): Promise<{ code: number; message: string }> {
+/**
+ * The capture itself, over any async piece of work — not just a `Verb`.
+ *
+ * Whole-branch review, area C, finding C2: `/api/switch-all` used to call
+ * `switchAll` OUTSIDE this chain, and `recoverSession` writes every refusal
+ * to `process.stderr`. Those lines went wherever the global write pointer
+ * happened to point at that instant: the `ms dashboard` terminal, which
+ * promised exactly one line — or another session's in-flight capture, which
+ * then answered the browser with a refusal about a session the human had not
+ * touched. Everything that can write to stderr goes through here, so there is
+ * exactly one writer at a time and its output belongs to it alone.
+ */
+function captured<T>(fn: () => Promise<T>): Promise<{ value: T; out: string }> {
   const task = chain.then(async () => {
     // Not bound: nothing here ever calls `original` (the captured line never
     // reaches the real stderr), so the exact reference that was there before
@@ -54,8 +67,7 @@ export function captureVerb(fn: Verb, argv: string[]): Promise<{ code: number; m
       return true;
     }) as typeof process.stderr.write;
     try {
-      const code = await fn(argv);
-      return { code, message: out.trimEnd() };
+      return { value: await fn(), out };
     } finally {
       process.stderr.write = original;
     }
@@ -65,6 +77,63 @@ export function captureVerb(fn: Verb, argv: string[]): Promise<{ code: number; m
     () => undefined,
   );
   return task;
+}
+
+export async function captureVerb(fn: Verb, argv: string[]): Promise<{ code: number; message: string }> {
+  const { value, out } = await captured(() => fn(argv));
+  return { code: value, message: out.trimEnd() };
+}
+
+// --- One move per session at a time --------------------------------------
+
+/**
+ * Finding C6: no control on the page was disabled for the 15–75 s a handoff
+ * takes, and the capture chain QUEUES rather than dedupes — so two clicks on
+ * Rotate were two handoffs, and the session ended two accounts and two
+ * `/exit`+resume cycles further on than the human asked for. (`switch` and
+ * `stop` were saved only by their own "already on X"/"already stopped"
+ * refusals.)
+ *
+ * This is the process-local half of the answer: a session already being moved
+ * HERE is refused before it can even join the queue, so the second request
+ * answers immediately instead of running minutes later. The cross-process half
+ * is unchanged and still the real guard — `sessionLockName(<id>)`, which is
+ * what makes a page action and a CLI invocation agree.
+ */
+const inFlight = new Set<string>();
+
+async function runSessionVerb(session: string, fn: Verb, argv: string[]): Promise<ApiResponse> {
+  if (inFlight.has(session)) {
+    return { status: 200, json: { code: 1, message: `a move is already in progress for ${session}` } };
+  }
+  inFlight.add(session);
+  try {
+    return await runVerb(fn, argv);
+  } finally {
+    inFlight.delete(session);
+  }
+}
+
+// --- Repair before acting -------------------------------------------------
+
+/**
+ * `cli.ts` runs `reconcile()` once per PROCESS, at the start of every public
+ * verb — which is once, ever, for a dashboard left open for hours. So a page
+ * that had been watching a closed pane kept a `running` row for it, and a
+ * fleet move from that page refused it ("obsolete: the pane is gone") where
+ * the same command typed into a terminal would have repaired it first.
+ *
+ * Every POST verb therefore reconciles first, exactly as the CLI does, and a
+ * GET never does: `/api/state` is `ms status`, which reports and does not
+ * repair. A failed repair is a courtesy that did not land, never the reason
+ * the verb the human asked for does not run.
+ */
+function reconcileQuietly(): void {
+  try {
+    reconcile();
+  } catch {
+    /* a repair is a courtesy; the verb still runs */
+  }
 }
 
 // --- Body validation ----------------------------------------------------
@@ -80,8 +149,12 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 function isBool(v: unknown): v is boolean {
   return typeof v === "boolean";
 }
-function isPositiveNumber(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v) && v > 0;
+/** A budget in milliseconds. `0` is legal and means "start nothing" — the
+ *  CLI's own `--timeout 0` (src/manual.ts's `parseManualArgs`) says exactly
+ *  that, and an API that 400'd the identical request would be a second,
+ *  narrower command line for the same verb. */
+function isBudgetMs(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0;
 }
 
 type RotateBody = { session: string; force: boolean };
@@ -107,7 +180,7 @@ function parseStopBody(body: unknown): StopBody | null {
 function parseSwitchAllBody(body: unknown): SwitchAllBody | null {
   if (!isRecord(body) || typeof body.to !== "string") return null;
   if (body.force !== undefined && !isBool(body.force)) return null;
-  if (body.timeoutMs !== undefined && !isPositiveNumber(body.timeoutMs)) return null;
+  if (body.timeoutMs !== undefined && !isBudgetMs(body.timeoutMs)) return null;
   return { to: body.to, force: body.force === true, timeoutMs: (body.timeoutMs as number | undefined) ?? DEFAULT_SWITCH_ALL_TIMEOUT_MS };
 }
 
@@ -128,8 +201,14 @@ async function runVerb(fn: Verb, argv: string[]): Promise<ApiResponse> {
   }
 }
 
+/** The four routes that ACT. A POST to one of them repairs the store first,
+ *  the way the CLI does at the start of every public verb. */
+const POST_VERB_PATHS = new Set(["/api/rotate", "/api/switch", "/api/stop", "/api/switch-all"]);
+
 export async function handle(req: ApiRequest): Promise<ApiResponse> {
   const { method, path, body } = req;
+
+  if (method === "POST" && POST_VERB_PATHS.has(path)) reconcileQuietly();
 
   if (method === "GET" && path === "/api/state") {
     try {
@@ -146,7 +225,7 @@ export async function handle(req: ApiRequest): Promise<ApiResponse> {
     const parsed = parseRotateBody(body);
     if (!parsed) return badBody("{ session: string, force?: boolean }");
     const argv = [parsed.session, ...(parsed.force ? ["--force"] : [])];
-    return runVerb(rotateVerb, argv);
+    return runSessionVerb(parsed.session, rotateVerb, argv);
   }
 
   if (method === "POST" && path === "/api/switch") {
@@ -159,13 +238,13 @@ export async function handle(req: ApiRequest): Promise<ApiResponse> {
       ...(parsed.continue ? ["--continue"] : []),
       ...(parsed.force ? ["--force"] : []),
     ];
-    return runVerb(switchVerb, argv);
+    return runSessionVerb(parsed.session, switchVerb, argv);
   }
 
   if (method === "POST" && path === "/api/stop") {
     const parsed = parseStopBody(body);
     if (!parsed) return badBody("{ session: string }");
-    return runVerb(stopVerb, [parsed.session]);
+    return runSessionVerb(parsed.session, stopVerb, [parsed.session]);
   }
 
   if (method === "POST" && path === "/api/switch-all") {
@@ -180,11 +259,19 @@ export async function handle(req: ApiRequest): Promise<ApiResponse> {
     // answer (unreadable registry, unregistered, or an account name two
     // providers both claim) — nothing was started, and `results` is empty.
     try {
-      const { results, code, message } = await switchAll(parsed.to, {
-        force: parsed.force,
-        continueAfter: "auto",
-        timeoutMs: parsed.timeoutMs,
-      });
+      // Inside the SAME capture as every other verb (finding C2). The captured
+      // stderr is thrown away on purpose: `results` already carries one
+      // message per session, which is what the page renders and what the CLI
+      // prints — the stderr copy exists only because the transaction is shared
+      // with a command-line caller.
+      const { value } = await captured(() =>
+        switchAll(parsed.to, {
+          force: parsed.force,
+          continueAfter: "auto",
+          timeoutMs: parsed.timeoutMs,
+        }),
+      );
+      const { results, code, message } = value;
       return { status: 200, json: { code, message, results } };
     } catch (e) {
       return { status: 500, json: { error: (e as Error).message } };

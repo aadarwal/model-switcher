@@ -25,6 +25,7 @@ import path from "node:path";
 import { tempHome, stubDir, run } from "./helpers.ts";
 import { openState } from "../src/state.ts";
 import { startDashboard, DEFAULT_IDLE_MS } from "../src/dashboard/server.ts";
+import { EMBEDDED_FUNCTION_NAMES } from "../src/dashboard/page.ts";
 
 const PANE = "%7";
 const SOCKET = "/tmp/ms-dashboard-server-test.sock";
@@ -238,7 +239,11 @@ test("startDashboard binds 127.0.0.1 and GET / returns HTML with both table head
   // Review round 1, finding 8: the served page embeds client-logic.ts's OWN
   // functions (via `.toString()`), not a hand-written copy — if page.ts ever
   // stops importing one of these, its name disappears from the script too.
-  for (const name of ["esc", "buildRotateBody", "buildSwitchBody", "buildStopBody", "buildSwitchAllBody", "nextPollState", "pollStateOnVisible"]) {
+  // The list is page.ts's own, so a function ADDED to the client and not
+  // embedded fails here too — the row builders call each other by name in the
+  // page's script scope, where a missing one is a silent ReferenceError.
+  assert.ok(EMBEDDED_FUNCTION_NAMES.length >= 15, `only ${EMBEDDED_FUNCTION_NAMES.length} functions are embedded`);
+  for (const name of EMBEDDED_FUNCTION_NAMES) {
     assert.ok(html.includes(`function ${name}(`), `missing embedded function: ${name}`);
   }
 
@@ -462,3 +467,136 @@ test("the `ms dashboard` verb rejects an unknown flag with usage (exit 2), never
   assert.match(res.stderr, /usage: ms dashboard/);
 });
 
+
+// --- Whole-branch review, area C, finding C4 ------------------------------
+//
+// "No auth is needed because it is loopback-only" rested on a false premise.
+// The server parsed the body as JSON whatever the `Content-Type` said and
+// checked no `Origin`, and a cross-origin `fetch(…, {method:"POST", body})`
+// with the default `text/plain` is a CORS *simple* request — no preflight, so
+// it reaches the handler. Any page the human had open could drive the verbs
+// (probe D stopped a session and told its pane to `/exit`) for as long as the
+// dashboard was up; the port is ephemeral but loopback-scannable from JS.
+//
+// Two rules close it. `application/json` is not a simple content type, so a
+// cross-origin POST must preflight — and this server answers no preflight.
+// An `Origin` that is present and is not ours (and a `Sec-Fetch-Site` that
+// says cross-site) is refused outright. GETs are untouched: no CORS header is
+// ever sent, so the browser blocks the reader from seeing the answer.
+
+/** A POST with exactly the headers the test names — `fetch` in a browser
+ *  would refuse to set `Origin`/`Sec-Fetch-Site` by hand, which is the point:
+ *  these are the values the BROWSER attaches, and this is how a test forges
+ *  what a hostile page's own request would look like. */
+function rawPost(
+  url: string,
+  path: string,
+  headers: Record<string, string>,
+  body: string,
+): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; text: string }> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = httpRequest({ hostname: u.hostname, port: u.port, path, method: "POST", headers }, (res) => {
+      let text = "";
+      res.on("data", (c: Buffer) => {
+        text += c;
+      });
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, text }));
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+test("finding C4: a POST without content-type: application/json is 415, and the verb never runs", async (t) => {
+  const w = await world(t);
+  const dash = await startDashboard({ port: 0, open: false });
+  t.after(() => dash.close());
+
+  const body = JSON.stringify({ session: "s1" });
+  for (const ct of ["text/plain;charset=UTF-8", "application/x-www-form-urlencoded", "multipart/form-data"]) {
+    const res = await rawPost(dash.url, "/api/stop", { "content-type": ct }, body);
+    assert.equal(res.status, 415, `${ct} was accepted`);
+  }
+  // No content-type header at all, either.
+  const bare = await rawPost(dash.url, "/api/stop", {}, body);
+  assert.equal(bare.status, 415);
+
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "a refused POST still reached the verb");
+  const st = openState();
+  try {
+    assert.equal(st.getSession("s1")!.state, "running", "the session was stopped by a refused request");
+  } finally {
+    st.close();
+  }
+
+  // The same request with the page's own content type does reach the route
+  // (a session that does not exist, not a 415) — proves 415 is a real gate,
+  // not a mutation that refuses every POST.
+  const ok = await rawPost(dash.url, "/api/rotate", { "content-type": "application/json" }, JSON.stringify({ session: "nope" }));
+  assert.equal(ok.status, 200);
+  // …including with the charset parameter a browser may append.
+  const withCharset = await rawPost(
+    dash.url,
+    "/api/rotate",
+    { "content-type": "application/json; charset=utf-8" },
+    JSON.stringify({ session: "nope" }),
+  );
+  assert.equal(withCharset.status, 200);
+});
+
+test("finding C4: a POST whose Origin is not the server's own is 403, whatever its content type says", async (t) => {
+  const w = await world(t);
+  const dash = await startDashboard({ port: 0, open: false });
+  t.after(() => dash.close());
+
+  const body = JSON.stringify({ session: "s1" });
+  for (const origin of ["http://evil.example", "https://evil.example", "null", "http://127.0.0.1:1", "http://localhost:9"]) {
+    const res = await rawPost(dash.url, "/api/stop", { "content-type": "application/json", origin }, body);
+    assert.equal(res.status, 403, `Origin ${origin} was accepted`);
+  }
+
+  // `Sec-Fetch-Site` alone is enough, with no Origin at all.
+  const site = await rawPost(dash.url, "/api/stop", { "content-type": "application/json", "sec-fetch-site": "cross-site" }, body);
+  assert.equal(site.status, 403);
+  const sameSite = await rawPost(dash.url, "/api/stop", { "content-type": "application/json", "sec-fetch-site": "same-site" }, body);
+  assert.equal(sameSite.status, 403);
+
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "a cross-origin POST still reached the verb");
+  const st = openState();
+  try {
+    assert.equal(st.getSession("s1")!.state, "running", "the session was stopped by a cross-origin request");
+  } finally {
+    st.close();
+  }
+});
+
+test("finding C4: the page's own POST — its Origin, its Sec-Fetch-Site, its content type — still works", async (t) => {
+  const w = await world(t);
+  const dash = await startDashboard({ port: 0, open: false });
+  t.after(() => dash.close());
+
+  const res = await rawPost(
+    dash.url,
+    "/api/stop",
+    { "content-type": "application/json", origin: dash.url, "sec-fetch-site": "same-origin" },
+    JSON.stringify({ session: "s1" }),
+  );
+
+  assert.equal(res.status, 200, res.text);
+  assert.deepEqual(JSON.parse(res.text), { code: 0, message: "ms: s1 stopped" });
+  assert.ok(logLines(w).some((l) => l.includes("send-keys")), "the page's own request did not reach the verb");
+});
+
+test("finding C4: GETs are unchanged, and no CORS header is ever sent (the browser is what blocks a cross-origin read)", async (t) => {
+  await world(t);
+  const dash = await startDashboard({ port: 0, open: false });
+  t.after(() => dash.close());
+
+  for (const p of ["/", "/api/state"]) {
+    const res = await fetch(`${dash.url}${p}`, { headers: { origin: "http://evil.example" } });
+    assert.equal(res.status, 200, `GET ${p} was refused`);
+    assert.equal(res.headers.get("access-control-allow-origin"), null, `GET ${p} sent an ACAO header`);
+    assert.equal(res.headers.get("access-control-allow-credentials"), null);
+  }
+});

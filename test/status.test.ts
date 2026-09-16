@@ -309,7 +309,7 @@ async function seedSessions(w: World): Promise<{ sess1: string; sess2: string; w
  *  separator is exactly two, and padding only ever adds more). */
 const cells = (line: string): string[] => line.trim().split(/\s{2,}/);
 
-test("ms status: accounts table (NAME LABEL 5H WEEK FABLE RESETS STATE) and sessions table, with the unreported flag", async () => {
+test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE) and sessions table, with the unreported flag", async () => {
   const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
   await seedSessions(w);
   const { localTimeCli } = await import("../src/status.ts");
@@ -320,21 +320,22 @@ test("ms status: accounts table (NAME LABEL 5H WEEK FABLE RESETS STATE) and sess
   const lines = r.stdout.split("\n");
   const accHeaderIdx = lines.findIndex((l) => l.startsWith("NAME"));
   assert.ok(accHeaderIdx >= 0, r.stdout);
-  assert.deepEqual(cells(lines[accHeaderIdx]!), ["NAME", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"]);
+  assert.deepEqual(cells(lines[accHeaderIdx]!), ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"]);
 
   const dirkLine = lines.find((l) => l.startsWith("dirk"))!;
   assert.ok(dirkLine, r.stdout);
   assert.deepEqual(cells(dirkLine), [
-    "dirk", "Dirk", "42.5%", "10%", "33.3%", localTimeCli(Date.parse("2026-09-18T12:30:00Z")), "ok",
+    "dirk", "claude", "Dirk", "42.5%", "10%", "33.3%", localTimeCli(Date.parse("2026-09-18T12:30:00Z")), "ok",
   ]);
 
   const gmailLine = lines.find((l) => l.startsWith("gmail"))!;
   assert.ok(gmailLine, r.stdout);
   const gmailCells = cells(gmailLine);
   assert.equal(gmailCells[0], "gmail");
-  assert.equal(gmailCells[1], "Gmail");
-  assert.equal(gmailCells[2], "—"); // no poll grant → no reading
-  assert.equal(gmailCells[6], "no-grant");
+  assert.equal(gmailCells[1], "claude");
+  assert.equal(gmailCells[2], "Gmail");
+  assert.equal(gmailCells[3], "—"); // no poll grant → no reading
+  assert.equal(gmailCells[7], "no-grant");
 
   const sessHeaderIdx = lines.findIndex((l) => l.startsWith("SESSION"));
   assert.ok(sessHeaderIdx >= 0, r.stdout);
@@ -441,10 +442,11 @@ test("ms status: a Codex account row renders — for FABLE and a missing 5H wind
   assert.ok(codexLine, r.stdout);
   const cCells = cells(codexLine);
   assert.equal(cCells[0], "codexacct");
-  assert.equal(cCells[1], "CodexAcct");
-  assert.equal(cCells[2], "—"); // 5H: no primary_window on this plan
-  assert.equal(cCells[4], "—"); // FABLE: codex has no fable-scoped window at all
-  assert.equal(cCells[6], "ok"); // a healthy read — never no-token, never no-grant
+  assert.equal(cCells[1], "codex");
+  assert.equal(cCells[2], "CodexAcct");
+  assert.equal(cCells[3], "—"); // 5H: no primary_window on this plan
+  assert.equal(cCells[5], "—"); // FABLE: codex has no fable-scoped window at all
+  assert.equal(cCells[7], "ok"); // a healthy read — never no-token, never no-grant
 
   const sess3 = lines.find((l) => l.startsWith("sess-3"))!;
   assert.ok(sess3, r.stdout);
@@ -488,7 +490,8 @@ test("ms status: a Codex account with no auth.json reads STATE no-grant through 
   assert.ok(codexLine, r.stdout);
   const cCells = cells(codexLine);
   assert.equal(cCells[0], "codexnogrant");
-  assert.equal(cCells[6], "no-grant");
+  assert.equal(cCells[1], "codex");
+  assert.equal(cCells[7], "no-grant");
 });
 
 test("ms status --json prints { accounts, sessions, takenAt } and parses", async () => {
@@ -606,7 +609,7 @@ test("ms status --watch actually loops: MS_WATCH_ITERATIONS=2 redraws twice, not
   // newline between them), so "starts with NAME" per split("\n") line only
   // matches the SECOND redraw onward — count occurrences in the raw text
   // instead.
-  const headerCount = (r.stdout.match(/NAME\s+LABEL\s+5H\s+WEEK\s+FABLE\s+RESETS\s+STATE/g) ?? []).length;
+  const headerCount = (r.stdout.match(/NAME\s+PROVIDER\s+LABEL\s+5H\s+WEEK\s+FABLE\s+RESETS\s+STATE/g) ?? []).length;
   assert.equal(headerCount, 2, r.stdout);
   const sessionHeaderCount = (r.stdout.match(/SESSION\s+PANE\s+PROVIDER\s+ACCOUNT\s+NEED\s+STATE\s+GEN\s+PENDING\s+WAKEUP\s+WALLED\?/g) ?? []).length;
   assert.equal(sessionHeaderCount, 2, r.stdout);

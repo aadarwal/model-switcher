@@ -121,6 +121,7 @@ function accountRow(a: AccountUsage, registry: Registry): string[] {
   const reset = earliestWeeklyResetCli(a.usage);
   return [
     a.name,
+    a.provider,
     c.label,
     fmtPercentCli(a.usage?.session ?? null),
     fmtPercentCli(a.usage?.weeklyAll ?? null),
@@ -275,7 +276,11 @@ async function render(json: boolean): Promise<string> {
     // the last known readings, carried forward by src/snapshot.ts).
     if (parseError) lines.push(parseError);
     lines.push(...table(
-      ["NAME", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"],
+      // PROVIDER sits next to NAME for the same reason it sits next to
+      // ACCOUNT in the sessions table below: identity in this tool is
+      // (provider, name), and an account name is reused across providers
+      // (a Claude `tulp` and a Codex `tulp` are two different accounts).
+      ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"],
       snapshot.accounts.map((a) => accountRow(a, registry)),
     ));
     lines.push("");

@@ -310,6 +310,11 @@ const ACCOUNT: AccountRowView = {
   },
 };
 
+test("accountRowHtml: PROVIDER sits right after NAME, before LABEL", () => {
+  const html = accountRowHtml(ACCOUNT, "—");
+  assert.ok(html.startsWith("<tr><td>dirk</td><td>claude</td><td>Dirk</td>"), html);
+});
+
 test("accountRowHtml: LABEL and STATE are rendered as given, percentages round to one place, a missing window is the dash", () => {
   const html = accountRowHtml(ACCOUNT, "—");
   assert.ok(html.includes("<td>Dirk</td>"), html);
@@ -407,6 +412,7 @@ const FIXTURE_STATE = {
       usage: { session: { usedPercent: 41.5, resetsAt: null }, weeklyAll: { usedPercent: 12, resetsAt: null }, weeklyFable: null },
     },
     { name: "gmail", provider: "claude", label: "Gmail", state: "ok", usage: null },
+    { name: "tulp", provider: "codex", label: "Tulp", state: "ok", usage: null },
   ],
   sessions: [
     {
@@ -440,6 +446,10 @@ test("the served page's own script renders LABEL, PENDING and WALLED? from a fix
   assert.ok(accounts.includes('<td class="worry">no-grant</td>'), `a no-grant account is not amber: ${accounts}`);
   assert.ok(accounts.includes("41.5%"), accounts);
   assert.ok(accounts.includes("<td>Gmail</td>"), accounts);
+  // PROVIDER column: same words the sessions table uses — the point of the
+  // column is telling apart a claude account from a codex one of the same
+  // name, so a rendered "codex" cell must actually reach the page.
+  assert.ok(accounts.includes("<td>codex</td>"), `PROVIDER never reached the page: ${accounts}`);
 
   const sessions = el("#sessions-table tbody").innerHTML;
   assert.ok(sessions.includes("<td>owned</td>"), `PENDING never reached the page: ${sessions}`);

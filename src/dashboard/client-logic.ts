@@ -173,6 +173,7 @@ export function accountRowHtml(a: AccountRowView, dash: string): string {
   return (
     "<tr>" +
     "<td>" + esc(a.name) + "</td>" +
+    "<td>" + esc(a.provider || dash) + "</td>" +
     "<td>" + esc(a.label) + "</td>" +
     "<td>" + fmtPercent(u.session, dash) + "</td>" +
     "<td>" + fmtPercent(u.weeklyAll, dash) + "</td>" +

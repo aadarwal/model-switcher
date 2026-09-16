@@ -109,7 +109,19 @@ async function onRow<T>(session: string, gen: number, fn: (st: State, s: Session
  * both on the event.
  *
  * The other half is the state: a `startup` report for this generation is the
- * launch itself answering, which is what `launching → running` means.
+ * launch itself answering, which is what `launching → running` means. A
+ * `resume` report for a session that is `resuming` is the same answer to the
+ * other question — the replacement CLI the recovery worker respawned, saying it
+ * is up. The worker normally writes that itself when its readiness wait sees
+ * this very event; the case this exists for is the worker that is not there any
+ * more. Live, one was `kill -9`'d a second after its respawn: the CLI came up
+ * and reported itself, and the row still read `resuming` until reconciliation's
+ * five-minute stuck rule got to it. The wake-up goes with it, because a session
+ * whose CLI is back is not waiting for a window to reset.
+ *
+ * Only from `resuming`: `continuing` is already there, and every other state
+ * belongs to somebody else (a stop, a park, reconciliation). Reconciliation's
+ * own rule stays as the net for a resume that never reports at all.
  *
  * A `compacted` report is neither: compaction keeps the conversation, its id
  * and the state it was in, so nothing moves.
@@ -129,6 +141,12 @@ async function noteSessionStart(session: string, gen: number, kind: EventKind, c
     // A launch is `running` only once the CLI reports itself under this
     // generation (spec §7 step 5); until then it is `launching`.
     if (kind === "started" && s.state === "launching") patch.state = "running";
+    // A handoff's replacement, reporting in. Adopt it now rather than leaving
+    // the row to reconciliation's stuck-state threshold.
+    if (kind === "resumed" && s.state === "resuming") {
+      patch.state = "continuing";
+      patch.wakeupAt = null;
+    }
     if (Object.keys(patch).length) st.updateSession(session, patch);
     return prev;
   });

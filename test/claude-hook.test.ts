@@ -152,6 +152,55 @@ test("a launch is running once the CLI reports itself, and a continuation once t
   }
 });
 
+test("a resume report adopts a session whose worker never came back to it", async () => {
+  // Live matrix case 9: the recovery worker was `kill -9`'d a second after its
+  // respawn. The replacement CLI came up and reported itself through this very
+  // hook — and nothing moved the row, so `ms status` read `resuming` until
+  // reconciliation's five-minute stuck rule finally looked at it.
+  const a = setup();
+  const openA = await seedSession(a.env, { state: "resuming" });
+  const seeded = openA();
+  seeded.setWakeup("s1", Math.floor(Date.now() / 1000) + 600);
+  seeded.close();
+
+  assert.equal(run(["_hook", "claude"], a.env, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "c-42" })).code, 0);
+
+  const stA = openA();
+  try {
+    const s = stA.getSession("s1")!;
+    assert.equal(s.state, "continuing", "the CLI is back, and the row says so at once");
+    assert.equal(s.wakeupAt, null, "a session whose CLI is back is not also waiting for a window to reset");
+  } finally {
+    stA.close();
+  }
+
+  // Only from `resuming`. Every other state belongs to somebody else — a stop,
+  // a park, the worker itself — and a late report may not overwrite it.
+  for (const state of ["running", "stopping", "parked"] as const) {
+    const b = setup();
+    const openB = await seedSession(b.env, { state });
+    assert.equal(run(["_hook", "claude"], b.env, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "c-42" })).code, 0);
+    const stB = openB();
+    try {
+      assert.equal(stB.getSession("s1")!.state, state, state);
+    } finally {
+      stB.close();
+    }
+  }
+
+  // And never for a generation the session has left: that report is the dead
+  // process's, and the row belongs to its replacement.
+  const c = setup();
+  const openC = await seedSession(c.env, { state: "resuming", generation: 5 });
+  assert.equal(run(["_hook", "claude"], c.env, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "c-42" })).code, 0);
+  const stC = openC();
+  try {
+    assert.equal(stC.getSession("s1")!.state, "resuming", "generation 2's report may not adopt generation 5's row");
+  } finally {
+    stC.close();
+  }
+});
+
 test("StopFailure rate_limit records the wall kind from the screen, opens a recovery and asks tmux to dispatch the worker", async () => {
   const { env, msHome, tlog } = setup();
   const openState = await seedSession(env);

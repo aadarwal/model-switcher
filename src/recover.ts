@@ -446,14 +446,16 @@ function subdirs(dir: string): string[] {
  * recorded path that no longer resolves falls through to the search for the
  * same reason: the path names an account's home, the store outlives it.
  */
-function codexConversation(session: SessionRow): Conversation {
+export function codexConversation(session: SessionRow): Conversation {
   const id = session.cliSessionId;
   if (!id) return "gone";
   if (session.transcriptPath && existsSync(session.transcriptPath)) return "on-disk";
   const root = p.codexSessions();
   // Matched as a whole filename, never as a pattern: the id comes off a row
-  // and has no business being spliced into a path.
-  const needle = `-${id}.jsonl`;
+  // and has no business being spliced into a path. The shape is exactly
+  // `rollout-<YYYY-MM-DDTHH-MM-SS>-<id>.jsonl`, so a shorter id that happens
+  // to be a dash-bounded suffix of a longer one can never match.
+  const shape = new RegExp(`^rollout-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.jsonl$`);
   let budget = ROLLOUT_SCAN_DIRS;
   for (const y of subdirs(root)) {
     for (const m of subdirs(path.join(root, y))) {
@@ -465,7 +467,7 @@ function codexConversation(session: SessionRow): Conversation {
         } catch {
           continue;
         }
-        if (names.some((n) => n.startsWith("rollout-") && n.endsWith(needle))) return "on-disk";
+        if (names.some((n) => shape.test(n))) return "on-disk";
       }
     }
   }

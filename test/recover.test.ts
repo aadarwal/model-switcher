@@ -23,7 +23,8 @@ import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
 import { appendEvent } from "../src/events.ts";
 import { openState, type SessionRow } from "../src/state.ts";
-import { recoverSession } from "../src/recover.ts";
+import { codexConversation, recoverSession } from "../src/recover.ts";
+import { p } from "../src/paths.ts";
 
 /** The continuation text, spelled out here rather than imported: the whole
  *  point of the assertion is that the shipped constant still says this. */
@@ -1865,4 +1866,15 @@ test("with no codex account left to launch, the refusal names the verb that logs
   assert.equal(rec.owner, null);
   // Nothing was disturbed, so one more worker is sent in case a login lands.
   assert.match(logLines(w).find((l) => l.includes("run-shell")) ?? "", /_recover' 's1'/);
+});
+
+test("a rollout search matches the whole filename: id `1` does not claim `cx-1`'s rollout", () => {
+  const { msHome } = tempHome();
+  process.env.MS_HOME = msHome;
+  const root = p.codexSessions();
+  const day = path.join(root, "2026", "09", "16");
+  mkdirSync(day, { recursive: true });
+  writeFileSync(path.join(day, "rollout-2026-09-16T10-00-00-cx-1.jsonl"), "{}\n");
+  assert.equal(codexConversation({ cliSessionId: "1", transcriptPath: null } as never), "gone");
+  assert.equal(codexConversation({ cliSessionId: "cx-1", transcriptPath: null } as never), "on-disk");
 });

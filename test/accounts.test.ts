@@ -154,7 +154,7 @@ if [ "$1" = "-p" ]; then
   logcfg probe
   [ "$CLAUDE_CODE_OAUTH_TOKEN" = "$MS_TEST_TOKEN" ] || { echo "probe ran without the token env" >&2; exit 9; }
   printf '%s\\n' "$MS_TEST_PROBE_OUT"
-  exit "${MS_TEST_PROBE_EXIT:-0}"
+  exit "$MS_TEST_PROBE_EXIT"
 fi
 exit 3
 `;

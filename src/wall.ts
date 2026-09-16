@@ -22,7 +22,7 @@ const LEAD = String.raw`^\s*(?:⎿\s*)?`;
 const PATTERNS: [WallKind, RegExp][] = [
   ["fable", new RegExp(LEAD + String.raw`(?:you'?ve reached your fable limit|fable limit reached)`, "i")],
   ["weekly", new RegExp(LEAD + String.raw`(?:you'?(?:ve|\s+have) reached your weekly usage limit|weekly limit reached)`, "i")],
-  ["session", new RegExp(LEAD + String.raw`(?:you'?ve hit your (?:usage )?limit|new messages wait for your usage limit to reset|claude usage limit reached|usage limit reached)`, "i")],
+  ["session", new RegExp(LEAD + String.raw`(?:you'?ve hit your (?:usage |session |weekly )?limit|new messages wait for your usage limit to reset|claude usage limit reached|usage limit reached)`, "i")],
 ];
 
 /** A choice cursor in an option list (`❯ 1. Yes`). It wears the prompt glyph but

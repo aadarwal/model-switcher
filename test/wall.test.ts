@@ -11,6 +11,8 @@ test("wallKindFromText reads each wall kind from the TUI's own rendering", () =>
   assert.equal(wallKindFromText(plain(FABLE)), "fable");
   assert.equal(wallKindFromText(plain("  ⎿  You've reached your weekly usage limit. Resets Monday.")), "weekly");
   assert.equal(wallKindFromText(plain("  ⎿  You've hit your usage limit. New messages wait for your usage limit to reset.")), "session");
+  // Seen live 2026-09-15 from a headless `claude -p` on a 5 h-walled account.
+  assert.equal(wallKindFromText(plain("You've hit your session limit · resets 10:10pm (America/New_York)")), "session");
   assert.equal(wallKindFromText(plain("Claude usage limit reached")), "session");
   assert.equal(wallKindFromText(plain("  ⎿  Wrote 12 lines to src/wall.ts")), null);
 });

@@ -298,6 +298,9 @@ test("--as an account with no launch token: exit 1, naming the account only", as
   const r = run(["claude", "--as", "work"], w.env());
   assert.equal(r.code, 1);
   assert.match(r.stderr, /work/);
+  // The verb that MINTS a launch token is `login`; `add` only writes the
+  // registry row, and an account named here already has one.
+  assert.match(r.stderr, /ms accounts login work/);
   assert.equal(r.stderr.includes(SAMPLE_TOKEN), false);
   const st = await readState(w);
   assert.equal(st.sessions.length, 0);

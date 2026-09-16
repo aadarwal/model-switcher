@@ -280,7 +280,7 @@ export const launchClaude: Verb = async (argv) => {
   // Existence only: the value belongs in the pane's environment (src/exec.ts),
   // never here, and never in a message.
   if (!readLaunchToken(account)) {
-    say(`no launch token for account '${account}' (run: ms accounts add ${account})`);
+    say(`no launch token for account '${account}' (run: ms accounts login ${account})`);
     return EXIT_ACCOUNT;
   }
 

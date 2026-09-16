@@ -873,7 +873,7 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     // only for an automatic rotation (see the registry path above).
     st.releaseRecovery(rec.id);
     if (!manual) redispatch(tmux, id, g);
-    return fail(id, g, `no candidate account has a launch token (run: ms accounts add <name>)`);
+    return fail(id, g, `no candidate account has a launch token (run: ms accounts login <name>)`);
   }
 
   // 5. Say what is happening, and keep the pane alive across the exit. The

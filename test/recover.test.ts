@@ -1053,6 +1053,7 @@ test("a failed manual move never dispatches an automatic one behind the human's 
   assert.equal(s.state, "walled");
   assert.deepEqual(rows(w, "attempts").map((a) => [a.account, a.outcome]), [["work", "auth"]]);
   assert.equal(rows(w, "recoveries")[0].status, "pending", "what it claimed is released");
+  assert.match(recoverLog(w), /ms accounts login <name>/, "`login` is the verb that mints a launch token; `add` only writes the registry row");
 });
 
 test("candidates used up by failures park the session; they do not wait for a window", async (t) => {

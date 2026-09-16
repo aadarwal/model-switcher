@@ -14,6 +14,7 @@
 import type { Verb } from "../cli.ts";
 import { rotateVerb, stopVerb, switchAll, switchVerb } from "../manual.ts";
 import { reconcile } from "../reconcile.ts";
+import type { Provider } from "../registry.ts";
 import { statusJson } from "../status.ts";
 
 // The CLI's own `--timeout` default (`ALL_TIMEOUT_SECONDS` in src/manual.ts,
@@ -160,7 +161,17 @@ function isBudgetMs(v: unknown): v is number {
 type RotateBody = { session: string; force: boolean };
 type SwitchBody = { session: string; to: string; continue: boolean; force: boolean };
 type StopBody = { session: string };
-type SwitchAllBody = { to: string; force: boolean; timeoutMs: number };
+type SwitchAllBody = { to: string; force: boolean; timeoutMs: number; provider?: Provider };
+
+/** `switch-all`'s own `--provider claude|codex` (src/manual.ts): needed only
+ *  when `to` is a name both providers hold. `undefined` is "not given" and
+ *  passes straight through to `switchAll`, which then applies its own
+ *  unchanged ambiguity refusal; anything present that isn't one of the two
+ *  providers is the same malformed-body 400 every other field gets, never a
+ *  guess at what the human meant. */
+function isProvider(v: unknown): v is Provider {
+  return v === "claude" || v === "codex";
+}
 
 function parseRotateBody(body: unknown): RotateBody | null {
   if (!isRecord(body) || typeof body.session !== "string") return null;
@@ -181,7 +192,13 @@ function parseSwitchAllBody(body: unknown): SwitchAllBody | null {
   if (!isRecord(body) || typeof body.to !== "string") return null;
   if (body.force !== undefined && !isBool(body.force)) return null;
   if (body.timeoutMs !== undefined && !isBudgetMs(body.timeoutMs)) return null;
-  return { to: body.to, force: body.force === true, timeoutMs: (body.timeoutMs as number | undefined) ?? DEFAULT_SWITCH_ALL_TIMEOUT_MS };
+  if (body.provider !== undefined && !isProvider(body.provider)) return null;
+  return {
+    to: body.to,
+    force: body.force === true,
+    timeoutMs: (body.timeoutMs as number | undefined) ?? DEFAULT_SWITCH_ALL_TIMEOUT_MS,
+    ...(body.provider !== undefined ? { provider: body.provider } : {}),
+  };
 }
 
 function badBody(expected: string): ApiResponse {
@@ -249,7 +266,7 @@ export async function handle(req: ApiRequest): Promise<ApiResponse> {
 
   if (method === "POST" && path === "/api/switch-all") {
     const parsed = parseSwitchAllBody(body);
-    if (!parsed) return badBody("{ to: string, force?: boolean, timeoutMs?: number }");
+    if (!parsed) return badBody('{ to: string, force?: boolean, timeoutMs?: number, provider?: "claude"|"codex" }');
     // `switchAll` (src/manual.ts, Task 3) IS the fleet move — this route calls
     // it in-process, the same way every other route here calls a verb
     // function directly rather than shelling out. `continueAfter: "auto"`
@@ -258,6 +275,9 @@ export async function handle(req: ApiRequest): Promise<ApiResponse> {
     // one does not. `message` is non-null only when `to` itself had no
     // answer (unreadable registry, unregistered, or an account name two
     // providers both claim) — nothing was started, and `results` is empty.
+    // `provider` is the same escape hatch the CLI's `--provider` is (finding
+    // F1): omitted, an ambiguous `to` refuses exactly as before; given, it
+    // picks which of the two fleets `to` names before that check ever runs.
     try {
       // Inside the SAME capture as every other verb (finding C2). The captured
       // stderr is thrown away on purpose: `results` already carries one
@@ -269,6 +289,7 @@ export async function handle(req: ApiRequest): Promise<ApiResponse> {
           force: parsed.force,
           continueAfter: "auto",
           timeoutMs: parsed.timeoutMs,
+          provider: parsed.provider,
         }),
       );
       const { results, code, message } = value;

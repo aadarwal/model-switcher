@@ -617,10 +617,12 @@ test("ms status --watch actually loops: MS_WATCH_ITERATIONS=2 redraws twice, not
 
 test("ms status: a session whose pane no longer exists shows STATE gone, with no WALLED? flag", async () => {
   // %2 is deliberately left out of `list-panes` — sess-2's pane is gone.
+  // Finding F6: a gone row is hidden by default, so this reads it with
+  // --all — the word itself, not the default-hide rule, is the point here.
   const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": "" } });
   await seedSessions(w);
 
-  const r = run(["status"], env());
+  const r = run(["status", "--all"], env());
   assert.equal(r.code, 0, r.stderr);
 
   const lines = r.stdout.split("\n");
@@ -644,11 +646,12 @@ test("ms status --json: a gone pane's JSON state is the same word the text table
   // (seedSessions), so a fix that only patches the text table's own
   // `sessionRow` — and not `statusJson`'s `computeSession` application —
   // would print "gone" in one place and "running" in the other for the
-  // same closed pane.
+  // same closed pane. Finding F6: a gone row is hidden by default, so this
+  // reads it with --all.
   const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": "" } });
   await seedSessions(w);
 
-  const r = run(["status", "--json"], env());
+  const r = run(["status", "--json", "--all"], env());
   assert.equal(r.code, 0, r.stderr);
   const parsed = JSON.parse(r.stdout) as { sessions: { id: string; state: string }[] };
   const s2 = parsed.sessions.find((s) => s.id === "sess-2")!;
@@ -658,6 +661,75 @@ test("ms status --json: a gone pane's JSON state is the same word the text table
   // sess-1's pane is still there and unaffected.
   const s1 = parsed.sessions.find((s) => s.id === "sess-1")!;
   assert.equal(s1.state, "walled");
+});
+
+// --- Finding F6: gone/stopped sessions hidden by default -------------------
+//
+// `/api/state` and `ms status` used to list every session the store had ever
+// recorded — 17 `gone` rows before one run, 20 after. `ms status` now hides
+// `gone` and `stopped` rows by default and shows them with `--all`;
+// `/api/state` itself is UNCHANGED (see test/dashboard-api.test.ts's own GET
+// /api/state test — statusJson() is not touched here at all), because the
+// dashboard page filters client-side over that same, still-complete json
+// (test/dashboard-client.test.ts's isFinishedSession/visibleSessions tests).
+
+test("ms status: gone and stopped sessions are hidden by default, and --all shows them", async () => {
+  // %2 is left out of list-panes (the same fixture shape as the "gone" tests
+  // above), so sess-2 reads STATE gone; sess-3 is created directly in state
+  // "stopped" — the other word --all is the escape hatch for.
+  const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": WALL_SCREEN } });
+  await seedSessions(w);
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    st.createSession({
+      id: "sess-3", provider: "claude", cliSessionId: "cli-3", cwd: "/tmp/work3",
+      socket: TMUX_SOCKET, pane: "", serverStart: "srv1",
+      need: "any", account: "dirk", generation: 1, state: "stopped", desired: "stopped", flags: [],
+    });
+  } finally {
+    st.close();
+  }
+
+  const r = run(["status"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const lines = r.stdout.split("\n");
+  assert.ok(lines.some((l) => l.startsWith("sess-1")), r.stdout);
+  assert.ok(!lines.some((l) => l.startsWith("sess-2")), `a gone session shown by default: ${r.stdout}`);
+  assert.ok(!lines.some((l) => l.startsWith("sess-3")), `a stopped session shown by default: ${r.stdout}`);
+
+  const rAll = run(["status", "--all"], env());
+  assert.equal(rAll.code, 0, rAll.stderr);
+  const allLines = rAll.stdout.split("\n");
+  assert.ok(allLines.some((l) => l.startsWith("sess-1")), rAll.stdout);
+  assert.ok(allLines.some((l) => l.startsWith("sess-2")), `--all did not show the gone session: ${rAll.stdout}`);
+  assert.ok(allLines.some((l) => l.startsWith("sess-3")), `--all did not show the stopped session: ${rAll.stdout}`);
+});
+
+test("ms status --json: gone/stopped are hidden by default and included with --all, the same two words the text table uses", async () => {
+  const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": WALL_SCREEN } });
+  await seedSessions(w);
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    st.createSession({
+      id: "sess-3", provider: "claude", cliSessionId: "cli-3", cwd: "/tmp/work3",
+      socket: TMUX_SOCKET, pane: "", serverStart: "srv1",
+      need: "any", account: "dirk", generation: 1, state: "stopped", desired: "stopped", flags: [],
+    });
+  } finally {
+    st.close();
+  }
+
+  const r = run(["status", "--json"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout) as { sessions: { id: string; state: string }[] };
+  assert.deepEqual(parsed.sessions.map((s) => s.id).sort(), ["sess-1"]);
+
+  const rAll = run(["status", "--json", "--all"], env());
+  assert.equal(rAll.code, 0, rAll.stderr);
+  const parsedAll = JSON.parse(rAll.stdout) as { sessions: { id: string; state: string }[] };
+  assert.deepEqual(parsedAll.sessions.map((s) => s.id).sort(), ["sess-1", "sess-2", "sess-3"]);
 });
 
 test("ms status: an unreadable registry prints its parse error as the first line", async () => {

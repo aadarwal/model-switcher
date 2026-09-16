@@ -905,7 +905,16 @@ case "$1" in
       *) get identity ;;
     esac ;;
   capture-pane) cat "$MS_TMUX_SCREENS/$pane" 2>/dev/null ;;
-  send-keys) case "$*" in */exit*) put "dead$pane" 1 ;; esac ;;
+  send-keys)
+    case "$*" in
+      */exit*) put "dead$pane" 1 ;;
+      # Codex's own way out (test/recover.test.ts's TMUX_STUB has the single-
+      # pane version of this): the FIRST Ctrl-C arms the quit, the second
+      # takes it — keyed by pane, since a fleet move can be signalling
+      # several codex panes' TUIs at once.
+      *C-c*) n=$(get "sigints$pane"); if [ -z "$n" ]; then n=0; fi; n=$((n + 1)); put "sigints$pane" "$n"
+        if [ "$n" -ge 2 ]; then put "dead$pane" 1; fi ;;
+    esac ;;
   respawn-pane) put "dead$pane" 0 ;;
 esac
 exit 0`;
@@ -1330,6 +1339,134 @@ test("the library refuses that name too, in the same words the verb prints", asy
   // under it: a move that never started has nothing to summarise.
   assert.equal(await switchVerb(["--all", "--to", "home"]), 1);
   assert.deepEqual(say().split("\n").filter(Boolean), [`ms switch: ${message}`]);
+});
+
+// --- Finding F1: --all's own --provider ---------------------------------
+
+test("--provider resolves the same ambiguous name the library and the verb both refused above", async (t) => {
+  // No codex session in this fixture (unlike FLEET, whose s5 is one) — the
+  // point here is the ambiguity resolving, not a real handoff completing.
+  const w = await fleet(t, fleetSessions(2));
+  writeFileSync(
+    path.join(w.msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: ["claude", "codex"].map((provider) => ({ name: "home", provider, label: "home", shared: false })),
+    }),
+    { mode: 0o600 },
+  );
+  const say = stderr(t);
+
+  // The library call: `provider` picks one of the two "home" rows before the
+  // ambiguity check ever runs. No codex session exists in this fixture, so
+  // the move starts and finishes having touched nothing — never the
+  // "--all cannot tell which fleet you mean" refusal.
+  const lib = await switchAll("home", { force: false, continueAfter: "auto", timeoutMs: 60_000, provider: "codex" });
+  assert.equal(lib.code, 0, JSON.stringify(lib));
+  assert.deepEqual(lib.results, []);
+  assert.equal(lib.message, null);
+
+  // Same through the verb.
+  assert.equal(await switchVerb(["--all", "--to", "home", "--provider", "codex"]), 0, say());
+  assert.doesNotMatch(say(), /cannot tell which fleet you mean/);
+  assert.match(say(), /^ms: moved 0, refused 0$/m);
+});
+
+test("--provider for a name that only ONE provider holds still resolves the (unambiguous) fleet — the escape hatch never gets in its own way", async (t) => {
+  const w = await fleet(t, FLEET);
+  const say = stderr(t);
+  const rep = reportFleet(w);
+  t.after(rep.stop);
+
+  assert.equal(await switchVerb(["--all", "--to", "home", "--provider", "claude"]), 0, say());
+
+  for (const id of ["s1", "s2", "s3"]) assert.equal(row(id).account, "home", `${id} did not move`);
+  assert.match(say(), /^ms: moved 3, refused 0$/m);
+});
+
+test("--provider takes claude|codex only, and only bounds --all", async (t) => {
+  const w = await fleet(t, FLEET);
+  const say = stderr(t);
+
+  assert.equal(await switchVerb(["--all", "--to", "home", "--provider", "gemini"]), 2);
+  assert.match(say(), /--provider takes claude\|codex, not 'gemini'/);
+  assert.equal(await switchVerb(["--all", "--to", "home", "--provider"]), 2, "a forgotten provider");
+  // A single-session switch already knows its own provider from the row —
+  // --provider only disambiguates a NAME two providers hold, which is only
+  // ever in question for --all.
+  assert.equal(await switchVerb(["s1", "--to", "home", "--provider", "claude"]), 2);
+  assert.match(say(), /--provider bounds --all/);
+  assert.deepEqual(logLines(w), [], "a command line that did not parse never reaches a pane");
+  assert.equal(row("s1").account, "away");
+});
+
+test("--provider for an account nobody registered under that provider is refused by name, not silently empty", async (t) => {
+  await fleet(t, FLEET);
+  const say = stderr(t);
+
+  // "cdx" is registered only as a codex account in the FLEET fixture's own
+  // registry (test/manual.test.ts's fleet() helper) — asking for it under
+  // claude is the same kind of typo `ms accounts`' own --provider refuses.
+  assert.equal(await switchVerb(["--all", "--to", "cdx", "--provider", "claude"]), 1);
+  assert.match(say(), /no such claude account 'cdx'/);
+});
+
+test("--all --provider codex moves only the codex fleet — the claude ambiguity never even has to be resolved", async (t) => {
+  const w = await fleet(t, FLEET);
+  // Make "home" ambiguous (a claude AND a codex account both named it), the
+  // live finding's own shape — and give the codex "home" a real credential
+  // and a home ready to receive a pane, so the move actually completes
+  // rather than just being routed correctly.
+  writeFileSync(
+    path.join(w.msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: [
+        { name: "home", provider: "claude", label: "home", shared: false },
+        { name: "away", provider: "claude", label: "away", shared: false },
+        { name: "cdx", provider: "codex", label: "cdx", shared: false },
+        { name: "home", provider: "codex", label: "home", shared: false },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+  const codexHomeDir = path.join(w.msHome, "codex", "home");
+  mkdirSync(codexHomeDir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(codexHomeDir, "auth.json"),
+    JSON.stringify({
+      tokens: { id_token: "x.y.z", access_token: "cat-home-SECRET", refresh_token: "crt-home-SECRET", account_id: "acc-home" },
+    }),
+    { mode: 0o600 },
+  );
+  // s5 (the fixture's one codex session, on "cdx") has no rollout on disk and
+  // an idle screen — the relaunch is fresh and carries no continuation, so
+  // recoverSession's own readiness step is `waitForSettle` (src/recover.ts):
+  // the pane just has to stay alive, never a fake SessionStart report.
+  process.env.MS_SETTLE_MS = "50";
+  const say = stderr(t);
+  const rep = reportFleet(w);
+  t.after(rep.stop);
+
+  assert.equal(await switchVerb(["--all", "--to", "home", "--provider", "codex"]), 0, say());
+
+  const s5 = row("s5");
+  assert.equal(s5.account, "home");
+  assert.equal(s5.generation, 3);
+  assert.match(say(), /^ms: s5 moved → home$/m);
+  assert.match(say(), /^ms: moved 1, refused 0$/m);
+  assert.doesNotMatch(say(), /cannot tell which fleet you mean/);
+
+  // Nothing else was even asked a question: the claude "home"/"away"
+  // ambiguity never had to be resolved, because --provider picked the codex
+  // fleet before that check ever ran.
+  assert.equal(row("s1").account, "away");
+  assert.equal(row("s2").account, "away");
+  assert.equal(row("s3").account, "away");
+  assert.equal(row("s4").account, "home");
+  for (const pane of ["%1", "%2", "%3", "%4", "%6", "%7"]) {
+    assert.ok(!logLines(w).some((l) => l.includes(`-t ${pane} `) || l.endsWith(`-t ${pane}`)), `${pane} was touched`);
+  }
 });
 
 test("a switchOne that throws is that session's refusal, never the fleet's", async (t) => {

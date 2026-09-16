@@ -48,18 +48,18 @@ ms attach
 ### Running sessions
 
 ```
-ms status [--watch] [--json]
+ms status [--watch] [--json] [--all]
 ms rotate [<session|pane>] [--force]
 ms switch [<session|pane>] --to <account> [--continue] [--force]
-ms switch --all --to <account> [--continue] [--force] [--timeout <seconds>]
+ms switch --all --to <account> [--provider claude|codex] [--continue] [--force] [--timeout <seconds>]
 ms stop [<session|pane>]
 ms dashboard [--port N] [--no-open]
 ```
 
-- `ms status` — two tables: the account pool as usage sees it, and every managed session. `--watch` reprints every 5 s; `--json` prints the same rows as JSON.
+- `ms status` — two tables: the account pool as usage sees it, and every managed session. `--watch` reprints every 5 s; `--json` prints the same rows as JSON. Sessions in state `gone` or `stopped` are hidden by default; `--all` shows them too.
 - `ms rotate` — move a session to the next account with room: the move a wall would have made, on demand. Always carries the unfinished work over.
 - `ms switch` — move a session to a named account. It carries the work over only when the pane reads as walled; `--continue` always carries it over.
-- `ms switch --all` — move every session of that account's provider that is not already on it, four at a time. `--timeout` bounds how long new moves are *started* (default 600 s); a move in flight is never cut off.
+- `ms switch --all` — move every session of that account's provider that is not already on it, four at a time. `--timeout` bounds how long new moves are *started* (default 600 s); a move in flight is never cut off. `--provider` is needed only when the destination name is registered under both providers, same rule as `ms accounts`' own `--provider`.
 - `ms stop` — stop managing a session. The CLI in the pane keeps running.
 - `ms dashboard` — serve the `ms status` tables on `127.0.0.1`, with rotate, switch and stop buttons. It prints its URL, opens it (unless `--no-open`), and exits about 90 s after the last request, so it is alive only while a tab polls it.
 - `--force` moves a session that is mid-turn; without it a busy session is refused. With no `<session|pane>`, `rotate`, `switch` and `stop` act on the current pane.

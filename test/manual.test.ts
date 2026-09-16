@@ -30,7 +30,7 @@ import { openState, type SessionRow } from "../src/state.ts";
 import { rotateVerb, stopVerb, switchVerb } from "../src/manual.ts";
 
 const CONTINUATION =
-  "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions.";
+  "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions. If the last user message was already answered, or needs nothing more, say so in one line and wait for the user; do not start new work.";
 
 const MS_BIN = path.resolve("bin/ms");
 const PANE = "%7";
@@ -260,6 +260,13 @@ const rx = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const logLines = (w: World): string[] => readFileSync(w.log, "utf8").split("\n").filter((l) => l.trim());
 const respawnLine = (w: World): string | undefined => logLines(w).find((l) => l.includes("respawn-pane"));
 const typedAnything = (w: World): boolean => logLines(w).some((l) => l.includes("send-keys"));
+const recoverLog = (w: World): string => {
+  try {
+    return readFileSync(path.join(w.msHome, "sessions", "s1", "recover.log"), "utf8");
+  } catch {
+    return "";
+  }
+};
 
 function session(w: World): SessionRow {
   const st = openState();
@@ -351,6 +358,11 @@ test("rotate hands a walled pane to the next account and continues the work", as
   const launch = launchOf(respawnLaunchId(w))!;
   assert.deepEqual(launch.command, ["claude", "--resume", "c-1", CONTINUATION, "--model", "sonnet"]);
   assert.match(say(), /^ms: s1 rotated → gmail$/m);
+  // The log says who asked for the move. A wall kind belongs to an automatic
+  // recovery; on a manual one it is at best redundant and at worst invented.
+  assert.match(recoverLog(w), /handing dirk → gmail \(manual\)/);
+  assert.match(recoverLog(w), /s1: dirk → gmail \(manual, generation 3\)/);
+  assert.doesNotMatch(recoverLog(w), /wall\)/);
 });
 
 
@@ -430,6 +442,12 @@ test("switch --to on an idle pane relaunches on that account without a continuat
   assert.deepEqual(launch.command, ["claude", "--resume", "c-1", "--model", "sonnet"]);
   assert.ok(!launch.command.includes(CONTINUATION), "a finished conversation is not told to continue");
   assert.match(say(), /^ms: s1 switched → gmail$/m);
+  // Live matrix case 4: this move used to be logged "(unknown wall)" — the
+  // placeholder kind of the recovery row a manual verb opens, printed as though
+  // a wall nobody could name had happened. The human named the account.
+  assert.match(recoverLog(w), /handing dirk → gmail \(manual, --to gmail\)/);
+  assert.match(recoverLog(w), /s1: dirk → gmail \(manual, --to gmail, generation 3\)/);
+  assert.doesNotMatch(recoverLog(w), /unknown wall/);
 });
 
 test("switch on a pane that has never had a turn starts it under the same id", async (t) => {

@@ -45,9 +45,16 @@ import { lastTurn, wallKindFromText } from "./wall.ts";
  * argument, so it reaches Claude as the human's own next turn would — and it
  * says "check before retrying" because a wall can land mid-action: the tool
  * call that hit the limit may or may not have taken effect.
+ *
+ * The last sentence is the live matrix's: a wall can land on a turn that was
+ * trivial or already answered, and "continue the unfinished work" then invites
+ * the model to invent some. It did, on a real rotation — explored the repo and
+ * proposed deleting untracked directories nobody had mentioned. A continuation
+ * that must be able to say "there is nothing to continue" is the only safe
+ * version of an instruction we send unattended.
  */
 export const CONTINUATION =
-  "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions.";
+  "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions. If the last user message was already answered, or needs nothing more, say so in one line and wait for the user; do not start new work.";
 
 /** One recovery at a time per session; a second worker is a duplicate. */
 const SESSION_LOCK_WAIT_MS = 5_000;
@@ -828,7 +835,12 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   } catch (e) {
     logLine(id, g, `could not mark the pane: ${(e as Error).message}`);
   }
-  logLine(id, g, `${id}: handing ${from} → ${to} (${rec.kind} wall)`);
+  // Why this move is happening, for the log. A manual one says so: the wall
+  // kind on a `ms switch` of an idle session is whatever `claimManual` had to
+  // put in the row it opened — `unknown` — and printing "(unknown wall)" over a
+  // move a human asked for describes a failure that never happened.
+  const why = manual ? (manual.toAccount ? `manual, --to ${manual.toAccount}` : "manual") : `${rec.kind} wall`;
+  logLine(id, g, `${id}: handing ${from} → ${to} (${why})`);
 
   // §9 checks the human's intent before EVERY destructive step, and `ms stop`
   // can land at any moment: re-read it, never trust the row we started with.
@@ -923,7 +935,7 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   } catch {
     /* the pane may already be gone; the handoff still happened */
   }
-  logLine(id, next, `${id}: ${from} → ${to} (${rec.kind} wall, generation ${next})`);
+  logLine(id, next, `${id}: ${from} → ${to} (${why}, generation ${next})`);
   return 0;
 }
 

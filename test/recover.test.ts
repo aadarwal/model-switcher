@@ -27,7 +27,7 @@ import { recoverSession } from "../src/recover.ts";
 /** The continuation text, spelled out here rather than imported: the whole
  *  point of the assertion is that the shipped constant still says this. */
 const CONTINUATION =
-  "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions.";
+  "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions. If the last user message was already answered, or needs nothing more, say so in one line and wait for the user; do not start new work.";
 
 const MS_BIN = path.resolve("bin/ms");
 const PANE = "%7";

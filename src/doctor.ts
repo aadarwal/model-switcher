@@ -20,7 +20,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync,
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
-import { msBinary, msHome, p } from "./paths.ts";
+import { claudeSettingsPath, msBinary, msHome, p } from "./paths.ts";
 import { claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
 import { codexConfigPath, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
 import { loadRegistry, type Account } from "./registry.ts";
@@ -134,11 +134,11 @@ export function checkCodexBinary(hasCodexAccounts: boolean): Result {
 // --- Claude hooks ----------------------------------------------------------
 
 /** Claude Code's settings file — where its hooks and its statusline live.
- *  Exported because `ms setup` installs into the very file this checks, and
- *  two spellings of one path is how an installer and its check drift apart. */
-export function claudeSettingsPath(): string {
-  return path.join(process.env.HOME || homedir(), ".claude", "settings.json");
-}
+ *  Re-exported (it lives in ./paths.ts, beside every other path this tool
+ *  knows) because `ms setup` installs into the very file this checks, and two
+ *  spellings of one path is how an installer and its check drift apart. It
+ *  honours `CLAUDE_CONFIG_DIR` exactly as `ms _statusline` does. */
+export { claudeSettingsPath };
 
 export function checkHooks(fix: boolean): Result {
   const what = "Claude hooks installed";

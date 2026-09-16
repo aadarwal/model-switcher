@@ -5,8 +5,11 @@ import path from "node:path";
 import { tempHome } from "./helpers.ts";
 import { claudeHooksInstalled, installClaudeHooks } from "../src/hooks/install.ts";
 
-const MS = "/opt/homebrew/bin/ms";
-const CMD = `${MS} _hook claude`;
+const MS = "/opt/homebrew/opt/model-switcher/bin/ms";
+// The command an entry carries: `msBin` single-quoted, the same way the
+// statusline wrapper and the alias block quote it, so a path with a space
+// stays one shell word (fix wave B-M5/B-M12).
+const CMD = `'${MS}' _hook claude`;
 const EVENTS = ["SessionStart", "UserPromptSubmit", "StopFailure", "SessionEnd"] as const;
 
 type Entry = { matcher?: string; hooks: { type: string; command: string }[] };

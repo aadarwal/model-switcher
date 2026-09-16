@@ -303,7 +303,7 @@ test("a full run with one Claude and one Codex account finishes every step, veri
   const events = s.settings().hooks;
   for (const e of ["SessionStart", "UserPromptSubmit", "SessionEnd", "StopFailure"]) {
     assert.ok(
-      (events[e] as { hooks: { command: string }[] }[]).some((entry) => entry.hooks.some((h) => h.command === `${s.msBin} _hook claude`)),
+      (events[e] as { hooks: { command: string }[] }[]).some((entry) => entry.hooks.some((h) => h.command === `'${s.msBin}' _hook claude`)),
       `no ${e} hook for ${s.msBin}`,
     );
   }

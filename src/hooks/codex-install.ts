@@ -39,9 +39,10 @@
 // `codexHooksInstalled` reads false and the wizard re-installs. Nothing here
 // touches a credential; `config.toml` holds none.
 
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { backupThroughLink, resolveTarget, writeAtomicThroughLink } from "../fsx.ts";
 // Shared with the launcher's own config.toml writer rather than reimplemented:
 // one definition of "where does the TOML end and the comment begin" is the
 // only way both writers agree about what a line says.
@@ -313,10 +314,9 @@ export function installCodexHooks(homeDir: string, msBin: string): InstallResult
 
   let backup: string | null = null;
   if (existed) {
-    backup = `${file}.bak-ms-${Math.floor(Date.now() / 1000)}`;
-    copyFileSync(file, backup);
+    backup = backupThroughLink(file, "bak-ms-");
   } else {
-    mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    mkdirSync(path.dirname(resolveTarget(file)), { recursive: true, mode: 0o700 });
   }
   writeAtomic(file, next);
   return { changed: true, backup };
@@ -406,13 +406,8 @@ export function codexHooksInstalled(homeDir: string, msBin: string): boolean {
  * previous writer chose (or a umask allowed) would mean a home that is
  * world-readable stays world-readable for ever. */
 function writeAtomic(file: string, text: string): void {
-  const tmp = `${file}.tmp-${process.pid}`;
-  try {
-    writeFileSync(tmp, text, { mode: 0o600 });
-    chmodSync(tmp, 0o600); // writeFileSync's mode is subject to umask; this is not
-    renameSync(tmp, file);
-  } catch (e) {
-    try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* best effort */ }
-    throw e;
-  }
+  // Through any symlink (a dotfiles-managed config.toml stays a link), and
+  // always 0600 — `writeAtomicThroughLink` re-chmods after the write because
+  // writeFileSync's own `mode` is subject to the umask.
+  writeAtomicThroughLink(file, text, { forceMode: 0o600 });
 }

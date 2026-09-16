@@ -1,5 +1,6 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { backupThroughLink, resolveTarget, shellQuote, writeAtomicThroughLink } from "../fsx.ts";
 
 type HookCommand = { type: string; command: string };
 type HookEntry = { matcher?: string; hooks: HookCommand[] };
@@ -15,8 +16,11 @@ const EVENTS: readonly [string, string][] = [
   ["SessionEnd", ""],
 ];
 
-/** The exact command string an installed entry carries. */
-export function claudeHookCommand(msBin: string): string { return `${msBin} _hook claude`; }
+/** The exact command string an installed entry carries. `msBin` is quoted
+ * the same way the statusline wrapper and the alias block quote it — Claude
+ * Code hands this to a shell, and a path with a space in it (or, worse, a
+ * quote) is otherwise two words and a broken hook on every turn. */
+export function claudeHookCommand(msBin: string): string { return `${shellQuote(msBin)} _hook claude`; }
 
 function readSettings(settingsPath: string): Settings | null {
   if (!existsSync(settingsPath)) return null;
@@ -79,23 +83,10 @@ export function installClaudeHooks(settingsPath: string, msBin: string): { chang
 
   let backup: string | null = null;
   if (existing !== null) {
-    backup = `${settingsPath}.bak-${Math.floor(Date.now() / 1000)}`;
-    copyFileSync(settingsPath, backup);
+    backup = backupThroughLink(settingsPath, "bak-");
   } else {
-    mkdirSync(path.dirname(settingsPath), { recursive: true });
+    mkdirSync(path.dirname(resolveTarget(settingsPath)), { recursive: true });
   }
-  writeAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+  writeAtomicThroughLink(settingsPath, JSON.stringify(settings, null, 2) + "\n", { defaultMode: 0o600 });
   return { changed: true, backup };
-}
-
-function writeAtomic(file: string, text: string): void {
-  const mode = existsSync(file) ? statSync(file).mode & 0o777 : 0o600;
-  const tmp = `${file}.tmp-${process.pid}`;
-  try {
-    writeFileSync(tmp, text, { mode });
-    renameSync(tmp, file);
-  } catch (e) {
-    try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* best effort */ }
-    throw e;
-  }
 }

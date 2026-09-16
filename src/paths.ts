@@ -55,3 +55,20 @@ export function ensureSessionDir(id: string): string {
 export function msBinary(): string {
   return process.env.MS_BIN || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "ms");
 }
+
+/**
+ * Claude Code's own settings file — where its hooks and its statusline live.
+ *
+ * `CLAUDE_CONFIG_DIR` is Claude Code's OWN override of where `~/.claude`
+ * is, so anything that writes into that file (the hook installer, the
+ * statusline installer), anything that checks it (`ms doctor`) and the
+ * statusline wrapper that reads it back at runtime must all honour it — an
+ * installer and its check that disagree about the path are an install that
+ * never takes effect and a doctor that cannot say why. Defined here, beside
+ * the other paths, so there is exactly one spelling of it.
+ */
+export function claudeSettingsPath(): string {
+  const configDir = process.env.CLAUDE_CONFIG_DIR;
+  const dir = configDir && configDir.length > 0 ? configDir : path.join(process.env.HOME || homedir(), ".claude");
+  return path.join(dir, "settings.json");
+}

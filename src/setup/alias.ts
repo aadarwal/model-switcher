@@ -13,8 +13,9 @@
 // two `alias` lines are the whole of it, so install/remove is a straight
 // block splice rather than a scan for pre-existing tables.
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { backupThroughLink, resolveTarget, shellQuote, writeAtomicThroughLink } from "../fsx.ts";
 
 export type AliasResult = { changed: boolean; backup: string | null; problem?: string };
 
@@ -23,9 +24,13 @@ const END = "# ms-alias-end";
 const BEGIN_RE = /^\s*# ms-alias-begin\b/;
 const END_RE = /^\s*# ms-alias-end\b/;
 
-/** The block this tool owns, markers included, for a given binary. */
+/** The block this tool owns, markers included, for a given binary. Each
+ * alias's VALUE is the whole command (`<bin> claude`), quoted as ONE shell
+ * word — so a `'` inside the path is escaped rather than ending the quoted
+ * run and turning the rest of the rc file into a syntax error. For a path
+ * with neither quote nor oddity this is byte-for-byte what it always was. */
 function block(msBin: string): string {
-  return [BEGIN, `alias claude='${msBin} claude'`, `alias codex='${msBin} codex'`, END].join("\n");
+  return [BEGIN, `alias claude=${shellQuote(`${msBin} claude`)}`, `alias codex=${shellQuote(`${msBin} codex`)}`, END].join("\n");
 }
 
 function escapeRegExp(s: string): string {
@@ -95,22 +100,6 @@ function spliceIn(pre: string, blockText: string, post: string): string {
   return before + blockText + after;
 }
 
-function writeAtomic(file: string, text: string): void {
-  const mode = existsSync(file) ? statSync(file).mode & 0o777 : 0o644;
-  const tmp = `${file}.tmp-${process.pid}`;
-  try {
-    writeFileSync(tmp, text, { mode });
-    renameSync(tmp, file);
-  } catch (e) {
-    try {
-      if (existsSync(tmp)) unlinkSync(tmp);
-    } catch {
-      /* best effort */
-    }
-    throw e;
-  }
-}
-
 /**
  * Append (or, for a different binary, replace) the `ms` alias block in
  * `rcPath`.
@@ -144,12 +133,11 @@ export function installAlias(rcPath: string, msBin: string): AliasResult {
 
   let backup: string | null = null;
   if (existed) {
-    backup = `${rcPath}.bak-ms-${Math.floor(Date.now() / 1000)}`;
-    copyFileSync(rcPath, backup);
+    backup = backupThroughLink(rcPath, "bak-ms-");
   } else {
-    mkdirSync(path.dirname(rcPath), { recursive: true });
+    mkdirSync(path.dirname(resolveTarget(rcPath)), { recursive: true });
   }
-  writeAtomic(rcPath, next);
+  writeAtomicThroughLink(rcPath, next, { defaultMode: 0o644 });
   return { changed: true, backup };
 }
 
@@ -187,9 +175,8 @@ export function removeAlias(rcPath: string): AliasResult {
   const { pre, post } = stripSep(located.rawBefore, located.rawAfter);
   const next = pre + post;
 
-  const backup = `${rcPath}.bak-ms-${Math.floor(Date.now() / 1000)}`;
-  copyFileSync(rcPath, backup);
-  writeAtomic(rcPath, next);
+  const backup = backupThroughLink(rcPath, "bak-ms-");
+  writeAtomicThroughLink(rcPath, next, { defaultMode: 0o644 });
   return { changed: true, backup };
 }
 

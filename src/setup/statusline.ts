@@ -14,10 +14,27 @@
 //
 // Every other key in the settings file, and every other key already inside
 // `statusLine` (`type`, `padding`, …), is preserved exactly: only `command`
-// is ever written.
+// (and the `msOriginal` key this tool owns) is ever written.
+//
+// Fix round 2: this used to detect and unwrap "ours" by PARSING the command
+// text (`<bin> _statusline[ -- <orig>]`). Two real bugs came from that: a
+// human's own statusline command that happened to end in `_statusline` was
+// silently swallowed as if it were already our wrapper, and an older
+// wrapper whose `msBin` path itself contained a space could not be told
+// apart from its own `-- ` separator, so re-installing over it nested rather
+// than replaced. The fix is to stop parsing command text entirely. Ownership
+// is now a dedicated key, `statusLine.msOriginal`, holding the human's
+// original command verbatim (or `""` when there was none) — set ONCE, on
+// the first install, and never touched again by a later re-install for a
+// different binary. `command` itself carries nothing but the wrapper
+// invocation (`'<msBin>' _statusline`, single-quoted so a spaced path is one
+// shell word); the wrapper reads the original back out of the settings file
+// at RUNTIME instead of being handed it on argv, so there is no command text
+// to parse on either side of the round trip.
 
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 
 type Settings = Record<string, unknown> & { statusLine?: unknown };
@@ -58,24 +75,22 @@ function writeAtomic(file: string, text: string): void {
   }
 }
 
-/** The command text this tool installs, wrapping `original` when there is one. */
-function wrapperCommand(msBin: string, original?: string): string {
-  return original !== undefined ? `${msBin} _statusline -- ${original}` : `${msBin} _statusline`;
+/** The command text this tool installs: `msBin`, single-quoted so a path
+ * containing a space is still one shell word, followed by the verb. Never
+ * carries the original command any more — the runtime side reads that back
+ * out of `statusLine.msOriginal` itself. */
+function wrapperCommand(msBin: string): string {
+  return `'${msBin}' _statusline`;
 }
 
-/** True when `cmd` is already this exact binary's wrapper. A different `ms`
- * path is a different install (mirrors `claudeHooksInstalled`'s rule), so a
- * wizard re-pointed at another binary wraps again rather than no-op'ing. */
-function isOurWrapper(cmd: string, msBin: string): boolean {
-  return cmd === `${msBin} _statusline` || cmd.startsWith(`${msBin} _statusline -- `);
+/** Ownership is this key's presence, never the shape of `command` — the
+ * whole point of fix round 2. A `statusLine` this tool has ever installed
+ * into carries `msOriginal` (a string, `""` when there was nothing to
+ * preserve); anything else, however its `command` happens to read, is not
+ * ours to unwrap or guess about. */
+function isOurs(statusLine: Record<string, unknown>): boolean {
+  return typeof statusLine.msOriginal === "string";
 }
-
-/** Any `<bin> _statusline[ -- <original>]` wrapper, whoever installed it.
- * `removeStatusline` is not told which binary to look for — it only needs to
- * know a wrapper is there and, when one is, what it was wrapping — so this
- * matches the shape generically. A binary path is never spaced, so `\S+` is
- * exact rather than a guess. */
-const GENERIC_WRAPPER_RE = /^\S+ _statusline(?: -- ([\s\S]*))?$/;
 
 /**
  * Point `settingsPath`'s `statusLine.command` at `msBin`'s wrapper.
@@ -83,8 +98,12 @@ const GENERIC_WRAPPER_RE = /^\S+ _statusline(?: -- ([\s\S]*))?$/;
  * The file is backed up (`settings.json.bak-ms-<unix seconds>`) before the
  * first change and created (0600, parents included) when missing. A second
  * call for the SAME binary is a no-op: `changed: false`, no backup, file
- * untouched — so the wizard can run it every time without piling up backups
- * or double-wrapping an already-wrapped command.
+ * untouched. A second call for a DIFFERENT binary (a brew-shim move, a
+ * re-pointed wizard run) rewrites ONLY `command` — `msOriginal` was set once,
+ * on the first install, and is never touched again, so there is nothing left
+ * to nest: whatever was there before this tool ever ran is still exactly
+ * what a later `removeStatusline` restores, however many binaries this ran
+ * between.
  */
 export function installStatusline(settingsPath: string, msBin: string): StatuslineResult {
   let existing: Settings | null;
@@ -101,31 +120,25 @@ export function installStatusline(settingsPath: string, msBin: string): Statusli
   }
   const hadStatusLine = rawStatusLine !== undefined;
   const statusLine: Record<string, unknown> = hadStatusLine ? { ...(rawStatusLine as Record<string, unknown>) } : {};
-  const currentCmd = typeof statusLine.command === "string" ? statusLine.command : undefined;
+  const newCommand = wrapperCommand(msBin);
 
-  if (currentCmd !== undefined && isOurWrapper(currentCmd, msBin)) {
-    return { changed: false, backup: null };
+  if (isOurs(statusLine)) {
+    if (statusLine.command === newCommand) return { changed: false, backup: null };
+    statusLine.command = newCommand;
+  } else {
+    // First install: whatever `command` reads right now — a human's own
+    // script, or nothing at all — is captured VERBATIM, never parsed or
+    // interpreted, before it is overwritten. `""` is the explicit marker
+    // for "there was none", not "we forgot to look".
+    statusLine.msOriginal = typeof statusLine.command === "string" ? statusLine.command : "";
+    statusLine.command = newCommand;
+    // Claude Code only runs `statusLine.command` as a shell command when
+    // `type` says so. There is nothing pre-existing to preserve when the
+    // block did not exist at all, so this is the one case a fresh install
+    // sets it — every other key, on a `statusLine` that already existed, is
+    // left exactly as it was found.
+    if (!hadStatusLine) statusLine.type = "command";
   }
-
-  // Unwrap any wrapper ALREADY there — ours for a different binary, or one a
-  // prior install left behind — before wrapping with `msBin`. Wrapping the
-  // wrapper text itself (`<new> _statusline -- <old> _statusline -- <orig>`)
-  // is how a brew-shim move or a re-pointed wizard run nests one layer per
-  // install; unwrapping first means re-installing for a new binary always
-  // replaces, never stacks.
-  let original = currentCmd;
-  if (original !== undefined) {
-    const wrapped = GENERIC_WRAPPER_RE.exec(original);
-    if (wrapped) original = wrapped[1]; // undefined when THAT wrapper had nothing to wrap either
-  }
-
-  statusLine.command = wrapperCommand(msBin, original);
-  // Claude Code only runs `statusLine.command` as a shell command when `type`
-  // says so. There is nothing pre-existing to preserve when the block did not
-  // exist at all, so this is the one case a fresh install sets it — every
-  // other key, on a `statusLine` that already existed, is left exactly as it
-  // was found.
-  if (!hadStatusLine) statusLine.type = "command";
   settings.statusLine = statusLine;
 
   let backup: string | null = null;
@@ -139,13 +152,20 @@ export function installStatusline(settingsPath: string, msBin: string): Statusli
   return { changed: true, backup };
 }
 
-// --- The runtime side: `ms _statusline [-- <cmd…>]` -----------------------
+// --- The runtime side: `ms _statusline` ------------------------------------
 //
 // Claude Code spawns `statusLine.command` through a shell and waits on it to
 // render every prompt, so this must never be the thing that makes a prompt
 // slow or a session look broken: total time is bounded, and the exit code is
 // always 0 — a statusline that fails is a statusline with no badge, never a
 // broken Claude Code.
+//
+// Fix round 2 dropped the `-- <cmd>` argv form entirely: the wrapper takes
+// NO arguments now (`command` is just `'<msBin>' _statusline`) and instead
+// reads the original command back out of the settings file at runtime — the
+// same file, and the same `statusLine.msOriginal` key, `installStatusline`
+// wrote. That file lives at `$CLAUDE_CONFIG_DIR/settings.json` when that
+// variable is set (Claude Code's own override), else `~/.claude/settings.json`.
 
 /** Total budget for reading Claude Code's own stdin payload. It is a few
  * hundred bytes of JSON; anything larger is not one. */
@@ -155,29 +175,56 @@ const STDIN_MAX = 1 << 20;
  * statusline has no time to wait for a hung child to notice SIGTERM. */
 const WRAPPED_TIMEOUT_MS = 3_000;
 
+/** Where Claude Code keeps `settings.json` from THIS process's point of
+ * view: `$CLAUDE_CONFIG_DIR` when set (also how tests point this at a
+ * fixture without touching the real file), else `~/.claude`. */
+function claudeSettingsPath(): string {
+  const configDir = process.env.CLAUDE_CONFIG_DIR;
+  const dir = configDir && configDir.length > 0 ? configDir : path.join(process.env.HOME || homedir(), ".claude");
+  return path.join(dir, "settings.json");
+}
+
+/** The original command `installStatusline` captured into
+ * `statusLine.msOriginal`, or `""` for "nothing to run" — a missing file, a
+ * file this tool never touched, an unreadable or unparseable one, all read
+ * the same way here: never worth a diagnostic, only ever a badge with
+ * nothing after it. */
+function readOriginalCommand(): string {
+  try {
+    const text = readFileSync(claudeSettingsPath(), "utf8");
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object") return "";
+    const statusLine = (parsed as Settings).statusLine;
+    if (!statusLine || typeof statusLine !== "object") return "";
+    const original = (statusLine as Record<string, unknown>).msOriginal;
+    return typeof original === "string" ? original : "";
+  } catch {
+    return "";
+  }
+}
+
 /**
- * `ms _statusline [-- <cmd…>]`.
+ * `ms _statusline` — takes no arguments; everything it needs comes from the
+ * environment and the settings file.
  *
  * Reads Claude Code's statusline JSON from stdin (never parsed — only
  * relayed, unchanged, to the wrapped command's stdin), prints `[<account>] `
  * when `MS_ACCOUNT` is set in this pane's environment (nothing when it is
- * not), then — when a command was given after `--` — runs it with the same
- * environment, bounded to `WRAPPED_TIMEOUT_MS`, and prints whatever it wrote
- * to stdout. Always returns 0, whatever happened to the wrapped command or
- * to reading stdin.
+ * not), then — when `statusLine.msOriginal` names a real command — runs it
+ * through a shell (exactly how Claude Code itself would have), bounded to
+ * `WRAPPED_TIMEOUT_MS`, and prints whatever it wrote to stdout. Always
+ * returns 0, whatever happened to the wrapped command or to reading stdin.
  */
-export async function statuslineVerb(args: string[]): Promise<number> {
+export async function statuslineVerb(_args: string[]): Promise<number> {
   try {
-    const dashIdx = args.indexOf("--");
-    const cmd = dashIdx === -1 ? [] : args.slice(dashIdx + 1);
-
     const input = process.stdin.isTTY ? "" : await readStdin(STDIN_MS);
 
     const account = process.env.MS_ACCOUNT;
     process.stdout.write(account ? `[${account}] ` : "");
 
-    if (cmd.length > 0) {
-      const out = await runWrapped(cmd, input, WRAPPED_TIMEOUT_MS);
+    const original = readOriginalCommand();
+    if (original !== "") {
+      const out = await runWrapped(["/bin/sh", "-c", original], input, WRAPPED_TIMEOUT_MS);
       process.stdout.write(out);
     }
   } catch {
@@ -290,11 +337,12 @@ function runWrapped(cmd: string[], input: string, timeoutMs: number): Promise<st
 }
 
 /**
- * Undo `installStatusline`: restore whatever `statusLine.command` was
- * wrapping (the part after `-- `), or — when there was nothing to wrap —
- * delete `statusLine` entirely, since that is exactly what a fresh install
- * added. A file with no wrapper installed, or none matching this shape at
- * all, is left untouched: `changed: false`, no backup.
+ * Undo `installStatusline`: restore `statusLine.command` from
+ * `statusLine.msOriginal` and drop that key — or, when `msOriginal` is `""`
+ * (there was nothing before this tool ever ran), delete `statusLine`
+ * entirely, since that is exactly what a fresh install added. A
+ * `statusLine` with no `msOriginal` at all is not ours to touch:
+ * `changed: false`, no backup.
  */
 export function removeStatusline(settingsPath: string): StatuslineResult {
   let existing: Settings | null;
@@ -309,19 +357,18 @@ export function removeStatusline(settingsPath: string): StatuslineResult {
   const rawStatusLine = settings.statusLine;
   if (!rawStatusLine || typeof rawStatusLine !== "object" || Array.isArray(rawStatusLine)) return { changed: false, backup: null };
   const statusLine = { ...(rawStatusLine as Record<string, unknown>) };
-  const cmd = typeof statusLine.command === "string" ? statusLine.command : undefined;
-  if (cmd === undefined) return { changed: false, backup: null };
-  const m = GENERIC_WRAPPER_RE.exec(cmd);
-  if (!m) return { changed: false, backup: null };
+  if (!isOurs(statusLine)) return { changed: false, backup: null };
+  const original = statusLine.msOriginal as string;
 
   const backup = `${settingsPath}.bak-ms-${Math.floor(Date.now() / 1000)}`;
   copyFileSync(settingsPath, backup);
 
-  if (m[1] !== undefined) {
-    statusLine.command = m[1];
-    settings.statusLine = statusLine;
-  } else {
+  if (original === "") {
     delete settings.statusLine;
+  } else {
+    delete statusLine.msOriginal;
+    statusLine.command = original;
+    settings.statusLine = statusLine;
   }
   writeAtomic(settingsPath, JSON.stringify(settings, null, 2) + "\n");
   return { changed: true, backup };

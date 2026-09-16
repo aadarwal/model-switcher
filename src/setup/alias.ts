@@ -51,24 +51,66 @@ const EXPECTED_BLOCK_RE = new RegExp(`^${escapeRegExp(BEGIN)}\\nalias claude='(.
 /**
  * Finds the marker block using LINE boundaries only (never trimmed), so
  * `rawBefore`/`rawAfter` are the exact bytes immediately outside the block —
- * whatever they are. `null` when there is no `# ms-alias-begin` at all
- * (nothing installed yet); `undefined` when one is there with no matching
- * `# ms-alias-end` — a state this tool refuses to touch rather than
- * guessing where "ours" stops.
+ * whatever they are.
+ *
+ * Three answers, and each one is a different thing to do:
+ *
+ *   `none`     no `# ms-alias-begin` at all — nothing installed yet.
+ *   `one`      exactly one well-formed block: the only state either verb acts on.
+ *   `problem`  a begin marker with no matching end (this tool cannot tell
+ *              where "ours" stops), or MORE THAN ONE begin/end marker. Two
+ *              blocks used to mean the first was managed and the second left
+ *              behind for ever — an `alias claude=` pointing at a binary
+ *              nothing ever re-points, shadowing the one that is maintained,
+ *              because the LAST assignment in an rc file is the one that
+ *              wins. Neither is guessable, so both are refusals naming the
+ *              file and the markers.
  */
 type Located = { rawBefore: string; blockText: string; rawAfter: string };
-function locate(text: string): Located | null | undefined {
+type LocateResult = { kind: "none" } | { kind: "one"; at: Located } | { kind: "problem"; why: string };
+
+function locate(rcPath: string, text: string): LocateResult {
   const lines = text.split("\n");
-  const beginIdx = lines.findIndex((l) => BEGIN_RE.test(l));
-  if (beginIdx < 0) return null;
-  const endIdx = lines.findIndex((l, i) => i > beginIdx && END_RE.test(l));
-  if (endIdx < 0) return undefined;
+  const begins = lines.flatMap((l, i) => (BEGIN_RE.test(l) ? [i] : []));
+  const ends = lines.flatMap((l, i) => (END_RE.test(l) ? [i] : []));
+  if (begins.length === 0 && ends.length === 0) return { kind: "none" };
+  if (begins.length > 1 || ends.length > 1) {
+    return {
+      kind: "problem",
+      why: `${rcPath}: more than one '${BEGIN}' … '${END}' block; remove all but one by hand, refusing to manage only the first`,
+    };
+  }
+  const beginIdx = begins[0];
+  if (beginIdx === undefined) {
+    return { kind: "problem", why: `${rcPath}: a '${END}' marker with no '${BEGIN}'; repair or remove that line by hand, refusing to guess` };
+  }
+  const endIdx = ends[0];
+  if (endIdx === undefined || endIdx < beginIdx) {
+    return {
+      kind: "problem",
+      why: `${rcPath}: a '${BEGIN}' marker with no '${END}'; repair or remove that block by hand, refusing to overwrite everything below it`,
+    };
+  }
 
   const offsets: number[] = [0];
   for (let i = 0; i < text.length; i++) if (text[i] === "\n") offsets.push(i + 1);
   const blockStart = offsets[beginIdx]!;
   const blockEnd = offsets[endIdx]! + lines[endIdx]!.length; // right after END's own text, before its "\n"
-  return { rawBefore: text.slice(0, blockStart), blockText: text.slice(blockStart, blockEnd), rawAfter: text.slice(blockEnd) };
+  return { kind: "one", at: { rawBefore: text.slice(0, blockStart), blockText: text.slice(blockStart, blockEnd), rawAfter: text.slice(blockEnd) } };
+}
+
+/** Is this block exactly what `installAlias` writes? Both verbs ask, because
+ * a hand edit is a hand edit whichever direction the tool is going: install
+ * used to replace one silently, which destroys the human's line just as
+ * surely as a removal would have. `m[1] !== m[2]` catches the two alias lines
+ * naming DIFFERENT binaries — a block no single re-point could have produced. */
+function isOurBlock(blockText: string): boolean {
+  const m = EXPECTED_BLOCK_RE.exec(blockText);
+  return !!m && m[1] === m[2];
+}
+
+function handEdited(rcPath: string): string {
+  return `${rcPath}: the '${BEGIN}' … '${END}' block does not match what this tool writes (hand-edited?); remove it by hand, refusing to guess`;
 }
 
 /**
@@ -113,21 +155,18 @@ function spliceIn(pre: string, blockText: string, post: string): string {
 export function installAlias(rcPath: string, msBin: string): AliasResult {
   const existed = existsSync(rcPath);
   const text = existed ? readFileSync(rcPath, "utf8") : "";
-  const located = locate(text);
-  if (located === undefined) {
-    return {
-      changed: false,
-      backup: null,
-      problem: `${rcPath}: a '${BEGIN}' marker with no '${END}'; repair or remove that block by hand, refusing to overwrite everything below it`,
-    };
+  const located = locate(rcPath, text);
+  if (located.kind === "problem") return { changed: false, backup: null, problem: located.why };
+  if (located.kind === "one" && !isOurBlock(located.at.blockText)) {
+    return { changed: false, backup: null, problem: handEdited(rcPath) };
   }
   // No block yet: the whole file is "pre", appended to as is — nothing to
   // strip a separator from, because no separator has ever been added. A
-  // block already there (any binary, any content — install always replaces
-  // rather than validating) recovers the true surrounding bytes first, so
-  // re-pointing at a new binary never nests one wrapper's block inside
-  // another's separator.
-  const { pre, post } = located === null ? { pre: text, post: "" } : stripSep(located.rawBefore, located.rawAfter);
+  // block already there (validated as ours just above) recovers the true
+  // surrounding bytes first, so re-pointing at a new binary never nests one
+  // wrapper's block inside another's separator — and a block the human MOVED
+  // into the middle of the file is re-pointed where it stands.
+  const { pre, post } = located.kind === "none" ? { pre: text, post: "" } : stripSep(located.at.rawBefore, located.at.rawAfter);
   const next = spliceIn(pre, block(msBin), post);
   if (existed && next === text) return { changed: false, backup: null };
 
@@ -154,26 +193,20 @@ export function installAlias(rcPath: string, msBin: string): AliasResult {
 export function removeAlias(rcPath: string): AliasResult {
   if (!existsSync(rcPath)) return { changed: false, backup: null };
   const text = readFileSync(rcPath, "utf8");
-  const located = locate(text);
-  if (located === null) return { changed: false, backup: null }; // nothing installed
-  if (located === undefined) {
-    return {
-      changed: false,
-      backup: null,
-      problem: `${rcPath}: a '${BEGIN}' marker with no '${END}'; repair or remove that block by hand, refusing to touch it`,
-    };
-  }
-  const m = EXPECTED_BLOCK_RE.exec(located.blockText);
-  if (!m || m[1] !== m[2]) {
-    return {
-      changed: false,
-      backup: null,
-      problem: `${rcPath}: the '${BEGIN}' … '${END}' block does not match what this tool writes (hand-edited?); remove it by hand, refusing to guess`,
-    };
-  }
+  const located = locate(rcPath, text);
+  if (located.kind === "none") return { changed: false, backup: null }; // nothing installed
+  if (located.kind === "problem") return { changed: false, backup: null, problem: located.why };
+  if (!isOurBlock(located.at.blockText)) return { changed: false, backup: null, problem: handEdited(rcPath) };
 
-  const { pre, post } = stripSep(located.rawBefore, located.rawAfter);
-  const next = pre + post;
+  // `stripSep` gives back the surrounding content with the ONE newline
+  // `spliceIn` added on each side taken off again. When there is content on
+  // both sides, that leaves two lines with nothing between them: a block the
+  // human moved into the middle of the file had exactly one newline holding
+  // its neighbours apart before it was ever spliced in, and `pre + post`
+  // welded `export A=1` onto `source ~/.fzf.zsh`. One newline goes back
+  // wherever the block stood between two pieces of the human's own file.
+  const { pre, post } = stripSep(located.at.rawBefore, located.at.rawAfter);
+  const next = pre === "" || post === "" ? pre + post : `${pre}\n${post}`;
 
   const backup = backupThroughLink(rcPath, "bak-ms-");
   writeAtomicThroughLink(rcPath, next, { defaultMode: 0o644 });

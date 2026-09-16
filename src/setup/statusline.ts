@@ -313,11 +313,16 @@ function runWrapped(cmd: string[], input: string, timeoutMs: number): Promise<st
 
 /**
  * Undo `installStatusline`: restore `statusLine.command` from
- * `statusLine.msOriginal` and drop that key — or, when `msOriginal` is `""`
- * (there was nothing before this tool ever ran), delete `statusLine`
- * entirely, since that is exactly what a fresh install added. A
- * `statusLine` with no `msOriginal` at all is not ours to touch:
- * `changed: false`, no backup.
+ * `statusLine.msOriginal` and drop that key.
+ *
+ * When `msOriginal` is `""` there was no command before this tool ever ran —
+ * but that does NOT mean there was no `statusLine`. A human can perfectly
+ * well have had `{ "type": "command", "padding": 0 }` and no command, and
+ * deleting the whole object (which this used to do) took their keys with it.
+ * So the removal is always the exact inverse of the install: drop the two
+ * keys this tool owns, put `command` back only when there was one, and
+ * delete `statusLine` itself only when what remains is nothing — or nothing
+ * but the `type: "command"` a fresh install added alongside its own keys.
  */
 export function removeStatusline(settingsPath: string): StatuslineResult {
   let existing: Settings | null;
@@ -337,13 +342,13 @@ export function removeStatusline(settingsPath: string): StatuslineResult {
 
   const backup = backupThroughLink(settingsPath, "bak-ms-");
 
-  if (original === "") {
-    delete settings.statusLine;
-  } else {
-    delete statusLine.msOriginal;
-    statusLine.command = original;
-    settings.statusLine = statusLine;
-  }
+  delete statusLine.msOriginal;
+  if (original === "") delete statusLine.command;
+  else statusLine.command = original;
+  const remaining = Object.keys(statusLine);
+  const onlyWhatWeAdded = remaining.length === 0 || (remaining.length === 1 && statusLine.type === "command");
+  if (original === "" && onlyWhatWeAdded) delete settings.statusLine;
+  else settings.statusLine = statusLine;
   writeAtomicThroughLink(settingsPath, JSON.stringify(settings, null, 2) + "\n", { defaultMode: 0o600 });
   return { changed: true, backup };
 }

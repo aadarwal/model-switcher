@@ -26,7 +26,7 @@
 // spawnSync timeout — nothing here can hang a release forever.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, cpSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, cpSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -65,6 +65,25 @@ function git(cwd, args) {
   return run("git", args, { cwd });
 }
 
+/** Same contract as `run()`, but for a command whose stdout is BINARY (tar,
+ *  gzip) — `run()`'s `encoding: "utf8"` would corrupt it. */
+function runBuffer(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { timeout: 120_000, maxBuffer: 256 * 1024 * 1024, ...opts });
+  if (r.error) return { ok: false, stdout: Buffer.alloc(0), stderr: r.error.message };
+  return { ok: r.status === 0, stdout: r.stdout ?? Buffer.alloc(0), stderr: (r.stderr ?? Buffer.alloc(0)).toString("utf8") };
+}
+
+/** HEAD's committer timestamp (`git log -1 --format=%ct`), the fixed mtime
+ *  every staged file gets before tarring — so two builds of the same commit,
+ *  seconds apart, embed the same time in every entry. Falls back to the
+ *  epoch on any failure (there is always a HEAD by the time this runs: the
+ *  dirty-tree check already requires a commit to compare against). */
+function commitMtimeSeconds(repoRoot) {
+  const r = git(repoRoot, ["log", "-1", "--format=%ct"]);
+  const n = Number(r.stdout.trim());
+  return r.ok && Number.isFinite(n) ? n : 0;
+}
+
 function parseArgs(argv) {
   const flags = { publish: false, dryRun: false, tap: "../homebrew-tap" };
   const positional = [];
@@ -86,22 +105,43 @@ function sha256File(file) {
 /** Stages the six tarball entries under `model-switcher-<tag>/` in a scratch
  *  directory, then tars them by NAME (never a bare directory argument) so
  *  the archive holds exactly six entries — no directory entries, nothing
- *  else swept in. */
+ *  else swept in.
+ *
+ *  Byte-reproducible by construction, not by luck: every staged file's
+ *  mtime is pinned to HEAD's own commit timestamp (so two builds of the
+ *  same commit, run seconds apart, produce identical entry headers),
+ *  ownership is pinned to uid/gid 0 with names omitted
+ *  (`--uid 0 --gid 0 --numeric-owner`, tar's own portable equivalent of
+ *  GNU's `--owner=0 --group=0 --numeric-owner`), and the gzip wrapper is
+ *  written by a SEPARATE `gzip -n` pass over tar's own uncompressed
+ *  stdout — never tar's own built-in `-z`, whose gzip layer would otherwise
+ *  stamp the archive with the current wall-clock time on every build. */
 function buildTarball(repoRoot, tag) {
   const versionDir = `model-switcher-${tag}`;
   const scratch = mkdtempSync(path.join(tmpdir(), "ms-release-stage-"));
   try {
+    const mtime = commitMtimeSeconds(repoRoot);
     for (const rel of TARBALL_ENTRIES) {
       const dest = path.join(scratch, versionDir, rel);
       mkdirSync(path.dirname(dest), { recursive: true });
       cpSync(path.join(repoRoot, rel), dest);
+      utimesSync(dest, mtime, mtime);
     }
     const releaseDir = path.join(repoRoot, "release");
     mkdirSync(releaseDir, { recursive: true });
     const tarballPath = path.join(releaseDir, `${versionDir}.tar.gz`);
-    const args = ["-czf", tarballPath, "-C", scratch, ...TARBALL_ENTRIES.map((rel) => path.join(versionDir, rel))];
-    const r = run("tar", args, { timeout: 60_000 });
-    if (!r.ok) fail(`tar failed: ${r.stderr || r.stdout}`);
+
+    const tarArgs = ["-cf", "-", "--uid", "0", "--gid", "0", "--numeric-owner", "-C", scratch, ...TARBALL_ENTRIES.map((rel) => path.join(versionDir, rel))];
+    const tarResult = runBuffer("tar", tarArgs, { timeout: 60_000 });
+    if (!tarResult.ok) fail(`tar failed: ${tarResult.stderr}`);
+
+    // -n: no original name/timestamp in the gzip header — the other half of
+    // reproducibility (tar's own entry headers carry the pinned mtime above;
+    // gzip's OUTER wrapper has its own, separate timestamp field).
+    const gzResult = runBuffer("gzip", ["-n"], { input: tarResult.stdout, timeout: 60_000 });
+    if (!gzResult.ok) fail(`gzip failed: ${gzResult.stderr}`);
+
+    writeFileSync(tarballPath, gzResult.stdout);
     return tarballPath;
   } finally {
     rmSync(scratch, { recursive: true, force: true });

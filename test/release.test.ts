@@ -10,7 +10,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -87,6 +88,10 @@ function extractSha(stdout: string): string {
   const m = stdout.match(/^sha256\s+([0-9a-f]{64})$/m);
   assert.ok(m, `no sha256 in stdout:\n${stdout}`);
   return m![1]!;
+}
+
+function sha256Hex(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 // --- --dry-run: tarball contents and layout -------------------------------
@@ -166,6 +171,39 @@ test("renderFormula substitutes all three fields and leaves no placeholder", () 
   assert.ok(!out.includes("__VERSION__"), out);
   assert.ok(!out.includes("__URL__"), out);
   assert.ok(!out.includes("__SHA256__"), out);
+  // MS_BIN must travel alongside MS_ENTRY=dist in the shim: msBinary()
+  // (src/paths.ts) honours MS_BIN, and without it the doctor's "ms on PATH
+  // is msBinary()" check resolves the wrong path against a real keg (see
+  // task-4-report.md, fix round 1).
+  assert.ok(out.includes('MS_BIN="#{bin}/ms"'), out);
+});
+
+// --- reproducibility ---------------------------------------------------------
+
+test("two builds of the same commit, seconds apart, are byte-identical", () => {
+  const dir = makeFixture();
+
+  const r1 = runRelease(dir, ["v0.1.0", "--dry-run"]);
+  assert.equal(r1.status, 0, r1.stderr);
+  const tarball1 = extractTarballPath(r1.stdout);
+  const sha1 = extractSha(r1.stdout);
+  const bytes1 = readFileSync(tarball1);
+
+  // Actually wait a few real seconds — not just rely on the gzip -n / pinned
+  // mtime logic being right on paper. rmSync + a fresh dry-run forces a
+  // completely new tar+gzip pass at a different wall-clock time.
+  rmSync(path.dirname(tarball1), { recursive: true, force: true });
+  execFileSync("sleep", ["2"]);
+
+  const r2 = runRelease(dir, ["v0.1.0", "--dry-run"]);
+  assert.equal(r2.status, 0, r2.stderr);
+  const tarball2 = extractTarballPath(r2.stdout);
+  const sha2 = extractSha(r2.stdout);
+  const bytes2 = readFileSync(tarball2);
+
+  assert.equal(sha1, sha2, "printed sha256 must match across builds");
+  assert.equal(sha256Hex(bytes1), sha1);
+  assert.ok(bytes1.equals(bytes2), "the two tarballs must be byte-identical, not just same-shaped");
 });
 
 // --- --publish ---------------------------------------------------------------

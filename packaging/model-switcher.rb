@@ -16,7 +16,7 @@ class ModelSwitcher < Formula
 
     (bin/"ms").write <<~SHIM
       #!/bin/bash
-      exec env MS_ENTRY=dist node "#{libexec}/dist/ms.js" "$@"
+      exec env MS_ENTRY=dist MS_BIN="#{bin}/ms" node "#{libexec}/dist/ms.js" "$@"
     SHIM
     (bin/"ms").chmod 0755
   end

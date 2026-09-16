@@ -113,7 +113,12 @@ interchangeable:
   inference-scope only and cannot read usage limits.
 * the **poll grant** — OAuth profile credentials in that account's own config
   directory (`MS_HOME/claude/<name>`), which is what reads the account's
-  remaining usage so the chooser can rank accounts.
+  remaining usage so the chooser can rank accounts. On macOS `claude auth
+  login` puts it in your login keychain, under a service derived from that
+  directory; `ms` reads it there. When `ms` refreshes it, the refreshed grant
+  is written to `MS_HOME/claude/<name>/.credentials.json` (0600) — which is
+  where `ms` looks first — and the keychain item it came from, whose refresh
+  token the refresh has just spent, is deleted.
 
 `ms accounts login` mints both, in two browser flows. **Sign in as the same
 account in both tabs** — nothing downstream can tell that you did not, and an

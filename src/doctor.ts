@@ -27,6 +27,7 @@ import { loadRegistry, type Account } from "./registry.ts";
 import { AuthError, TransientError, readPollCredentials, refreshPollCredentials } from "./providers/claude-usage.ts";
 import { fetchCodexUsage, readCodexCredentials } from "./providers/codex-usage.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
+import { codexAutorotateEnabled, codexAutorotateLine } from "./autorotate.ts";
 import { openState, type SessionRow } from "./state.ts";
 import { Tmux } from "./tmux.ts";
 import { resolveOnPath } from "./exec.ts";
@@ -670,6 +671,15 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
   const { registry, parseError, problems } = loadRegistry();
   const codexAccounts = registry.accounts.filter((a) => a.provider === "codex");
   results.push(checkCodexBinary(codexAccounts.length > 0));
+  // The Codex auto-recovery gate, stated rather than left to be guessed at:
+  // it ships off, it is a stored setting (src/autorotate.ts) because the
+  // processes that read it are dispatched by tmux, and the line names the
+  // shell the variable that sets it belongs in. Never a ✗ — off is the
+  // shipped default, not a fault.
+  if (codexAccounts.length > 0) {
+    const st = openState();
+    try { results.push({ ok: true, what: codexAutorotateLine(codexAutorotateEnabled(st)) }); } finally { st.close(); }
+  }
   for (const a of codexAccounts) {
     results.push(...(await checkCodexAccount(a, fix)));
   }

@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { run, stubDir, tempHome } from "./helpers.ts";
@@ -345,6 +345,52 @@ test("the usage fetch carries the access token and the account id, never the ref
 
 // --- verify ------------------------------------------------------------
 
+test("login installs the codex hooks into the home it just filled", () => {
+  // A-I4. Nothing else sends the human to `ms doctor --fix`, and a Codex home
+  // with no hooks starts fine and reports NOTHING: no SessionStart, so the row
+  // never learns its conversation id, and the first `ms rotate` respawns a
+  // plain `codex` over the human's conversation.
+  const s = scene();
+  s.ms(["add", "work", "--provider", "codex"]);
+  const r = s.ms(["login", "work"]);
+  assert.equal(r.code, 0, r.stderr);
+
+  const config = path.join(s.codexHome("work"), "config.toml");
+  assert.ok(existsSync(config), "config.toml was written");
+  assert.equal(statSync(config).mode & 0o777, 0o600);
+  const text = readFileSync(config, "utf8");
+  for (const ev of ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]) {
+    assert.ok(text.includes(`[[hooks.${ev}]]`), ev);
+  }
+  assert.match(text, /trusted_hash = "sha256:[0-9a-f]{64}"/);
+  assert.match(r.stdout, /codex hooks installed/);
+
+  // Idempotent: a second login over the same home changes nothing and says
+  // nothing about hooks.
+  const before = readFileSync(config, "utf8");
+  const again = s.ms(["login", "work"]);
+  assert.equal(again.code, 0, again.stderr);
+  assert.equal(readFileSync(config, "utf8"), before);
+  assert.doesNotMatch(again.stdout, /codex hooks installed/);
+});
+
+test("a config.toml the hook installer will not touch warns, and never fails the login", () => {
+  // The credential is good; a `hooks` table this tool cannot classify is a
+  // person's job, and taking the login away from them would not help.
+  const s = scene();
+  s.ms(["add", "work", "--provider", "codex"]);
+  const before = "[hooks]\nSessionStart = []\n";
+  writeFileSync(path.join(s.codexHome("work"), "config.toml"), before, { mode: 0o600 });
+
+  const r = s.ms(["login", "work"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /could not install the codex hooks for work/);
+  assert.match(r.stderr, /a 'hooks' table this tool cannot read/);
+  assert.match(r.stderr, /ms doctor --fix/);
+  assert.equal(readFileSync(path.join(s.codexHome("work"), "config.toml"), "utf8"), before, "untouched");
+  assert.equal(s.row("work").identityVerified, true, "the identity was still recorded");
+});
+
 test("verify re-reads auth.json, re-proves the credential, and never logs in", () => {
   const s = scene();
   s.ms(["add", "work", "--provider", "codex"]);
@@ -449,6 +495,33 @@ test("remove deletes the home but not the shared sessions store", () => {
   assert.equal(existsSync(s.codexHome("work")), false);
   assert.ok(existsSync(rollout), "the shared rollout store was followed and deleted");
   assert.equal(readFileSync(rollout, "utf8"), '{"session":"kept"}\n');
+});
+
+test("remove refuses when <home>/sessions is a real directory of transcripts", () => {
+  // A-M8. `ensureCodexHome` and `ms doctor` both leave a real `sessions`
+  // directory alone on purpose — it is this account's own transcripts, from a
+  // `codex` that ran before the link existed. `rmSync` on the home tree would
+  // take it with them, and a transcript is never this tool's to throw away.
+  const s = scene();
+  s.ms(["add", "work", "--provider", "codex"]);
+  const sessions = path.join(s.codexHome("work"), "sessions");
+  rmSync(sessions);                       // the link the wizard made
+  mkdirSync(sessions, { recursive: true, mode: 0o700 });
+  const kept = path.join(sessions, "rollout-2026-09-16.jsonl");
+  writeFileSync(kept, '{"session":"mine"}\n');
+
+  const r = s.ms(["remove", "work", "--provider", "codex"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /real directory of transcripts/);
+  assert.ok(r.stderr.includes(sessions), "the message names the path");
+  assert.equal(readFileSync(kept, "utf8"), '{"session":"mine"}\n', "and nothing was deleted");
+  assert.deepEqual(s.accounts().map((a) => a.name), ["work"], "the row stays too");
+
+  // With the ordinary symlink there, remove works exactly as before.
+  rmSync(sessions, { recursive: true });
+  const s2 = scene();
+  s2.ms(["add", "other", "--provider", "codex"]);
+  assert.equal(s2.ms(["remove", "other", "--provider", "codex"]).code, 0);
 });
 
 test("remove of a codex row leaves the claude row of the same name alone", () => {

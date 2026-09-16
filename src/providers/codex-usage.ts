@@ -86,6 +86,37 @@ export function codexIdentity(auth: CodexAuth): { accountId: string; email: stri
   };
 }
 
+/**
+ * An `AuthError` from the usage endpoint that remembers WHICH status caused
+ * it. The two are not the same answer: a 401 says this access token is no
+ * longer accepted, which one refresh can fix and the poller retries once (the
+ * rule the dashboard's `fetchOpenAIUsage` has always used); a 403 is a scope
+ * answer no refresh changes. It subclasses `AuthError` — and inherits its
+ * `name` — so every existing `instanceof`/name classification is unchanged.
+ */
+export class CodexAuthError extends AuthError {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/**
+ * The `exp` claim of an access token, in epoch milliseconds, or null when the
+ * token carries none this tool can read.
+ *
+ * This is the refresh trigger, copied from the proven poller
+ * (data/lib/providers/openai.ts's `jwtExpiryMs`): a token is refreshed when
+ * its own expiry is near, never on how long ago it was last refreshed. Null
+ * means "the token does not say", and the answer to that is to leave it
+ * alone and let a 401 speak instead — not to refresh on a clock.
+ */
+export function codexAccessTokenExpiryMs(auth: CodexAuth): number | null {
+  const exp = decodeJwtClaims(auth.tokens.access_token).exp;
+  return typeof exp === "number" ? exp * 1000 : null;
+}
+
 /** Classifies a thrown `fetch`. Deadline reached ⇒ TransientError; a network
  *  fault ⇒ TransientError; but a caller-initiated abort is cancellation, not
  *  a transient failure, so its own reason is rethrown — identical logic to
@@ -167,7 +198,7 @@ export async function fetchCodexUsage(auth: CodexAuth, signal: AbortSignal): Pro
     throw transientFromFetchError(err, "the usage endpoint", signal);
   }
 
-  if (res.status === 401 || res.status === 403) throw new AuthError(`${res.status} from wham/usage`);
+  if (res.status === 401 || res.status === 403) throw new CodexAuthError(`${res.status} from wham/usage`, res.status);
   if (res.status === 429 || res.status >= 500) {
     throw new TransientError(`${res.status} from wham/usage`, parseRetryAfter(res.headers.get("retry-after")));
   }

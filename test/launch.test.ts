@@ -764,6 +764,48 @@ test("the hook tables in the same config.toml survive a launch untouched", async
   assert.match(text, /^trust_level = "trusted"$/m);
 });
 
+test("a codex home with no hooks gets them installed before the pane is launched", async () => {
+  // A-I4. A hook-less Codex home starts fine and reports NOTHING: no
+  // SessionStart, so the row never learns its conversation id or its rollout
+  // path; reconcile adopts it as `running` after five minutes, so `ms status`
+  // reads healthy; the watchdog never arms. The bill arrives at the first
+  // `ms rotate`, which finds no conversation to resume and respawns a plain
+  // `codex` over the human's own. So no Codex pane is ever launched blind.
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  assert.equal(existsSync(configToml(w.msHome, "home")), false, "nothing has written this home's config yet");
+
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 0, r.stderr);
+
+  const { codexHooksInstalled } = await import("../src/hooks/codex-install.ts");
+  assert.equal(codexHooksInstalled(path.join(w.msHome, "codex", "home"), MS_BIN), true);
+  // And they were there at the instant tmux was told to run the CLI, not a
+  // moment after it: the snapshot is the file as the respawn saw it. (It is
+  // compared as TEXT, because a trust key names the config's own path and a
+  // copy at another path can never read as installed.)
+  const atRespawn = readFileSync(path.join(w.atRespawn, "codex", "home", "config.toml"), "utf8");
+  assert.ok(atRespawn.includes("[[hooks.SessionStart]]"), atRespawn);
+  assert.ok(atRespawn.includes(`command = "${MS_BIN} _hook codex"`), atRespawn);
+  assert.ok(atRespawn.includes(`[hooks.state."${configToml(w.msHome, "home")}:session_start:0:0"]`), atRespawn);
+
+  // A second launch installs nothing again: the file does not move.
+  const before = readFileSync(configToml(w.msHome, "home"), "utf8");
+  assert.equal(run(["codex"], w.env()).code, 0);
+  assert.equal(readFileSync(configToml(w.msHome, "home"), "utf8"), before);
+});
+
+test("a config.toml the hook installer will not touch refuses the launch, naming the doctor", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  // A `hooks` table this tool cannot classify — the installer's own refusal.
+  writeFileSync(configToml(w.msHome, "home"), "[hooks]\nSessionStart = []\n", { mode: 0o600 });
+
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 1, r.stderr); // EXIT_ACCOUNT: a home that is not ready
+  assert.match(r.stderr, /a 'hooks' table this tool cannot read/);
+  assert.match(r.stderr, /ms doctor --fix/);
+  assert.equal(existsSync(w.log), false, "tmux was never invoked at all: no pane was launched blind");
+});
+
 test("ms codex --need fable is a usage error: there is no such window", async () => {
   const w = await codexWorld([{ name: "home", weekly: 10 }]);
   const r = run(["codex", "--need", "fable"], w.env());

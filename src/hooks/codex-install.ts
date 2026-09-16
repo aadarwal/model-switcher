@@ -153,6 +153,21 @@ const STATE = String.raw`(?:state|"state"|'state')`;
 const BARE = String.raw`[A-Za-z0-9_-]+`;
 const EVENT_HEADER = new RegExp(String.raw`^\[\[\s*${HOOKS}\s*\.\s*(?:(${BARE})|"(${BARE})"|'(${BARE})')\s*\]\]$`);
 const STATE_HEADER = new RegExp(String.raw`^\[\s*${HOOKS}\s*\.\s*${STATE}\s*\.\s*("(?:[^"\\]|\\.)*"|'[^']*')\s*\]$`);
+/**
+ * A header whose FIRST key segment is `hooks` — `[hooks]`, `[[hooks]]`,
+ * `[hooks.state]`, `[[hooks.SessionStart.extra]]`, and the quoted spellings.
+ * Those are the only headers that can shift the matcher index our trust key is
+ * built from, or collide with one of our keys.
+ *
+ * It is deliberately NOT the substring `hooks`. `ensureCodexTrust` appends
+ * `[projects."<cwd>"]` to this very file on every launch, so a launch from
+ * `~/src/webhooks-service` (or `git-hooks`, `pre-commit-hooks`) would
+ * otherwise turn a correctly installed home into one the installer refuses to
+ * touch and `codexHooksInstalled` reports false — a home the wizard could
+ * never repair. A `projects` or `mcp_servers` table that merely carries the
+ * word is the human's, and is copied through byte for byte.
+ */
+const HOOKS_SEGMENT = new RegExp(String.raw`^\[\[?\s*${HOOKS}\s*[.\]]`);
 
 /**
  * Whether a line is a table header at all: after its comment is cut and its
@@ -170,14 +185,15 @@ function classify(raw: string): Header {
   if (ev) return { kind: "event", table: ev[1] ?? ev[2] ?? ev[3]! };
   const st = STATE_HEADER.exec(line);
   if (st) return { kind: "state", key: unquoteTomlKey(st[1]) };
-  // Not one of ours — but is it under `hooks` at all? A header that does not
-  // contain the word cannot be, whatever else it is, and refusing on every
+  // Not one of ours — but is it under `hooks` at all? Only a header whose
+  // FIRST key segment is `hooks` can be, whatever else it is; refusing on every
   // unparsed header would refuse on a nested array literal that happens to sit
-  // on its own line. (A key that spells the word with an escape —
-  // `["\u0068ooks".SessionStart]` — defeats this; it also defeats every other
+  // on its own line, and refusing on the mere substring would refuse on the
+  // human’s own `[projects."…/webhooks-service"]`. (A key that spells the word
+  // with an escape — `["\u0068ooks".SessionStart]` — defeats this; it also defeats every other
   // reader of this file, Codex's own included, and is not a shape any tool
   // writes.)
-  return /hooks/.test(line) ? { kind: "unknown" } : null;
+  return HOOKS_SEGMENT.test(line) ? { kind: "unknown" } : null;
 }
 
 /** The inverse of `tomlString` for the one quoted segment `STATE_HEADER`
@@ -315,11 +331,43 @@ export function installCodexHooks(homeDir: string, msBin: string): InstallResult
   if (existed) {
     backup = `${file}.bak-ms-${Math.floor(Date.now() / 1000)}`;
     copyFileSync(file, backup);
+    // `copyFileSync` gives the copy the SOURCE's mode (libuv fchmods to
+    // `st_mode`), and Codex's own writes — the modal trust prompt,
+    // `/settings` → t — are 0644. A backup is a full copy of a file that
+    // names every project this account is trusted in, so it is 0600 like the
+    // original this tool writes, not like the one it found.
+    chmodSync(backup, 0o600);
   } else {
     mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   }
   writeAtomic(file, next);
   return { changed: true, backup };
+}
+
+/**
+ * Make sure this home's hooks are installed AND trusted, or say why not.
+ *
+ * The one call both the account wizard and a launch make, because a Codex home
+ * with no hooks is the worst kind of broken: nothing fails. No SessionStart
+ * ever fires, so the row's `cliSessionId` and `transcriptPath` stay null;
+ * reconcile adopts the row as `running` after five minutes, so `ms status`
+ * reads healthy; the watchdog never arms, so no wall is ever noticed — and
+ * the first `ms rotate` finds no conversation to resume and respawns a plain
+ * `codex`, replacing the human's conversation with an empty one.
+ *
+ * Idempotent, and cheap when there is nothing to do: an already-correct home
+ * writes nothing and backs nothing up. `problem` is the installer's own
+ * refusal, verbatim, plus the case where a write that claimed to succeed did
+ * not produce an installed home — which is a refusal too, not a shrug.
+ */
+export function ensureCodexHooks(homeDir: string, msBin: string): InstallResult {
+  if (codexHooksInstalled(homeDir, msBin)) return { changed: false, backup: null };
+  const res = installCodexHooks(homeDir, msBin);
+  if (res.problem) return res;
+  if (!codexHooksInstalled(homeDir, msBin)) {
+    return { ...res, problem: `${codexConfigPath(homeDir)}: the hooks are still not installed after writing them` };
+  }
+  return res;
 }
 
 /** One `[[hooks.<Event>]]` table as the scan below sees it: its position

@@ -212,6 +212,22 @@ export class State {
   }
   setKv(k: string, v: string): void { this.db.prepare("INSERT INTO kv (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(k, v); }
   delKv(k: string): void { this.db.prepare("DELETE FROM kv WHERE k=?").run(k); }
+  /**
+   * Move a session's rollout offset, but ONLY while it still names the file
+   * the offset was measured in.
+   *
+   * The Codex watch reads a row at the start of a pass and stamps the offset
+   * at the end of it. In between, a `/new` in that pane fires a SessionStart
+   * whose hook points the row at a fresh rollout and resets the offset to 0 —
+   * and that hook does not hold the watch's lock. A plain `updateSession`
+   * would then stamp the OLD file's offset onto the NEW path, and the watch
+   * would skip the first N bytes of a conversation it has never read (it
+   * self-heals only while the new file happens to be shorter). The path in
+   * the WHERE clause is what makes the write a no-op instead.
+   */
+  advanceRolloutOffset(sessionId: string, transcriptPath: string, offset: number): void {
+    this.db.prepare("UPDATE sessions SET rolloutOffset=?, updatedAt=? WHERE id=? AND transcriptPath=?").run(offset, now(), sessionId, transcriptPath);
+  }
   setWakeup(sessionId: string, at: number | null): void { this.db.prepare("UPDATE sessions SET wakeupAt=?, updatedAt=? WHERE id=?").run(at, now(), sessionId); }
   /**
    * Clear a wake-up ONLY if it is still the exact deadline being consumed.

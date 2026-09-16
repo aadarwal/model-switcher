@@ -303,6 +303,12 @@ function rows(w: World, table: "recoveries" | "attempts"): Record<string, unknow
   }
 }
 
+/** Write the Codex auto-recovery gate the way the hook does. */
+function setGate(value: string): void {
+  const st = openState();
+  try { st.setKv("codexAutorotate", value); } finally { st.close(); }
+}
+
 function session(w: World): SessionRow {
   const st = openState();
   try {
@@ -1633,6 +1639,37 @@ test("without MS_CODEX_AUTOROTATE nothing automatic moves a codex session — an
   assert.deepEqual(sendKeys(w), [`send-keys -t ${PANE} C-c`, `send-keys -t ${PANE} C-c`]);
 });
 
+test("the codex gate is a STORED setting: kv acts with nothing in the environment, and kv wins over it", async (t) => {
+  // A-I2. `ms _recover` is dispatched by `tmux run-shell`, which runs it with
+  // the tmux SERVER's global environment — not the shell that exported the
+  // flag. Reading `process.env` here read the wrong environment, so a wall
+  // inside an existing tmux was recorded and nothing opened. The gate the
+  // worker reads is the row the hook writes.
+  const w = await codexWorld(t, { autorotate: false });
+  assert.equal(process.env.MS_CODEX_AUTOROTATE, undefined, "nothing in this process's environment");
+  setGate("1");
+
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0, "the stored gate is the whole authority");
+  assert.equal(session(w).account, "home");
+  assert.equal(rows(w, "recoveries")[0].status, "done");
+});
+
+test("a stored 'off' wins over an exported MS_CODEX_AUTOROTATE=1", async (t) => {
+  // The hook keeps the store current from the shell that actually runs codex,
+  // so whatever some other environment still carries does not overrule it.
+  const w = await codexWorld(t, { autorotate: false });
+  setGate("0");
+  process.env.MS_CODEX_AUTOROTATE = "1";
+  t.after(() => { delete process.env.MS_CODEX_AUTOROTATE; });
+
+  assert.equal(await recoverSession("s1"), 1);
+  assert.match(recoverLog(w), /codex automatic recovery is disabled until a live wall is observed/);
+  assert.ok(!respawnLine(w), "nothing is respawned");
+  assert.equal(rows(w, "recoveries")[0].status, "pending", "and the wall is left for the human's own verb");
+});
+
 test("a codex conversation nobody has typed into is resumed, but not asked to continue", async (t) => {
   // Two questions, two answers. The rollout exists, so there IS a conversation
   // to come back to — but no turn was ever submitted on it, so there is no
@@ -1994,9 +2031,22 @@ test("a codex session that needs fable is refused: there is no such window to wa
   assert.equal(s.account, "work");
   assert.equal(s.state, "walled");
   assert.equal(s.wakeupAt, null);
+  // A-M7. The refusal is TERMINAL, so the row that asked for it is closed.
+  // Left pending and unowned, `reconcile`'s `redispatchOrphan` sends a worker
+  // at it every 45 s for ever, and every one of them lands here and says the
+  // same thing. `failed`, not `done`: a reader can tell "rotated fine" from
+  // "needs a human", and a real wall on a later generation can still open a
+  // fresh recovery over it.
   const rec = rows(w, "recoveries")[0];
-  assert.equal(rec.status, "pending");
+  assert.equal(rec.status, "failed");
   assert.equal(rec.owner, null, "nothing was claimed");
+
+  // A second dispatch changes nothing further, and finds nothing to re-open.
+  assert.equal(await recoverSession("s1"), 2);
+  assert.equal(rows(w, "recoveries").length, 1);
+  assert.equal(rows(w, "recoveries")[0].status, "failed");
+  assert.equal(session(w).state, "walled", "the session itself is untouched");
+  assert.equal(session(w).account, "work");
 });
 
 test("no codex credential ever reaches a tmux command line", async (t) => {

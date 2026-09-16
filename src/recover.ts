@@ -39,6 +39,7 @@ import { hostname } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
+import { codexAutorotateEnabled } from "./autorotate.ts";
 import { readEvents } from "./events.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
@@ -81,12 +82,16 @@ export const CONTINUATION =
  * The human's own verbs are never gated by this — `ms rotate`, `ms switch`
  * and `ms stop` move a Codex session today. What is gated is the automatic
  * claim, which is the one path with no person in front of it.
+ *
+ * The gate itself is `codexAutorotateEnabled` (src/autorotate.ts): a row in
+ * the store with the environment variable in front of it. It has to be. This
+ * module runs as `ms _recover`, which `tmux run-shell` dispatches with the
+ * tmux SERVER's global environment — never the shell that exported
+ * `MS_CODEX_AUTOROTATE`. Reading `process.env` here read the wrong
+ * environment, and the symptom was silence.
  */
 const CODEX_AUTOROTATE_MESSAGE =
   "codex automatic recovery is disabled until a live wall is observed (set MS_CODEX_AUTOROTATE=1)";
-/** Exactly "1": a variable somebody exported as "0" or "false" to turn this
- *  OFF must never read as on. */
-const codexAutorotate = (): boolean => process.env.MS_CODEX_AUTOROTATE === "1";
 
 /** One recovery at a time per session; a second worker is a duplicate. */
 const SESSION_LOCK_WAIT_MS = 5_000;
@@ -934,9 +939,23 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
     // Only the automatic path. A human's `ms rotate`/`switch --as` is not
     // asking the chooser to satisfy a need — it names the account, or accepts
     // whatever has room — and refusing them here would leave a hand-edited row
-    // with no way out at all. Nothing is claimed and nothing is touched.
+    // with no way out at all. Nothing is claimed, and the only thing written
+    // is the closing of the row below.
     if (!opts.manual && session.provider === "codex" && session.need === "fable") {
       const why = `codex has no fable window; ${id} cannot be recovered while it needs fable`;
+      // A TERMINAL refusal, so the row that asked for it is closed. Left
+      // pending and unowned, `reconcile`'s `redispatchOrphan` sends a worker
+      // at it every 45 s for ever, and every one of them lands here and says
+      // the same thing. `failed` (not `done`) is what `park` uses for the same
+      // reason: a reader can tell "rotated fine" from "needs a human", and
+      // `one_open_recovery` already treats anything outside pending/owned as
+      // closed, so a real wall on a later generation can still open one.
+      //
+      // The SESSION is not touched. It is not parked, it keeps its state and
+      // its account, and the human's own `ms rotate`/`switch --as` — which
+      // never comes through here — still moves it.
+      const rec = st.pendingRecovery(id);
+      if (rec) st.finishRecovery(rec.id, "failed");
       logLine(id, g, why);
       process.stderr.write(`ms _recover: ${why}\n`);
       return 2;
@@ -1024,7 +1043,7 @@ function claimAutomatic(st: State, session: SessionRow, tmux: Tmux): Claim {
   // exactly as its trigger wrote it: `ms status` still shows the wall, and
   // the human's own `ms rotate` — which never comes through here — can pick
   // that same row up and move the session on their say-so.
-  if (session.provider === "codex" && !codexAutorotate()) return { why: CODEX_AUTOROTATE_MESSAGE };
+  if (session.provider === "codex" && !codexAutorotateEnabled(st)) return { why: CODEX_AUTOROTATE_MESSAGE };
   const rec = st.pendingRecovery(session.id);
   if (!rec) return { why: "no pending recovery" };
   if (!st.ownRecovery(rec.id, owner())) return { why: `recovery ${rec.id} is already owned by ${rec.owner ?? "another worker"}` };

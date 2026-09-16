@@ -31,15 +31,22 @@
 // parallel panes, all of them reading the same rows.
 //
 // Automatic rotation stays OFF until a live Codex wall has been observed
-// (spike verdict G1: PARTIAL). Without `MS_CODEX_AUTOROTATE=1` the watch
-// records the `rate_limited` event — which is what `ms status` reads — and
-// stops there. The flag is the single line that turns evidence into action.
+// (spike verdict G1: PARTIAL). Without the gate the watch records the
+// `rate_limited` event — which is what `ms status` reads — and stops there.
+// The gate is the single line that turns evidence into action, and it is a row
+// in the store rather than `process.env` because `_codex_watch` and `_recover`
+// are dispatched by `tmux run-shell`, which hands them the tmux server's
+// global environment and not the shell that exported `MS_CODEX_AUTOROTATE`
+// (src/autorotate.ts). THIS hook is one of the few `ms` processes that does
+// see the human's own environment — the CLI inherits the pane's — so it
+// mirrors an exported value into the store on its way past.
 //
 // Neither verb ever prints. `_hook` is read by the Codex TUI, which renders a
 // hook's output; `_codex_watch` is dispatched by tmux, where stderr becomes a
 // message over the human's pane. Both exit 0 on every path, including failure.
 
 import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { codexAutorotateEnabled, codexAutorotateEnv, syncCodexAutorotate } from "../autorotate.ts";
 import { appendEvent, readEvents, type EventKind } from "../events.ts";
 import { msBinary } from "../paths.ts";
 // type-only: erased, so naming them here never loads node:sqlite
@@ -124,6 +131,11 @@ export async function codexHook(): Promise<number> {
     // is 0 too, so "finite" is not enough to tell a real one from a blank.
     if (!session || !Number.isInteger(gen) || gen <= 0 || !socket || !pane) return 0;
 
+    // The gate, carried from the human's shell into the store the dispatched
+    // processes can actually read. Only when the variable is set here — the
+    // ordinary case is unset, and that must cost no store at all.
+    await mirrorAutorotate();
+
     if (process.stdin.isTTY) return 0;
     let input: Record<string, unknown>;
     try { input = JSON.parse(await readStdin(STDIN_MS)) as Record<string, unknown>; } catch { return 0; }
@@ -165,6 +177,24 @@ export async function codexHook(): Promise<number> {
     // reconciliation reads the store and the screen on the next `ms` command.
     return 0;
   }
+}
+
+/**
+ * Write an exported `MS_CODEX_AUTOROTATE` into the store, so `_codex_watch`
+ * and `_recover` — which tmux dispatches with the SERVER's environment, not
+ * this one — read the gate the human actually set.
+ *
+ * A variable that is not set here says nothing and writes nothing: the stored
+ * gate stays as it was. Everything is guarded, because a hook that threw would
+ * print through the CLI's error path into the human's transcript.
+ */
+async function mirrorAutorotate(): Promise<void> {
+  if (codexAutorotateEnv() === null) return; // the ordinary case: no store opened
+  try {
+    const { openState } = await import("../state.ts");
+    const st = openState();
+    try { syncCodexAutorotate(st); } finally { st.close(); }
+  } catch { /* a gate we could not record is the gate that was already there */ }
 }
 
 /**
@@ -392,9 +422,22 @@ export async function codexWatch(): Promise<number> {
           const seconds = await watchSeconds();
           new Tmux(inFlight.socket).runShell([msBinary(), "_codex_watch"], { delaySeconds: seconds });
           claimTimer(st, seconds);
-        } else {
-          st.delKv(ARMED_UNTIL);
+          return;
         }
+        // Nothing was still flying when this pass read it — but the pass took
+        // time, and a `UserPromptSubmit` that lost the 2 s lock wait appended
+        // its `activity` and armed nothing. Standing down on the pre-pass
+        // answer would leave that turn unwatched for good: with a single busy
+        // session, its wall would never be noticed. So look again, cheaply,
+        // before the claim is cleared.
+        const late = firstInFlight(st);
+        if (late) {
+          const seconds = await watchSeconds();
+          new Tmux(late.socket).runShell([msBinary(), "_codex_watch"], { delaySeconds: seconds });
+          claimTimer(st, seconds);
+          return;
+        }
+        st.delKv(ARMED_UNTIL);
       } finally {
         st.close();
       }
@@ -418,14 +461,31 @@ function inFlightTurn(s: SessionRow): { turnId: string; activityIndex: number } 
   let act = -1;
   let end = -1;
   for (let i = 0; i < events.length; i++) {
-    const k = events[i].kind;
-    if (k === "activity") act = i;
-    else if (k === "stop" || k === "rate_limited" || k === "ended") end = i;
+    const e = events[i];
+    // BOTH halves are filtered by generation, not just the activity. An end
+    // from a generation the session has left belongs to a process that is
+    // gone: a pass that listed the row before a `--force` rotate and appended
+    // a stale-generation `rate_limited` after the new `activity` would
+    // otherwise mask the new turn until its next prompt.
+    if (e.generation !== s.generation) continue;
+    if (e.kind === "activity") act = i;
+    else if (e.kind === "stop" || e.kind === "rate_limited" || e.kind === "ended") end = i;
   }
   if (act < 0 || end > act) return null;
   const a = events[act];
-  if (a.generation !== s.generation || !a.turnId) return null;
+  if (!a.turnId) return null;
   return { turnId: a.turnId, activityIndex: act };
+}
+
+/** The first Codex session with a turn in flight, or null. A pure read of the
+ * rows and their event logs — no rollout is tailed and nothing is written. */
+function firstInFlight(st: State): SessionRow | null {
+  for (const s of st.listSessions()) {
+    if (s.provider !== "codex") continue;
+    if (s.state !== "running" && s.state !== "continuing") continue;
+    if (inFlightTurn(s)) return s;
+  }
+  return null;
 }
 
 /**
@@ -471,7 +531,7 @@ async function readRollout(st: State, s: SessionRow, turn: { turnId: string }): 
     // never seeing the turn end. Step over it. Nothing is lost that this tool
     // could have read: a `task_complete` record is a few hundred bytes.
     if (buf.length >= ROLLOUT_CHUNK_MAX) {
-      st.updateSession(s.id, { rolloutOffset: from + buf.length });
+      st.advanceRolloutOffset(s.id, s.transcriptPath, from + buf.length);
       note(`${s.id}: skipped ${buf.length} rollout bytes with no line break`);
     }
     return false;
@@ -508,7 +568,11 @@ async function readRollout(st: State, s: SessionRow, turn: { turnId: string }): 
   // that carried nothing for this turn is fully consumed however it went; a
   // chunk whose record we could not write down is re-read next pass, which is
   // the entire reason the append comes first.
-  if (!lost) st.updateSession(s.id, { rolloutOffset: from + lastNewline + 1 });
+  // ...and onto THIS file only. A `/new` mid-pass has already pointed the row
+  // at a fresh rollout and reset the offset to 0, without holding this lock;
+  // stamping the old file's offset onto the new path would skip the first N
+  // bytes of a conversation nothing has read.
+  if (!lost) st.advanceRolloutOffset(s.id, s.transcriptPath, from + lastNewline + 1);
   return settled;
 }
 
@@ -558,7 +622,7 @@ async function recordWall(st: State, s: SessionRow, turnId: string): Promise<boo
   // reads, and the manual verbs still move the session. With the flag off it
   // is ALSO the only record, so an append that failed is a wall not yet read —
   // the caller leaves the offset where it is and the next pass tries again.
-  if (process.env.MS_CODEX_AUTOROTATE !== "1") return recorded;
+  if (!codexAutorotateEnabled(st)) return recorded;
   // Re-read: the row was listed before this file was read.
   const now = st.getSession(s.id);
   if (!now || now.generation !== s.generation || now.desired !== "running") return recorded;

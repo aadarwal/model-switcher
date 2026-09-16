@@ -10,3 +10,5 @@ ms setup
 ```
 
 Status: engine under construction; see docs/superpowers/specs
+
+Codex automatic recovery ships off: export `MS_CODEX_AUTOROTATE=1` in the shell you run `codex` from — `ms` stores the gate from there, so the tmux-dispatched watchdog and recovery worker read it too — and `ms doctor` prints its state.

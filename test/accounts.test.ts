@@ -193,6 +193,8 @@ type Opts = {
   profile?: unknown;
   token?: string;
   noCredFile?: boolean;
+  /** What the keychain stub serves for this account's item. */
+  cred?: string;
   keychainOk?: string[];
   keychainAfter?: string[];
   pollStatusOk?: boolean;
@@ -239,7 +241,7 @@ function scene(opts: Opts = {}) {
     MS_TEST_TOKEN_SPLIT: opts.tokenSplit ?? "",
     MS_TEST_PROMPT_HOLD: opts.promptHold ?? "",
     MS_TEST_TOKEN_ONLINE: opts.tokenOnline ?? "",
-    MS_TEST_CRED: CRED,
+    MS_TEST_CRED: opts.cred ?? CRED,
     MS_TEST_NO_CRED_FILE: opts.noCredFile ? "1" : "0",
     MS_TEST_KEYCHAIN_OK: (opts.keychainOk ?? []).join("\n"),
     MS_TEST_KEYCHAIN_AFTER: (opts.keychainAfter ?? []).join("\n"),
@@ -786,7 +788,11 @@ test("accounts ls calls a token it cannot read `unreadable`, not `yes`", { skip:
   assert.equal(r.stdout.includes(TOKEN), false, "the account book never prints a credential");
 });
 
-test("accounts ls fills the POLL column without reading any secret", () => {
+test("accounts ls answers POLL from the grant it can actually READ, and prints none of it", () => {
+  // The column used to be existence alone, which was cheap and wrong: ms
+  // 0.2.0 left items that exist and hold nothing parseable (see the truncated
+  // case below). Telling those apart costs one read of the value, which `ls`
+  // holds just long enough to parse and never prints.
   const s = scene({ noCredFile: true });
   const scoped = s.scopedService("gmail");
   s.ms(["add", "gmail"]);
@@ -797,7 +803,28 @@ test("accounts ls fills the POLL column without reading any secret", () => {
   assert.match(r.stdout, /gmail\s+claude\s+gmail\s+org-1\s+yes\s+yes\s+yes/);
   const probes = s.securityLog().split("\n").filter(Boolean);
   assert.ok(probes.length > 0, "ls did check the keychain");
-  for (const line of probes) assert.equal(line.includes("-w"), false, `ls asked for a secret: ${line}`);
+  assert.equal(r.stdout.includes("rt-1"), false, "the account book never prints a credential");
+  assert.equal(r.stdout.includes("at-1"), false, "the account book never prints a credential");
+  // Whatever it asked for, it never asked for the human's own login.
+  for (const line of probes) assert.doesNotMatch(line, /-s Claude Code-credentials(?=\s|$)/, line);
+});
+
+test("accounts ls calls a truncated keychain grant POLL `no`, not `yes`", () => {
+  // The item ms 0.2.0 leaves behind: 128 bytes of a ~600-byte credentials
+  // blob, written through `security`'s interactive prompt. `ls` said `yes`
+  // about a grant nothing can read, which is the one thing the book must not
+  // do — the doctor calls the same grant unreadable.
+  const whole = JSON.stringify({
+    claudeAiOauth: { accessToken: `at-${"A".repeat(260)}`, refreshToken: `rt-${"R".repeat(260)}`, expiresAt: Date.now() + 3_600_000 },
+  });
+  const truncated = whole.slice(0, 128);
+  const s = scene({ noCredFile: true, cred: truncated });
+  const scoped = s.scopedService("gmail");
+  s.ms(["add", "gmail"]);
+  const r = s.ms(["ls"], { MS_TEST_KEYCHAIN_OK: scoped });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /gmail\s+claude\s+gmail\s+-\s+no\s+no\s+no/);
+  assert.equal(r.stdout.includes("AAAA"), false, "the account book never prints a credential");
 });
 
 test("accounts remove deletes the row, the token file and the config dir", () => {

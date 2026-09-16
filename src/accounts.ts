@@ -51,6 +51,7 @@ import {
   type PollCredentials,
   type Profile,
   readPollCredentials,
+  readPollGrant,
   refreshPollCredentials,
   writeKeychainNote,
 } from "./providers/claude-usage.ts";
@@ -410,8 +411,10 @@ function locatePollCredential(name: string, dir: string): void {
   );
 }
 
-/** Is there a poll grant on disk for this account? Existence only — `ls` has
- *  no business pulling a secret out of the keychain to fill in a column. */
+/** Is there a poll grant on disk for this account? Existence only — this is
+ *  `cmdLogin`'s pre-flight, which asks `claude auth status` next and has no
+ *  need to pull a secret out of the keychain to decide whether to. (The `ls`
+ *  column is the one that needs more than existence: see `pollCell`.) */
 function hasPollGrant(name: string): boolean {
   const dir = p.claudeConfigDir(name);
   try {
@@ -420,6 +423,20 @@ function hasPollGrant(name: string): boolean {
     /* no file; the scoped keychain item is the other place it can be */
   }
   return keychainItemExists(keychainItemFor(name));
+}
+
+/** The POLL cell for a Claude row.
+ *
+ *  Existence used to be the whole answer, and ms 0.2.0 made it a lie: its
+ *  refresh write-back truncated grants at `security`'s 128-byte prompt
+ *  (src/providers/claude-usage.ts), leaving items that are THERE and hold
+ *  nothing parseable. This column called those `yes` while `ms doctor` called
+ *  the same grant unreadable — and a book and a doctor must never disagree
+ *  about one credential, which is exactly the reason the TOKEN column stopped
+ *  trusting `existsSync` (see `tokenCell`). So the value is read, held for as
+ *  long as the parse takes, and printed nowhere. */
+function pollCell(name: string): string {
+  return readPollGrant(name).state === "ok" ? "yes" : "no";
 }
 
 /** Does this account ALREADY hold a usable poll grant? `claude auth status`
@@ -753,7 +770,7 @@ async function cmdLs(): Promise<number> {
     a.provider === "codex"
       ? await codexCells(a)
       : {
-          poll: hasPollGrant(a.name) ? "yes" : "no",
+          poll: pollCell(a.name),
           token: tokenCell(a.name),
           verified: a.identityVerified ? "yes" : "no",
         },

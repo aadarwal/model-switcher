@@ -6,8 +6,9 @@
 // read usage — a `claude setup-token` (the *launch* grant) is inference-scope
 // only and 403s `oauth_scope_insufficient` on both endpoints below (verified
 // live by the author's dashboard, 2026-09-14). This module reads that
-// credential, refreshes it (writing the rotated token back where it came
-// from), and reads the account's usage windows and organisation.
+// credential, refreshes it (writing the rotated token back to the credentials
+// FILE — see `runSecurity` for why never to the keychain), and reads the
+// account's usage windows and organisation.
 //
 // Endpoints, token URL, client id and the header set are COPIED VERBATIM from
 // the author's working poller at data/lib/providers/claude.ts — the versions
@@ -22,7 +23,7 @@
 // No token or credential value ever appears in a message or a log line here;
 // error text carries only a status and a URL path.
 
-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { userInfo } from "node:os";
@@ -172,24 +173,40 @@ export function keychainItemFor(name: string): KeychainItem {
   return readKeychainNote(dir) ?? { service: keychainServiceFor(dir), account: userInfo().username };
 }
 
-/** Every `security` call this tool makes goes through here, so the service is
- *  checked exactly once: addressing the unscoped item is a programming error,
- *  not a runtime condition, and throws rather than quietly reading the human's
- *  own login. Bounded like every other call here — a locked keychain puts up a
- *  GUI prompt nobody will answer. A secret only ever travels on stdin; argv is
- *  world-readable through `ps`. */
-function runSecurity(verb: string, item: KeychainItem, extra: string[] = [], input?: string) {
+/**
+ * Every `security` call this tool makes goes through here, so the service is
+ * checked exactly once: addressing the unscoped item is a programming error,
+ * not a runtime condition, and throws rather than quietly reading the human's
+ * own login. Bounded like every other call here — a locked keychain puts up a
+ * GUI prompt nobody will answer.
+ *
+ * READS AND DELETES ONLY. Nothing here writes a secret to the keychain, and
+ * nothing should, because there is no way to do it safely:
+ *
+ *   * `security add-generic-password -w <value>` (and `-X`) puts the secret on
+ *     ARGV, where `ps` shows it to every process on the box;
+ *   * `-w` given as the last option with no value makes `security` PROMPT and
+ *     read the password off stdin instead — invisible to `ps`, but the prompt
+ *     TRUNCATES AT 128 BYTES. Measured live on the author's Mac, 2026-09-16:
+ *     a 300-byte value came back 128 bytes.
+ *
+ * A Claude poll grant is ~600 bytes, so ms 0.2.0's write-back through that
+ * prompt destroyed every grant it refreshed — and because the token endpoint
+ * rotates the refresh token, the value it replaced was already spent. Four
+ * real grants went that way under one `ms doctor --fix`. A refreshed grant now
+ * goes to the credentials file (`writeCredFile`), which `readPollCredentials`
+ * prefers anyway, and the spent item is DELETED — addressed by service and
+ * account, with no secret on the argv that does it.
+ */
+function runSecurity(verb: string, item: KeychainItem, extra: string[] = []) {
   if (!isScopedKeychainService(item.service)) {
     throw new Error(`refusing to address the keychain service "${item.service}": it is not scoped to a config dir`);
   }
-  const argv =
-    verb === "add-generic-password"
-      ? [verb, "-U", "-a", item.account, "-s", item.service, ...extra]
-      : [verb, "-s", item.service, "-a", item.account, ...extra];
-  const opts = { encoding: "utf8" as const, timeout: KEYCHAIN_TIMEOUT_MS };
-  return input === undefined
-    ? spawnSync("security", argv, { ...opts, stdio: ["ignore", "pipe", "pipe"] })
-    : spawnSync("security", argv, { ...opts, input });
+  return spawnSync("security", [verb, "-s", item.service, "-a", item.account, ...extra], {
+    encoding: "utf8",
+    timeout: KEYCHAIN_TIMEOUT_MS,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 
 /** `security`'s errSecItemNotFound — the ONLY status that means absent. */
@@ -242,6 +259,21 @@ function parseCredFile(txt: string): PollCredentials | null {
 
 const credFile = (name: string) => path.join(p.claudeConfigDir(name), ".credentials.json");
 
+/**
+ * What a read of this account's poll grant found.
+ *
+ * `unreadable` is the third answer, and the one `readPollCredentials` cannot
+ * give: the grant IS there, and what is in it is not the credentials JSON. ms
+ * 0.2.0 made that state common — its keychain write-back went through
+ * `security`'s 128-byte prompt (see `runSecurity`) — and it needs a different
+ * word from the human than a grant that was never minted. One is a login to
+ * redo; the other is a login never done.
+ */
+export type PollGrantRead =
+  | { state: "ok"; cred: PollCredentials }
+  | { state: "unreadable"; where: "file" | "keychain" }
+  | { state: "absent" };
+
 /** The poll grant for `name`: the credentials file first, then the SCOPED
  *  keychain item.
  *
@@ -249,94 +281,107 @@ const credFile = (name: string) => path.join(p.claudeConfigDir(name), ".credenti
  *  credential is a generic password whose service is derived from that dir
  *  (`keychainServiceFor`) and whose account is the macOS username. Both are
  *  derived, so there is no account string to guess and no way to read the
- *  human's own unscoped item. Returns null — never throws — when there is
- *  nothing usable; a present-but-unusable file is "no credential", not a
- *  reason to go looking elsewhere (the tool owns that dir). */
-export function readPollCredentials(name: string): PollCredentials | null {
-  const dir = p.claudeConfigDir(name);
-  const f = path.join(dir, ".credentials.json");
+ *  human's own unscoped item. Never throws. */
+export function readPollGrant(name: string): PollGrantRead {
+  const f = credFile(name);
   if (existsSync(f)) {
+    // The tool owns that dir: a present-but-unusable file is this account's
+    // answer, never a reason to go looking in the keychain as well.
     try {
-      return parseCredFile(readFileSync(f, "utf8"));
+      const c = parseCredFile(readFileSync(f, "utf8"));
+      return c ? { state: "ok", cred: c } : { state: "unreadable", where: "file" };
     } catch {
-      return null;
+      return { state: "unreadable", where: "file" };
     }
   }
   const blob = readKeychainBlob(keychainItemFor(name));
-  if (!blob) return null;
+  // Nothing readable under the item is "no grant": an absent item, a locked
+  // keychain and a spawn failure all land here, and none of them is a payload
+  // to call truncated.
+  if (blob === null) return { state: "absent" };
   try {
     const c = parseCredFile(blob);
-    return c ? { ...c, source: "keychain" } : null;
+    return c ? { state: "ok", cred: { ...c, source: "keychain" } } : { state: "unreadable", where: "keychain" };
   } catch {
-    return null;
+    return { state: "unreadable", where: "keychain" };
   }
+}
+
+/** The usable grant, or null — for every caller that has nothing different to
+ *  do about an unreadable one than about a missing one. */
+export function readPollCredentials(name: string): PollCredentials | null {
+  const r = readPollGrant(name);
+  return r.state === "ok" ? r.cred : null;
 }
 
 // --- Refresh, with write-back -----------------------------------------
 
+/** One line on stderr under MS_VERBOSE, never a token. The write-back is a
+ *  note, not an error (the dashboard learned this — an errored account drops
+ *  out of the pool), but a credential that moved, or one that could not, is
+ *  worth saying when someone asked to be told. */
+function verbose(text: string): void {
+  if (process.env.MS_VERBOSE === "1") console.error(`ms: ${text} (No token value is ever logged.)`);
+}
+
 /**
- * Put the refreshed credential back where it came from. Best-effort, never
- * throws: a refresh that landed must not be lost to a write problem, and the
- * write-back signal is a note, not an error (the dashboard learned this — an
- * errored account drops out of the pool). The caller holds the fresh
- * credential in memory either way.
+ * Put the refreshed credential back — in the CREDENTIALS FILE, always.
+ *
+ * Best-effort, never throws: a refresh that landed must not be lost to a write
+ * problem. The caller holds the fresh credential in memory either way.
  *
  * Not writing it back at all is what a resident process can afford and a
  * one-shot `ms` cannot: the token endpoint ROTATES the refresh token, so the
  * credential we were handed is spent the moment we exit, and the next poll
- * reads the old one out of the keychain and gets `invalid_grant` — an account
- * that reads `auth`, drops out of the pool and stays out until a re-login.
+ * reads the old one, gets `invalid_grant`, and the account drops out of the
+ * pool until a re-login.
+ *
+ * The file — not the keychain item it may have come from — because there is no
+ * safe way to write a ~600-byte secret through `security` (see `runSecurity`:
+ * argv is world-readable, and the stdin prompt truncates at 128 bytes). The
+ * file is not a second-best copy: it is what `readPollCredentials` prefers, so
+ * it is where the credential now lives. Once it is there and reads back, the
+ * item it came from holds nothing but a spent grant, and is deleted.
  */
 function writeBack(name: string, c: PollCredentials): boolean {
-  if (c.source === "keychain") {
-    if (writeKeychain(name, c)) return true;
-    // The file is what `readPollCredentials` prefers, so this is not a
-    // second-best copy — it is where the credential now lives.
-    const ok = writeCredFile(name, c);
-    if (process.env.MS_VERBOSE === "1") {
-      console.error(
-        `ms: could not write the refreshed Claude credentials for ${name} back to the keychain; ` +
-          `they are in ${credFile(name)} (0600) instead, which is where the poller looks first. ` +
-          `(No token value is ever logged.)`,
+  if (!writeCredFile(name, c)) {
+    // The keychain item is left exactly as it was. Its grant is spent, but a
+    // spent grant a re-login can replace beats no grant at all, and this run
+    // still has the fresh credential in memory. `writeCredFile` has already
+    // said so on stderr.
+    if (c.source === "keychain") {
+      verbose(
+        `the refreshed Claude poll grant for ${name} could not be written to ${credFile(name)}, ` +
+          `so the keychain item it came from is left untouched and the refreshed credentials are ` +
+          `used in memory for this run only.`,
       );
     }
-    return ok;
+    return false;
   }
-  return writeCredFile(name, c);
+  if (c.source === "keychain") retireKeychainItem(name, c);
+  return true;
 }
 
 /**
- * Update the account's keychain item in place, keeping every other key in it
- * (Claude Code owns the rest of that blob). Returns whether it landed.
+ * Delete the keychain item this grant came from, once the file it moved to
+ * reads back as the credential we just wrote.
  *
- * The secret never touches argv. `security add-generic-password -w <value>`
- * would put it there, where any process on the box can read it out of `ps`;
- * given as the LAST option with no value, `security` prompts instead and reads
- * the password — the value, then a confirmation — from stdin, which nothing
- * else can see. Bounded like every other `security` call here: a locked
- * keychain puts up a GUI prompt nobody will answer, and a write we could not
- * make is an ordinary answer (the file is the fallback), never a hang.
+ * Re-reading first is the whole safety of it: a delete on an unverified write
+ * takes the only copy with it. Once the file answers, the item holds a SPENT
+ * refresh token and nothing will read it again on purpose — but a spent
+ * credential that can still be read is one that can still be sent to the token
+ * endpoint, so it goes. Best effort: an item that would not delete is not a
+ * refresh to fail over.
  */
-function writeKeychain(name: string, c: PollCredentials): boolean {
-  const item = keychainItemFor(name);
-  const current = readKeychainBlob(item);
-  // No readable item is no item to update: writing our three fields over it
-  // would drop whatever else Claude Code keeps in that blob.
-  if (!current) return false;
-  let blob: string;
-  try {
-    const parsed: unknown = JSON.parse(current);
-    const j = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
-    const prev = (j.claudeAiOauth ?? {}) as Record<string, unknown>;
-    j.claudeAiOauth = { ...prev, accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt };
-    blob = JSON.stringify(j);
-  } catch {
-    return false;
-  }
-  // The value and its confirmation, one line each: that is what the prompt
-  // asks for, in that order, and it goes in on stdin — never on argv.
-  const r = runSecurity("add-generic-password", item, ["-w"], `${blob}\n${blob}\n`);
-  return r.status === 0;
+function retireKeychainItem(name: string, c: PollCredentials): void {
+  const back = readPollGrant(name);
+  if (back.state !== "ok" || back.cred.source !== "file") return;
+  if (back.cred.refreshToken !== c.refreshToken || back.cred.accessToken !== c.accessToken) return;
+  deleteKeychainItem(keychainItemFor(name));
+  verbose(
+    `the refreshed Claude poll grant for ${name} now lives in ${credFile(name)} (0600), ` +
+      `where the poller looks first; the spent keychain item has been removed.`,
+  );
 }
 
 /** Atomic (temp + rename), 0600, never throws. */
@@ -344,6 +389,10 @@ function writeCredFile(name: string, c: PollCredentials): boolean {
   const f = credFile(name);
   const tmp = `${f}.${process.pid}.tmp`;
   try {
+    // The dir may not exist yet for a keychain-held grant that has never been
+    // written to a file. 0700 on creation only — an existing dir's mode is the
+    // store's business (`ensureStore`), not this write's.
+    mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
     // Keep every other key in the file (Claude Code owns the rest of it).
     let j: Record<string, unknown> = {};
     if (existsSync(f)) {
@@ -402,8 +451,9 @@ function transientFromFetchError(err: unknown, what: string, signal: AbortSignal
   return new TransientError(`${what} could not be reached`);
 }
 
-/** Exchange the refresh token for a fresh access token and write the result
- *  back to wherever the credential came from (file only — see writeBack).
+/** Exchange the refresh token for a fresh access token and write the result to
+ *  the credentials file, retiring the keychain item it came from (see
+ *  `writeBack`).
  *  Throws AuthError when the grant is dead, TransientError when it is worth
  *  trying again. */
 export async function refreshPollCredentials(

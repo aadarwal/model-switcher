@@ -14,7 +14,7 @@
 import { test, after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from "node:fs";
 import { userInfo } from "node:os";
 import path from "node:path";
 import { stubDir, tempHome } from "./helpers.ts";
@@ -50,8 +50,8 @@ function env(t: TestContext) {
   process.env.HOME = home;
   process.env.MS_HOME = msHome;
   const dir = path.join(msHome, "claude", "gmail");
-  mkdirSync(dir, { recursive: true });
-  return { dir, msHome };
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return { dir, msHome, home };
 }
 const cred = {
   claudeAiOauth: { accessToken: "at-1", refreshToken: "rt-1", expiresAt: Date.now() + 3_600_000 },
@@ -272,78 +272,138 @@ test("refreshPollCredentials keeps unrelated keys in the credentials file", asyn
   assert.ok(written.claudeAiOauth.expiresAt > Date.now());
 });
 
-/** A keychain that really holds an item: `find` serves the vault file (the
- *  seeded credential until something writes it), `add -U` takes the new value
- *  off STDIN — the first of the two lines `security` prompts for — and every
- *  argv line is logged so a test can prove no secret was ever on it. */
-function keychainScene(t: TestContext, opts: { writeFails?: boolean } = {}) {
-  const { dir } = env(t);
+/** ~600 bytes of credential — the size the author's real poll grants are, and
+ *  the reason `security`'s 128-byte prompt destroys one. */
+const LONG_AT = `at-2-${"A".repeat(260)}`;
+const LONG_RT = `rt-2-${"R".repeat(260)}`;
+/** The token endpoint's answer: a new access token AND a rotated refresh
+ *  token. The rotation is what makes a lost write-back fatal. */
+const rotating = (async () =>
+  new Response(JSON.stringify({ access_token: LONG_AT, refresh_token: LONG_RT, expires_in: 3600 }), {
+    status: 200,
+  })) as typeof fetch;
+
+/** root writes through a 0500 directory, so denying ourselves one proves
+ *  nothing there. */
+const CAN_DENY_WRITE = process.getuid?.() !== 0;
+
+/**
+ * A keychain that really holds an item — with `security`'s OWN prompt limit
+ * modelled, because that limit is the defect.
+ *
+ * `find -w` serves the vault, `delete-generic-password` removes it, and
+ * `add-generic-password` given `-w` as the LAST option with no value is the
+ * INTERACTIVE PROMPT path: `security` reads the password off stdin (value,
+ * then confirmation) and keeps only the first 128 BYTES of the first line.
+ * Measured live on the author's Mac, 2026-09-16: a 300-byte value came back
+ * 128 bytes, and `ms doctor --fix` truncated four real ~600-byte poll grants
+ * that way. Modelling it here is what makes the fix provable — route a
+ * write-back back through the prompt and the grant below reads as garbage.
+ *
+ * Every argv line is logged, so a test can still prove no secret was ever on
+ * one and that the human's own unscoped item was never named.
+ */
+function keychainScene(t: TestContext) {
+  const { dir, home } = env(t);
   const { stub, dir: bin } = stubDir();
-  const vault = path.join(dir, "vault.json");
-  const argv = path.join(dir, "security-argv.log");
+  // Outside the config dir on purpose: a test that makes that dir unwritable
+  // must not also break the stub's own bookkeeping.
+  const vault = path.join(home, "vault.json");
+  const argv = path.join(home, "security-argv.log");
   writeFileSync(vault, JSON.stringify({ ...cred, otherThing: { keep: true } }));
   writeFileSync(argv, "");
   process.env.PATH = `${bin}:${process.env.PATH}`;
   process.env.MS_TEST_VAULT = vault;
   process.env.MS_TEST_SECURITY_ARGV = argv;
-  process.env.MS_TEST_KEYCHAIN_WRITE_FAILS = opts.writeFails ? "1" : "";
   t.after(() => {
     delete process.env.MS_TEST_VAULT;
     delete process.env.MS_TEST_SECURITY_ARGV;
-    delete process.env.MS_TEST_KEYCHAIN_WRITE_FAILS;
   });
   // The item this config dir's login would have written, and no other.
   const service = `Claude Code-credentials-${createHash("sha256").update(dir).digest("hex").slice(0, 8)}`;
   stub(
     "security",
     `printf '%s\\n' "$*" >> "$MS_TEST_SECURITY_ARGV"
+mine() { case "$*" in *"-s ${service} -a ${USER}"*) return 0 ;; *) return 1 ;; esac; }
 case "$1" in
-  find-generic-password) case "$*" in *"-s ${service} -a ${USER}"*) cat "$MS_TEST_VAULT" ;; *) exit 44 ;; esac ;;
+  find-generic-password)
+    mine "$@" || exit 44
+    [ -f "$MS_TEST_VAULT" ] || exit 44
+    case "$*" in *" -w") cat "$MS_TEST_VAULT" ;; esac ;;
+  delete-generic-password)
+    mine "$@" || exit 44
+    [ -f "$MS_TEST_VAULT" ] || exit 44
+    rm -f "$MS_TEST_VAULT" ;;
   add-generic-password)
-    [ "$MS_TEST_KEYCHAIN_WRITE_FAILS" = "1" ] && exit 1
-    head -1 > "$MS_TEST_VAULT" ;;
+    # The interactive prompt: the value arrives on stdin and 128 bytes of it
+    # survive. Nothing in this tool may write a secret this way.
+    IFS= read -r line
+    printf '%s' "\${line:0:128}" > "$MS_TEST_VAULT" ;;
 esac
 exit 0`,
   );
-  return { dir, vault, service, argv: () => readFileSync(argv, "utf8") };
+  return { dir, home, vault, service, argv: () => readFileSync(argv, "utf8") };
 }
 
-test("a refreshed keychain-sourced credential is written back to the keychain, never onto argv", async (t) => {
-  // The token endpoint rotates the refresh token, so a one-shot `ms` that only
-  // held the new one in memory left the OLD, spent one in the keychain: the
-  // next poll read it, got invalid_grant, and the account dropped out of the
-  // pool until a re-login. (A resident dashboard survives that; nothing here
-  // is resident.)
+test("a refreshed keychain-sourced grant is written WHOLE to the credentials file, never through security's prompt", async (t) => {
+  // The defect, verified live 2026-09-16: ms 0.2.0 wrote the refreshed blob
+  // back into the keychain through `security`'s interactive prompt, to keep
+  // the secret off argv. That prompt stops at 128 bytes and a poll grant is
+  // ~600, so every refreshed grant was truncated on write-back — and because
+  // the token endpoint ROTATES the refresh token, the one it replaced was
+  // already spent. The account was dead until a re-login.
   const scene = keychainScene(t);
   const { readPollCredentials, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
-  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 3600 }), { status: 200 })) as typeof fetch;
+  globalThis.fetch = rotating;
 
   const c = readPollCredentials("gmail")!;
   assert.equal(c.source, "keychain");
   const c2 = await refreshPollCredentials("gmail", c, AbortSignal.timeout(1000));
-  assert.equal(c2.accessToken, "at-2");
-  assert.equal(c2.source, "keychain");
+  assert.equal(c2.accessToken, LONG_AT);
+  assert.equal(c2.refreshToken, LONG_RT);
 
-  const stored = JSON.parse(readFileSync(scene.vault, "utf8"));
-  assert.equal(stored.claudeAiOauth.refreshToken, "rt-2", "the rotated refresh token is the one the keychain now holds");
-  assert.equal(stored.claudeAiOauth.accessToken, "at-2");
-  assert.deepEqual(stored.otherThing, { keep: true }, "and the rest of Claude Code's own blob is kept");
-  const seen = readPollCredentials("gmail")!;
-  assert.equal(seen.source, "keychain", "no stray file was left beside it");
-  assert.equal(seen.refreshToken, "rt-2");
+  const seen = readPollCredentials("gmail");
+  assert.ok(seen, "the refreshed grant is unreadable — the write-back truncated it");
+  assert.equal(seen!.source, "file", "the file is what readPollCredentials prefers, so that is where it goes");
+  assert.equal(seen!.refreshToken, LONG_RT, "the ROTATED refresh token, whole");
+  assert.equal(seen!.accessToken, LONG_AT);
 
-  // argv is world-readable through `ps`. `-w` is passed as the last option
-  // with no value, so the blob goes in on stdin.
+  const file = path.join(scene.dir, ".credentials.json");
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+
   const argv = scene.argv();
-  assert.equal(argv.includes("rt-2"), false, argv);
-  assert.equal(argv.includes("at-2"), false, argv);
-  assert.match(argv, new RegExp(`add-generic-password -U -a ${USER} -s ${scene.service} -w$`, "m"));
-  // ...and the human's own unscoped login is never named on any of them.
+  assert.equal(/add-generic-password/.test(argv), false, `a secret was routed through security's prompt: ${argv}`);
+  assert.equal(argv.includes(LONG_RT), false, argv);
+  assert.equal(argv.includes(LONG_AT), false, argv);
   assert.equal(queriedTheUnscopedItem(argv), false, argv);
 });
 
-test("a keychain write that fails leaves the refreshed credential in the file the poller prefers", async (t) => {
-  const scene = keychainScene(t, { writeFails: true });
+test("the spent keychain item is deleted once the file write lands", async (t) => {
+  // Nothing reads it again on purpose — the file wins — but a spent grant that
+  // can still be read is a spent grant that can still be handed to the token
+  // endpoint. It is addressed by service and account only: no secret on argv.
+  const scene = keychainScene(t);
+  const { readPollCredentials, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
+  globalThis.fetch = rotating;
+  await refreshPollCredentials("gmail", readPollCredentials("gmail")!, AbortSignal.timeout(1000));
+
+  assert.equal(existsSync(scene.vault), false, "the spent grant is gone from the keychain");
+  const argv = scene.argv();
+  assert.match(argv, new RegExp(`^delete-generic-password -s ${scene.service} -a ${USER}$`, "m"), argv);
+  assert.equal(argv.includes(LONG_RT), false, argv);
+  assert.equal(queriedTheUnscopedItem(argv), false, argv);
+  // ...and the grant still reads, out of the file it moved to.
+  assert.equal(readPollCredentials("gmail")!.refreshToken, LONG_RT);
+});
+
+test("a credentials file that cannot be written leaves the keychain item alone", { skip: !CAN_DENY_WRITE }, async (t) => {
+  // The write-back is best-effort by contract: a refresh that landed must not
+  // be lost to a write problem. So the stale item stays — a grant the human
+  // can re-login over beats no grant at all — and this run uses the fresh
+  // credential from memory.
+  const scene = keychainScene(t);
+  chmodSync(scene.dir, 0o500);
+  t.after(() => chmodSync(scene.dir, 0o700));
   process.env.MS_VERBOSE = "1";
   t.after(() => delete process.env.MS_VERBOSE);
   const said: string[] = [];
@@ -354,19 +414,21 @@ test("a keychain write that fails leaves the refreshed credential in the file th
   });
 
   const { readPollCredentials, refreshPollCredentials } = await import("../src/providers/claude-usage.ts");
-  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 3600 }), { status: 200 })) as typeof fetch;
-  await refreshPollCredentials("gmail", readPollCredentials("gmail")!, AbortSignal.timeout(1000));
+  globalThis.fetch = rotating;
+  const c2 = await refreshPollCredentials("gmail", readPollCredentials("gmail")!, AbortSignal.timeout(1000));
 
-  const file = path.join(scene.dir, ".credentials.json");
-  const written = JSON.parse(readFileSync(file, "utf8"));
-  assert.equal(written.claudeAiOauth.refreshToken, "rt-2");
-  assert.equal(statSync(file).mode & 0o777, 0o600);
-  // The file is where readPollCredentials looks FIRST, so the credential now
-  // lives there rather than in a keychain item nothing will read again.
-  assert.equal(readPollCredentials("gmail")!.source, "file");
-  assert.equal(said.length, 1, said.join("\n"));
-  assert.match(said[0]!, /could not write the refreshed Claude credentials for gmail back to the keychain/);
-  assert.equal(said[0]!.includes("rt-2"), false, "no token value is ever logged");
+  assert.equal(c2.refreshToken, LONG_RT, "the caller still holds the fresh credential for this run");
+  assert.ok(existsSync(scene.vault), "the keychain item is untouched");
+  assert.equal(/delete-generic-password/.test(scene.argv()), false, scene.argv());
+  assert.ok(said.length > 0, "a stranded refresh token is never silent");
+  assert.ok(
+    said.some((l) => /could not write refreshed Claude credentials back to/.test(l)),
+    said.join("\n"),
+  );
+  for (const l of said) {
+    assert.equal(l.includes(LONG_RT), false, "no token value is ever logged");
+    assert.equal(l.includes(LONG_AT), false, "no token value is ever logged");
+  }
 });
 
 test("refresh rejections: invalid_grant and 400/401 are auth, 5xx is transient", async (t) => {

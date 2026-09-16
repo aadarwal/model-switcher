@@ -46,7 +46,7 @@ import { backupThroughLink, resolveTarget, writeAtomicThroughLink } from "../fsx
 // Shared with the launcher's own config.toml writer rather than reimplemented:
 // one definition of "where does the TOML end and the comment begin" is the
 // only way both writers agree about what a line says.
-import { stripComment } from "../providers/codex-cli.ts";
+import { ensureCodexTrust, stripComment } from "../providers/codex-cli.ts";
 
 /** The four lifecycle events the Codex hook subscribes to, with the snake_case
  * spelling Codex uses in a trust key and the timeout it applies by default.
@@ -362,6 +362,38 @@ export function ensureCodexHooks(homeDir: string, msBin: string): InstallResult 
     return { ...res, problem: `${codexConfigPath(homeDir)}: the hooks are still not installed after writing them` };
   }
   return res;
+}
+
+/**
+ * Make a codex home ready to receive a pane: trusted for `cwd`, and carrying
+ * this binary's hooks. Trust first, because its dialog is the modal one — an
+ * unattended pane that met it would sit in front of it forever with nobody to
+ * answer — and the hooks second, for a subtler reason but the same shape: a
+ * home with no hooks starts fine and reports NOTHING (see `ensureCodexHooks`
+ * above), so the bill is deferred to the next rotation rather than refused
+ * up front.
+ *
+ * The ONE call every path that is about to put a pane in this home makes —
+ * `launchCodex`'s own `prepare` for a fresh launch, and a rotation's
+ * `prepareCandidate` for a relaunch target — so the two can never drift: a
+ * home good enough to launch into is good enough to rotate into, and a home
+ * neither installer will touch is a candidate refusal in both places, not
+ * just one.
+ */
+export function ensureCodexReady(homeDir: string, cwd: string, msBin: string): { problem: string } | null {
+  try {
+    const { problem } = ensureCodexTrust(homeDir, cwd);
+    if (problem) return { problem };
+  } catch (e) {
+    return { problem: `cannot record directory trust in ${homeDir}: ${(e as Error).message}` };
+  }
+  try {
+    const { problem } = ensureCodexHooks(homeDir, msBin);
+    if (problem) return { problem: `${problem} — then run: ms doctor --fix` };
+  } catch (e) {
+    return { problem: `cannot install the codex hooks in ${homeDir}: ${(e as Error).message} (run: ms doctor --fix)` };
+  }
+  return null;
 }
 
 /** One `[[hooks.<Event>]]` table as the scan below sees it: its position

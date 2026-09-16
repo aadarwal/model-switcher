@@ -48,7 +48,10 @@ test("install merges statusLine.command and preserves every other key, with no p
   const first = installStatusline(file, MS);
   assert.equal(first.changed, true);
   assert.ok(first.backup);
-  assert.match(path.basename(first.backup!), /^settings\.json\.bak-ms-\d+$/);
+  // Milliseconds, plus a `-N` counter when even that name is taken (fix wave
+  // B-M2). Unix SECONDS meant three re-points inside one second left ONE
+  // backup file — a backup that overwrites the previous backup is not one.
+  assert.match(path.basename(first.backup!), /^settings\.json\.bak-ms-\d+(-\d+)?$/);
   assert.equal(readFileSync(first.backup!, "utf8"), text, "the backup is the original, byte for byte");
 
   const after = JSON.parse(readFileSync(file, "utf8"));
@@ -107,7 +110,7 @@ test("removeStatusline restores the original command and only that key", () => {
   const r = removeStatusline(file);
   assert.equal(r.changed, true);
   assert.ok(r.backup);
-  assert.match(path.basename(r.backup!), /^settings\.json\.bak-ms-\d+$/);
+  assert.match(path.basename(r.backup!), /^settings\.json\.bak-ms-\d+(-\d+)?$/);
 
   const after = JSON.parse(readFileSync(file, "utf8"));
   assert.deepEqual(after, original, "round trip is exact: every key restored, msOriginal dropped");
@@ -380,7 +383,7 @@ test("installAlias appends to existing rc content, backs it up, and is idempoten
   const first = installAlias(rc, MS);
   assert.equal(first.changed, true);
   assert.ok(first.backup);
-  assert.match(path.basename(first.backup!), /^\.zshrc\.bak-ms-\d+$/);
+  assert.match(path.basename(first.backup!), /^\.zshrc\.bak-ms-\d+(-\d+)?$/);
   assert.equal(readFileSync(first.backup!, "utf8"), original, "the backup is the original, byte for byte");
 
   const afterFirst = readFileSync(rc, "utf8");

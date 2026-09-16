@@ -34,7 +34,7 @@ test("installing merges the four entries and preserves every other key", () => {
   const first = installClaudeHooks(file, MS);
   assert.equal(first.changed, true);
   assert.ok(first.backup);
-  assert.match(path.basename(first.backup!), /^settings\.json\.bak-\d+$/);
+  assert.match(path.basename(first.backup!), /^settings\.json\.bak-\d+(-\d+)?$/);
   assert.equal(readFileSync(first.backup!, "utf8"), text, "the backup is the original, byte for byte");
 
   const after = JSON.parse(readFileSync(file, "utf8"));

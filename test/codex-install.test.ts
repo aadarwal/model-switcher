@@ -82,7 +82,7 @@ test("an existing config keeps every other table byte for byte, and is backed up
   const r = installCodexHooks(d, MS);
   assert.equal(r.changed, true);
   assert.ok(r.backup);
-  assert.match(path.basename(r.backup!), /^config\.toml\.bak-ms-\d+$/);
+  assert.match(path.basename(r.backup!), /^config\.toml\.bak-ms-\d+(-\d+)?$/);
   assert.equal(readFileSync(r.backup!, "utf8"), original, "the backup is the original, byte for byte");
 
   const text = read(d);

@@ -32,8 +32,9 @@
 // session waits and a wake-up is scheduled), 1 anything else.
 
 import { randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, closeSync, existsSync, openSync, statSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readdirSync, statSync } from "node:fs";
 import { hostname } from "node:os";
+import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { readEvents } from "./events.ts";
@@ -392,28 +393,96 @@ function startsFresh(id: string, cliSessionId: string): boolean {
 }
 
 /**
- * The same question for Codex, which answers it with less evidence and needs
- * less: has a prompt ever been submitted on THIS conversation?
+ * Codex asks the same question of the DISK rather than of the event log, and
+ * it asks two questions where Claude asks one.
  *
- * Two things make the "we watched it be born" half of `startsFresh` above
- * neither available nor necessary here.
+ * Whether to resume at all is whether the conversation still exists: a row
+ * with an id whose rollout is on disk is resumed, and nothing else is. The
+ * event log is not evidence here — a hook event that never landed (a crash
+ * mid-turn, a `run-shell` that lost its race) would, on an "is there an
+ * `activity`?" rule, silently DISCARD a live conversation and start an empty
+ * one over it. The rollout is the conversation; its absence is the only thing
+ * that says there is nothing to come back to.
  *
- * Not available: Codex has no `--session-id`. The id is Codex's own, reported
- * by the hook's first SessionStart, so a pane that has launched but not yet
- * reported carries a NULL `cliSessionId` — which is not a broken row, it is a
- * conversation whose name we have not been told. There is nothing to resume.
- *
- * Not necessary: the relaunch for a fresh conversation is a plain `codex`,
- * which cannot CREATE one under an id we cannot vouch for — it makes its own
- * and the hook adopts it. The disaster `startsFresh` guards against (a
- * corrupted id coming back as a brand new empty conversation wearing that
- * same id, silently) has no way to happen on this side. So an id with no
- * `activity` is simply a conversation with no transcript, and a new one loses
- * nothing.
+ * `unknown` is a third answer and it matters: a search that runs out of
+ * budget has not found the rollout ABSENT, and treating it as absent is the
+ * same silent discard by another road. It resumes, which fails loudly (the
+ * pane dies, readiness sees it, the session parks for a human) rather than
+ * quietly.
  */
-function codexStartsFresh(id: string, cliSessionId: string | null): boolean {
-  if (!cliSessionId) return true;
-  return !readEvents(id).some((e) => e.cliSessionId === cliSessionId && e.kind === "activity");
+type Conversation = "on-disk" | "gone" | "unknown";
+
+/** How many day-directories of the rollout store one search will look
+ *  through, newest first. Codex writes one per day it was used, so this is
+ *  well over a year of daily use — and running out is not an answer. */
+const ROLLOUT_SCAN_DIRS = 400;
+
+/** Sub-directories newest-first, so a live conversation is found in the first
+ *  one looked at. A directory we cannot read is not a directory we can say
+ *  anything about, and contributes nothing. */
+function subdirs(dir: string): string[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort()
+      .reverse();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Is this session's Codex conversation still on disk?
+ *
+ * The row's own `transcriptPath` is the cheap answer — Codex reports it on
+ * every hook payload and Task 6 records it. When it is recorded and the file
+ * is there, that is the rollout, with no search at all.
+ *
+ * Otherwise the shared store is searched by name. Rollouts live at
+ * `<store>/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`, and every account home of this
+ * tool links its own `sessions` at that ONE store — which is exactly what
+ * makes a conversation started under one account resumable under another. A
+ * recorded path that no longer resolves falls through to the search for the
+ * same reason: the path names an account's home, the store outlives it.
+ */
+function codexConversation(session: SessionRow): Conversation {
+  const id = session.cliSessionId;
+  if (!id) return "gone";
+  if (session.transcriptPath && existsSync(session.transcriptPath)) return "on-disk";
+  const root = p.codexSessions();
+  // Matched as a whole filename, never as a pattern: the id comes off a row
+  // and has no business being spliced into a path.
+  const needle = `-${id}.jsonl`;
+  let budget = ROLLOUT_SCAN_DIRS;
+  for (const y of subdirs(root)) {
+    for (const m of subdirs(path.join(root, y))) {
+      for (const d of subdirs(path.join(root, y, m))) {
+        if (budget-- <= 0) return "unknown";
+        let names: string[];
+        try {
+          names = readdirSync(path.join(root, y, m, d));
+        } catch {
+          continue;
+        }
+        if (names.some((n) => n.startsWith("rollout-") && n.endsWith(needle))) return "on-disk";
+      }
+    }
+  }
+  return "gone";
+}
+
+/**
+ * Has a prompt ever been submitted on this conversation? The SEPARATE
+ * question, and the only thing the continuation turns on: a conversation with
+ * no turn in it has no unfinished work, so resuming it is right and asking it
+ * to "continue the unfinished work" is not. The hook stamps every `activity`
+ * with the id the turn was submitted on, so a missing one costs a
+ * continuation here — never a conversation.
+ */
+function codexHadTurn(id: string, cliSessionId: string | null): boolean {
+  if (!cliSessionId) return false;
+  return readEvents(id).some((e) => e.cliSessionId === cliSessionId && e.kind === "activity");
 }
 
 /**
@@ -495,6 +564,16 @@ async function waitForExit(tmux: Tmux, pane: string, budgetMs: number): Promise<
  */
 async function askedAndLeft(tmux: Tmux, session: SessionRow, generation: number): Promise<boolean> {
   if (session.provider === "codex") {
+    // A pane whose process has already gone is asked nothing. Keys sent into a
+    // corpse do nothing, the two seconds spent waiting for an exit that
+    // happened are two seconds of a human's session sitting dead — and the
+    // `send-keys failed … signalling instead` line below would name a step
+    // that cannot run, because `stopPane` only ever signals a LIVE pid.
+    const info = tmux.paneInfo(session.pane);
+    if (!info || info.dead || !info.pid || !alive(info.pid)) {
+      logLine(session.id, generation, "the CLI had already exited; nothing to ask");
+      return true;
+    }
     const { keys, settleMs } = codexExitSequence();
     try {
       for (const k of keys) tmux.sendKeys(session.pane, k);
@@ -624,13 +703,20 @@ function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[]
   return Math.max(soonest || nowSeconds() + NO_ROOM_SECONDS, nowSeconds() + MIN_DISPATCH_SECONDS);
 }
 
-/** Why an account cannot be handed this session, in the two fields the
- *  attempt row wants. */
-type Unlaunchable = { outcome: AttemptOutcome; note: string };
+/** Why an account cannot be handed this session: the two fields the attempt
+ *  row wants, plus whether this was the account's HOME refusing — which is
+ *  the one refusal no other account and no later try can fix. */
+type Refusal = { outcome: AttemptOutcome; note: string; trust?: true };
 
 /**
- * Why this candidate cannot be launched as, or null — asked before anything
- * is disturbed, so a candidate that fails here costs nothing but its turn.
+ * Make this account ready to be launched as, or say why it cannot be — asked
+ * before anything is disturbed, so a candidate that fails here costs nothing
+ * but its turn.
+ *
+ * It is named for the WRITE, not for the question: preparing a Codex
+ * candidate records this directory in that account's home (see below), and a
+ * call site that read `unlaunchable(...)` would have hidden a file being
+ * written behind what looks like a query.
  *
  * Claude's answer is one file: a launch token exists, or the account is not a
  * candidate. (Existence only. The value belongs in the pane's environment,
@@ -655,7 +741,7 @@ type Unlaunchable = { outcome: AttemptOutcome; note: string };
  * is fine, its home is not, and a human fixes it by editing a file rather
  * than by logging in again.
  */
-function unlaunchable(session: SessionRow, name: string): Unlaunchable | null {
+function prepareCandidate(session: SessionRow, name: string): Refusal | null {
   if (session.provider !== "codex") {
     return readLaunchToken(name) ? null : { outcome: "auth", note: "no launch token" };
   }
@@ -665,9 +751,9 @@ function unlaunchable(session: SessionRow, name: string): Unlaunchable | null {
   }
   try {
     const { problem } = ensureCodexTrust(home, session.cwd);
-    return problem ? { outcome: "infra", note: problem } : null;
+    return problem ? { outcome: "infra", note: problem, trust: true } : null;
   } catch (e) {
-    return { outcome: "infra", note: `cannot record directory trust in ${home}: ${(e as Error).message}` };
+    return { outcome: "infra", note: `cannot record directory trust in ${home}: ${(e as Error).message}`, trust: true };
   }
 }
 
@@ -780,10 +866,14 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
     // chooser would pass over every account for "no fable window" and this
     // worker would schedule a wake-up for a window that does not exist and
     // cannot reset. `ms codex --need fable` is refused at the launch, so this
-    // row could only come from a hand-edited store — and the honest answer
-    // there is the same one: nobody has room, and nobody ever will. Nothing
-    // is claimed and nothing is touched, so the human's own verbs still work.
-    if (session.provider === "codex" && session.need === "fable") {
+    // row could only come from a hand-edited store — and the honest answer to
+    // an AUTOMATIC rotation of one is: nobody has room, and nobody ever will.
+    //
+    // Only the automatic path. A human's `ms rotate`/`switch --as` is not
+    // asking the chooser to satisfy a need — it names the account, or accepts
+    // whatever has room — and refusing them here would leave a hand-edited row
+    // with no way out at all. Nothing is claimed and nothing is touched.
+    if (!opts.manual && session.provider === "codex" && session.need === "fable") {
       const why = `codex has no fable window; ${id} cannot be recovered while it needs fable`;
       logLine(id, g, why);
       process.stderr.write(`ms _recover: ${why}\n`);
@@ -1052,16 +1142,26 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // also where its home is made to trust this directory — before the pane is
   // touched, so the refusal costs a candidate rather than a conversation.
   let to: string | null = null;
+  const refused: Refusal[] = [];
   for (const name of names) {
-    const no = unlaunchable(session, name);
+    const no = prepareCandidate(session, name);
     if (!no) {
       to = name;
       break;
     }
+    refused.push(no);
     st.addAttempt({ recoveryId: rec.id, account: name, outcome: no.outcome, note: no.note });
     logLine(id, g, `${name}: ${no.note}; trying the next account`);
   }
   if (!to) {
+    // Every candidate's HOME refused. That is not "come back when a
+    // credential lands": the writer will make the same decision about the
+    // same file in thirty seconds, and re-dispatching only spends the
+    // three-attempt budget and ends at "gave up after 3 attempts" — a message
+    // that names nothing a human can act on. Park now, saying exactly what
+    // the first home said, because a human editing that file is the only
+    // thing that changes this answer.
+    if (refused.length && refused.every((r) => r.trust)) return park(st, id, rec.id, g, refused[0]!.note);
     // Nothing has been touched yet: keep the recovery open on this generation
     // and send one more worker, in case a token lands in the meantime — but
     // only for an automatic rotation (see the registry path above).
@@ -1117,8 +1217,14 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // A conversation we watched begin and nobody has typed into cannot be
   // resumed, and has no unfinished work to continue: it is started under its
   // own id instead. Anything else is resumed.
-  const fresh = codex ? codexStartsFresh(id, session.cliSessionId) : startsFresh(id, session.cliSessionId!);
-  const continuing = !fresh && (!manual || manual.continueAfter);
+  const conversation = codex ? codexConversation(session) : null;
+  const fresh = codex ? conversation === "gone" : startsFresh(id, session.cliSessionId!);
+  // Whether there is anything to CONTINUE is a separate question from whether
+  // there is anything to resume, and on the Codex side it has a separate
+  // answer: a rollout with no turn in it is a conversation worth coming back
+  // to and has no unfinished work to carry on with.
+  const unfinished = codex ? codexHadTurn(id, session.cliSessionId) : !fresh;
+  const continuing = !fresh && unfinished && (!manual || manual.continueAfter);
   // The same flag treatment for both CLIs, and for the same reason: the
   // launch's own positional prompt is not re-submitted beside the
   // continuation, and never re-submitted at all (see `flagsForResume`).
@@ -1135,7 +1241,7 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
       id,
       next,
       codex
-        ? `${session.cliSessionId ?? "this pane"} has no transcript yet (no turn was ever submitted); starting a new conversation rather than resuming`
+        ? `${session.cliSessionId ? `${session.cliSessionId} has no rollout on disk` : "no conversation id was ever reported"}; starting a new conversation rather than resuming`
         : `${session.cliSessionId} has no transcript yet (no turn was ever submitted); starting it under the same id rather than resuming`,
     );
   }
@@ -1166,7 +1272,19 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // launch. Bumping it earlier is what left a released recovery describing a
   // generation the session had already left — a stale row that the hook's own
   // `addRecovery` then handed to the NEXT wall, swallowing it.
-  st.updateSession(id, { account: to, generation: next, state: "resuming" });
+  // A fresh Codex relaunch leaves the row's identity behind with the
+  // conversation it named. Keeping it would cost twice: the hook's own
+  // `sameId` guard refuses to adopt a `resuming` row whose reported id is not
+  // the one on it (the session would never leave `resuming`), and the NEXT
+  // rotation would read that id and `codex resume` a conversation this one
+  // already replaced. The rollout path and its byte offset go with it — they
+  // index a file that is no longer this session's.
+  st.updateSession(id, {
+    account: to,
+    generation: next,
+    state: "resuming",
+    ...(codex && fresh ? { cliSessionId: null, transcriptPath: null, rolloutOffset: 0 } : {}),
+  });
   logLine(id, next, `respawned pane ${session.pane} on ${to} (launch ${launchId}${forced ? ", forced exit" : ""})`);
 
   // 8. Readiness, from the hook's own report — or from the pane, when the

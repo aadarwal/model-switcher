@@ -60,7 +60,9 @@ case "$1" in
       # Codex's own way out: the FIRST Ctrl-C arms the quit, the second takes
       # it (verified live: the TUI is gone in ~2 s). A pane that died on one
       # keystroke would never prove the sequence was sent twice.
-      *C-c*) n=$(get sigints); if [ -z "$n" ]; then n=0; fi; n=$((n + 1)); put sigints "$n"; if [ "$n" -ge 2 ]; then put pane_dead 1; fi ;;
+      *C-c*) n=$(get sigints); if [ -z "$n" ]; then n=0; fi; n=$((n + 1)); put sigints "$n"
+        # A TUI that will not go: the signal path is the floor under both CLIs.
+        if [ "$n" -ge 2 ] && [ -z "$MS_TMUX_STUBBORN" ]; then put pane_dead 1; fi ;;
     esac ;;
   respawn-pane)
     put pane_dead "$MS_TMUX_RESPAWN_DEAD"; put pane_dead_status "$MS_TMUX_DEAD_STATUS"
@@ -216,6 +218,7 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   // Codex-world settings, off in a Claude world: the env is process-global and
   // these tests run one after another.
   process.env.MS_TMUX_SNAPSHOT = "";
+  process.env.MS_TMUX_STUBBORN = "";
   delete process.env.MS_CODEX_AUTOROTATE;
   process.env.MS_POLL_MS = "20";
   process.env.MS_READY_MS = "10000"; // generous: the report below arrives in milliseconds
@@ -1346,6 +1349,20 @@ type CodexWorldOptions = {
   untouchableTrust?: string[];
   /** Accounts nobody has run `codex login` for: a home with no auth.json. */
   noAuth?: string[];
+  /**
+   * Where this conversation's rollout is — which is what says whether there is
+   * anything to resume:
+   *   "store"     in the shared rollout store, found by name (the default)
+   *   "recorded"  named by the row's own `transcriptPath`, and NOWHERE the
+   *               search would look: a home whose `sessions` link was never
+   *               made. Only the recorded path can find it.
+   *   "none"      no rollout at all — the conversation is gone.
+   */
+  rollout?: "store" | "recorded" | "none";
+  /** The pane ignores Ctrl-C: the TUI has to be signalled. */
+  survivesCtrlC?: boolean;
+  /** The CLI had already exited before the worker got there. */
+  paneDead?: boolean;
 };
 
 type CodexWorld = World & { atRespawn: string; fetched: string[] };
@@ -1366,7 +1383,16 @@ async function codexWorld(t: TestContext, opts: CodexWorldOptions = {}): Promise
   writeFileSync(screen, opts.screen ?? CODEX_WALLED_SCREEN);
   writeFileSync(
     state,
-    [`panes=${PANE}`, `pane_pid=${pid}`, "command=codex", "pane_dead=0", "pane_dead_status=0", "sigints=0", `cwd=${cwd}`, ""].join("\n"),
+    [
+      `panes=${PANE}`,
+      `pane_pid=${pid}`,
+      "command=codex",
+      `pane_dead=${opts.paneDead ? 1 : 0}`,
+      "pane_dead_status=0",
+      "sigints=0",
+      `cwd=${cwd}`,
+      "",
+    ].join("\n"),
   );
   writeFileSync(
     path.join(msHome, "accounts.json"),
@@ -1392,6 +1418,7 @@ async function codexWorld(t: TestContext, opts: CodexWorldOptions = {}): Promise
   process.env.MS_TMUX_DEAD_STATUS = "0";
   process.env.MS_TMUX_ON_MATCH = "";
   process.env.MS_TMUX_ON = "";
+  process.env.MS_TMUX_STUBBORN = opts.survivesCtrlC ? "1" : "";
   process.env.MS_POLL_MS = "20";
   process.env.MS_READY_MS = "10000";
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
@@ -1412,6 +1439,18 @@ async function codexWorld(t: TestContext, opts: CodexWorldOptions = {}): Promise
   writeCodexSnapshot(msHome, accounts);
 
   const cliSessionId = opts.session && "cliSessionId" in opts.session ? opts.session.cliSessionId! : "cx-1";
+  // The rollout: `<store>/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`, which is what
+  // Codex writes and what `codex resume <id>` needs to exist.
+  const rollout = opts.rollout ?? "store";
+  let transcriptPath: string | null = null;
+  if (cliSessionId && rollout !== "none") {
+    const root = rollout === "store" ? path.join(msHome, "codex", "sessions") : path.join(msHome, "codex", "work", "sessions");
+    const day = path.join(root, "2026", "09", "16");
+    mkdirSync(day, { recursive: true, mode: 0o700 });
+    const file = path.join(day, `rollout-2026-09-16T10-00-00-${cliSessionId}.jsonl`);
+    writeFileSync(file, `{"type":"session_meta","payload":{"id":"${cliSessionId}"}}\n`, { mode: 0o600 });
+    if (rollout === "recorded") transcriptPath = file;
+  }
   const st = openState();
   try {
     st.createSession({
@@ -1435,6 +1474,9 @@ async function codexWorld(t: TestContext, opts: CodexWorldOptions = {}): Promise
     if (opts.born !== false) appendEvent({ t: nowSeconds() - 60, kind: "started", session: "s1", generation: 1, cliSessionId });
     if (opts.activity !== false) appendEvent({ t: nowSeconds() - 20, kind: "activity", session: "s1", generation: 2, cliSessionId });
     if (opts.wall !== false) appendEvent({ t: nowSeconds() - 10, kind: "rate_limited", session: "s1", generation: 2, cliSessionId, kindDetail: "weekly" });
+    // `transcriptPath` is not a creation input (the hook records it), so it is
+    // patched on afterwards — exactly as a SessionStart payload would.
+    if (transcriptPath) st.updateSession("s1", { transcriptPath });
     if (opts.recovery !== false) st.addRecovery({ sessionId: "s1", generation: 2, turnId: null, kind: "weekly" });
   } finally {
     st.close();
@@ -1530,24 +1572,175 @@ test("without MS_CODEX_AUTOROTATE nothing automatic moves a codex session — an
   assert.deepEqual(sendKeys(w), [`send-keys -t ${PANE} C-c`, `send-keys -t ${PANE} C-c`]);
 });
 
-test("a codex conversation nobody has typed into is relaunched as a new one, with no continuation", async (t) => {
+test("a codex conversation nobody has typed into is resumed, but not asked to continue", async (t) => {
+  // Two questions, two answers. The rollout exists, so there IS a conversation
+  // to come back to — but no turn was ever submitted on it, so there is no
+  // unfinished work, and handing it the continuation would invite the model to
+  // invent some. (A missing `activity` costs a continuation here; it must
+  // never cost the conversation.)
   const w = await codexWorld(t, { activity: false });
-  // There is no `--session-id` to hold the old name to: `codex` picks an id
-  // and the hook reports whichever one it picked.
-  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-2", kind: "started" });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
   t.after(stop);
 
   assert.equal(await recoverSession("s1"), 0);
 
   const launch = launchOf(w, respawnLaunchId(w))!;
-  assert.deepEqual(launch.command, ["codex", "--model", "gpt-5"]);
+  assert.deepEqual(launch.command, ["codex", "resume", "cx-1", "--model", "gpt-5"]);
   assert.ok(!launch.command.includes(CONTINUATION), "a conversation with no turns has no unfinished work to continue");
-  assert.ok(!launch.command.includes("resume"), "and nothing to resume");
   const s = session(w);
   assert.equal(s.account, "home", "the handoff still happened");
   assert.equal(s.generation, 3);
   assert.equal(s.state, "running", "no continuation means the session is merely running");
-  assert.match(recoverLog(w), /cx-1 has no transcript yet/);
+  assert.equal(s.cliSessionId, "cx-1", "and the row still names the conversation it resumed");
+  assert.doesNotMatch(recoverLog(w), /starting a new conversation/);
+});
+
+test("a rollout the row names itself is resumed without a search", async (t) => {
+  // The hook records `transcriptPath` from every Codex payload, and this one
+  // sits where no search would look: an account home whose `sessions` link at
+  // the shared store was never made. The row's own path is the cheap answer.
+  const w = await codexWorld(t, { rollout: "recorded" });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-5"]);
+  assert.equal(session(w).state, "continuing");
+});
+
+test("a conversation whose rollout is gone starts a new one, and the row stops naming the old", async (t) => {
+  // The only thing that says there is nothing to come back to. The row keeps
+  // an id and a transcript path that no longer resolve — a home the human
+  // cleaned out, a store that moved — and `codex resume` on it would die on
+  // arrival.
+  const w = await codexWorld(t, { rollout: "none" });
+  const st = openState();
+  try {
+    st.updateSession("s1", { transcriptPath: "/nonexistent/rollout-2026-09-16T10-00-00-cx-1.jsonl", rolloutOffset: 4096 });
+  } finally {
+    st.close();
+  }
+  // `codex` picks its own id and the hook reports whichever one it picked.
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-2", kind: "started" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "--model", "gpt-5"]);
+  const s = session(w);
+  assert.equal(s.account, "home");
+  assert.equal(s.state, "running");
+  // The identity of the conversation this relaunch did NOT resume must not
+  // survive it: the hook refuses to adopt a `resuming` row whose reported id
+  // is not the one on it, and the next rotation would resume a conversation
+  // this one already replaced.
+  assert.equal(s.cliSessionId, null, "the row stops naming a conversation it is not in");
+  assert.equal(s.transcriptPath, null, "and stops pointing at a rollout that is not its own");
+  assert.equal(s.rolloutOffset, 0, "the byte offset indexes a file this session does not have");
+  assert.match(recoverLog(w), /cx-1 has no rollout on disk; starting a new conversation rather than resuming/);
+});
+
+test("a rollout the search runs out of budget before reaching is resumed, not replaced", async (t) => {
+  // A search that gave up has not found the conversation ABSENT. Reading "I
+  // stopped looking" as "it is gone" would discard a live conversation
+  // silently; resuming a rollout that really is missing fails loudly instead —
+  // the pane dies on arrival, readiness sees it, and the session parks.
+  const w = await codexWorld(t, { rollout: "none" });
+  const store = path.join(w.msHome, "codex", "sessions");
+  const day = path.join(store, "2024", "01", "01");
+  mkdirSync(day, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(day, "rollout-2024-01-01T10-00-00-cx-1.jsonl"), "{}\n", { mode: 0o600 });
+  // More recent days than the search will look through, all of them empty.
+  for (const year of ["2026", "2025"]) {
+    for (let m = 1; m <= 12; m++) {
+      for (let d = 1; d <= 28; d++) {
+        mkdirSync(path.join(store, year, String(m).padStart(2, "0"), String(d).padStart(2, "0")), { recursive: true, mode: 0o700 });
+      }
+    }
+  }
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-5"]);
+  assert.equal(session(w).cliSessionId, "cx-1", "nothing was discarded");
+});
+
+test("a codex TUI that will not go on Ctrl-C is signalled", async (t) => {
+  // The floor under both CLIs. Two Ctrl-C and two seconds is what the spike
+  // measured; a pane still running past that is not asked a third time.
+  const w = await codexWorld(t, { survivesCtrlC: true });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  assert.deepEqual(sendKeys(w), [`send-keys -t ${PANE} C-c`, `send-keys -t ${PANE} C-c`], "asked twice, and only twice");
+  assert.ok(await gone(w.pid), "the pane's process was never signalled");
+  const attempt = rows(w, "attempts")[0]!;
+  assert.equal(attempt.outcome, "forced");
+  assert.match(String(attempt.note), /forced exit/);
+  assert.match(recoverLog(w), /the CLI did not leave on Ctrl-C; signalling/);
+  assert.match(recoverLog(w), /sent SIGTERM to pid/);
+  assert.equal(session(w).account, "home", "and the handoff still happened");
+});
+
+test("a codex pane whose CLI had already exited is not asked to leave", async (t) => {
+  // Keys sent into a corpse do nothing, the settle wait is two seconds of a
+  // dead pane on a human's screen, and "signalling instead" would name a step
+  // that cannot run: `stopPane` signals a live pid or nothing.
+  const w = await codexWorld(t, { paneDead: true });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  assert.deepEqual(sendKeys(w), [], "nothing is typed into a pane that has already gone");
+  assert.ok(respawnLine(w), "the handoff still happened");
+  assert.equal(rows(w, "attempts")[0]!.outcome, "exhausted", "a CLI that had already left was not forced out");
+  assert.match(recoverLog(w), /the CLI had already exited; nothing to ask/);
+  assert.doesNotMatch(recoverLog(w), /signalling/);
+});
+
+test("every candidate's home refusing trust parks at once, saying what the file said", async (t) => {
+  // Not "come back when a credential lands": the writer will make the same
+  // decision about the same file in thirty seconds. Re-dispatching would only
+  // spend the budget and end at "gave up after 3 attempts", which names
+  // nothing a human can act on.
+  const w = await codexWorld(t, { untouchableTrust: ["home", "spare"] });
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  const s = session(w);
+  assert.equal(s.state, "parked");
+  assert.equal(s.account, "work", "nothing moved");
+  assert.equal(s.wakeupAt, null, "a parked session waits for a person, not for a window");
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "and no worker is sent to make the same decision again");
+  assert.deepEqual(sendKeys(w), [], "the pane still holds the conversation");
+  assert.equal(rows(w, "recoveries")[0]!.status, "failed");
+  assert.deepEqual(
+    rows(w, "attempts").map((a) => [a.account, a.outcome]),
+    [["home", "infra"], ["spare", "infra"]],
+  );
+  // Verbatim: it already names the file, the line and what to add to it.
+  assert.match(recoverLog(w), /already defines 'projects' in a form this tool will not edit \(the table on line 1\)/);
+  assert.doesNotMatch(recoverLog(w), /gave up after 3 attempts/);
+});
+
+test("the fable refusal is the automatic path's; a human's own move is never gated", async (t) => {
+  // A hand-edited row that needs a window Codex does not have still has to be
+  // movable — refusing the human here would leave it with no way out at all.
+  const w = await codexWorld(t, { session: { need: "fable" } });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "spare", continueAfter: true } }), 0);
+
+  const s = session(w);
+  assert.equal(s.account, "spare");
+  assert.equal(s.state, "continuing");
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-5"]);
+  assert.doesNotMatch(recoverLog(w), /codex has no fable window/);
 });
 
 test("a codex pane whose hook has not yet named its conversation is relaunched, not parked", async (t) => {

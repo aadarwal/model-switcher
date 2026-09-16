@@ -364,7 +364,7 @@ test("accounts login refuses a second account resolving to the same organisation
   // nothing saved: the credential this run's browser login wrote is undone,
   // so `ls` cannot report a poll grant for the account it turned away.
   assert.equal(existsSync(s.configDir("gmail")), false);
-  assert.match(s.ms(["ls"]).stdout, /gmail\s+gmail\s+-\s+no\s+no\s+no/);
+  assert.match(s.ms(["ls"]).stdout, /gmail\s+claude\s+gmail\s+-\s+no\s+no\s+no/);
 });
 
 test("accounts login: identityVerified follows the probe, not whether auth status names an org", () => {
@@ -748,14 +748,14 @@ test("accounts token fails when the account has no launch token", () => {
   assert.equal(r.stdout, "");
 });
 
-test("accounts ls prints the six columns", () => {
+test("accounts ls prints the seven columns, provider among them", () => {
   const s = scene();
   s.ms(["add", "gmail", "--label", "Personal"]);
   assert.equal(s.ms(["login", "gmail"]).code, 0);
   const r = s.ms(["ls"]);
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stdout, /NAME\s+LABEL\s+ORG\s+POLL\s+TOKEN\s+VERIFIED/);
-  assert.match(r.stdout, /gmail\s+Personal\s+org-1\s+yes\s+yes\s+yes/);
+  assert.match(r.stdout, /NAME\s+PROVIDER\s+LABEL\s+ORG\s+POLL\s+TOKEN\s+VERIFIED/);
+  assert.match(r.stdout, /gmail\s+claude\s+Personal\s+org-1\s+yes\s+yes\s+yes/);
 });
 
 test("accounts ls shows a registered-but-uncredentialed account as no/no/no", () => {
@@ -763,7 +763,7 @@ test("accounts ls shows a registered-but-uncredentialed account as no/no/no", ()
   s.ms(["add", "gmail"]);
   const r = s.ms(["ls"]);
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stdout, /gmail\s+gmail\s+-\s+no\s+no\s+no/);
+  assert.match(r.stdout, /gmail\s+claude\s+gmail\s+-\s+no\s+no\s+no/);
 });
 
 /** root reads a 0000 file, so denying ourselves a read proves nothing there. */
@@ -782,7 +782,7 @@ test("accounts ls calls a token it cannot read `unreadable`, not `yes`", { skip:
 
   const r = s.ms(["ls"]);
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stdout, /gmail\s+Personal\s+org-1\s+yes\s+unreadable\s+yes/);
+  assert.match(r.stdout, /gmail\s+claude\s+Personal\s+org-1\s+yes\s+unreadable\s+yes/);
   assert.equal(r.stdout.includes(TOKEN), false, "the account book never prints a credential");
 });
 
@@ -794,7 +794,7 @@ test("accounts ls fills the POLL column without reading any secret", () => {
   s.truncateSecurity();
   const r = s.ms(["ls"], { MS_TEST_KEYCHAIN_OK: scoped });
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stdout, /gmail\s+gmail\s+org-1\s+yes\s+yes\s+yes/);
+  assert.match(r.stdout, /gmail\s+claude\s+gmail\s+org-1\s+yes\s+yes\s+yes/);
   const probes = s.securityLog().split("\n").filter(Boolean);
   assert.ok(probes.length > 0, "ls did check the keychain");
   for (const line of probes) assert.equal(line.includes("-w"), false, `ls asked for a secret: ${line}`);

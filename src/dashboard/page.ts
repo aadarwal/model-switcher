@@ -5,20 +5,28 @@
 // `/api/state` every 5 s (src/dashboard/api.ts), which is also what keeps
 // `ms dashboard` alive: server.ts's idle timer resets on every request the
 // poll makes, so an open tab is the thing holding the process open, and
-// closing it lets the process exit within `idleMs`.
+// closing it lets the process exit within `idleMs` (90 s by default —
+// review round 1, finding 4). A `visibilitychange` listener re-polls
+// immediately when the tab is foregrounded again — a hidden tab's own JS
+// timers get throttled by the browser, so the 5 s interval alone can't be
+// trusted to keep the server's idle clock fresh while backgrounded.
 //
 // It renders the same two tables `ms status` prints (src/status.ts), reading
-// the RAW rows `statusJson()` returns — `{ accounts, sessions, takenAt }` —
-// not that file's own pre-rendered strings. Three columns `ms status` itself
-// computes from data the JSON API does not carry are approximated rather than
-// invented:
-//   * accounts LABEL — the registry's label never crosses the API (the API
-//     has no registry access of its own); this renders the account name.
-//   * sessions PENDING and WALLED? — both need a live tmux capture and the
-//     event log (src/status.ts's `sessionRow`/`sessionWalled`), which
-//     `statusJson()` does not serialize. Both render "—".
-// Nothing here ever renders a token or credential — the API it reads never
-// carries one (src/dashboard/api.ts's own header comment).
+// `statusJson()`'s own rows — `{ accounts, sessions, takenAt }` — which,
+// since review round 1's finding 1, carry the exact computed words the
+// table renders (LABEL, STATE, PENDING, WALLED?), not just the raw
+// snapshot/store rows: this file renders them as given, it does not
+// re-derive any of them (finding 2 was exactly that — a re-derived STATE
+// that skipped the hasToken/no-token check).
+//
+// Every POST body and the `esc()` escaper live in ./client-logic.ts as
+// plain, closure-free functions — this file imports them and embeds each
+// one's own runtime source (`fn.toString()`) into the single inline
+// <script> below, so test/dashboard-client.test.ts exercises the EXACT code
+// that runs in the browser, with no bundler and no second copy to drift
+// out of sync (review round 1, finding 8).
+
+import { esc, buildRotateBody, buildSwitchBody, buildStopBody, buildSwitchAllBody, nextPollState, pollStateOnVisible, MAX_POLL_FAILURES } from "./client-logic.ts";
 
 const DASH = "—"; // matches status.ts's own DASH exactly
 
@@ -54,6 +62,15 @@ td.actions { display: flex; align-items: center; gap: 6px; white-space: nowrap; 
 .empty { color: #bab8b0; font-style: italic; }
 `;
 
+// Every function in this list is imported from ./client-logic.ts, so its
+// `.toString()` here is the exact compiled body test/dashboard-client.test.ts
+// already exercises under Node — never a hand-copied duplicate. Each is a
+// closure-free named `function` declaration, so re-emitting its source as a
+// statement in the page's own script scope defines the same callable name.
+const EMBEDDED_FUNCTIONS = [esc, buildRotateBody, buildSwitchBody, buildStopBody, buildSwitchAllBody, nextPollState, pollStateOnVisible]
+  .map((fn) => fn.toString())
+  .join("\n\n");
+
 // Kept as one string so the whole client is visible in one place, the way
 // the page's own tables read as one instrument rather than assembled parts.
 // It is plain ES5-ish JS (no build step, no bundler — this ships as-is to
@@ -61,9 +78,15 @@ td.actions { display: flex; align-items: center; gap: 6px; white-space: nowrap; 
 const JS = `
 (function () {
   "use strict";
+
+${EMBEDDED_FUNCTIONS}
+
   var POLL_MS = 5000;
   var MSG_MS = 10000;
   var DASH = ${JSON.stringify(DASH)};
+  var MAX_POLL_FAILURES = ${MAX_POLL_FAILURES};
+  // Amber-worry cells: session STATE ("walled"/"parked"), account STATE
+  // ("auth"), session WALLED? ("unreported"). Everything else stays ink.
   var WORRY = { walled: 1, parked: 1, auth: 1, unreported: 1 };
 
   var rowMessages = Object.create(null);
@@ -71,12 +94,8 @@ const JS = `
   var lastTakenAt = null;
   var currentAccounts = [];
   var currentSessions = [];
-
-  function esc(s) {
-    return String(s).replace(/[&<>"']/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\\"": "&quot;", "'": "&#39;" }[c];
-    });
-  }
+  var pollState = { failures: 0, stopped: false };
+  var pollTimer = null;
 
   function worryAttr(v) { return WORRY[v] ? ' class="worry"' : ""; }
 
@@ -102,32 +121,24 @@ const JS = `
     return c.reduce(function (a, b) { return Date.parse(a) <= Date.parse(b) ? a : b; });
   }
 
-  var NO_GRANT_RE = /no poll grant|credentials missing|no credentials/i;
-
-  function accountState(a) {
-    if (a.errorKind === "auth") return NO_GRANT_RE.test(a.error || "") ? "no-grant" : "auth";
-    if (a.errorKind === "transient" || a.errorKind === "other") return "transient";
-    if (a.stale) return "stale";
-    return "ok";
-  }
-
   function el(id) { return document.getElementById(id); }
 
+  // LABEL and STATE are statusJson()'s own computed words (src/status.ts's
+  // computeAccount()) — rendered as given, never re-derived here.
   function renderAccounts(accounts) {
     var tbody = document.querySelector("#accounts-table tbody");
     if (!accounts.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty">no accounts</td></tr>'; return; }
     tbody.innerHTML = accounts.map(function (a) {
-      var st = accountState(a);
       var reset = earliestWeeklyReset(a.usage);
       var u = a.usage || {};
       return "<tr>" +
         "<td>" + esc(a.name) + "</td>" +
-        "<td>" + esc(a.name) + "</td>" +
+        "<td>" + esc(a.label) + "</td>" +
         "<td>" + fmtPercent(u.session) + "</td>" +
         "<td>" + fmtPercent(u.weeklyAll) + "</td>" +
         "<td>" + fmtPercent(u.weeklyFable) + "</td>" +
         "<td>" + (reset ? localTime(Date.parse(reset)) : DASH) + "</td>" +
-        "<td" + worryAttr(st) + ">" + esc(st) + "</td>" +
+        "<td" + worryAttr(a.state) + ">" + esc(a.state) + "</td>" +
         "</tr>";
     }).join("");
   }
@@ -136,6 +147,9 @@ const JS = `
     return accounts.filter(function (a) { return a.provider === provider && a.name !== exclude; });
   }
 
+  // PENDING and WALLED? are statusJson()'s own computed words too
+  // (src/status.ts's computeSession()) — "pending" is null exactly where
+  // the text table prints "—".
   function renderSessions(sessions, accounts) {
     var tbody = document.querySelector("#sessions-table tbody");
     if (!sessions.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty">no sessions</td></tr>'; return; }
@@ -150,6 +164,7 @@ const JS = `
         ? '<select data-switch-select>' + options + '</select><button data-act="switch">Go</button>'
         : "";
       var wakeup = s.wakeupAt != null ? localTime(s.wakeupAt * 1000) : DASH;
+      var pending = s.pending == null ? DASH : esc(s.pending);
       return "<tr>" +
         "<td>" + esc(s.id) + "</td>" +
         "<td>" + esc(s.pane || DASH) + "</td>" +
@@ -158,9 +173,9 @@ const JS = `
         "<td>" + esc(s.need) + "</td>" +
         "<td" + worryAttr(s.state) + ">" + esc(s.state) + "</td>" +
         "<td>" + esc(String(s.generation)) + "</td>" +
-        "<td>" + DASH + "</td>" +
+        "<td>" + pending + "</td>" +
         "<td>" + wakeup + "</td>" +
-        "<td>" + DASH + "</td>" +
+        "<td" + worryAttr(s.walled) + ">" + esc(s.walled || DASH) + "</td>" +
         '<td class="actions" data-session="' + esc(s.id) + '">' +
           '<button data-act="rotate">Rotate</button>' +
           switchCell +
@@ -207,11 +222,19 @@ const JS = `
     }
   }
 
+  // While polling has given up (finding 6), the meta line belongs to
+  // showStopped() — a 1s tick must not paper over "the dashboard has
+  // exited" with "read Ns ago" using a takenAt that is now definitely stale.
   function updateMeta() {
+    if (pollState.stopped) return;
     var m = el("meta");
     if (lastTakenAt == null) { m.textContent = "reading…"; return; }
     var secs = Math.max(0, Math.round((Date.now() - lastTakenAt) / 1000));
     m.textContent = "read " + secs + " s ago";
+  }
+
+  function showStopped() {
+    el("meta").textContent = "the dashboard has exited — run ms dashboard again";
   }
 
   function post(path, body) {
@@ -235,6 +258,12 @@ const JS = `
     renderSessions(currentSessions, currentAccounts);
   }
 
+  // The Force checkbox governs ONLY the move-all control (review round 1,
+  // finding 5's ruling) — per-row Rotate/Switch never read it, so a busy
+  // session's own mid-turn guard can't be bypassed from a checkbox that
+  // visually sits next to a completely different button. See
+  // buildRotateBody()/buildSwitchBody() above: neither one even accepts a
+  // force argument, so there is no way to build a body that sends one.
   function forceChecked() { return el("force").checked; }
 
   document.querySelector("#sessions-table tbody").addEventListener("click", function (e) {
@@ -245,14 +274,14 @@ const JS = `
     var id = cell.getAttribute("data-session");
     var act = btn.getAttribute("data-act");
     if (act === "rotate") {
-      post("/api/rotate", { session: id, force: forceChecked() }).then(function (r) { setRowMessage(id, r); });
+      post("/api/rotate", buildRotateBody(id)).then(function (r) { setRowMessage(id, r); });
     } else if (act === "stop") {
-      post("/api/stop", { session: id }).then(function (r) { setRowMessage(id, r); });
+      post("/api/stop", buildStopBody(id)).then(function (r) { setRowMessage(id, r); });
     } else if (act === "switch") {
       var sel = cell.querySelector("select[data-switch-select]");
       var to = sel ? sel.value : "";
       if (!to) return;
-      post("/api/switch", { session: id, to: to, force: forceChecked() }).then(function (r) { setRowMessage(id, r); });
+      post("/api/switch", buildSwitchBody(id, to)).then(function (r) { setRowMessage(id, r); });
     }
   });
 
@@ -260,14 +289,29 @@ const JS = `
   el("moveall-go").addEventListener("click", function () {
     var to = el("moveall-account").value;
     if (!to) return;
-    post("/api/switch-all", { to: to, force: forceChecked() }).then(function (r) {
+    post("/api/switch-all", buildSwitchAllBody(to, forceChecked())).then(function (r) {
       moveMsg = { text: resultText(r), error: resultIsError(r), expiresAt: Date.now() + MSG_MS };
       renderMoveMsg();
     });
   });
 
+  function scheduleNext() {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(tick, POLL_MS);
+  }
+
+  // Finding 6: polling used to run forever on a plain setInterval, so a
+  // dashboard left open against a server that had exited kept trying every
+  // 5s with no sign anything was wrong. After MAX_POLL_FAILURES consecutive
+  // failures the interval stops outright; a later visibilitychange (finding
+  // 4) gets exactly one more try via pollStateOnVisible(), not a silently
+  // restored full retry budget.
   function tick() {
-    fetch("/api/state").then(function (r) { return r.json(); }).then(function (data) {
+    fetch("/api/state").then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (data) {
+      pollState = nextPollState(pollState, true);
       currentAccounts = data.accounts || [];
       currentSessions = data.sessions || [];
       lastTakenAt = data.takenAt;
@@ -275,13 +319,26 @@ const JS = `
       renderSessions(currentSessions, currentAccounts);
       renderMoveAll(currentAccounts);
       updateMeta();
+      scheduleNext();
     }).catch(function (e) {
+      pollState = nextPollState(pollState, false);
+      if (pollState.stopped) {
+        showStopped();
+        return; // no scheduleNext(): the interval stops until a retry
+      }
       el("meta").textContent = "could not read state: " + e;
+      scheduleNext();
     });
   }
 
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState !== "visible") return;
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    pollState = pollStateOnVisible(pollState);
+    tick();
+  });
+
   tick();
-  setInterval(tick, POLL_MS);
   setInterval(updateMeta, 1000);
 })();
 `;
@@ -315,7 +372,7 @@ export function renderDashboardPage(): string {
       <select id="moveall-provider"></select>
       <span>pane to</span>
       <select id="moveall-account"></select>
-      <label class="force"><input type="checkbox" id="force"> Force</label>
+      <label class="force"><input type="checkbox" id="force"> Force (governs "Move every…" only)</label>
       <button id="moveall-go">Go</button>
       <span class="rowmsg" id="moveall-msg"></span>
     </div>

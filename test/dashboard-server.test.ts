@@ -234,6 +234,17 @@ test("startDashboard binds 127.0.0.1 and GET / returns HTML with both table head
   const bound = new URL(dash.url);
   assert.equal(bound.hostname, "127.0.0.1");
   assert.notEqual(bound.hostname, "0.0.0.0");
+
+  // Review round 1, finding 8: the served page embeds client-logic.ts's OWN
+  // functions (via `.toString()`), not a hand-written copy — if page.ts ever
+  // stops importing one of these, its name disappears from the script too.
+  for (const name of ["esc", "buildRotateBody", "buildSwitchBody", "buildStopBody", "buildSwitchAllBody", "nextPollState", "pollStateOnVisible"]) {
+    assert.ok(html.includes(`function ${name}(`), `missing embedded function: ${name}`);
+  }
+
+  // Review round 1, finding 5's ruling: the Force checkbox's label says its
+  // own scope, right there in the served markup — not just "Force".
+  assert.ok(html.includes('Force (governs "Move every'), "Force checkbox label does not say it only governs the move-all control");
 });
 
 // --- GET /api/state ----------------------------------------------------

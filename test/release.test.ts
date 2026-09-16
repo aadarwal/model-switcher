@@ -435,11 +435,23 @@ test("the formula's own shim command line runs `main` out of a real tarball", ()
   writeFileSync(shim, `${shimBody}\n`, { mode: 0o755 });
 
   const msHome = mkdtempSync(path.join(tmpdir(), "ms-keg-home-"));
-  const runShim = (args: string[]) =>
+  // The keg's OWN `ms` goes in front of PATH for every spawn below. Without
+  // this the doctor's "ms on PATH is msBinary()" check resolves whatever `ms`
+  // the developer's machine has installed — on a machine with the real
+  // Homebrew formula, /opt/homebrew/bin/ms — and compares that binary against
+  // this temp keg. The test passed here only until `brew install model-switcher`
+  // put one there. That is a hermeticity gap in the test, not a defect in the
+  // product, and a test about a keg must see nothing but that keg.
+  //
+  // `opt/model-switcher/bin` is the STABLE link `def install` points `bin` at
+  // (and the one the shim exports as MS_BIN), so putting it on PATH is also
+  // exactly how a real installation is reached.
+  const kegBin = path.dirname(optBin);
+  const runShim = (args: string[], pathValue = `${kegBin}:${process.env.PATH}`) =>
     spawnSync(shim, args, {
       encoding: "utf8",
       timeout: 60_000,
-      env: { ...process.env, HOME: msHome, MS_HOME: path.join(msHome, "store"), MS_BIN: undefined, NODE_OPTIONS: "--disable-warning=ExperimentalWarning" },
+      env: { ...process.env, PATH: pathValue, HOME: msHome, MS_HOME: path.join(msHome, "store"), MS_BIN: undefined, NODE_OPTIONS: "--disable-warning=ExperimentalWarning" },
     });
 
   // This is the check the old shim could never pass: `node dist/ms.js` only
@@ -456,7 +468,30 @@ test("the formula's own shim command line runs `main` out of a real tarball", ()
   // And `msBinary()` inside the real bundle resolves to the stable opt path
   // the shim exported — the exact string every hook command, trust hash,
   // statusline wrapper and alias line is written with (B-C2).
+  //
+  // Two facts, and the doctor only ever prints the second one on a ✗ line, so
+  // they take two runs: that the `ms` PATH gives and the one `msBinary()`
+  // names are THE SAME FILE, and that the string `msBinary()` hands out is the
+  // stable `opt` path rather than the versioned Cellar one the next `brew
+  // upgrade` deletes.
+  const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const lineWith = (r: { stdout: string; stderr: string }, re: RegExp): string | undefined =>
+    `${r.stdout}${r.stderr}`.split("\n").find((l) => re.test(l));
+
   const doctor = runShim(["doctor"]);
-  assert.match(`${doctor.stdout}${doctor.stderr}`, new RegExp(optBin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), doctor.stdout + doctor.stderr);
-  assert.ok(!/Cellar/.test(doctor.stdout.split("\n").filter((l) => /msBinary/.test(l)).join("\n")), doctor.stdout);
+  const pathLine = lineWith(doctor, /ms on PATH is msBinary/);
+  assert.ok(pathLine, doctor.stdout + doctor.stderr);
+  // ✓, and nothing else: a ✗ here names both binaries, and the keg's own is
+  // the only one this run can see.
+  assert.equal(pathLine, "✓ ms on PATH is msBinary()", doctor.stdout + doctor.stderr);
+
+  // With no `ms` on PATH at all the doctor prints the string itself. Only the
+  // SIP-protected system directories, where a Homebrew keg cannot be, so this
+  // run cannot find one either; `/bin` is there because the shim is a bash
+  // script that execs `env`.
+  const bare = runShim(["doctor"], "/usr/bin:/bin");
+  const binLine = lineWith(bare, /msBinary\(\) is/);
+  assert.ok(binLine, bare.stdout + bare.stderr);
+  assert.match(binLine!, new RegExp(`msBinary\\(\\) is ${escapeRe(optBin)}$`), binLine);
+  assert.ok(!/Cellar/.test(binLine!), binLine);
 });

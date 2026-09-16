@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.4
+
+- Automatic Codex recovery is on by default (MS_CODEX_AUTOROTATE=0 disables):
+  the wall record is verified against real rollouts and the full handoff was
+  observed live
+- at most three account changes per session per ten minutes, then the session
+  parks
+- task_complete and turn_complete both read as the end of a turn
+- scripts/codex-wall-mock.mjs reproduces a Codex usage wall locally
+
 ## 0.2.3
 
 - ms dashboard wears the home dashboard's language: provider groups, account

@@ -1,11 +1,21 @@
 import { appendFileSync, existsSync, readFileSync, openSync, closeSync, fstatSync, readSync, statSync, chmodSync } from "node:fs";
 import { ensureSessionDir, p } from "./paths.ts";
 
-export type EventKind = "started" | "resumed" | "cleared" | "compacted" | "activity" | "rate_limited" | "ended" | "died" | "recovery" | "note";
+/** `stop` is Codex's: its Stop hook fires when a turn COMPLETES, and the
+ * turn watchdog (`ms _turn`) reads the presence of one for a turn id as
+ * "that turn finished, stand down". Claude Code has no equivalent — its
+ * wall arrives as a StopFailure, so nothing there needs a turn's end
+ * recorded. Recording the successful end of a turn is only load-bearing
+ * where the SIGNAL is a turn that never ended. */
+export type EventKind = "started" | "resumed" | "cleared" | "compacted" | "activity" | "stop" | "rate_limited" | "ended" | "died" | "recovery" | "note";
 /** `cliSessionId` is the CLI's own id as the hook reported it. When a
  * SessionStart moves the session onto a NEW id — a `/clear`, an interactive
  * `/resume`, a fork — `prevCliSessionId` carries the one it left, so the
- * audit log records the change itself and not merely its result. */
+ * audit log records the change itself and not merely its result.
+ *
+ * `turnId` is the CLI's own id for ONE turn (Codex reports it on
+ * UserPromptSubmit and again on Stop). It is what lets a watchdog armed for
+ * a turn recognise that very turn's ending, rather than any later one. */
 export type Event = { t: number; kind: EventKind; session: string; generation: number; cliSessionId?: string | null; prevCliSessionId?: string | null; turnId?: string | null; kindDetail?: string; text?: string };
 
 /** True if the file is non-empty and its last byte is not '\n' — a torn

@@ -89,18 +89,30 @@ export function localTime(epochMs: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function accountRow(a: AccountUsage, registry: Registry): string[] {
+/** Everything an account row needs that isn't already on `AccountUsage`
+ *  itself — the registry's own LABEL and the table's own STATE word — in
+ *  one place, so `accountRow()` (the text table) and `statusJson()` (Plan 4
+ *  Task 2's dashboard) compute it identically rather than one of them
+ *  copying the other's logic. See review round 1 (P4-T2), findings 1 & 2. */
+export type AccountComputed = { label: string; state: AccountState };
+
+function computeAccount(a: AccountUsage, registry: Registry): AccountComputed {
   const label = findAccount(registry, a.name, a.provider)?.label ?? a.name;
   const hasToken = !!readLaunchToken(a.name);
+  return { label, state: accountState(a, hasToken) };
+}
+
+function accountRow(a: AccountUsage, registry: Registry): string[] {
+  const c = computeAccount(a, registry);
   const reset = earliestWeeklyReset(a.usage);
   return [
     a.name,
-    label,
+    c.label,
     fmtPercent(a.usage?.session ?? null),
     fmtPercent(a.usage?.weeklyAll ?? null),
     fmtPercent(a.usage?.weeklyFable ?? null),
     reset ? localTime(Date.parse(reset)) : DASH,
-    accountState(a, hasToken),
+    c.state,
   ];
 }
 
@@ -142,7 +154,16 @@ export function sessionWalled(s: SessionRow, hasPendingRecovery: boolean, screen
  * Nothing here second-guesses either; a status that repaired what it printed
  * would be a different verb.
  */
-function sessionRow(s: SessionRow, st: State): string[] {
+/** Everything a session row needs that lives outside `SessionRow` itself —
+ *  the live "gone" override, the open recovery's own status word, and the
+ *  WALLED? reading — computed once so `sessionRow()` (the text table) and
+ *  `statusJson()` (Plan 4 Task 2's dashboard) never compute it two
+ *  different ways. See review round 1 (P4-T2), finding 1. `pending` is
+ *  `null` exactly where the table prints "—" (no open recovery); JSON has
+ *  no dash of its own. */
+export type SessionComputed = { state: string; pending: string | null; walled: Walled };
+
+function computeSession(s: SessionRow, st: State): SessionComputed {
   const tmux = new Tmux(s.socket || null);
   const hasPane = !!s.pane;
   const exists = hasPane && tmux.paneExists(s.pane);
@@ -158,17 +179,22 @@ function sessionRow(s: SessionRow, st: State): string[] {
   // render's paneExists catches up and shows "gone".
   const screen = exists ? tmux.capture(s.pane) : null;
   const walled = sessionWalled(s, rec !== null, screen, exists ? readEvents(s.id) : []);
+  return { state, pending: rec ? rec.status : null, walled };
+}
+
+function sessionRow(s: SessionRow, st: State): string[] {
+  const c = computeSession(s, st);
   return [
     s.id,
     s.pane || DASH,
     s.provider,
     s.account,
     s.need,
-    state,
+    c.state,
     String(s.generation),
-    rec ? rec.status : DASH,
+    c.pending ?? DASH,
     s.wakeupAt != null ? localTime(s.wakeupAt * 1000) : DASH,
-    walled,
+    c.walled,
   ];
 }
 
@@ -180,20 +206,36 @@ function table(headers: string[], rows: string[][]): string[] {
   return [line(headers), ...rows.map(line)];
 }
 
-export type StatusJson = { accounts: AccountUsage[]; sessions: SessionRow[]; takenAt: number | null };
+/** Additive over the raw rows: every existing key of `AccountUsage` /
+ *  `SessionRow` is present unchanged, plus the words the text table
+ *  computes and this JSON didn't use to carry (review round 1, finding 1:
+ *  LABEL/PENDING/WALLED? were rendering as placeholders on the dashboard
+ *  page because they simply weren't in this JSON at all). */
+export type StatusAccountRow = AccountUsage & AccountComputed;
+export type StatusSessionRow = SessionRow & { pending: string | null; walled: Walled };
+export type StatusJson = { accounts: StatusAccountRow[]; sessions: StatusSessionRow[]; takenAt: number | null };
 
 /**
  * The `--json` shape below, isolated so another caller (the dashboard API,
- * Plan 4 Task 1) can get the same numbers without going through stdout. Pure
- * over the snapshot and the store; extracted without changing what `ms
- * status --json` itself prints — `render`'s json branch below is now just
- * `JSON.stringify` over this.
+ * Plan 4 Task 1/2) can get the same numbers without going through stdout —
+ * and, since review round 1, the exact same COMPUTED words the text table
+ * prints (`computeAccount`/`computeSession` above), not just the raw
+ * snapshot/store rows a consumer would otherwise have to re-derive (badly:
+ * finding 2's page.ts copy never checked `hasToken`). Extracted without
+ * changing what `ms status --json` itself prints beyond that addition —
+ * `render`'s json branch below is still just `JSON.stringify` over this.
  */
 export async function statusJson(): Promise<StatusJson> {
+  const { registry } = loadRegistry();
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
   const st = openState();
   try {
-    return { accounts: snapshot.accounts, sessions: st.listSessions(), takenAt: snapshot.takenAt };
+    const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry) }));
+    const sessions = st.listSessions().map((s) => {
+      const c = computeSession(s, st);
+      return { ...s, pending: c.pending, walled: c.walled };
+    });
+    return { accounts, sessions, takenAt: snapshot.takenAt };
   } finally {
     st.close();
   }

@@ -117,9 +117,21 @@ export type RowMessage = { text: string; error: boolean } | null;
  * worry only; everything else stays ink, because a table where most cells are
  * coloured says nothing with colour at all.
  */
-export function worryAttr(v: unknown): string {
+export function isWorry(v: unknown): boolean {
   var worry: { [k: string]: number } = { walled: 1, parked: 1, auth: 1, unreported: 1, "no-token": 1, "no-grant": 1 };
-  return worry[String(v)] ? ' class="worry"' : "";
+  return !!worry[String(v)];
+}
+
+export function worryAttr(v: unknown): string {
+  return isWorry(v) ? ' class="worry"' : "";
+}
+
+/** A chip's own class list. The pill is structure (every chip is one); the
+ *  colour is worry, and only worry — `stale` and `transient` wear the same
+ *  pill in ink, because a panel where every chip is amber says nothing with
+ *  amber at all. */
+export function chipClass(v: unknown): string {
+  return isWorry(v) ? "ms-chip worry" : "ms-chip";
 }
 
 export function fmtPercent(w: UsageWindow | undefined, dash: string): string {
@@ -128,16 +140,37 @@ export function fmtPercent(w: UsageWindow | undefined, dash: string): string {
   return (Math.floor(v) === v ? String(v) : v.toFixed(1)) + "%";
 }
 
+/**
+ * Two digits.
+ *
+ * A top-level function, not the inner `var pad = function …` this used to be,
+ * and that is load-bearing: esbuild (tsx, and `scripts/build.mjs`) compiles a
+ * NAMED function expression assigned to a variable into
+ * `var pad = __name(function (n) { … }, "pad")` — a call to a helper it
+ * defines once at module scope. `fn.toString()` faithfully re-emits that
+ * call, and the page's script scope has no `__name`, so the embedded function
+ * threw `ReferenceError: __name is not defined` the first time it ran in a
+ * browser. (Found by loading the real served page: `localTime` had carried
+ * this since Task 2, which is every account row with a weekly reset and every
+ * session with a wake-up.) Nothing embedded here may close over anything —
+ * including a helper a compiler quietly inserted. The test
+ * "no embedded function depends on a compiler-inserted helper" is the rule.
+ */
+export function pad2(n: number): string {
+  return n < 10 ? "0" + n : String(n);
+}
+
 export function localTime(ms: number): string {
   var d = new Date(ms);
-  var pad = function (n: number): string {
-    return n < 10 ? "0" + n : String(n);
-  };
   return (
-    d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes())
+    d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes())
   );
 }
 
+/** The earliest of an account's WEEKLY resets. The RESETS column it used to
+ *  feed is gone — every meter now carries its own reset, in its own lane —
+ *  but it stays exported and tested: it is part of client-logic's contract,
+ *  and the dist guard embeds it by name. */
 export function earliestWeeklyReset(u: AccountRowView["usage"]): string | null {
   if (!u) return null;
   var c: string[] = [];
@@ -167,43 +200,216 @@ export function chosenAccount(options: string[], chosen: string): string {
   return options.length ? options[0]! : "";
 }
 
-export function accountRowHtml(a: AccountRowView, dash: string): string {
-  var u = a.usage || {};
-  var reset = earliestWeeklyReset(a.usage);
+// --- The accounts panel ----------------------------------------------------
+//
+// The page wears the home dashboard's own accounts block (its `lim-*` panel):
+// one group per provider, a brand rail naming it, and a card per account whose
+// windows are meters on one shared scale — not a row of bare percentages in a
+// table. The reference's rules travel with the shape:
+//
+//   * colour is worry only. A meter's fill takes the severity palette at the
+//     reference's own thresholds (`severityWord` below) and nothing else; the
+//     brand colours are worn by the rails and the marks, never by a bar —
+//     Anthropic's coral sits next to `--status-high` and OpenAI's green next
+//     to a healthy one, so a brand-coloured bar would read as a severity.
+//   * a window the JSON does not carry is simply absent. A Codex account
+//     reporting only its weekly window gets one lane, not a lane and a dash;
+//     a dash lane is a meter that measures nothing.
+//   * the percentages are USED, said once in the rail's count text, so no
+//     lane has to repeat the unit.
+
+/** The reference's own thresholds (`severityFor` in the data repo's
+ *  lib/types.ts), copied verbatim: 70 / 85 / 95. */
+export function severityWord(percent: number): string {
+  if (percent >= 95) return "critical";
+  if (percent >= 85) return "high";
+  if (percent >= 70) return "elevated";
+  return "normal";
+}
+
+/** Brand casing, not the provider key: a rail says "Claude" and "Codex". */
+export function providerLabel(provider: string): string {
+  if (provider === "claude") return "Claude";
+  if (provider === "codex") return "Codex";
+  return provider;
+}
+
+/** The provider's own mark, inlined as SVG so it renders in any ink and the
+ *  page keeps its one rule: no external asset, ever. `currentColor` lets the
+ *  rail decide, which is the only place a brand colour is allowed. */
+export function providerMark(provider: string): string {
+  var paths: { [k: string]: string } = {
+    claude:
+      "m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z",
+    codex:
+      "M22.282 9.821a6 6 0 0 0-.516-4.91a6.05 6.05 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a6 6 0 0 0-3.998 2.9a6.05 6.05 0 0 0 .743 7.097a5.98 5.98 0 0 0 .51 4.911a6.05 6.05 0 0 0 6.515 2.9A6 6 0 0 0 13.26 24a6.06 6.06 0 0 0 5.772-4.206a6 6 0 0 0 3.997-2.9a6.06 6.06 0 0 0-.747-7.073M13.26 22.43a4.48 4.48 0 0 1-2.876-1.04l.141-.081l4.779-2.758a.8.8 0 0 0 .392-.681v-6.737l2.02 1.168a.07.07 0 0 1 .038.052v5.583a4.504 4.504 0 0 1-4.494 4.494M3.6 18.304a4.47 4.47 0 0 1-.535-3.014l.142.085l4.783 2.759a.77.77 0 0 0 .78 0l5.843-3.369v2.332a.08.08 0 0 1-.033.062L9.74 19.95a4.5 4.5 0 0 1-6.14-1.646M2.34 7.896a4.5 4.5 0 0 1 2.366-1.973V11.6a.77.77 0 0 0 .388.677l5.815 3.354l-2.02 1.168a.08.08 0 0 1-.071 0l-4.83-2.786A4.504 4.504 0 0 1 2.34 7.872zm16.597 3.855l-5.833-3.387L15.119 7.2a.08.08 0 0 1 .071 0l4.83 2.791a4.494 4.494 0 0 1-.676 8.105v-5.678a.79.79 0 0 0-.407-.667m2.01-3.023l-.141-.085l-4.774-2.782a.78.78 0 0 0-.785 0L9.409 9.23V6.897a.07.07 0 0 1 .028-.061l4.83-2.787a4.5 4.5 0 0 1 6.68 4.66zm-12.64 4.135l-2.02-1.164a.08.08 0 0 1-.038-.057V6.075a4.5 4.5 0 0 1 7.375-3.453l-.142.08L8.704 5.46a.8.8 0 0 0-.393.681zm1.097-2.365l2.602-1.5l2.607 1.5v2.999l-2.597 1.5l-2.607-1.5Z",
+  };
+  var d = paths[provider];
+  if (!d) return "";
+  return '<svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="' + d + '"></path></svg>';
+}
+
+/** "resets Tue 20:00" — local wall clock, the weekday named because every
+ *  weekly window resets days out and "20:00" alone would read as tonight.
+ *  A window with no reset says nothing rather than guessing one. */
+export function resetNote(iso: string | null | undefined): string {
+  if (!iso) return "";
+  var t = Date.parse(String(iso));
+  if (!isFinite(t)) return "";
+  var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  var d = new Date(t);
+  return "resets " + days[d.getDay()] + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+
+/**
+ * One window as a meter: the label, the reset as a quiet note, the used
+ * percentage, then the bar. Returns "" for a window the account does not
+ * have — the panel's rule that a missing window is absent, not a dash, lives
+ * here so every caller gets it.
+ */
+export function laneHtml(label: string, w: UsageWindow | undefined, dash: string): string {
+  if (!w || typeof w.usedPercent !== "number" || !isFinite(w.usedPercent)) return "";
+  var pct = Math.max(0, Math.min(100, w.usedPercent));
+  var idle = pct === 0;
+  var note = resetNote(w.resetsAt);
   return (
-    "<tr>" +
-    "<td>" + esc(a.name) + "</td>" +
-    "<td>" + esc(a.provider || dash) + "</td>" +
-    "<td>" + esc(a.label) + "</td>" +
-    "<td>" + fmtPercent(u.session, dash) + "</td>" +
-    "<td>" + fmtPercent(u.weeklyAll, dash) + "</td>" +
-    "<td>" + fmtPercent(u.weeklyFable, dash) + "</td>" +
-    "<td>" + (reset ? localTime(Date.parse(reset)) : dash) + "</td>" +
-    "<td" + worryAttr(a.state) + ">" + esc(a.state) + "</td>" +
-    "</tr>"
+    '<div class="ms-lane">' +
+    '<div class="ms-lane-top">' +
+    '<span class="ms-lane-label">' + esc(label) + "</span>" +
+    '<span class="ms-lane-read">' +
+    (note ? '<span class="ms-lane-note">' + esc(note) + "</span>" : "") +
+    '<span class="ms-lane-value"' + (idle ? " data-idle" : "") + ">" + fmtPercent(w, dash) + "</span>" +
+    "</span>" +
+    "</div>" +
+    '<div class="ms-track" role="progressbar" aria-valuenow="' + Math.round(pct) + '" aria-valuemin="0" aria-valuemax="100" aria-label="' + esc(label) + ": " + fmtPercent(w, dash) + ' used">' +
+    '<span class="ms-fill" data-severity="' + (idle ? "idle" : severityWord(pct)) + '" style="width:' + pct + '%"></span>' +
+    "</div>" +
+    "</div>"
   );
 }
 
+/** Every window this account actually reports, in the order a human reads
+ *  them: the session first, then the week. Claude's Fable lane only exists
+ *  when Claude reports it; Codex never carries one, so nothing has to know
+ *  which provider it is looking at. */
+export function accountLanesHtml(a: AccountRowView, dash: string): string {
+  var u = a.usage || {};
+  return (
+    laneHtml("Session · 5h", u.session, dash) +
+    laneHtml("Week · all models", u.weeklyAll, dash) +
+    laneHtml("Week · Fable", u.weeklyFable, dash)
+  );
+}
+
+/** One account card: the name, the registry's LABEL when it says something
+ *  the name doesn't, a chip for a STATE that isn't `ok`, then the meters.
+ *  LABEL and STATE are `statusJson()`'s own computed words — rendered as
+ *  given, never re-derived here. */
+export function accountRowHtml(a: AccountRowView, dash: string): string {
+  var lanes = accountLanesHtml(a, dash);
+  var showLabel = a.label && a.label !== a.name;
+  return (
+    '<section class="ms-acct">' +
+    '<header class="ms-acct-head">' +
+    '<h3 class="ms-name">' + esc(a.name) + "</h3>" +
+    (a.state && a.state !== "ok" ? '<span class="' + chipClass(a.state) + '">' + esc(a.state) + "</span>" : "") +
+    (showLabel ? '<span class="ms-meta">' + esc(a.label) + "</span>" : "") +
+    "</header>" +
+    (lanes || '<div class="ms-note">no windows reported</div>') +
+    "</section>"
+  );
+}
+
+/** The whole panel: one group per provider present in the JSON, in the order
+ *  the JSON names them, each behind its own brand rail. */
+export function accountGroupsHtml(accounts: AccountRowView[], dash: string): string {
+  if (!accounts.length) return '<div class="ms-empty">no accounts</div>';
+  var order: string[] = [];
+  var byProvider: { [k: string]: AccountRowView[] } = {};
+  for (var i = 0; i < accounts.length; i++) {
+    var p = accounts[i]!.provider || "";
+    if (!byProvider[p]) {
+      byProvider[p] = [];
+      order.push(p);
+    }
+    byProvider[p]!.push(accounts[i]!);
+  }
+  var out = "";
+  for (var g = 0; g < order.length; g++) {
+    var key = order[g]!;
+    var members = byProvider[key]!;
+    var mark = providerMark(key);
+    out +=
+      '<div class="ms-group" data-provider="' + esc(key) + '">' +
+      '<div class="ms-rail">' +
+      (mark ? '<span class="ms-rail-mark">' + mark + "</span>" : "") +
+      '<span class="ms-rail-name">' + esc(providerLabel(key)) + "</span>" +
+      '<span class="ms-rail-count">' + members.length + " " + (members.length === 1 ? "account" : "accounts") + " · used</span>" +
+      "</div>" +
+      '<div class="ms-group-grid">';
+    for (var m = 0; m < members.length; m++) out += accountRowHtml(members[m]!, dash);
+    out += "</div></div>";
+  }
+  return '<div class="ms-panel">' + out + "</div>";
+}
+
+/** The fleet move's provider control: a segmented pill over whichever
+ *  providers the pool actually has. It writes through to the `<select>` the
+ *  POST body is still built from, so the control changed shape and nothing
+ *  else did. */
+export function providerSegHtml(providers: string[], current: string): string {
+  var out = "";
+  for (var i = 0; i < providers.length; i++) {
+    var p = providers[i]!;
+    var on = p === current;
+    out += '<button type="button" data-provider="' + esc(p) + '" aria-pressed="' + (on ? "true" : "false") + '">' + esc(providerLabel(p)) + "</button>";
+  }
+  return out;
+}
+
+/** A session id is a UUID; the ledger shows its first group, which is what a
+ *  human types at `ms switch` anyway. The full id stays in the cell's title
+ *  and, verbatim, in the row's own `data-session`. */
+export function shortSessionId(id: string): string {
+  var s = String(id);
+  var cut = s.indexOf("-");
+  return cut > 0 ? s.slice(0, cut) : s;
+}
+
+/**
+ * One session as a ledger row, in the panel's own language: hairline rows, a
+ * quiet header, mono reserved for the two identifiers (the session id and the
+ * pane), and colour only where a human has to act.
+ *
+ * STATE carries the WALLED? reading with it rather than in a column of its
+ * own — `walled · unreported` is one fact about one session, and the tenth
+ * column it used to occupy was a column of blanks. Both words are
+ * `statusJson()`'s own computed ones (src/status.ts's `computeSession()`),
+ * rendered as given.
+ */
 export function sessionRowHtml(s: SessionRowView, others: string[], chosen: string, msg: RowMessage, dash: string): string {
   var pick = chosenAccount(others, chosen);
   var options = "";
   for (var i = 0; i < others.length; i++) {
     options += '<option value="' + esc(others[i]) + '"' + (others[i] === pick ? " selected" : "") + ">" + esc(others[i]) + "</option>";
   }
-  var switchCell = others.length ? "<select data-switch-select>" + options + '</select><button data-act="switch">Go</button>' : "";
+  var switchCell = others.length
+    ? '<button data-act="switch">Switch to</button><select data-switch-select>' + options + "</select>"
+    : "";
   var msgHtml = msg ? '<span class="rowmsg' + (msg.error ? " error" : "") + '">' + esc(msg.text) + "</span>" : "";
+  var state = isWorry(s.state) ? '<span class="' + chipClass(s.state) + '">' + esc(s.state) + "</span>" : esc(s.state);
+  var walled = s.walled ? '<small class="ms-sub"><span' + worryAttr(s.walled) + ">" + esc(s.walled) + "</span></small>" : "";
   return (
     "<tr>" +
-    "<td>" + esc(s.id) + "</td>" +
-    "<td>" + esc(s.pane || dash) + "</td>" +
+    '<td class="mono" title="' + esc(s.id) + '">' + esc(shortSessionId(s.id)) + "</td>" +
+    '<td class="mono">' + esc(s.pane || dash) + "</td>" +
     "<td>" + esc(s.provider) + "</td>" +
     "<td>" + esc(s.account) + "</td>" +
     "<td>" + esc(s.need) + "</td>" +
-    "<td" + worryAttr(s.state) + ">" + esc(s.state) + "</td>" +
-    "<td>" + esc(String(s.generation)) + "</td>" +
+    '<td class="ms-state">' + state + walled + "</td>" +
+    '<td class="num">' + esc(String(s.generation)) + "</td>" +
     "<td>" + (s.pending == null ? dash : esc(s.pending)) + "</td>" +
-    "<td>" + (s.wakeupAt != null ? localTime(s.wakeupAt * 1000) : dash) + "</td>" +
-    "<td" + worryAttr(s.walled) + ">" + esc(s.walled || dash) + "</td>" +
+    '<td class="num">' + (s.wakeupAt != null ? esc(localTime(s.wakeupAt * 1000)) : dash) + "</td>" +
     '<td class="actions" data-session="' + esc(s.id) + '">' +
     '<button data-act="rotate">Rotate</button>' +
     switchCell +

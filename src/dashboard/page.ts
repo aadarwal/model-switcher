@@ -11,13 +11,26 @@
 // timers get throttled by the browser, so the 5 s interval alone can't be
 // trusted to keep the server's idle clock fresh while backgrounded.
 //
-// It renders the same two tables `ms status` prints (src/status.ts), reading
-// `statusJson()`'s own rows — `{ accounts, sessions, takenAt }` — which,
-// since review round 1's finding 1, carry the exact computed words the
-// table renders (LABEL, STATE, PENDING, WALLED?), not just the raw
+// It renders `statusJson()`'s own rows — `{ accounts, sessions, takenAt }` —
+// which, since review round 1's finding 1, carry the exact computed words the
+// text table renders (LABEL, STATE, PENDING, WALLED?), not just the raw
 // snapshot/store rows: this file renders them as given, it does not
 // re-derive any of them (finding 2 was exactly that — a re-derived STATE
 // that skipped the hasToken/no-token check).
+//
+// LOOK (final review, the restyle): the page wears the home dashboard's own
+// language — the accounts block at home.aadarwal.com, which Plan 4 Task 2
+// named as the reference and then didn't follow. Near-black plane, one
+// grotesque at every size, mono reserved for identifiers, quiet gray labels,
+// sentence-case titles, and colour that only ever means "how worried should
+// you be". Accounts are the reference's `lim-*` panel: a provider group per
+// provider, a brand rail naming it, a card per account whose windows are
+// meters on one shared scale. Sessions are a ledger in the same grammar. The
+// tokens below are copied from the reference's `:root`; the brand colours are
+// worn by rails and marks ONLY, never by a bar (Anthropic's coral sits next
+// to --status-high, so a brand-coloured bar would read as a severity).
+// Nothing here is fetched: no font file, no icon set, no stylesheet, no
+// framework — the marks are inline SVG and the chevrons are gradients.
 //
 // Every POST body and the `esc()` escaper live in ./client-logic.ts as
 // plain, closure-free functions — this file imports them and embeds each
@@ -34,12 +47,24 @@ import {
   buildSwitchAllBody,
   nextPollState,
   pollStateOnVisible,
+  isWorry,
   worryAttr,
+  chipClass,
   fmtPercent,
+  pad2,
   localTime,
   earliestWeeklyReset,
   chosenAccount,
+  severityWord,
+  providerLabel,
+  providerMark,
+  resetNote,
+  laneHtml,
+  accountLanesHtml,
   accountRowHtml,
+  accountGroupsHtml,
+  providerSegHtml,
+  shortSessionId,
   sessionRowHtml,
   formatSwitchAll,
   fleetCandidateIds,
@@ -51,41 +76,201 @@ import {
 
 const DASH = "—"; // matches status.ts's own DASH exactly
 
+// The reference's tokens, verbatim (the data repo's app/globals.css `:root`),
+// plus the two families. No font is fetched: the stack names Geist and Inter
+// in case the machine already has them and falls through to the system
+// grotesque, which is what every mac actually renders.
 const CSS = `
-:root { color-scheme: dark; }
+:root {
+  color-scheme: dark;
+  --plane: #090909;
+  --surface: #131312;
+  --surface-2: #1b1b19;
+  --ink: #f6f5f1;
+  --ink-2: #bab8b0;
+  --muted: #898781;
+  --grid: #262624;
+  --baseline: #36352f;
+  --border: rgba(255, 255, 255, 0.075);
+  --status-warn: #fab219;
+  --status-high: #ec835a;
+  --status-critical: #d03b3b;
+  /* Worn by rails and marks only — never by a bar. */
+  --brand-claude: #d97757;
+  --brand-openai: #10a37f;
+  --sans: "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
 * { box-sizing: border-box; }
 html, body {
   margin: 0; padding: 0;
-  background: #090909; color: #f6f5f1;
-  font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
-  font-size: 14px;
+  background: var(--plane); color: var(--ink);
+  font-family: var(--sans); font-size: 14px;
+  -webkit-font-smoothing: antialiased;
 }
-main { max-width: 980px; margin: 0 auto; padding: 32px 20px 64px; }
-h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
-h2 { font-size: 14px; font-weight: 600; margin: 32px 0 10px; }
-.meta { color: #bab8b0; font-size: 12px; margin-bottom: 8px; }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 6px 12px 6px 0; font-size: 12.5px; white-space: nowrap; border-bottom: 1px solid #1c1c1a; }
-th { color: #bab8b0; font-weight: 500; }
-td.worry { color: #e0b25a; }
-.moveall { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: #bab8b0; font-size: 12.5px; margin-bottom: 10px; }
-select, button, input[type="checkbox"] { font-family: inherit; }
-select, button {
-  background: #141412; color: #f6f5f1; border: 1px solid #2a2a26; border-radius: 6px;
-  padding: 3px 9px; font-size: 12.5px;
+main { max-width: 980px; margin: 0 auto; padding: 40px 24px 72px; }
+
+/* ———— Masthead: the title, and the one caption on the page ———— */
+h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 4px; }
+.meta { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* Sections are named, never captioned. */
+.ms-sechead { display: flex; align-items: baseline; margin: 38px 0 12px; }
+h2 { margin: 0; font-size: 13px; font-weight: 500; letter-spacing: -0.01em; color: var(--ink); }
+.ms-empty { font-size: 12.5px; color: var(--muted); }
+.worry { color: var(--status-warn); }
+
+/* ———— The accounts panel ————
+   One provider, one rail: the mark says who, the cards under it say how much
+   each account has spent. A 2px brand spine runs the whole zone. */
+.ms-panel {
+  margin-top: 30px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
 }
-button { cursor: pointer; }
-button:hover { border-color: #47453f; }
-label.force { display: inline-flex; align-items: center; gap: 4px; }
-td.actions { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
-.rowmsg { color: #bab8b0; font-size: 12px; }
-.rowmsg.error { color: #e06c5a; }
+.ms-group { --rail-brand: var(--baseline); box-shadow: inset 2px 0 0 var(--rail-brand); }
+.ms-group[data-provider="claude"] { --rail-brand: var(--brand-claude); }
+.ms-group[data-provider="codex"] { --rail-brand: var(--brand-openai); }
+.ms-rail {
+  display: flex; align-items: center; gap: 9px;
+  padding: 9px 18px 8px;
+  background: color-mix(in srgb, var(--rail-brand) 5%, var(--surface-2));
+  border-bottom: 1px solid var(--grid);
+}
+.ms-group + .ms-group .ms-rail { border-top: 1px solid var(--grid); }
+.ms-rail-mark { display: flex; color: var(--rail-brand); }
+.ms-rail-name { font-size: 11.5px; font-weight: 500; letter-spacing: 0.015em; color: var(--ink-2); }
+.ms-rail-count { margin-left: auto; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ms-group-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.ms-acct { padding: 15px 18px 17px; min-width: 0; }
+/* Drawn on the left column, so the divider still runs when an odd account
+   count leaves the last row half empty. */
+.ms-acct:nth-child(odd) { border-right: 1px solid var(--grid); }
+.ms-acct:nth-child(n + 3) { border-top: 1px solid var(--grid); }
+.ms-acct-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 13px; }
+.ms-name {
+  margin: 0; font-size: 13px; font-weight: 500; letter-spacing: -0.01em; color: var(--ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ms-meta { margin-left: auto; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.ms-chip {
+  flex: none;
+  font-size: 9.5px; font-weight: 500; letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--ink-2); border: 1px solid var(--baseline); border-radius: 4px;
+  padding: 1.5px 5px 1px; white-space: nowrap;
+}
+.ms-chip.worry { color: var(--status-warn); border-color: color-mix(in srgb, var(--status-warn) 45%, transparent); }
+.ms-acct-head .ms-chip { transform: translateY(-1px); }
+.ms-note { padding: 4px 0 2px; font-size: 12.5px; color: var(--muted); }
+
+/* ———— The meter ————
+   Two rows, always: label · reset · number on one baseline, then a hairline
+   bar, so every lane in the panel is the same height and one scale. */
+.ms-lane { padding: 3px 0 11px; }
+.ms-lane:last-child { padding-bottom: 2px; }
+.ms-lane-top { display: flex; align-items: baseline; gap: 12px; row-gap: 2px; flex-wrap: wrap; margin-bottom: 6px; }
+.ms-lane-label { font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.ms-lane-read { margin-left: auto; display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+.ms-lane-note { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ms-lane-value { min-width: 52px; font-size: 12.5px; font-weight: 500; font-variant-numeric: tabular-nums; color: var(--ink); text-align: right; }
+.ms-lane-value[data-idle] { color: var(--muted); font-weight: 400; }
+.ms-track { position: relative; height: 3px; border-radius: 1.5px; background: color-mix(in srgb, var(--grid) 60%, var(--surface)); }
+/* The severity palette and nothing else — no brand colour ever reaches a
+   fill, whatever provider the card belongs to. */
+.ms-fill { position: absolute; inset: 0 auto 0 0; border-radius: 1.5px; background: var(--ink-2); transition: width 0.5s ease; }
+.ms-fill[data-severity="idle"] { background: var(--baseline); }
+.ms-fill[data-severity="elevated"] { background: var(--status-warn); }
+.ms-fill[data-severity="high"] { background: var(--status-high); }
+.ms-fill[data-severity="critical"] { background: var(--status-critical); }
+@media (prefers-reduced-motion: reduce) { .ms-fill { transition: none; } }
+
+/* ———— The sessions ledger ———— */
+.ms-scroll { overflow-x: auto; }
+.ms-ledger { width: 100%; border-collapse: collapse; }
+.ms-ledger th {
+  text-align: left; font-weight: 400; font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted); padding: 0 14px 8px 0; white-space: nowrap; border-bottom: 1px solid var(--grid);
+}
+.ms-ledger td {
+  font-size: 12.5px; color: var(--ink-2); padding: 9px 14px 9px 0;
+  white-space: nowrap; border-bottom: 1px solid var(--border); vertical-align: middle;
+}
+.ms-ledger tr:last-child td { border-bottom: 0; }
+.ms-ledger td.mono { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.ms-ledger td.num { font-variant-numeric: tabular-nums; }
+.ms-ledger td:nth-child(4) { color: var(--ink); }
+.ms-sub { margin-left: 6px; font-size: 11px; color: var(--muted); }
+.ms-sub .worry { color: var(--status-warn); }
+
+/* Per-row actions: quiet text, the dots drawn between them. */
+.ms-ledger td.actions { display: flex; align-items: center; gap: 8px; padding-right: 0; white-space: nowrap; }
+.ms-ledger td.actions button {
+  appearance: none; background: transparent; border: 0; padding: 0;
+  font-family: inherit; font-size: 11.5px; color: var(--muted); cursor: pointer;
+}
+.ms-ledger td.actions button:hover:not(:disabled) { color: var(--ink); }
+.ms-ledger td.actions button:disabled { opacity: 0.4; cursor: default; }
+.ms-ledger td.actions button:not(:first-child)::before { content: "·"; margin-right: 8px; color: var(--baseline); }
+select {
+  appearance: none; font-family: inherit; font-size: 11.5px; color: var(--ink);
+  background-color: transparent; border: 0; border-bottom: 1px solid var(--grid);
+  padding: 1px 13px 1px 2px; cursor: pointer;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 6px) calc(50% - 1px), calc(100% - 3px) calc(50% - 1px);
+  background-size: 3px 3px, 3px 3px;
+  background-repeat: no-repeat;
+}
+select:disabled { opacity: 0.4; cursor: default; }
+select option { background: var(--surface); color: var(--ink); }
+.rowmsg { font-size: 11.5px; color: var(--muted); }
+.rowmsg.error { color: var(--status-high); }
+
+/* ———— Move every pane: one quiet control row under the ledger ———— */
+.ms-move { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-top: 18px; font-size: 12px; color: var(--muted); }
+#moveall-provider { display: none; }
+.ms-seg { display: inline-flex; gap: 2px; padding: 2px; background: var(--surface-2); border-radius: 7px; }
+.ms-seg button {
+  appearance: none; border: 0; background: transparent; color: var(--muted);
+  font-family: inherit; font-size: 10.5px; font-weight: 500; letter-spacing: 0.09em; text-transform: uppercase;
+  padding: 4px 11px; border-radius: 5px; cursor: pointer; white-space: nowrap;
+}
+.ms-seg button:hover { color: var(--ink-2); }
+.ms-seg button[aria-pressed="true"] { background: color-mix(in srgb, var(--ink) 13%, var(--surface-2)); color: var(--ink); }
+.ms-force { display: inline-flex; align-items: center; gap: 5px; }
+#moveall-go {
+  appearance: none; background: var(--surface-2); border: 1px solid var(--grid); border-radius: 6px;
+  color: var(--ink); font-family: inherit; font-size: 11.5px; padding: 4px 13px; cursor: pointer;
+}
+#moveall-go:hover:not(:disabled) { border-color: var(--baseline); }
+#moveall-go:disabled { opacity: 0.45; cursor: default; }
 /* The fleet move's answer is one line per session plus a summary (finding
    C3), so it needs its own block and its newlines honoured — inside the
    flex control it would have been one squashed run of text. */
-#moveall-msg { display: block; white-space: pre-line; line-height: 1.5; margin: 0 0 10px; }
-.empty { color: #bab8b0; font-style: italic; }
-.finished-toggle { font-size: 11px; font-weight: 400; padding: 2px 8px; margin-left: 8px; vertical-align: middle; color: #bab8b0; }
+#moveall-msg { display: block; white-space: pre-line; line-height: 1.6; margin-top: 10px; }
+.finished-toggle {
+  appearance: none; background: transparent; border: 0; padding: 0; margin-left: 10px;
+  font-family: inherit; font-size: 11px; color: var(--muted); cursor: pointer;
+}
+.finished-toggle:hover { color: var(--ink-2); }
+
+/* ———— Phone: the cards stack, the gutter is 16, the page never scrolls
+   sideways (the ledger scrolls inside its own frame instead). ———— */
+@media (max-width: 1100px) {
+  .ms-group-grid { grid-template-columns: 1fr; }
+  .ms-acct:nth-child(odd) { border-right: 0; }
+  .ms-acct:nth-child(n + 2) { border-top: 1px solid var(--grid); }
+}
+@media (max-width: 720px) {
+  main { padding: 28px 16px 56px; }
+  .ms-rail { padding: 9px 14px 8px; }
+  .ms-acct { padding: 14px 14px 16px; }
+  .ms-panel { margin-top: 24px; }
+  .ms-move { gap: 8px; }
+}
 `;
 
 // Every function in this list is imported from ./client-logic.ts, so its
@@ -101,12 +286,24 @@ const EMBEDDED = [
   buildSwitchAllBody,
   nextPollState,
   pollStateOnVisible,
+  isWorry,
   worryAttr,
+  chipClass,
   fmtPercent,
+  pad2,
   localTime,
   earliestWeeklyReset,
   chosenAccount,
+  severityWord,
+  providerLabel,
+  providerMark,
+  resetNote,
+  laneHtml,
+  accountLanesHtml,
   accountRowHtml,
+  accountGroupsHtml,
+  providerSegHtml,
+  shortSessionId,
   sessionRowHtml,
   formatSwitchAll,
   fleetCandidateIds,
@@ -125,9 +322,10 @@ export const EMBEDDED_FUNCTION_NAMES = EMBEDDED.map((fn) => fn.name);
 const EMBEDDED_FUNCTIONS = EMBEDDED.map((fn) => fn.toString()).join("\n\n");
 
 // Kept as one string so the whole client is visible in one place, the way
-// the page's own tables read as one instrument rather than assembled parts.
-// It is plain ES5-ish JS (no build step, no bundler — this ships as-is to
-// whatever browser `open` points at) and touches the DOM directly.
+// the page's own panel and ledger read as one instrument rather than
+// assembled parts. It is plain ES5-ish JS (no build step, no bundler — this
+// ships as-is to whatever browser `open` points at) and touches the DOM
+// directly.
 const JS = `
 (function () {
   "use strict";
@@ -169,11 +367,10 @@ ${EMBEDDED_FUNCTIONS}
   function el(id) { return document.getElementById(id); }
 
   // LABEL and STATE are statusJson()'s own computed words (src/status.ts's
-  // computeAccount()) — rendered as given, never re-derived here.
+  // computeAccount()) — rendered as given, never re-derived here. The panel
+  // itself (groups, rails, cards, meters) is accountGroupsHtml().
   function renderAccounts(accounts) {
-    var tbody = document.querySelector("#accounts-table tbody");
-    if (!accounts.length) { tbody.innerHTML = '<tr><td colspan="8" class="empty">no accounts</td></tr>'; return; }
-    tbody.innerHTML = accounts.map(function (a) { return accountRowHtml(a, DASH); }).join("");
+    el("accounts").innerHTML = accountGroupsHtml(accounts, DASH);
   }
 
   function otherAccounts(accounts, provider, exclude) {
@@ -182,9 +379,9 @@ ${EMBEDDED_FUNCTIONS}
     return out;
   }
 
-  // PENDING and WALLED? are statusJson()'s own computed words too
-  // (src/status.ts's computeSession()) — "pending" is null exactly where
-  // the text table prints "—".
+  // PENDING, STATE and the WALLED? reading are statusJson()'s own computed
+  // words too (src/status.ts's computeSession()) — "pending" is null exactly
+  // where the text table prints "—".
   //
   // Finding F6: "sessions" here is still the FULL list from /api/state —
   // gone/stopped rows included — so the toggle's own count is always right;
@@ -193,7 +390,7 @@ ${EMBEDDED_FUNCTIONS}
     var visible = visibleSessions(sessions, showFinished);
     var tbody = document.querySelector("#sessions-table tbody");
     if (!visible.length) {
-      tbody.innerHTML = '<tr><td colspan="11" class="empty">' + (sessions.length ? "no sessions to show" : "no sessions") + "</td></tr>";
+      tbody.innerHTML = '<tr><td colspan="10" class="ms-empty">' + (sessions.length ? "no sessions to show" : "no sessions") + "</td></tr>";
     } else {
       tbody.innerHTML = visible.map(function (s) {
         var m = rowMessages[s.id];
@@ -240,6 +437,13 @@ ${EMBEDDED_FUNCTIONS}
     if (list.some(function (a) { return a.name === prev; })) acctSel.value = prev;
   }
 
+  // The segmented pill is the visible provider control; the <select> it
+  // writes through to is still the one buildSwitchAllBody() reads, so the
+  // control changed shape and the request did not.
+  function renderSeg() {
+    el("moveall-seg").innerHTML = providerSegHtml(uniqueProviders(currentAccounts), el("moveall-provider").value);
+  }
+
   function renderMoveAll(accounts) {
     var providerSel = el("moveall-provider");
     var prev = providerSel.value;
@@ -247,6 +451,7 @@ ${EMBEDDED_FUNCTIONS}
     providerSel.innerHTML = providers.map(function (p) { return '<option value="' + esc(p) + '">' + esc(p) + "</option>"; }).join("");
     if (providers.indexOf(prev) >= 0) providerSel.value = prev;
     refreshMoveAllAccounts();
+    renderSeg();
     renderMoveMsg();
   }
 
@@ -349,6 +554,13 @@ ${EMBEDDED_FUNCTIONS}
     renderSessions(currentSessions, currentAccounts);
   });
 
+  el("moveall-seg").addEventListener("click", function (e) {
+    var btn = e.target.closest ? e.target.closest("button[data-provider]") : null;
+    if (!btn) return;
+    el("moveall-provider").value = btn.getAttribute("data-provider");
+    refreshMoveAllAccounts();
+    renderSeg();
+  });
   el("moveall-provider").addEventListener("change", refreshMoveAllAccounts);
   el("moveall-go").addEventListener("click", function () {
     var to = el("moveall-account").value;
@@ -433,32 +645,32 @@ export function renderDashboardPage(): string {
   <h1>model-switcher</h1>
   <div class="meta" id="meta">reading…</div>
 
-  <section>
-    <h2>Accounts</h2>
-    <table id="accounts-table">
-      <thead><tr><th>NAME</th><th>PROVIDER</th><th>LABEL</th><th>5H</th><th>WEEK</th><th>FABLE</th><th>RESETS</th><th>STATE</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </section>
+  <div id="accounts"></div>
 
   <section>
-    <h2>Sessions <button id="finished-toggle" class="finished-toggle" style="display:none"></button></h2>
-    <div class="moveall">
+    <div class="ms-sechead">
+      <h2>Sessions</h2>
+      <button id="finished-toggle" class="finished-toggle" style="display:none"></button>
+    </div>
+    <div class="ms-scroll">
+      <table class="ms-ledger" id="sessions-table">
+        <thead><tr>
+          <th>Session</th><th>Pane</th><th>Provider</th><th>Account</th><th>Need</th>
+          <th>State</th><th>Gen</th><th>Pending</th><th>Wakeup</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="ms-move">
       <span>Move every</span>
+      <span class="ms-seg" id="moveall-seg"></span>
       <select id="moveall-provider"></select>
       <span>pane to</span>
       <select id="moveall-account"></select>
-      <label class="force"><input type="checkbox" id="force"> Force (governs "Move every…" only)</label>
+      <label class="ms-force"><input type="checkbox" id="force"> Force (governs "Move every…" only)</label>
       <button id="moveall-go">Go</button>
     </div>
     <div class="rowmsg" id="moveall-msg"></div>
-    <table id="sessions-table">
-      <thead><tr>
-        <th>SESSION</th><th>PANE</th><th>PROVIDER</th><th>ACCOUNT</th><th>NEED</th>
-        <th>STATE</th><th>GEN</th><th>PENDING</th><th>WAKEUP</th><th>WALLED?</th><th></th>
-      </tr></thead>
-      <tbody></tbody>
-    </table>
   </section>
 </main>
 <script>${JS}</script>

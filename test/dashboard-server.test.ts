@@ -217,13 +217,14 @@ test("startDashboard binds 127.0.0.1 and GET / returns HTML with both table head
   assert.match(res.headers.get("content-type") ?? "", /text\/html/);
   const html = await res.text();
 
-  // The accounts table's own header row.
-  for (const h of ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"]) {
-    assert.ok(html.includes(`>${h}<`), `accounts header missing: ${h}`);
-  }
-  // The sessions table's own header row (mirrors src/status.ts's columns).
-  for (const h of ["SESSION", "PANE", "PROVIDER", "ACCOUNT", "NEED", "GEN", "PENDING", "WAKEUP", "WALLED?"]) {
-    assert.ok(html.includes(`>${h}<`), `sessions header missing: ${h}`);
+  // The accounts panel — the home dashboard's own accounts block. It has no
+  // heading and no header row: the provider rails introduce it, and the
+  // script fills it from /api/state.
+  assert.ok(html.includes('<div id="accounts"></div>'), "accounts panel container missing");
+  // The sessions ledger's own header row (mirrors src/status.ts's columns).
+  // Sentence case in the markup; the uppercase is CSS.
+  for (const h of ["Session", "Pane", "Provider", "Account", "Need", "State", "Gen", "Pending", "Wakeup"]) {
+    assert.ok(html.includes(`<th>${h}</th>`), `sessions header missing: ${h}`);
   }
   // The move-all control: "Move every <provider> pane to <account> [Go]".
   assert.ok(html.includes("Move every"), "move-all control text missing");
@@ -250,6 +251,19 @@ test("startDashboard binds 127.0.0.1 and GET / returns HTML with both table head
   // Review round 1, finding 5's ruling: the Force checkbox's label says its
   // own scope, right there in the served markup — not just "Force".
   assert.ok(html.includes('Force (governs "Move every'), "Force checkbox label does not say it only governs the move-all control");
+
+  // The restyle's own constraint, checked on the wire: this page fetches
+  // NOTHING. No font, no icon set, no stylesheet, no script — a dashboard
+  // served on loopback from a machine that may have no route out has to
+  // render whole, offline, from one response.
+  assert.ok(!/<link\b/i.test(html), "the page pulls in an external stylesheet or asset");
+  assert.ok(!/<script[^>]+src=/i.test(html), "the page pulls in an external script");
+  assert.ok(!/@import/i.test(html), "the page @imports a stylesheet");
+  assert.ok(!/https?:\/\//i.test(html.replace(/<html lang="en">/, "")), "the page reaches out to a URL");
+  // The one place a provider's brand colour may appear is a rail or a mark;
+  // a fill only ever takes the severity palette, chosen by data-severity.
+  assert.ok(html.includes("--brand-claude"), "the provider rails lost their brand colour");
+  assert.ok(!/\.ms-fill[^{]*\{[^}]*--brand/.test(html), "a brand colour reached a meter's fill");
 });
 
 // --- GET /api/state ----------------------------------------------------

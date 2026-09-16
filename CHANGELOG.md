@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- ms dashboard wears the home dashboard's language: provider groups, account
+  cards with window lanes, a session ledger
+
 ## 0.2.2
 
 - PROVIDER column on the accounts table, on the page and in ms status
@@ -16,6 +21,10 @@
   fleet move
 - ms status and the page hide finished sessions by default (ms status
   --all)
+- ms dashboard: a wake-up time, a weekly reset and every other date on the
+  page rendered nothing — the compiler had inserted a `__name` helper into
+  the embedded client function, which the browser's script scope does not
+  have
 
 ## 0.2.1
 

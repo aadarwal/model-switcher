@@ -42,3 +42,11 @@ Cases 1, 2, 4, 5, 6, 7, 11 PASS; 3 PASS on exclusion / FAIL on the handoff of a 
 - **B1b** Relaunch with `--session-id <id>` only when the tool saw that id born (a `started` or `cleared` event carries it) and it has no `activity`; any other id with no transcript is broken → `--resume` (fails fast under B2) → parked.
 - **B8** (cosmetic) "no candidate account has a launch token (run: ms accounts add <name>)" → `ms accounts login <name>`.
 - **B9** A failed MANUAL move (no candidate, refused, threw) must finish the recovery it opened (`obsolete`) — never leave an ownerless `pending` row for the orphan rule to re-dispatch as an automatic rotation.
+
+## Spot-check after the follow-ups (engine 893a154, 2026-09-15 23:05 ET)
+| Case | Result | Evidence |
+|------|--------|----------|
+| 8 | PASS | bogus id + `rotate --force` → `the resumed CLI exited (pane_dead_status 1) before reporting; … is parked` in 3 s; events `ended:2 died:2`; pane dead, status 1; row `parked` (B1b, B2, B3) |
+| 10v | PASS | other tokens unreadable → `no candidate account has a launch token (run: ms accounts login <name>)`, no open recovery rows after the failed manual move (B9, B8); `ms accounts ls` shows `unreadable` for the locked files (R2) |
+
+Exit criteria met: 1–8 and 11 PASS (3 and 8 after the fix wave); 9 PASS; 10 and 12 documented (not reproducible with real usage tonight; the wake-up path is unit-tested). Gate to Plan 2: open.

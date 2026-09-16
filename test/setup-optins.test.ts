@@ -159,7 +159,7 @@ test("a settings.json that cannot be parsed is refused via a problem, never thro
   assert.match(rr.problem!, /settings/i);
 });
 
-test("a different ms binary wraps again rather than treating the file as already installed", () => {
+test("a different ms binary REPLACES the wrapper rather than nesting it (a brew-shim move)", () => {
   const { home } = tempHome();
   const file = path.join(home, "settings.json");
   writeFileSync(file, JSON.stringify({ model: "opusplan" }, null, 2));
@@ -168,7 +168,38 @@ test("a different ms binary wraps again rather than treating the file as already
   const r = installStatusline(file, other);
   assert.equal(r.changed, true);
   const after = JSON.parse(readFileSync(file, "utf8"));
-  assert.equal(after.statusLine.command, `${other} _statusline -- ${MS} _statusline`);
+  // NOT nested (`${other} _statusline -- ${MS} _statusline`) — the old
+  // wrapper is unwrapped first, and there was nothing under IT to wrap,
+  // so the new wrapper carries nothing after `--` either.
+  assert.equal(after.statusLine.command, `${other} _statusline`);
+
+  // A third binary, on top of a wrapper that itself wraps a real command,
+  // must unwrap down to the ORIGINAL command — never accrete a chain of
+  // `_statusline -- ` layers, however many times the wizard re-points it.
+  writeFileSync(file, JSON.stringify({ statusLine: { command: "~/.claude/statusline.sh" } }, null, 2));
+  installStatusline(file, MS);
+  installStatusline(file, other);
+  const third = "/opt/homebrew/bin/ms-new";
+  const r2 = installStatusline(file, third);
+  assert.equal(r2.changed, true);
+  const after2 = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(after2.statusLine.command, `${third} _statusline -- ~/.claude/statusline.sh`);
+});
+
+test("removeStatusline restores an original command that itself contains ' -- '", () => {
+  const { home } = tempHome();
+  const file = path.join(home, "settings.json");
+  const original = { statusLine: { command: "~/.claude/statusline.sh --flag -- extra bits" } };
+  writeFileSync(file, JSON.stringify(original, null, 2));
+
+  installStatusline(file, MS);
+  const wrapped = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(wrapped.statusLine.command, `${MS} _statusline -- ~/.claude/statusline.sh --flag -- extra bits`);
+
+  const r = removeStatusline(file);
+  assert.equal(r.changed, true);
+  const after = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(after.statusLine.command, "~/.claude/statusline.sh --flag -- extra bits", "the FULL original is restored, not truncated at the first ' -- '");
 });
 
 // --- ms _statusline (the runtime wrapper) -----------------------------------
@@ -215,6 +246,27 @@ test("exits 0 within a few seconds even when the wrapped command hangs", () => {
   assert.equal(r.code, 0);
   assert.ok(elapsed < 4_000, `expected the wrapper to give up well before 30s, took ${elapsed}ms`);
   assert.equal(r.stdout, "[gmail] ", "the hung command produced no output before it was killed");
+});
+
+test("the process-group kill also reaches a grandchild the wrapped command backgrounded", () => {
+  const env = stubDir();
+  const marker = path.join(env.dir, "grandchild-pid");
+  // `sleep 30` is backgrounded (`&`), so the shell records its pid and moves
+  // straight on to `cat`, which returns almost immediately on empty stdin —
+  // this whole `sh` exits fast, well inside the 3s budget, via the NORMAL
+  // close path, not the timeout. The backgrounded sleep is left running,
+  // sharing the same process group `detached: true` gave `sh`, unless the
+  // process-group kill on every finish path reaches it too.
+  const r = run(
+    ["_statusline", "--", "/bin/sh", "-c", `sleep 30 & echo $! > '${marker}'; cat`],
+    { MS_ACCOUNT: "gmail" },
+    "",
+  );
+  assert.equal(r.code, 0);
+  assert.ok(existsSync(marker), "the script had time to record the backgrounded sleep's pid before it exited");
+  const pid = Number(readFileSync(marker, "utf8").trim());
+  assert.ok(Number.isInteger(pid) && pid > 0, `expected a real pid, got ${JSON.stringify(readFileSync(marker, "utf8"))}`);
+  assert.throws(() => process.kill(pid, 0), /ESRCH/, "the grandchild must be gone, not merely orphaned and still sleeping");
 });
 
 test("a wrapped command that cannot be spawned still exits 0 with just the badge", () => {
@@ -275,6 +327,62 @@ test("removeAlias leaves the rest of the file byte-identical to before install",
   assert.equal(r.changed, true);
   assert.ok(r.backup);
   assert.equal(readFileSync(rc, "utf8"), original, "removal restores the original bytes exactly");
+});
+
+test("installAlias/removeAlias round-trip a file with NO trailing newline byte-identically", () => {
+  const { home } = tempHome();
+  const rc = path.join(home, ".zshrc");
+  const original = 'export FOO="bar"'; // deliberately no trailing \n
+  writeFileSync(rc, original);
+
+  installAlias(rc, MS);
+  const installed = readFileSync(rc, "utf8");
+  assert.ok(installed.includes(`alias claude='${MS} claude'`));
+
+  const r = removeAlias(rc);
+  assert.equal(r.changed, true);
+  assert.equal(readFileSync(rc, "utf8"), original, "the missing trailing newline is remembered and restored exactly");
+
+  // Same property with content AFTER the block too (not just before).
+  const withSuffix = 'export FOO="bar"\n# a trailing comment, no newline at the very end';
+  writeFileSync(rc, withSuffix);
+  installAlias(rc, MS);
+  removeAlias(rc);
+  assert.equal(readFileSync(rc, "utf8"), withSuffix);
+});
+
+test("removeAlias refuses a hand-edited block rather than deleting it", () => {
+  const { home } = tempHome();
+  const rc = path.join(home, ".zshrc");
+  installAlias(rc, MS);
+  const installed = readFileSync(rc, "utf8");
+
+  // A human added a third line inside the markers.
+  const handEdited = installed.replace(`alias codex='${MS} codex'`, `alias codex='${MS} codex'\nalias foo='bar'`);
+  writeFileSync(rc, handEdited);
+  const r = removeAlias(rc);
+  assert.equal(r.changed, false);
+  assert.equal(r.backup, null);
+  assert.match(r.problem!, /hand-edited/);
+  assert.equal(readFileSync(rc, "utf8"), handEdited, "untouched");
+
+  // A human renamed one of the two aliases.
+  writeFileSync(rc, installed.replace(`alias codex='${MS} codex'`, `alias c='${MS} codex'`));
+  const r2 = removeAlias(rc);
+  assert.equal(r2.changed, false);
+  assert.match(r2.problem!, /hand-edited/);
+
+  // The two alias lines point at DIFFERENT binaries — also not ours to trust.
+  writeFileSync(rc, installed.replace(`alias codex='${MS} codex'`, `alias codex='/usr/local/bin/ms codex'`));
+  const r3 = removeAlias(rc);
+  assert.equal(r3.changed, false);
+  assert.match(r3.problem!, /hand-edited/);
+
+  // installAlias, in contrast, is free to REPLACE a hand-edited block.
+  writeFileSync(rc, handEdited);
+  const r4 = installAlias(rc, "/usr/local/bin/ms");
+  assert.equal(r4.changed, true);
+  assert.ok(!readFileSync(rc, "utf8").includes("alias foo='bar'"));
 });
 
 test("removeAlias on a file with no block is a no-op", () => {
@@ -343,4 +451,13 @@ test("rcPathFor: an unknown shell (e.g. fish) is refused with null", () => {
   const { home } = tempHome();
   assert.equal(rcPathFor("fish", home), null);
   assert.equal(rcPathFor("tcsh", home), null);
+});
+
+test("rcPathFor: accepts a full $SHELL path, not just the bare name", () => {
+  const { home } = tempHome();
+  assert.equal(rcPathFor("/bin/zsh", home), path.join(home, ".zshrc"));
+  assert.equal(rcPathFor("/bin/bash", home), path.join(home, ".bashrc"), "no .bash_profile yet");
+  writeFileSync(path.join(home, ".bash_profile"), "");
+  assert.equal(rcPathFor("/bin/bash", home), path.join(home, ".bash_profile"));
+  assert.equal(rcPathFor("/opt/homebrew/bin/fish", home), null);
 });

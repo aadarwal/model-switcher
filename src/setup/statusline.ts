@@ -107,7 +107,19 @@ export function installStatusline(settingsPath: string, msBin: string): Statusli
     return { changed: false, backup: null };
   }
 
-  statusLine.command = wrapperCommand(msBin, currentCmd);
+  // Unwrap any wrapper ALREADY there — ours for a different binary, or one a
+  // prior install left behind — before wrapping with `msBin`. Wrapping the
+  // wrapper text itself (`<new> _statusline -- <old> _statusline -- <orig>`)
+  // is how a brew-shim move or a re-pointed wizard run nests one layer per
+  // install; unwrapping first means re-installing for a new binary always
+  // replaces, never stacks.
+  let original = currentCmd;
+  if (original !== undefined) {
+    const wrapped = GENERIC_WRAPPER_RE.exec(original);
+    if (wrapped) original = wrapped[1]; // undefined when THAT wrapper had nothing to wrap either
+  }
+
+  statusLine.command = wrapperCommand(msBin, original);
   // Claude Code only runs `statusLine.command` as a shell command when `type`
   // says so. There is nothing pre-existing to preserve when the block did not
   // exist at all, so this is the one case a fresh install sets it — every
@@ -210,45 +222,57 @@ function runWrapped(cmd: string[], input: string, timeoutMs: number): Promise<st
   return new Promise((resolve) => {
     let out = "";
     let settled = false;
-    const finish = (v: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(v);
-    };
 
     let child: ReturnType<typeof spawn>;
     try {
       // `detached: true` makes the child the leader of its own process
-      // group, so a wrapped shell script's own children (a `sleep` it
-      // forked, say) share that group and die with it. SIGKILL to just the
-      // immediate child would otherwise orphan them — and an orphan that
-      // still holds the stdout pipe open keeps the whole `ms _statusline`
-      // process alive long after this timeout fired, no matter how promptly
-      // `finish` below resolves this promise.
+      // group, so a wrapped shell script's own children — a `sleep` it
+      // forked, or backgrounded with `&` — share that group rather than
+      // ours, and `killGroup` below reaches every one of them by pgid.
+      // Without it, SIGKILL to just the immediate child orphans them: an
+      // orphan that still holds the stdout pipe open keeps the whole
+      // `ms _statusline` process alive long past any timeout, and one that
+      // does not is still a process this tool spawned, left running on the
+      // human's machine well after `ms _statusline` itself has returned.
       child = spawn(cmd[0]!, cmd.slice(1), { env: process.env, stdio: ["pipe", "pipe", "ignore"], detached: true });
     } catch {
       resolve("");
       return;
     }
 
-    const timer = setTimeout(() => {
+    /** SIGKILL the whole process group, not just `child` itself. Safe to
+     * call after the immediate child has already exited (`close` already
+     * fired): a pgid stays alive as long as ANY member of it does, which is
+     * exactly the case a backgrounded grandchild leaves behind. Never
+     * throws — "no such process/group" is the common, successful case. */
+    const killGroup = () => {
       try {
         if (child.pid) process.kill(-child.pid, "SIGKILL");
-        else child.kill("SIGKILL");
       } catch {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
+        /* the group is already empty — nothing left to reach */
       }
-      // Release our own handle on the pipe regardless of whether the group
-      // kill above actually reached every descendant — the point is THIS
-      // process's event loop must never wait on it past the timeout.
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    };
+
+    const finish = (v: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // Whatever ended this — a normal exit, a failure, or the timeout below
+      // — nothing the wrapped command spawned is allowed to outlive it.
+      killGroup();
+      // Release our own handle on the pipe regardless of whether the kill
+      // above actually reached every descendant — the point is THIS
+      // process's event loop must never wait on it past this moment.
       child.stdout?.destroy();
-      finish(out);
-    }, timeoutMs);
+      resolve(v);
+    };
+
+    const timer = setTimeout(() => finish(out), timeoutMs);
 
     child.stdout?.on("data", (d) => {
       out += d.toString("utf8");

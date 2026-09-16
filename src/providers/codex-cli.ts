@@ -45,6 +45,51 @@ export function codexLaunchCommand(flags: string[]): string[] {
   return ["codex", ...flags];
 }
 
+/**
+ * The argv that picks an existing Codex conversation back up, with the
+ * continuation submitted as its first turn.
+ *
+ * Verified live on 0.153.4 (spike G1): `codex resume <id> "<prompt>"` resumes
+ * the conversation — the prior turns re-render, SessionStart reports
+ * `source: resume` under the SAME session id — and the prompt argument is
+ * submitted automatically. So the continuation travels as an ARGUMENT here
+ * exactly as it does for Claude Code, and nothing is ever typed into a
+ * composer (Codex's own paste detection swallows a `send-keys` prompt that
+ * arrives too fast, which is the other reason never to type one).
+ *
+ * `continuation` is null for a move the human asked for without one; the
+ * session is then merely resumed, with no turn of ours at all.
+ *
+ * The id crosses accounts because every home of this tool links its
+ * `sessions` at ONE rollout store (`p.codexSessions`), which is what makes a
+ * rotation to another account able to resume the conversation at all.
+ */
+export function codexResumeCommand(cliSessionId: string, continuation: string | null, flags: string[]): string[] {
+  return ["codex", "resume", cliSessionId, ...(continuation ? [continuation] : []), ...flags];
+}
+
+/** How a Codex pane is asked to leave: the keys, and how long the TUI is
+ *  given to act on them before it is signalled instead. */
+export type CodexExit = { keys: string[][]; settleMs: number };
+
+/**
+ * Ctrl-C, twice.
+ *
+ * Verified live (spike G1, Codex 0.153.4): `/exit` and `/quit` did nothing at
+ * all in ~10 s — they are not commands this TUI knows — while Ctrl-C twice
+ * ended it in about two seconds and fired its SessionEnd hook on the way out.
+ * So a rotation asks a Codex pane to leave with the only thing that works,
+ * and `settleMs` is the observed two seconds: past it the pane is signalled
+ * (SIGTERM, then SIGKILL) by the caller's own bounded fallback.
+ *
+ * Unlike Claude Code's `/exit`, neither key is text: a Ctrl-C lands on a
+ * modal as an interrupt, never as an answer to the question the human was
+ * asked, which is why this sequence has no "a dialog is on screen" detour.
+ */
+export function codexExitSequence(): CodexExit {
+  return { keys: [["C-c"], ["C-c"]], settleMs: 2_000 };
+}
+
 // --- The home's config.toml --------------------------------------------
 
 const TRUSTED = `trust_level = "trusted"`;

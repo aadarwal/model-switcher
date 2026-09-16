@@ -15,7 +15,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -54,8 +54,27 @@ case "$1" in
       *) get pane_dead ;;
     esac ;;
   capture-pane) cat "$MS_TMUX_SCREEN" 2>/dev/null ;;
-  send-keys) case "$*" in */exit*) put pane_dead 1 ;; esac ;;
-  respawn-pane) put pane_dead "$MS_TMUX_RESPAWN_DEAD"; put pane_dead_status "$MS_TMUX_DEAD_STATUS" ;;
+  send-keys)
+    case "$*" in
+      */exit*) put pane_dead 1 ;;
+      # Codex's own way out: the FIRST Ctrl-C arms the quit, the second takes
+      # it (verified live: the TUI is gone in ~2 s). A pane that died on one
+      # keystroke would never prove the sequence was sent twice.
+      *C-c*) n=$(get sigints); if [ -z "$n" ]; then n=0; fi; n=$((n + 1)); put sigints "$n"; if [ "$n" -ge 2 ]; then put pane_dead 1; fi ;;
+    esac ;;
+  respawn-pane)
+    put pane_dead "$MS_TMUX_RESPAWN_DEAD"; put pane_dead_status "$MS_TMUX_DEAD_STATUS"
+    # What the Codex account homes said at the instant the pane was respawned:
+    # the only way a test can see that trust was recorded BEFORE the CLI started.
+    if [ -n "$MS_TMUX_SNAPSHOT" ]; then
+      for f in "$MS_HOME"/codex/*/config.toml; do
+        [ -f "$f" ] || continue
+        d="$MS_TMUX_SNAPSHOT/$(basename "$(dirname "$f")")"
+        mkdir -p "$d"
+        cp "$f" "$d/config.toml"
+      done
+    fi
+    ;;
 esac
 exit 0`;
 
@@ -194,6 +213,10 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   // in this process could not, the event loop never runs there.
   process.env.MS_TMUX_ON_MATCH = "";
   process.env.MS_TMUX_ON = "";
+  // Codex-world settings, off in a Claude world: the env is process-global and
+  // these tests run one after another.
+  process.env.MS_TMUX_SNAPSHOT = "";
+  delete process.env.MS_CODEX_AUTOROTATE;
   process.env.MS_POLL_MS = "20";
   process.env.MS_READY_MS = "10000"; // generous: the report below arrives in milliseconds
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
@@ -1189,4 +1212,464 @@ test("a failure against the account being left does not spend a candidate", asyn
   assert.ok(Math.abs(s.wakeupAt! - Math.floor(Date.parse(resetsAt) / 1000)) < 5, "and it waits for the earliest reset");
   assert.equal(rows(w, "recoveries")[0].status, "pending");
   assert.match(logLines(w).find((l) => l.includes("run-shell")) ?? "", /run-shell -b -d \d+ '.*ms' '_recover' 's1'/);
+});
+
+// --- The Codex world ---------------------------------------------------
+//
+// The same stub tmux and the same store, with what a Codex session does
+// differently: its credential is a DIRECTORY (`auth.json` inside that
+// account's own CODEX_HOME, never a launch token), its pane leaves on Ctrl-C
+// twice rather than on `/exit`, its relaunch is `codex resume <id>` (or a
+// plain `codex`, for a conversation nobody has typed into yet), its home must
+// be made to trust the session's directory before the CLI can start
+// unattended, and its automatic path is gated until a live wall has been seen.
+//
+// The usage snapshot is STATED on disk, fresh, exactly as src/snapshot.ts
+// would have written it: what a rotation is answerable for here is choosing
+// and relaunching correctly from numbers somebody already read. The fetch stub
+// is there to make a stray reading loud, not to serve one.
+
+/** A literal path inside a RegExp: a temp dir can hold `.` and `+`. */
+const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** The default Pro wall, verbatim from the spike record. */
+const CODEX_WALLED_SCREEN = [
+  "❯ ship it",
+  "",
+  "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later.",
+  "",
+  "❯ ",
+  "",
+].join("\n");
+
+/** `codex login`'s file, as far as a rotation reads it. The token is spelled
+ *  distinctively so the secrets scan below cannot pass vacuously. */
+const codexAuth = (name: string) =>
+  JSON.stringify({
+    tokens: { id_token: "x.y.z", access_token: `cat-${name}-SECRET`, refresh_token: `crt-${name}-SECRET`, account_id: `acc-${name}` },
+  });
+
+/** A `projects` definition this tool refuses to edit: a bare `[projects]`
+ *  table, whose keys live INSIDE it. Appending a second definition of the
+ *  same table is invalid TOML, and Codex answers an invalid config.toml by
+ *  dropping the whole file — hook tables and existing trust included. */
+const UNTOUCHABLE_CONFIG = `[projects]\n"/somewhere/else" = { trust_level = "trusted" }\n`;
+
+type CodexRow = { name: string; weekly: number };
+/** `work` is where the session is; `home` is the best candidate and `spare`
+ *  the next one. Every window resets at the same moment, so the ranking here
+ *  is purely "more room left". */
+const CODEX_ACCOUNTS: CodexRow[] = [
+  { name: "work", weekly: 100 },
+  { name: "home", weekly: 10 },
+  { name: "spare", weekly: 40 },
+];
+
+/** The claude side of this registry, and the point of it: `spare` is a name
+ *  BOTH providers use — identity is (provider, name), never a name alone —
+ *  and it has more room than any codex account here. A candidate pool that
+ *  matched on the name would rank this claude row first and hand a Codex
+ *  session an account whose credential its CLI cannot even read. */
+const CLAUDE_ACCOUNTS = ["gmail", "spare"];
+
+/** The usage cache, as src/snapshot.ts writes it. A ChatGPT Pro plan reports
+ *  NO five-hour window at all (verified live), which is why `session` is null
+ *  on every codex row. */
+function writeCodexSnapshot(msHome: string, rows: CodexRow[]): void {
+  const now = Date.now();
+  const resetsAt = new Date(now + 6 * HOUR).toISOString();
+  writeFileSync(
+    path.join(msHome, "snapshot.json"),
+    JSON.stringify({
+      takenAt: now,
+      accounts: [
+        ...CLAUDE_ACCOUNTS.map((name) => ({
+          name,
+          provider: "claude",
+          shared: false,
+          usage: { session: { usedPercent: 0, resetsAt }, weeklyAll: { usedPercent: 0, resetsAt }, weeklyFable: null },
+          error: null,
+          errorKind: null,
+          observedAt: now,
+          stale: false,
+        })),
+        ...rows.map((r) => ({
+          name: r.name,
+          provider: "codex",
+          shared: false,
+          usage: { session: null, weeklyAll: { usedPercent: r.weekly, resetsAt }, weeklyFable: null },
+          error: null,
+          errorKind: null,
+          observedAt: now,
+          stale: false,
+        })),
+      ],
+      backoff: {},
+    }),
+    { mode: 0o600 },
+  );
+}
+
+/** `wham/usage`, stubbed: the snapshot above is fresh, so nothing should ask —
+ *  and a call to anything else fails loudly rather than reaching chatgpt.com.
+ *  The returned array is every URL that was asked for. */
+function stubUsageFetch(t: TestContext): string[] {
+  const seen: string[] = [];
+  const real = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = real;
+  });
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (!url.includes("wham/usage")) throw new Error(`test: unexpected network call to ${url}`);
+    return new Response(
+      JSON.stringify({ rate_limit: { secondary_window: { used_percent: 10, reset_at: Math.floor((Date.now() + 6 * HOUR) / 1000) } } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof globalThis.fetch;
+  return seen;
+}
+
+type CodexWorldOptions = {
+  screen?: string;
+  /** The gate. Most of these tests are about the transaction rather than the
+   *  gate, so it is open by default and one test closes it. */
+  autorotate?: boolean;
+  session?: Partial<SessionRow>;
+  recovery?: boolean;
+  wall?: boolean;
+  activity?: boolean;
+  born?: boolean;
+  accounts?: CodexRow[];
+  /** Accounts whose home already holds a config.toml this tool will not edit. */
+  untouchableTrust?: string[];
+  /** Accounts nobody has run `codex login` for: a home with no auth.json. */
+  noAuth?: string[];
+};
+
+type CodexWorld = World & { atRespawn: string; fetched: string[] };
+
+async function codexWorld(t: TestContext, opts: CodexWorldOptions = {}): Promise<CodexWorld> {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  stub("tmux", TMUX_STUB);
+  const log = path.join(dir, "tmux.log");
+  const state = path.join(dir, "tmux.state");
+  const screen = path.join(dir, "screen.txt");
+  const atRespawn = path.join(dir, "at-respawn");
+  const pid = liveProcess(t);
+  const cwd = home;
+  const accounts = opts.accounts ?? CODEX_ACCOUNTS;
+
+  writeFileSync(log, "");
+  writeFileSync(screen, opts.screen ?? CODEX_WALLED_SCREEN);
+  writeFileSync(
+    state,
+    [`panes=${PANE}`, `pane_pid=${pid}`, "command=codex", "pane_dead=0", "pane_dead_status=0", "sigints=0", `cwd=${cwd}`, ""].join("\n"),
+  );
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: [
+        ...CLAUDE_ACCOUNTS.map((name) => ({ name, provider: "claude", label: name, shared: false })),
+        ...accounts.map((a) => ({ name: a.name, provider: "codex", label: a.name, shared: false })),
+      ],
+    }),
+    { mode: 0o600 },
+  );
+
+  process.env.HOME = home;
+  process.env.MS_HOME = msHome;
+  process.env.MS_BIN = MS_BIN;
+  process.env.MS_TMUX_LOG = log;
+  process.env.MS_TMUX_STATE = state;
+  process.env.MS_TMUX_SCREEN = screen;
+  process.env.MS_TMUX_SNAPSHOT = atRespawn;
+  process.env.MS_TMUX_FAIL = "";
+  process.env.MS_TMUX_RESPAWN_DEAD = "0";
+  process.env.MS_TMUX_DEAD_STATUS = "0";
+  process.env.MS_TMUX_ON_MATCH = "";
+  process.env.MS_TMUX_ON = "";
+  process.env.MS_POLL_MS = "20";
+  process.env.MS_READY_MS = "10000";
+  process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
+  if (opts.autorotate === false) delete process.env.MS_CODEX_AUTOROTATE;
+  else process.env.MS_CODEX_AUTOROTATE = "1";
+
+  // The claude accounts are fully launchable on purpose: if the candidate pool
+  // ever stopped filtering by provider, one would be CHOSEN (they have the
+  // most room), not skipped for want of a token.
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  for (const name of CLAUDE_ACCOUNTS) saveLaunchToken(name, `sk-ant-oat01-${name}0123456789abcdefgh`);
+  for (const a of accounts) {
+    const h = path.join(msHome, "codex", a.name);
+    mkdirSync(h, { recursive: true, mode: 0o700 });
+    if (!opts.noAuth?.includes(a.name)) writeFileSync(path.join(h, "auth.json"), codexAuth(a.name), { mode: 0o600 });
+    if (opts.untouchableTrust?.includes(a.name)) writeFileSync(path.join(h, "config.toml"), UNTOUCHABLE_CONFIG, { mode: 0o600 });
+  }
+  writeCodexSnapshot(msHome, accounts);
+
+  const cliSessionId = opts.session && "cliSessionId" in opts.session ? opts.session.cliSessionId! : "cx-1";
+  const st = openState();
+  try {
+    st.createSession({
+      id: "s1",
+      provider: "codex",
+      cliSessionId,
+      cwd,
+      socket: SOCKET,
+      pane: PANE,
+      serverStart: "1:2",
+      need: "any",
+      account: "work",
+      generation: 2,
+      state: "walled",
+      desired: "running",
+      flags: ["--model", "gpt-5"],
+      ...opts.session,
+    });
+    // Codex's hook reports the id Codex chose; there is no `--session-id` to
+    // hand it one, so the birth is a `started` for whatever it picked.
+    if (opts.born !== false) appendEvent({ t: nowSeconds() - 60, kind: "started", session: "s1", generation: 1, cliSessionId });
+    if (opts.activity !== false) appendEvent({ t: nowSeconds() - 20, kind: "activity", session: "s1", generation: 2, cliSessionId });
+    if (opts.wall !== false) appendEvent({ t: nowSeconds() - 10, kind: "rate_limited", session: "s1", generation: 2, cliSessionId, kindDetail: "weekly" });
+    if (opts.recovery !== false) st.addRecovery({ sessionId: "s1", generation: 2, turnId: null, kind: "weekly" });
+  } finally {
+    st.close();
+  }
+  return { home, msHome, log, state, screen, pid, cwd, atRespawn, fetched: stubUsageFetch(t) };
+}
+
+/** Every key sequence that went to the pane, with the stub's own `-S <socket>`
+ *  prefix cut: what was sent, in order, and nothing else. */
+const sendKeys = (w: World): string[] =>
+  logLines(w)
+    .filter((l) => l.includes("send-keys"))
+    .map((l) => l.slice(l.indexOf("send-keys")));
+
+/** A codex home's config.toml — as it is now, or as it was at the respawn. */
+const configToml = (w: CodexWorld, account: string): string => path.join(w.msHome, "codex", account, "config.toml");
+const trustAtRespawn = (w: CodexWorld, account: string): string => readFileSync(path.join(w.atRespawn, account, "config.toml"), "utf8");
+
+test("the codex happy path: work hands off to home and the resumed conversation continues", async (t) => {
+  const w = await codexWorld(t);
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  const s = session(w);
+  assert.equal(s.account, "home", "and never the claude `spare`, which has more room: identity is (provider, name)");
+  assert.equal(s.generation, 3);
+  assert.equal(s.state, "continuing");
+
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.deepEqual(launch.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-5"]);
+  assert.equal(launch.account, "home");
+  assert.equal(launch.generation, 3);
+  assert.deepEqual(launch.env, {}, "the credential is the pane environment's (CODEX_HOME), never the launch row's");
+
+  // Asked to leave the only way a Codex TUI can be: Ctrl-C, twice. `/exit` and
+  // `/quit` do nothing there, so typing one would burn the whole grace period.
+  const lines = logLines(w);
+  assert.deepEqual(sendKeys(w), [`send-keys -t ${PANE} C-c`, `send-keys -t ${PANE} C-c`]);
+  assert.ok(!lines.some((l) => l.includes("/exit")), "a Codex pane must never be asked to /exit");
+  const at = (needle: string) => lines.findIndex((l) => l.includes(needle));
+  assert.ok(at("send-keys") < at("respawn-pane"), "the CLI is asked to leave before the pane is respawned");
+  assert.match(respawnLine(w)!, new RegExp(`respawn-pane -k -c ${esc(w.cwd)} -t ${PANE} `), "the relaunch runs in the session's own cwd");
+
+  // The NEW account's home trusts this directory, and said so before the
+  // respawn: the trust dialog is a modal, and a relaunch that met it would sit
+  // in front of it for ever with the human's conversation behind it.
+  const trusted = trustAtRespawn(w, "home");
+  assert.match(trusted, new RegExp(`^\\[projects\\."${esc(realpathSync(w.cwd))}"\\]$`, "m"));
+  assert.match(trusted, /^trust_level = "trusted"$/m);
+  assert.ok(!existsSync(configToml(w, "work")), "and the account we LEFT was never written into");
+
+  assert.deepEqual(
+    rows(w, "attempts").map((a) => [a.account, a.outcome]),
+    [["work", "exhausted"]],
+  );
+  assert.equal(rows(w, "recoveries")[0].status, "done");
+  assert.deepEqual(w.fetched, [], "a fresh snapshot is served without a reading of its own");
+  assert.match(recoverLog(w), /s1: work → home \(weekly wall, generation 3\)/);
+});
+
+test("without MS_CODEX_AUTOROTATE nothing automatic moves a codex session — and a manual rotate still does", async (t) => {
+  // Spike G1 is PARTIAL: no exhausted ChatGPT account existed, so what a
+  // walled Codex pane reports is unverified. Until it is, the tool will not
+  // move a Codex session on a signal nobody has seen.
+  const w = await codexWorld(t, { autorotate: false });
+
+  assert.equal(await recoverSession("s1"), 1);
+  assert.match(recoverLog(w), /codex automatic recovery is disabled until a live wall is observed \(set MS_CODEX_AUTOROTATE=1\)/);
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "nothing is typed");
+  assert.ok(!respawnLine(w), "and nothing is respawned");
+  const rec = rows(w, "recoveries")[0];
+  assert.equal(rec.status, "pending", "the wall is left on the record for the human's own verb");
+  assert.equal(rec.owner, null, "and unclaimed: the refusal happens before the row is touched");
+  assert.equal(rows(w, "attempts").length, 0);
+  assert.equal(session(w).account, "work");
+  assert.equal(session(w).state, "walled");
+
+  // Exactly "1" is on. A variable somebody exported as "0" to turn this OFF
+  // must never read as having turned it on.
+  process.env.MS_CODEX_AUTOROTATE = "0";
+  assert.equal(await recoverSession("s1"), 1);
+  assert.ok(!respawnLine(w), "'0' is somebody saying no");
+  delete process.env.MS_CODEX_AUTOROTATE;
+
+  // The gate is on the AUTOMATIC claim only. `ms rotate` is a person asking.
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1", { manual: { continueAfter: true } }), 0);
+  assert.equal(session(w).account, "home");
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-5"]);
+  assert.deepEqual(sendKeys(w), [`send-keys -t ${PANE} C-c`, `send-keys -t ${PANE} C-c`]);
+});
+
+test("a codex conversation nobody has typed into is relaunched as a new one, with no continuation", async (t) => {
+  const w = await codexWorld(t, { activity: false });
+  // There is no `--session-id` to hold the old name to: `codex` picks an id
+  // and the hook reports whichever one it picked.
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-2", kind: "started" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.deepEqual(launch.command, ["codex", "--model", "gpt-5"]);
+  assert.ok(!launch.command.includes(CONTINUATION), "a conversation with no turns has no unfinished work to continue");
+  assert.ok(!launch.command.includes("resume"), "and nothing to resume");
+  const s = session(w);
+  assert.equal(s.account, "home", "the handoff still happened");
+  assert.equal(s.generation, 3);
+  assert.equal(s.state, "running", "no continuation means the session is merely running");
+  assert.match(recoverLog(w), /cx-1 has no transcript yet/);
+});
+
+test("a codex pane whose hook has not yet named its conversation is relaunched, not parked", async (t) => {
+  // Codex fills `cliSessionId` only through the hook's first SessionStart, so
+  // a pane that has launched and not yet reported carries a null. For Claude
+  // that is a row with nothing to resume and the session is parked; here it is
+  // a conversation whose name we have not been told, and a plain `codex`
+  // starts one the hook then adopts.
+  const w = await codexWorld(t, { session: { cliSessionId: null }, activity: false, born: false });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-9", kind: "started" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "--model", "gpt-5"]);
+  const s = session(w);
+  assert.equal(s.state, "running");
+  assert.equal(s.account, "home");
+  assert.doesNotMatch(recoverLog(w), /never reported a CLI session id/, "a null id is not a broken row on this side");
+});
+
+test("a codex home this tool will not edit costs that candidate, not the rotation", async (t) => {
+  const w = await codexWorld(t, { untouchableTrust: ["home"] });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  assert.equal(session(w).account, "spare", "the next candidate took it");
+  const attempts = rows(w, "attempts");
+  assert.deepEqual(
+    attempts.map((a) => [a.account, a.outcome]),
+    [["home", "infra"], ["work", "exhausted"]],
+    "a home we cannot prepare is infra, not auth: the credential is fine, the file is not",
+  );
+  assert.match(String(attempts[0].note), /already defines 'projects' in a form this tool will not edit/);
+  assert.equal(readFileSync(configToml(w, "home"), "utf8"), UNTOUCHABLE_CONFIG, "not one byte written into the home that refused");
+  assert.match(trustAtRespawn(w, "spare"), /^trust_level = "trusted"$/m);
+  assert.match(recoverLog(w), /home: .*trying the next account/);
+});
+
+test("a codex session that needs fable is refused: there is no such window to wait for", async (t) => {
+  // Codex reports one subscription's windows and no model-scoped one at all,
+  // so the chooser would pass over every account for "no fable window" and a
+  // wake-up would be scheduled for a window that cannot reset.
+  const w = await codexWorld(t, { session: { need: "fable" } });
+
+  assert.equal(await recoverSession("s1"), 2);
+
+  assert.match(recoverLog(w), /codex has no fable window; s1 cannot be recovered while it needs fable/);
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
+  assert.ok(!respawnLine(w));
+  assert.ok(!logLines(w).some((l) => l.includes("run-shell")), "and no timer for a window that does not exist");
+  const s = session(w);
+  assert.equal(s.account, "work");
+  assert.equal(s.state, "walled");
+  assert.equal(s.wakeupAt, null);
+  const rec = rows(w, "recoveries")[0];
+  assert.equal(rec.status, "pending");
+  assert.equal(rec.owner, null, "nothing was claimed");
+});
+
+test("no codex credential ever reaches a tmux command line", async (t) => {
+  const w = await codexWorld(t);
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  // The credential exists and is readable — this is not vacuous.
+  const { readCodexAuth } = await import("../src/providers/codex-probe.ts");
+  assert.equal(readCodexAuth(path.join(w.msHome, "codex", "home"))?.accessToken, "cat-home-SECRET");
+  // tmux command strings are readable by anything that can talk to the server,
+  // and the launch row is world-readable to anything that can read the store.
+  assert.doesNotMatch(readFileSync(w.log, "utf8"), /SECRET|auth\.json/);
+  assert.doesNotMatch(JSON.stringify(launchOf(w, respawnLaunchId(w))), /SECRET/);
+  // The whole of the credential's path into the CLI is CODEX_HOME, set by
+  // `_exec` inside the pane — never an argument, never an env recorded here.
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.env, {});
+});
+
+test("a pass-through prompt is never re-submitted beside the codex continuation", async (t) => {
+  // `ms codex -- --model gpt-5 "finish the docs"` records all three as the
+  // session's flags, and a relaunch re-applies them: two positionals on one
+  // `codex resume` line, one of which is a turn the human asked for once.
+  const w = await codexWorld(t, { session: { flags: ["--model", "gpt-5", "finish the docs"] } });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-5"]);
+});
+
+test("a codex account nobody has logged into is skipped for the next one", async (t) => {
+  // The Codex credential is a directory, not a token: `auth.json` inside that
+  // account's own CODEX_HOME. An account without one cannot authenticate, and
+  // respawning the pane onto it would trade a walled CLI for a refused one.
+  const w = await codexWorld(t, { noAuth: ["home"] });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.equal(session(w).account, "spare", "the chooser's first pick had no credential; the next one took it");
+  assert.deepEqual(
+    rows(w, "attempts").map((a) => [a.account, a.outcome]),
+    [["home", "auth"], ["work", "exhausted"]],
+  );
+  assert.match(String(rows(w, "attempts")[0].note), /no codex credential \(run: ms accounts login home --provider codex\)/);
+  assert.ok(!existsSync(configToml(w, "home")), "and a home with no credential is not written into either");
+});
+
+test("with no codex account left to launch, the refusal names the verb that logs one in", async (t) => {
+  const w = await codexWorld(t, { noAuth: ["home", "spare"] });
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  assert.match(recoverLog(w), /no candidate codex account can be launched \(run: ms accounts login <name> --provider codex\)/);
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "nothing was touched: the pane still holds the conversation");
+  assert.ok(!respawnLine(w));
+  const rec = rows(w, "recoveries")[0];
+  assert.equal(rec.status, "pending", "still owed to whoever comes next");
+  assert.equal(rec.owner, null);
+  // Nothing was disturbed, so one more worker is sent in case a login lands.
+  assert.match(logLines(w).find((l) => l.includes("run-shell")) ?? "", /_recover' 's1'/);
 });

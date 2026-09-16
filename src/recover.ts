@@ -12,9 +12,17 @@
 //
 //   * Nothing is ever typed into a shell. The continuation is an ARGUMENT to
 //     the resumed invocation, not keystrokes into a prompt, and the only keys
-//     we ever send are `Escape` and `/exit` — the CLI's own way out — and never
-//     those when a modal choice is on screen, where a keystroke would answer a
-//     question the human was asked.
+//     we ever send are the CLI's own way out — `Escape` then `/exit` for
+//     Claude Code, Ctrl-C twice for Codex, which has no `/exit` at all — and
+//     never Claude's when a modal choice is on screen, where a keystroke would
+//     answer a question the human was asked.
+//
+// Both CLIs run through the one transaction below. Everything Codex does
+// differently is named `codex` at the seam it belongs to: the exit sequence,
+// the relaunch command (`codex resume <id> "<continuation>"`, or a plain
+// `codex` for a conversation nobody has typed into), the account home that
+// must trust this directory before the CLI starts, and the readiness report
+// for a relaunch whose session id Codex has not chosen yet.
 //   * Every step that could be wrong is rechecked under the session lock. A
 //     wall the session has already worked past, a generation that moved, a pane
 //     that is gone: each ends the transaction as obsolete rather than moving
@@ -33,6 +41,8 @@ import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
 import { pickAccounts, type PickInput, type Window } from "./pick.ts";
+import { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand, ensureCodexTrust } from "./providers/codex-cli.ts";
+import { readCodexAuth } from "./providers/codex-probe.ts";
 import { ownerDead } from "./reconcile.ts";
 import { NAME_PATTERN, findAccount, loadRegistry } from "./registry.ts";
 import { getSnapshot, toPickInputs } from "./snapshot.ts";
@@ -55,6 +65,25 @@ import { lastTurn, wallKindFromText } from "./wall.ts";
  */
 export const CONTINUATION =
   "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions. If the last user message was already answered, or needs nothing more, say so in one line and wait for the user; do not start new work.";
+
+/**
+ * Codex automatic rotation ships OFF, and this is the refusal (spike G1:
+ * PARTIAL). Every other Codex behaviour a rotation depends on was verified
+ * live; the WALL was not, because no exhausted ChatGPT account existed to
+ * produce one. Until a real one shows what a walled Codex pane reports, the
+ * tool will not move a Codex session on its own say-so: a rotation opened on
+ * a signal nobody has seen is a rotation that can fire on a pane that is
+ * merely working.
+ *
+ * The human's own verbs are never gated by this — `ms rotate`, `ms switch`
+ * and `ms stop` move a Codex session today. What is gated is the automatic
+ * claim, which is the one path with no person in front of it.
+ */
+const CODEX_AUTOROTATE_MESSAGE =
+  "codex automatic recovery is disabled until a live wall is observed (set MS_CODEX_AUTOROTATE=1)";
+/** Exactly "1": a variable somebody exported as "0" or "false" to turn this
+ *  OFF must never read as on. */
+const codexAutorotate = (): boolean => process.env.MS_CODEX_AUTOROTATE === "1";
 
 /** One recovery at a time per session; a second worker is a duplicate. */
 const SESSION_LOCK_WAIT_MS = 5_000;
@@ -363,6 +392,31 @@ function startsFresh(id: string, cliSessionId: string): boolean {
 }
 
 /**
+ * The same question for Codex, which answers it with less evidence and needs
+ * less: has a prompt ever been submitted on THIS conversation?
+ *
+ * Two things make the "we watched it be born" half of `startsFresh` above
+ * neither available nor necessary here.
+ *
+ * Not available: Codex has no `--session-id`. The id is Codex's own, reported
+ * by the hook's first SessionStart, so a pane that has launched but not yet
+ * reported carries a NULL `cliSessionId` — which is not a broken row, it is a
+ * conversation whose name we have not been told. There is nothing to resume.
+ *
+ * Not necessary: the relaunch for a fresh conversation is a plain `codex`,
+ * which cannot CREATE one under an id we cannot vouch for — it makes its own
+ * and the hook adopts it. The disaster `startsFresh` guards against (a
+ * corrupted id coming back as a brand new empty conversation wearing that
+ * same id, silently) has no way to happen on this side. So an id with no
+ * `activity` is simply a conversation with no transcript, and a new one loses
+ * nothing.
+ */
+function codexStartsFresh(id: string, cliSessionId: string | null): boolean {
+  if (!cliSessionId) return true;
+  return !readEvents(id).some((e) => e.cliSessionId === cliSessionId && e.kind === "activity");
+}
+
+/**
  * The session went on working after the wall, or null — re-read from the event
  * log every time it is asked (spec §9: "User starts a new turn during polling:
  * the failure is obsolete, nothing is killed").
@@ -424,6 +478,52 @@ async function waitForExit(tmux: Tmux, pane: string, budgetMs: number): Promise<
 }
 
 /**
+ * Ask the CLI to leave the way that CLI is left, and say whether it went.
+ * False means "it is still there" — which is the signal path's cue, not an
+ * error: every ask is bounded and the caller's SIGTERM/SIGKILL is the floor
+ * under both providers.
+ *
+ * Claude Code takes `Escape` then `/exit`, typed into its composer — and not
+ * when a modal choice is on screen, where those keys would answer a question
+ * the human was asked, so that pane is signalled instead.
+ *
+ * Codex takes Ctrl-C twice (`codexExitSequence`, verified live: `/exit` and
+ * `/quit` do nothing there). It has no modal detour, and does not need one:
+ * a Ctrl-C is an interrupt at every point of that TUI, never a choice made on
+ * the human's behalf — and Claude Code's own dialog chrome, which `isModal`
+ * reads, is not what a Codex screen draws anyway.
+ */
+async function askedAndLeft(tmux: Tmux, session: SessionRow, generation: number): Promise<boolean> {
+  if (session.provider === "codex") {
+    const { keys, settleMs } = codexExitSequence();
+    try {
+      for (const k of keys) tmux.sendKeys(session.pane, k);
+    } catch (e) {
+      logLine(session.id, generation, `send-keys failed (${(e as Error).message}); signalling instead`);
+      return false;
+    }
+    if (await waitForExit(tmux, session.pane, settleMs)) return true;
+    logLine(session.id, generation, "the CLI did not leave on Ctrl-C; signalling");
+    return false;
+  }
+
+  if (isModal(safeCapture(tmux, session.pane))) {
+    logLine(session.id, generation, "a modal choice is on screen; signalling rather than typing into it");
+    return false;
+  }
+  try {
+    tmux.sendKeys(session.pane, ["Escape"]);
+    await sleep(ESCAPE_SETTLE_MS);
+    tmux.sendKeys(session.pane, ["/exit", "Enter"]);
+  } catch (e) {
+    logLine(session.id, generation, `send-keys failed (${(e as Error).message}); signalling instead`);
+  }
+  if (await waitForExit(tmux, session.pane, GRACE_MS)) return true;
+  logLine(session.id, generation, "the CLI did not leave on /exit; signalling");
+  return false;
+}
+
+/**
  * Ask the CLI to leave, and make it leave if it will not. Returns whether the
  * exit had to be forced.
  *
@@ -432,20 +532,7 @@ async function waitForExit(tmux: Tmux, pane: string, budgetMs: number): Promise<
  * afterwards, never in how the CLI is asked to go.
  */
 export async function stopPane(tmux: Tmux, session: SessionRow, generation: number): Promise<boolean> {
-  const modal = isModal(safeCapture(tmux, session.pane));
-  if (modal) {
-    logLine(session.id, generation, "a modal choice is on screen; signalling rather than typing into it");
-  } else {
-    try {
-      tmux.sendKeys(session.pane, ["Escape"]);
-      await sleep(ESCAPE_SETTLE_MS);
-      tmux.sendKeys(session.pane, ["/exit", "Enter"]);
-    } catch (e) {
-      logLine(session.id, generation, `send-keys failed (${(e as Error).message}); signalling instead`);
-    }
-    if (await waitForExit(tmux, session.pane, GRACE_MS)) return false;
-    logLine(session.id, generation, "the CLI did not leave on /exit; signalling");
-  }
+  if (await askedAndLeft(tmux, session, generation)) return false;
 
   const info = tmux.paneInfo(session.pane);
   if (!info || info.dead || !info.pid || !alive(info.pid)) return false;
@@ -461,10 +548,16 @@ export async function stopPane(tmux: Tmux, session: SessionRow, generation: numb
 type Ready = "ok" | "resume-broken" | "timeout" | "dead";
 
 /**
- * The resumed CLI reports itself through Claude Code's own SessionStart hook —
- * we never scrape the screen for readiness. The same CLI session id means the
- * conversation survived; a different one means `--resume` silently started a
+ * The resumed CLI reports itself through its own SessionStart hook — we never
+ * scrape the screen for readiness. The same CLI session id means the
+ * conversation survived; a different one means the resume silently started a
  * new conversation, which is a broken handoff, not a successful one.
+ *
+ * `cliSessionId` is null for the one relaunch that has no id to expect: a
+ * Codex pane started as a NEW conversation, where `codex` chooses the id
+ * itself and the hook's first SessionStart is what tells us which it chose.
+ * There, any report for the new generation is the report we are waiting for —
+ * comparing it against the id we left would call every such handoff broken.
  *
  * The pane is watched alongside the log, every tick. A launch that dies on
  * arrival will never write a report, and waiting out the full minute for a
@@ -473,13 +566,13 @@ type Ready = "ok" | "resume-broken" | "timeout" | "dead";
  * CLI had exited at +1 s. `paneDead` is null when tmux could not be asked,
  * which is not a death and never ends the wait (src/tmux.ts).
  */
-async function waitForReady(id: string, generation: number, cliSessionId: string, tmux: Tmux, pane: string): Promise<Ready> {
+async function waitForReady(id: string, generation: number, cliSessionId: string | null, tmux: Tmux, pane: string): Promise<Ready> {
   const deadline = performance.now() + readyMs();
   for (;;) {
     for (const e of readEvents(id)) {
       if (e.generation !== generation) continue;
       if (e.kind !== "resumed" && e.kind !== "started") continue;
-      if (e.cliSessionId === cliSessionId) return "ok";
+      if (cliSessionId === null || e.cliSessionId === cliSessionId) return "ok";
       if (e.cliSessionId) return "resume-broken";
     }
     // After the log, not before it: a CLI that reported itself and then exited
@@ -529,6 +622,53 @@ function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[]
   }
   const soonest = times.length ? Math.min(...times) : 0;
   return Math.max(soonest || nowSeconds() + NO_ROOM_SECONDS, nowSeconds() + MIN_DISPATCH_SECONDS);
+}
+
+/** Why an account cannot be handed this session, in the two fields the
+ *  attempt row wants. */
+type Unlaunchable = { outcome: AttemptOutcome; note: string };
+
+/**
+ * Why this candidate cannot be launched as, or null — asked before anything
+ * is disturbed, so a candidate that fails here costs nothing but its turn.
+ *
+ * Claude's answer is one file: a launch token exists, or the account is not a
+ * candidate. (Existence only. The value belongs in the pane's environment,
+ * where `src/exec.ts` puts it, and never in a message or a tmux argument.)
+ *
+ * Codex's is two, because its credential is a DIRECTORY rather than a token:
+ *
+ *   * `auth.json` inside that account's own CODEX_HOME must hold a usable
+ *     credential — an absent or truncated one is a login that has not
+ *     happened, and answering "yes" for it respawns the pane onto a CLI that
+ *     cannot authenticate;
+ *   * that home must already trust this session's directory. Trust is per
+ *     home (verified live), and the dialog is a MODAL: a relaunch that met it
+ *     would sit in front of it for ever with the human's conversation behind
+ *     it. So the table is written here, before the pane is touched — and when
+ *     the writer refuses (a `projects` definition it will not edit, a
+ *     `trust_level` a human set themselves), that is this candidate's
+ *     failure, reported verbatim and skipped past, never a reason to go on
+ *     and launch into the modal.
+ *
+ * `infra` rather than `auth` for the trust refusal: the account's credential
+ * is fine, its home is not, and a human fixes it by editing a file rather
+ * than by logging in again.
+ */
+function unlaunchable(session: SessionRow, name: string): Unlaunchable | null {
+  if (session.provider !== "codex") {
+    return readLaunchToken(name) ? null : { outcome: "auth", note: "no launch token" };
+  }
+  const home = codexHome(name);
+  if (!readCodexAuth(home)?.accessToken) {
+    return { outcome: "auth", note: `no codex credential (run: ms accounts login ${name} --provider codex)` };
+  }
+  try {
+    const { problem } = ensureCodexTrust(home, session.cwd);
+    return problem ? { outcome: "infra", note: problem } : null;
+  } catch (e) {
+    return { outcome: "infra", note: `cannot record directory trust in ${home}: ${(e as Error).message}` };
+  }
 }
 
 type Candidates = { names: string[]; inputs: PickInput[]; out: { name: string; why: string }[]; registryError: string | null };
@@ -634,6 +774,22 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
       return fail(id, g, `${id} is stopping; the recovery is obsolete`);
     }
 
+    // A Codex session that asks for fable is not a session waiting for room.
+    // Codex reports ONE subscription's windows and no model-scoped window at
+    // all (src/providers/codex-usage.ts maps `weeklyFable` to null), so the
+    // chooser would pass over every account for "no fable window" and this
+    // worker would schedule a wake-up for a window that does not exist and
+    // cannot reset. `ms codex --need fable` is refused at the launch, so this
+    // row could only come from a hand-edited store — and the honest answer
+    // there is the same one: nobody has room, and nobody ever will. Nothing
+    // is claimed and nothing is touched, so the human's own verbs still work.
+    if (session.provider === "codex" && session.need === "fable") {
+      const why = `codex has no fable window; ${id} cannot be recovered while it needs fable`;
+      logLine(id, g, why);
+      process.stderr.write(`ms _recover: ${why}\n`);
+      return 2;
+    }
+
     // A named destination is checked before it can become anything — a path, a
     // launch account, a provider mismatch — and a bad one changes nothing at
     // all: no recovery is opened, no pane is touched.
@@ -658,7 +814,15 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
     // Without a CLI session id there is nothing to resume, and a respawn would
     // start a new conversation — the exact failure §9 calls resume-broken. Park
     // now, while the walled CLI is still alive and its transcript still on screen.
-    if (!session.cliSessionId) return park(st, id, rec.id, g, "the session never reported a CLI session id; nothing to resume");
+    //
+    // Codex is the exception, and it is not an exception to the rule: there,
+    // a null id means the hook has not reported one YET (Codex has no
+    // `--session-id`, so the id is its own to choose), and the relaunch for a
+    // conversation with no transcript is a plain `codex` that starts one and
+    // is adopted by the hook. Nothing is lost, so nothing is parked.
+    if (!session.cliSessionId && session.provider !== "codex") {
+      return park(st, id, rec.id, g, "the session never reported a CLI session id; nothing to resume");
+    }
 
     const slot = takeHandoffSlot();
     if (!slot) {
@@ -691,6 +855,11 @@ type Claim = { rec: RecoveryRow } | { why: string };
 
 /** Automatic mode: the hook left a pending recovery and we must own it. */
 function claimAutomatic(st: State, session: SessionRow, tmux: Tmux): Claim {
+  // Before the row is even read, so a refusal leaves the pending recovery
+  // exactly as its trigger wrote it: `ms status` still shows the wall, and
+  // the human's own `ms rotate` — which never comes through here — can pick
+  // that same row up and move the session on their say-so.
+  if (session.provider === "codex" && !codexAutorotate()) return { why: CODEX_AUTOROTATE_MESSAGE };
   const rec = st.pendingRecovery(session.id);
   if (!rec) return { why: "no pending recovery" };
   if (!st.ownRecovery(rec.id, owner())) return { why: `recovery ${rec.id} is already owned by ${rec.owner ?? "another worker"}` };
@@ -879,15 +1048,18 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     return 2;
   }
 
-  // 4. A candidate we cannot launch as is not a candidate.
+  // 4. A candidate we cannot launch as is not a candidate. For Codex this is
+  // also where its home is made to trust this directory — before the pane is
+  // touched, so the refusal costs a candidate rather than a conversation.
   let to: string | null = null;
   for (const name of names) {
-    if (readLaunchToken(name)) {
+    const no = unlaunchable(session, name);
+    if (!no) {
       to = name;
       break;
     }
-    st.addAttempt({ recoveryId: rec.id, account: name, outcome: "auth", note: "no launch token" });
-    logLine(id, g, `${name}: no launch token; trying the next account`);
+    st.addAttempt({ recoveryId: rec.id, account: name, outcome: no.outcome, note: no.note });
+    logLine(id, g, `${name}: ${no.note}; trying the next account`);
   }
   if (!to) {
     // Nothing has been touched yet: keep the recovery open on this generation
@@ -895,7 +1067,13 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     // only for an automatic rotation (see the registry path above).
     standDownFrom(st, rec, manual);
     if (!manual) redispatch(tmux, id, g);
-    return fail(id, g, `no candidate account has a launch token (run: ms accounts login <name>)`);
+    return fail(
+      id,
+      g,
+      session.provider === "codex"
+        ? "no candidate codex account can be launched (run: ms accounts login <name> --provider codex)"
+        : "no candidate account has a launch token (run: ms accounts login <name>)",
+    );
   }
 
   // 5. Say what is happening, and keep the pane alive across the exit. The
@@ -935,16 +1113,31 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
 
   // 7. The new generation, written down before it is started.
   const next = g + 1;
+  const codex = session.provider === "codex";
   // A conversation we watched begin and nobody has typed into cannot be
   // resumed, and has no unfinished work to continue: it is started under its
   // own id instead. Anything else is resumed.
-  const fresh = startsFresh(id, session.cliSessionId!);
+  const fresh = codex ? codexStartsFresh(id, session.cliSessionId) : startsFresh(id, session.cliSessionId!);
   const continuing = !fresh && (!manual || manual.continueAfter);
-  const command = fresh
-    ? ["claude", "--session-id", session.cliSessionId!, ...flagsForResume(session.flags)]
-    : ["claude", "--resume", session.cliSessionId!, ...(continuing ? [CONTINUATION] : []), ...flagsForResume(session.flags)];
+  // The same flag treatment for both CLIs, and for the same reason: the
+  // launch's own positional prompt is not re-submitted beside the
+  // continuation, and never re-submitted at all (see `flagsForResume`).
+  const flags = flagsForResume(session.flags);
+  const command = codex
+    ? fresh
+      ? codexLaunchCommand(flags)
+      : codexResumeCommand(session.cliSessionId!, continuing ? CONTINUATION : null, flags)
+    : fresh
+      ? ["claude", "--session-id", session.cliSessionId!, ...flags]
+      : ["claude", "--resume", session.cliSessionId!, ...(continuing ? [CONTINUATION] : []), ...flags];
   if (fresh) {
-    logLine(id, next, `${session.cliSessionId} has no transcript yet (no turn was ever submitted); starting it under the same id rather than resuming`);
+    logLine(
+      id,
+      next,
+      codex
+        ? `${session.cliSessionId ?? "this pane"} has no transcript yet (no turn was ever submitted); starting a new conversation rather than resuming`
+        : `${session.cliSessionId} has no transcript yet (no turn was ever submitted); starting it under the same id rather than resuming`,
+    );
   }
   const launchId = randomUUID();
   st.createLaunch({ id: launchId, sessionId: id, generation: next, account: to, command, env: {}, createdAt: nowSeconds() });
@@ -978,7 +1171,9 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
 
   // 8. Readiness, from the hook's own report — or from the pane, when the
   //    launch died before it could make one.
-  const ready = await waitForReady(id, next, session.cliSessionId!, tmux, session.pane);
+  // A Codex conversation started fresh has no id to expect back: `codex`
+  // chooses one and the hook's SessionStart is what names it.
+  const ready = await waitForReady(id, next, codex && fresh ? null : session.cliSessionId!, tmux, session.pane);
   if (ready !== "ok") {
     // The exit status first: it is the one fact that says WHY, and it is gone
     // the moment anything respawns over the corpse.

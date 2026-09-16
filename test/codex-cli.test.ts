@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSy
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const { codexHome, codexLaunchCommand, ensureCodexTrust } = await import("../src/providers/codex-cli.ts");
+const { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand, ensureCodexTrust } = await import("../src/providers/codex-cli.ts");
 
 const tempDir = (prefix: string) => mkdtempSync(path.join(tmpdir(), prefix));
 const configOf = (home: string) => path.join(home, "config.toml");
@@ -21,6 +21,29 @@ test("codexLaunchCommand is the CLI's own name and nothing else", () => {
   // hook's SessionStart, so a launch adds no argument of its own.
   assert.deepEqual(codexLaunchCommand([]), ["codex"]);
   assert.deepEqual(codexLaunchCommand(["--model", "gpt-5", "hi"]), ["codex", "--model", "gpt-5", "hi"]);
+});
+
+test("codexResumeCommand carries the continuation as an argument, never as keystrokes", () => {
+  // Verified live: `codex resume <id> "<prompt>"` resumes the conversation AND
+  // submits the prompt. Sending it as keys instead loses it to the TUI's paste
+  // detection, which is why the continuation is argv here as it is for Claude.
+  assert.deepEqual(codexResumeCommand("cx-1", "carry on", ["--model", "gpt-5"]), [
+    "codex", "resume", "cx-1", "carry on", "--model", "gpt-5",
+  ]);
+  // A move the human asked for without a continuation: resumed, and left alone.
+  assert.deepEqual(codexResumeCommand("cx-1", null, ["--model", "gpt-5"]), ["codex", "resume", "cx-1", "--model", "gpt-5"]);
+  assert.deepEqual(codexResumeCommand("cx-1", null, []), ["codex", "resume", "cx-1"]);
+  // An empty string is not a prompt: submitting one would be an empty turn.
+  assert.deepEqual(codexResumeCommand("cx-1", "", []), ["codex", "resume", "cx-1"]);
+});
+
+test("codexExitSequence is Ctrl-C twice, and never text", () => {
+  // Spike G1, Codex 0.153.4: `/exit` and `/quit` did nothing at all in ~10 s;
+  // Ctrl-C twice ended the TUI in about two seconds and fired SessionEnd.
+  const { keys, settleMs } = codexExitSequence();
+  assert.deepEqual(keys, [["C-c"], ["C-c"]]);
+  assert.equal(settleMs, 2_000, "the observed exit takes ~2 s; past it the pane is signalled instead");
+  assert.ok(keys.flat().every((k) => k === "C-c"), "nothing here may be text typed into the composer");
 });
 
 test("codexHome is the account's own CODEX_HOME under MS_HOME", () => {

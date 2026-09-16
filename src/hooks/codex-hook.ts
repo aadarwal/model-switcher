@@ -283,6 +283,15 @@ async function onRow<T>(session: string, gen: number, fn: (st: State, s: Session
  * recording the payload's id on it is this function's first job rather than a
  * correction. The same write also covers the id MOVING, exactly as for Claude.
  *
+ * That first job is deliberately NOT conditioned on the row's state, because
+ * the state by then is routinely `running`. The TUI reports SessionStart only
+ * when a prompt is SUBMITTED (C1, the 2026-09-16 live matrix), so a relaunch
+ * that carried no prompt is marked `running` on the strength of its live pane
+ * by the recovery worker (`waitForSettle`, src/recover.ts) and the report
+ * arrives whenever the human first types — an hour later, or never. Adopting
+ * only from `launching`/`resuming` would leave that session's id null for the
+ * rest of its life, and a null id is a session no rotation can resume.
+ *
  * **The rollout path arrives the same way**, and it is the only evidence a
  * usage-limit turn ever leaves. A new path means a new conversation, so the
  * byte offset into the old one is meaningless and is reset with it — carrying

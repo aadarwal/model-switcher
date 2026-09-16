@@ -538,6 +538,75 @@ test("(f) launching for over five minutes with no started event is parked", () =
   assert.ok(repaired.some((l) => l.includes("s-never")), repaired.join("\n"));
 });
 
+test("(f) a codex pane nobody has typed into yet is adopted as running, never parked", () => {
+  // C2. Codex 0.153.4's TUI fires SessionStart at the first SUBMITTED PROMPT,
+  // so a freshly launched Codex session stays `launching` with a null
+  // cliSessionId for as long as the human leaves the pane idle — all
+  // afternoon, if they like. (e)/(f) read that silence as a launch that never
+  // landed, and would park a session whose TUI is on screen in front of them.
+  // The event log cannot tell the two apart for this CLI; the pane can.
+  const w = world();
+  withState((st) => {
+    st.createSession({ id: "s-codex-idle", ...base, provider: "codex", cliSessionId: null, state: "launching" });
+    st.createSession({ id: "s-codex-resuming", ...base, provider: "codex", state: "resuming", generation: 2 });
+    // The control, and the reason this is not just a longer threshold: Claude
+    // Code reports SessionStart when the PROCESS starts, prompt or no prompt,
+    // so its silence really is a failed launch and still parks.
+    st.createSession({ id: "s-claude-idle", ...base, state: "launching" });
+  });
+  planted(w.msHome, "UPDATE sessions SET updatedAt=?", nowSec() - 400);
+
+  const repaired = reconcile();
+
+  assert.equal(stateOf("s-codex-idle"), "running", "the pane is alive: that is the report Codex will not send");
+  assert.equal(stateOf("s-codex-resuming"), "running", "a relaunch with no prompt is silent for the same reason");
+  assert.equal(stateOf("s-claude-idle"), "parked", "nothing about Codex's lazy hook crosses the provider seam");
+  assert.ok(repaired.some((l) => l.includes("s-codex-idle") && l.includes("idle pane adopted")), repaired.join("\n"));
+  assert.match(readFileSync(path.join(w.msHome, "sessions", "s-codex-idle", "recover.log"), "utf8"), /idle pane adopted/);
+  // Adoption is a state move and nothing else: no shell respawned over a live
+  // pane, and no worker sent at a session that is not in trouble.
+  assert.deepEqual(respawns(w), []);
+  assert.deepEqual(dispatches(w), []);
+});
+
+test("(f) a codex row whose pane is really dead is still parked, never adopted", () => {
+  // "The pane is alive" is the whole of the adoption rule, so it has to be
+  // read and not assumed. The recovery here is `owned` by a live worker,
+  // which is what makes (h) — the corpse rule, which would otherwise settle
+  // this pane first — stand aside and leave the row to (e)/(f).
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  withState((st) => {
+    st.createSession({ id: "s-codex-dead", ...base, provider: "codex", cliSessionId: null, state: "launching" });
+    const rec = st.addRecovery({ sessionId: "s-codex-dead", generation: 1, turnId: null, kind: "unknown" });
+    assert.ok(st.ownRecovery(rec, `${process.pid}@${hostname()}`), "the row is owned by this very much alive process");
+  });
+  planted(w.msHome, "UPDATE sessions SET updatedAt=?", nowSec() - 400);
+
+  const repaired = reconcile();
+
+  assert.equal(stateOf("s-codex-dead"), "parked");
+  assert.ok(!repaired.some((l) => l.includes("idle pane adopted")), repaired.join("\n"));
+  assert.match(readFileSync(path.join(w.msHome, "sessions", "s-codex-dead", "recover.log"), "utf8"), /parked/);
+});
+
+test("(f) an adopted codex pane must be one we actually found: an unlistable server adopts nothing", () => {
+  // Presence is the other half, and it is `presenceOf`'s answer, not a guess:
+  // a server we could not list panes on proves nothing about a pane, and a
+  // repair that adopted on "I could not ask" would call every session running.
+  const w = world();
+  process.env.MS_TMUX_LIST_FAILS = "1";
+  withState((st) => {
+    st.createSession({ id: "s-codex-unknown", ...base, provider: "codex", cliSessionId: null, state: "launching" });
+  });
+  planted(w.msHome, "UPDATE sessions SET updatedAt=?", nowSec() - 400);
+
+  const repaired = reconcile();
+
+  assert.equal(stateOf("s-codex-unknown"), "parked", "unknown is not present");
+  assert.ok(!repaired.some((l) => l.includes("idle pane adopted")), repaired.join("\n"));
+});
+
 // --- (6) a handoff that was abandoned in `stopping` ---------------------
 
 test("(6) a live handoff in stopping is left to its worker", () => {

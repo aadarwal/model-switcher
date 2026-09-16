@@ -15,13 +15,13 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
-import { appendEvent } from "../src/events.ts";
+import { appendEvent, readEvents } from "../src/events.ts";
 import { openState, type SessionRow } from "../src/state.ts";
 import { codexConversation, recoverSession } from "../src/recover.ts";
 import { p } from "../src/paths.ts";
@@ -223,6 +223,11 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   delete process.env.MS_CODEX_AUTOROTATE;
   process.env.MS_POLL_MS = "20";
   process.env.MS_READY_MS = "10000"; // generous: the report below arrives in milliseconds
+  // The Codex-only settle (`waitForSettle`). Set in BOTH worlds because the
+  // environment is process-global and these tests run one after another —
+  // a Claude world that left a previous Codex world's value standing would be
+  // testing a number no test chose.
+  process.env.MS_SETTLE_MS = "200";
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
 
   const { saveLaunchToken } = await import("../src/launch-credentials.ts");
@@ -752,6 +757,27 @@ test("a manual move to a named account on an idle pane resumes without a continu
   assert.equal(rows(w, "attempts")[0].outcome, "ok", "a manual move is not an exhaustion");
 });
 
+test("a claude move with no continuation still waits for the hook's own report", async (t) => {
+  // The other half of the Codex settle below: Claude Code fires SessionStart
+  // when the PROCESS starts, prompt or no prompt, so its silence after a
+  // relaunch is still a failed relaunch and still parks. Nothing about C1 may
+  // leak across the provider seam — a Claude pane adopted on "the pane is
+  // alive" would be a resume that never happened, reported as one.
+  const w = await world(t, { screen: IDLE_SCREEN, recovery: false, wall: false });
+  process.env.MS_READY_MS = "300"; // nobody will report; do not wait a minute for it
+  process.env.MS_SETTLE_MS = "60000"; // and if the settle were reached, it would never end in time
+
+  const started = Date.now();
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "work", continueAfter: false } }), 1);
+  assert.ok(Date.now() - started < 30_000, "the worker took the settle path on a Claude relaunch");
+
+  const s = session(w);
+  assert.equal(s.state, "parked", "no report, no readiness — whatever the pane looks like");
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["claude", "--resume", "c-1", "--model", "sonnet"]);
+  assert.equal(rows(w, "attempts").at(-1)!.note, "timeout", "and the silence is named a silence");
+  assert.match(recoverLog(w), /no resume report within/);
+});
+
 test("a pass-through prompt is never re-submitted beside the continuation", async (t) => {
   // `ms claude -- --model sonnet "finish the docs"` records all three as the
   // session's flags, and a resume re-applies them: two positionals on one
@@ -1246,6 +1272,11 @@ const CODEX_WALLED_SCREEN = [
   "",
 ].join("\n");
 
+/** A Codex TUI with nothing happening in it: no wall, nothing in flight, and
+ *  no option list — the pane a human leaves alone and then asks `ms switch`
+ *  to move. */
+const CODEX_IDLE_SCREEN = ["❯ ship it", "", "  Done.", "", "❯ ", ""].join("\n");
+
 /** `codex login`'s file, as far as a rotation reads it. The token is spelled
  *  distinctively so the secrets scan below cannot pass vacuously. */
 const codexAuth = (name: string) =>
@@ -1422,6 +1453,7 @@ async function codexWorld(t: TestContext, opts: CodexWorldOptions = {}): Promise
   process.env.MS_TMUX_STUBBORN = opts.survivesCtrlC ? "1" : "";
   process.env.MS_POLL_MS = "20";
   process.env.MS_READY_MS = "10000";
+  process.env.MS_SETTLE_MS = "200";
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
   if (opts.autorotate === false) delete process.env.MS_CODEX_AUTOROTATE;
   else process.env.MS_CODEX_AUTOROTATE = "1";
@@ -1761,6 +1793,141 @@ test("a codex pane whose hook has not yet named its conversation is relaunched, 
   assert.equal(s.state, "running");
   assert.equal(s.account, "home");
   assert.doesNotMatch(recoverLog(w), /never reported a CLI session id/, "a null id is not a broken row on this side");
+});
+
+test("a codex relaunch with no prompt is ready when its pane is: the TUI reports nothing until the first prompt", async (t) => {
+  // C1, live matrix case 4: `ms switch --to <account>` on an idle Codex pane
+  // relaunches it as `codex resume <id>` with no continuation. Codex 0.153.4
+  // fires SessionStart at the first SUBMITTED PROMPT, so that TUI comes up
+  // and says nothing — and the worker used to sit there for its whole
+  // readiness budget and then park a session whose TUI was on the screen.
+  //
+  // Nothing reports here on purpose: no `reportOnRespawn`, and the readiness
+  // budget is left at ten seconds, so a worker still waiting on the hook
+  // would park instead of finishing.
+  const w = await codexWorld(t, { screen: CODEX_IDLE_SCREEN, recovery: false, wall: false });
+  process.env.MS_SETTLE_MS = "400";
+
+  const started = Date.now();
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "home", continueAfter: false } }), 0);
+  const took = Date.now() - started;
+
+  const s = session(w);
+  assert.equal(s.state, "running", "and `running`, not `continuing`: no continuation was handed to it");
+  assert.equal(s.account, "home");
+  assert.equal(s.generation, 3);
+  assert.equal(s.cliSessionId, "cx-1", "the row still names the conversation it resumed");
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", "--model", "gpt-5"], "no prompt on the command line: that is what makes this the settle's case");
+  assert.equal(rows(w, "recoveries")[0].status, "done");
+  assert.ok(took < 5_000, `the worker waited on a hook that never fires (${took}ms of a 10s readiness budget)`);
+
+  // The pane was the report, and nothing pretended otherwise.
+  assert.match(recoverLog(w), /ready: the pane is alive \d+s after the respawn/);
+  assert.doesNotMatch(recoverLog(w), /no resume report within/);
+  assert.equal(
+    readEvents("s1").filter((e) => e.generation === 3 && (e.kind === "started" || e.kind === "resumed")).length,
+    0,
+    "no hook ever reported, and the tool never wrote an event pretending one had",
+  );
+});
+
+test("a codex relaunch whose pane dies inside the settle is parked, not adopted", async (t) => {
+  // The floor under the rule above. "The pane is alive" is only readiness
+  // while it stays true: a CLI that exits a moment after the respawn — a
+  // credential it refuses, a rollout it cannot open — must take the same
+  // dead-pane path as any other launch that died on arrival, screen tail and
+  // all, and never be adopted as a healthy idle TUI.
+  const w = await codexWorld(t, { screen: CODEX_IDLE_SCREEN, recovery: false, wall: false });
+  process.env.MS_SETTLE_MS = "4000";
+  let timer: NodeJS.Timeout | undefined;
+  const stop = onFirst(w, "respawn-pane", () => {
+    timer = setTimeout(() => appendFileSync(w.state, "pane_dead=1\n"), 100);
+  });
+  t.after(() => {
+    stop();
+    clearTimeout(timer);
+  });
+
+  const started = Date.now();
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "home", continueAfter: false } }), 1);
+  const took = Date.now() - started;
+
+  const s = session(w);
+  assert.equal(s.state, "parked");
+  assert.equal(s.generation, 3, "the respawn did happen; it is the relaunched CLI that died");
+  assert.equal(s.wakeupAt, null, "a parked session waits for a person, not for a window");
+  assert.equal(rows(w, "attempts").at(-1)!.outcome, "resume-broken");
+  assert.equal(rows(w, "attempts").at(-1)!.note, "dead", "a death, not a silence and not an unconfirmed pane");
+  assert.equal(rows(w, "recoveries")[0].status, "failed", "terminal: nothing may retry onto a dead pane");
+  assert.ok(took < 3_500, `the death was waited out rather than noticed (${took}ms of a 4s settle)`);
+  assert.match(recoverLog(w), /screen\| /, "the last screen is the evidence a human needs");
+  assert.match(recoverLog(w), /the resumed CLI exited \(pane_dead_status .*\) before reporting; s1 is parked/);
+  assert.doesNotMatch(recoverLog(w), /^.*ready: the pane is alive/m);
+});
+
+test("a settle that could never ask about the pane is unconfirmed, not a death", async (t) => {
+  // The distinction the rest of this module is built on: a tmux call that
+  // FAILED proves nothing about a pane. Readiness is not established either
+  // way and the session parks — but the log must not report an exit that was
+  // never read, because "the CLI exited" is what a human acts on next.
+  const w = await codexWorld(t, { screen: CODEX_IDLE_SCREEN, recovery: false, wall: false });
+  process.env.MS_SETTLE_MS = "300";
+  // Only from the respawn onwards: the exit and the relaunch themselves need a
+  // tmux that answers, and it is the settle that is being starved here.
+  const stop = onFirst(w, "respawn-pane", () => {
+    process.env.MS_TMUX_FAIL = "display-message";
+  });
+  t.after(() => {
+    stop();
+    process.env.MS_TMUX_FAIL = "";
+  });
+
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "home", continueAfter: false } }), 1);
+
+  assert.equal(session(w).state, "parked");
+  assert.equal(rows(w, "attempts").at(-1)!.note, "unconfirmed", "not `dead`: nothing was ever read that said so");
+  assert.match(recoverLog(w), /could not confirm the relaunched pane is alive \d+s after the respawn; s1 is parked/);
+  assert.doesNotMatch(recoverLog(w), /the resumed CLI exited/);
+});
+
+test("a codex relaunch of a never-prompted session settles too: a fresh `codex` reports nothing either", async (t) => {
+  // C1, live matrix case 7. The conversation has no id (the hook never named
+  // one) so the relaunch is a plain `codex` — which is exactly a TUI nobody
+  // has typed into, and therefore a TUI that will not fire SessionStart until
+  // somebody does. Again: no report is written by this test.
+  const w = await codexWorld(t, { session: { cliSessionId: null }, activity: false, born: false });
+  process.env.MS_SETTLE_MS = "400";
+
+  const started = Date.now();
+  assert.equal(await recoverSession("s1"), 0);
+  const took = Date.now() - started;
+
+  const s = session(w);
+  assert.equal(s.state, "running");
+  assert.equal(s.account, "home");
+  assert.equal(s.cliSessionId, null, "still unnamed: adopting the id is the hook's job, whenever the human first types");
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "--model", "gpt-5"]);
+  assert.equal(rows(w, "recoveries")[0].status, "done");
+  assert.ok(took < 5_000, `the worker waited on a hook that never fires (${took}ms)`);
+  assert.match(recoverLog(w), /ready: the pane is alive/);
+});
+
+test("a codex relaunch that DOES carry a continuation still waits for the hook", async (t) => {
+  // The seam is the prompt, not the CLI: `codex resume <id> "<continuation>"`
+  // submits that argument itself, so SessionStart does fire and the report is
+  // still what readiness means. Nothing reports here, and the session parks.
+  const w = await codexWorld(t);
+  process.env.MS_READY_MS = "300";
+  process.env.MS_SETTLE_MS = "60000"; // if the settle were reached it could not finish in time
+
+  const started = Date.now();
+  assert.equal(await recoverSession("s1"), 1);
+  assert.ok(Date.now() - started < 30_000, "a continuation-carrying relaunch took the settle path");
+
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-5"]);
+  assert.equal(session(w).state, "parked");
+  assert.equal(rows(w, "attempts").at(-1)!.note, "timeout");
+  assert.match(recoverLog(w), /no resume report within/);
 });
 
 test("a codex home this tool will not edit costs that candidate, not the rotation", async (t) => {

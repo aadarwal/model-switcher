@@ -21,8 +21,10 @@
 // differently is named `codex` at the seam it belongs to: the exit sequence,
 // the relaunch command (`codex resume <id> "<continuation>"`, or a plain
 // `codex` for a conversation nobody has typed into), the account home that
-// must trust this directory before the CLI starts, and the readiness report
-// for a relaunch whose session id Codex has not chosen yet.
+// must trust this directory before the CLI starts, the readiness report for a
+// relaunch whose session id Codex has not chosen yet, and the readiness of a
+// relaunch that carries no prompt — where the TUI reports nothing at all until
+// a human submits one, so the live pane is the report (`waitForSettle`).
 //   * Every step that could be wrong is rechecked under the session lock. A
 //     wall the session has already worked past, a generation that moved, a pane
 //     that is gone: each ends the transaction as obsolete rather than moving
@@ -101,6 +103,9 @@ const KILL_MS = 1_000;
 const ESCAPE_SETTLE_MS = 300;
 /** How long the resumed CLI has to report itself through the hook. */
 const READY_MS = 60_000;
+/** How long a Codex relaunch that carries NO prompt is watched before its own
+ * live pane is taken as the report. See `waitForSettle`. */
+const SETTLE_MS = 5_000;
 /** No window told us when it resets: try again in ten minutes. */
 const NO_ROOM_SECONDS = 600;
 /** Never re-dispatch sooner than this: a resetsAt that has already passed (a
@@ -114,6 +119,7 @@ const MAX_FAILED_ATTEMPTS = 3;
  * milliseconds; nothing else in the transaction depends on the value. */
 const pollMs = (): number => Number(process.env.MS_POLL_MS) || 500;
 const readyMs = (): number => Number(process.env.MS_READY_MS) || READY_MS;
+const settleMs = (): number => Number(process.env.MS_SETTLE_MS) || SETTLE_MS;
 const nowSeconds = (): number => Math.floor(Date.now() / 1000);
 
 export type ManualRecovery = {
@@ -626,7 +632,7 @@ export async function stopPane(tmux: Tmux, session: SessionRow, generation: numb
   return true;
 }
 
-type Ready = "ok" | "resume-broken" | "timeout" | "dead";
+type Ready = "ok" | "resume-broken" | "timeout" | "dead" | "unconfirmed";
 
 /**
  * The resumed CLI reports itself through its own SessionStart hook — we never
@@ -661,6 +667,53 @@ async function waitForReady(id: string, generation: number, cliSessionId: string
     if (tmux.paneDead(pane) === true) return "dead";
     const left = deadline - performance.now();
     if (left <= 0) return "timeout";
+    await sleep(Math.min(pollMs(), left));
+  }
+}
+
+/**
+ * Readiness for the one relaunch that will never report itself: a Codex
+ * command line carrying NO prompt.
+ *
+ * Verified live on Codex 0.153.4 (the C1 row of the 2026-09-16 matrix): the
+ * interactive TUI fires its SessionStart hook LAZILY — at the moment the first
+ * prompt is SUBMITTED, not when the process starts. So `codex resume <id>`
+ * with a continuation reports itself within seconds (the argument is submitted
+ * for it), while a plain `codex`, or a `codex resume <id>` a human asked for
+ * without a continuation, brings the TUI up and says nothing at all. Waiting
+ * for the hook there parked two healthy panes with the TUI on screen in front
+ * of the human ("no resume report within 60s"), which is the readiness check
+ * becoming the outage.
+ *
+ * So for that relaunch the pane IS the report: the pane still answers on the
+ * session's own socket, tmux does not call it dead, and the process in it is
+ * present, five seconds after the respawn. Nothing is scraped — the screen is
+ * never the evidence for either CLI — and nothing is typed; this is the same
+ * `paneInfo` read `waitForExit` makes, asked for the opposite answer.
+ *
+ * A death ends the wait the moment it is seen (the C1 pane that dies at +1 s
+ * must not cost the human the whole settle), and only a POSITIVE reading is a
+ * death: `paneInfo` is null when tmux could not be asked, which is not an exit
+ * and must never be recorded as one. A settle that ends without ever having
+ * confirmed the pane alive is `unconfirmed`, not `dead` — it parks either way,
+ * but the log never claims an exit that was never read.
+ *
+ * The later `started`/`resumed` the hook writes when the human does type is
+ * pure confirmation by then, and it is the hook — not this — that adopts the
+ * conversation id Codex chose (src/hooks/codex-hook.ts).
+ */
+async function waitForSettle(id: string, generation: number, tmux: Tmux, pane: string): Promise<Ready> {
+  const deadline = performance.now() + settleMs();
+  for (;;) {
+    const info = tmux.paneInfo(pane);
+    const live = !!info && !info.dead && !!info.pid && alive(info.pid);
+    if (info && !live) return "dead";
+    const left = deadline - performance.now();
+    if (left <= 0) {
+      if (!live) return "unconfirmed";
+      logLine(id, generation, `ready: the pane is alive ${Math.round(settleMs() / 1000)}s after the respawn (this relaunch carries no prompt, so codex reports no SessionStart until the human submits one)`);
+      return "ok";
+    }
     await sleep(Math.min(pollMs(), left));
   }
 }
@@ -1293,7 +1346,21 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   //    launch died before it could make one.
   // A Codex conversation started fresh has no id to expect back: `codex`
   // chooses one and the hook's SessionStart is what names it.
-  const ready = await waitForReady(id, next, codex && fresh ? null : session.cliSessionId!, tmux, session.pane);
+  //
+  // Except for the one command line that will never produce a report at all.
+  // Codex's TUI fires SessionStart at the FIRST SUBMITTED PROMPT, so a
+  // relaunch carrying no prompt — a fresh `codex`, or a `codex resume <id>`
+  // a human asked for without a continuation — is ready when its pane is
+  // (`waitForSettle`, and the C1 row of the 2026-09-16 live matrix). The two
+  // are the same question: `continuing` is exactly whether the continuation
+  // was passed as an argument, and `flagsForResume` has already dropped every
+  // other positional, so `codex && !continuing` IS "no prompt on the command
+  // line". Claude Code reports SessionStart at startup either way and is
+  // unchanged.
+  const reportsItself = !codex || continuing;
+  const ready = reportsItself
+    ? await waitForReady(id, next, codex && fresh ? null : session.cliSessionId!, tmux, session.pane)
+    : await waitForSettle(id, next, tmux, session.pane);
   if (ready !== "ok") {
     // The exit status first: it is the one fact that says WHY, and it is gone
     // the moment anything respawns over the corpse.
@@ -1313,7 +1380,9 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
         ? `the resumed CLI exited (pane_dead_status ${status ?? "unknown"}) before reporting; ${id} is parked`
         : ready === "timeout"
           ? `no resume report within ${Math.round(readyMs() / 1000)}s; ${id} is parked`
-          : `the resume started a new conversation; ${id} is parked`,
+          : ready === "unconfirmed"
+            ? `could not confirm the relaunched pane is alive ${Math.round(settleMs() / 1000)}s after the respawn; ${id} is parked`
+            : `the resume started a new conversation; ${id} is parked`,
     );
   }
 

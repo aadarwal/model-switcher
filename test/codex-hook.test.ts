@@ -155,6 +155,37 @@ test("SessionStart records the CLI session id on a row that has none — Codex h
   try { assert.equal(stD.getSession("s1")!.cliSessionId, null, "generation 2's report may not move generation 5's row"); } finally { stD.close(); }
 });
 
+test("a row already running with no id still adopts the one the first prompt finally reports", async () => {
+  // The other end of C1. A Codex relaunch that carries no prompt is marked
+  // `running` by the recovery worker on the strength of its live pane
+  // (src/recover.ts's `waitForSettle`), because this TUI fires SessionStart
+  // only when a prompt is SUBMITTED — which may be an hour later. When it
+  // finally does, the row is `running` and its id is still null, and this is
+  // the only place the tool will ever learn the id `codex resume <id>` needs.
+  // A guard that only adopted from `launching`/`resuming` would leave that
+  // session unrotatable for the rest of its life.
+  for (const source of ["startup", "resume"] as const) {
+    const a = setup();
+    const openA = await seedSession(a.env, { state: "running", cliSessionId: null });
+    assert.equal(
+      run(["_hook", "codex"], a.env, JSON.stringify({ hook_event_name: "SessionStart", source, session_id: "cx-late", transcript_path: "/tmp/rollout-late.jsonl" })).code,
+      0,
+    );
+    const stA = openA();
+    try {
+      const s = stA.getSession("s1")!;
+      assert.deepEqual(
+        [s.cliSessionId, s.transcriptPath, s.state],
+        ["cx-late", "/tmp/rollout-late.jsonl", "running"],
+        `${source}: the id and the rollout are adopted, and a running row is left running`,
+      );
+    } finally {
+      stA.close();
+    }
+    assert.equal(events(a.msHome).pop()!.prevCliSessionId, null, "and the event records the null it replaced");
+  }
+});
+
 test("a resumed session is adopted the moment its replacement CLI reports itself", async () => {
   const a = setup();
   const openA = await seedSession(a.env, { state: "resuming", cliSessionId: "cx-1" });

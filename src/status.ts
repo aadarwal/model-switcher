@@ -126,6 +126,22 @@ export function sessionWalled(s: SessionRow, hasPendingRecovery: boolean, screen
   return alreadyReported ? "" : "unreported";
 }
 
+/**
+ * One session row. Its STATE is the store's own word for the session, with
+ * exactly one substitution made here (`gone`, below) — this verb reports, it
+ * never repairs.
+ *
+ * So a Codex row may honestly read `launching` for as long as the human leaves
+ * a freshly launched pane idle: Codex 0.153.4's interactive TUI fires its
+ * SessionStart hook at the first SUBMITTED PROMPT, not at process start, and
+ * `launching → running` is that hook's move to make (src/hooks/codex-hook.ts).
+ * The pane is up and fine; nothing has been typed into it yet. Reconciliation
+ * adopts such a row as `running` once it is past its stuck threshold with a
+ * live pane (src/reconcile.ts), and the same lazy hook is why a `cliSessionId`
+ * of null is the NORMAL state of a new Codex session rather than a fault.
+ * Nothing here second-guesses either; a status that repaired what it printed
+ * would be a different verb.
+ */
 function sessionRow(s: SessionRow, st: State): string[] {
   const tmux = new Tmux(s.socket || null);
   const hasPane = !!s.pane;

@@ -15,7 +15,8 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
@@ -889,6 +890,58 @@ test("a candidate with no launch token is skipped for the next one", async (t) =
     [["gmail", "auth"], ["dirk", "exhausted"]],
   );
   assert.match(recoverLog(w), /gmail: no launch token/);
+});
+
+/** root reads a 0000 file, so denying ourselves a read proves nothing there. */
+const CAN_DENY_READ = process.getuid?.() !== 0;
+
+test("a candidate whose token cannot be READ is skipped like one that has none", { skip: !CAN_DENY_READ }, async (t) => {
+  // The live variant of case 10: `chmod 000` on the best-ranked account's token
+  // threw EACCES out of the transaction as "recovery failed", and the accounts
+  // that were perfectly fine were never tried.
+  const w = await world(t);
+  const token = path.join(w.msHome, "launch", "gmail.token");
+  chmodSync(token, 0o000);
+  t.after(() => chmodSync(token, 0o600));
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+
+  assert.equal(session(w).account, "work", "the next account took it");
+  assert.deepEqual(
+    rows(w, "attempts").map((a) => [a.account, a.outcome]),
+    [["gmail", "auth"], ["dirk", "exhausted"]],
+  );
+  assert.match(recoverLog(w), /gmail: no launch token/);
+  assert.doesNotMatch(recoverLog(w), /recovery failed/);
+});
+
+test("a throw past the transaction never leaves a recovery owned by a worker that has gone", async (t) => {
+  // Whatever threw, this process is about to exit — so an `owned` row is owned
+  // by nobody. Live, that left the session `stopping` under a dead pid, with
+  // every manual verb refusing ("already owned by <pid>@host") until
+  // reconciliation reclaimed it minutes later. A store that will not write is
+  // the case the catch-all's own comment names; this is one.
+  const w = await world(t);
+  const db = new DatabaseSync(path.join(w.msHome, "state.sqlite"));
+  try {
+    db.exec("CREATE TRIGGER no_launches BEFORE INSERT ON launches BEGIN SELECT RAISE(ABORT, 'the store would not write'); END");
+  } finally {
+    db.close();
+  }
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  const s = session(w);
+  assert.equal(s.state, "parked", "not `stopping`: nothing is coming back for this session");
+  assert.equal(s.wakeupAt, null, "a parked session is not also waiting for a window");
+  const rec = rows(w, "recoveries")[0];
+  assert.equal(rec.status, "failed", "closed, not left open for a worker that no longer exists");
+  assert.equal(rec.owner, `${process.pid}@${hostname()}`, "and closed by the worker that owned it");
+  assert.match(recoverLog(w), /recovery failed: .*the store would not write/);
+  assert.match(recoverLog(w), /s1 is parked/);
+  assert.ok(!respawnLine(w), "the launch was never written, so nothing was respawned");
 });
 
 test("no launch token ever reaches a tmux command line", async (t) => {

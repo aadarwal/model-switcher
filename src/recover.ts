@@ -563,7 +563,44 @@ export async function recoverSession(id: string, opts: RecoverOptions = {}): Pro
     // throw before that leaves the session and its open recovery on the same
     // generation, and the next worker (or §12's reconciliation) can simply try
     // again. The respawn itself is handled where it happens, not here.
-    return fail(id, 0, `recovery failed: ${(e as Error)?.message ?? String(e)}`);
+    //
+    // Except for the one thing it could not clean up itself: a recovery this
+    // worker had CLAIMED. This process is about to exit, so an `owned` row is
+    // owned by nobody — live, it left the session `stopping` under a pid that
+    // was gone, and every manual verb refused ("already owned by <pid>@host")
+    // until reconciliation reclaimed it. Close it out here, as the failure it
+    // was, and park the session for the human.
+    const why = (e as Error)?.message ?? String(e);
+    failOwnedRecovery(id, why);
+    return fail(id, 0, `recovery failed: ${why}`);
+  }
+}
+
+/**
+ * Close out a recovery this worker still owns, after a throw that got past the
+ * transaction (B6). Conditional on the owner being US: a row a live worker has
+ * claimed since is not ours to finish, and the whole point is that nothing is
+ * left `owned` by a process that is exiting.
+ *
+ * Every step is best effort. The thing that threw may well have been the store
+ * itself, and a repair that throws again out of a catch block would take the
+ * reason for the failure with it.
+ */
+function failOwnedRecovery(id: string, why: string): void {
+  try {
+    const st = openState();
+    try {
+      const rec = st.pendingRecovery(id);
+      if (!rec || rec.status !== "owned" || rec.owner !== owner()) return;
+      st.finishRecovery(rec.id, "failed");
+      st.updateSession(id, { state: "parked" });
+      st.setWakeup(id, null);
+      logLine(id, rec.generation, `recovery ${rec.id} failed (${why}); ${id} is parked`);
+    } finally {
+      st.close();
+    }
+  } catch {
+    /* the store is what threw, most likely; reconciliation is the net */
   }
 }
 

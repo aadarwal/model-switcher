@@ -26,7 +26,24 @@
 // that runs in the browser, with no bundler and no second copy to drift
 // out of sync (review round 1, finding 8).
 
-import { esc, buildRotateBody, buildSwitchBody, buildStopBody, buildSwitchAllBody, nextPollState, pollStateOnVisible, MAX_POLL_FAILURES } from "./client-logic.ts";
+import {
+  esc,
+  buildRotateBody,
+  buildSwitchBody,
+  buildStopBody,
+  buildSwitchAllBody,
+  nextPollState,
+  pollStateOnVisible,
+  worryAttr,
+  fmtPercent,
+  localTime,
+  earliestWeeklyReset,
+  chosenAccount,
+  accountRowHtml,
+  sessionRowHtml,
+  formatSwitchAll,
+  MAX_POLL_FAILURES,
+} from "./client-logic.ts";
 
 const DASH = "—"; // matches status.ts's own DASH exactly
 
@@ -59,6 +76,10 @@ label.force { display: inline-flex; align-items: center; gap: 4px; }
 td.actions { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .rowmsg { color: #bab8b0; font-size: 12px; }
 .rowmsg.error { color: #e06c5a; }
+/* The fleet move's answer is one line per session plus a summary (finding
+   C3), so it needs its own block and its newlines honoured — inside the
+   flex control it would have been one squashed run of text. */
+#moveall-msg { display: block; white-space: pre-line; line-height: 1.5; margin: 0 0 10px; }
 .empty { color: #bab8b0; font-style: italic; }
 `;
 
@@ -67,9 +88,32 @@ td.actions { display: flex; align-items: center; gap: 6px; white-space: nowrap; 
 // already exercises under Node — never a hand-copied duplicate. Each is a
 // closure-free named `function` declaration, so re-emitting its source as a
 // statement in the page's own script scope defines the same callable name.
-const EMBEDDED_FUNCTIONS = [esc, buildRotateBody, buildSwitchBody, buildStopBody, buildSwitchAllBody, nextPollState, pollStateOnVisible]
-  .map((fn) => fn.toString())
-  .join("\n\n");
+const EMBEDDED = [
+  esc,
+  buildRotateBody,
+  buildSwitchBody,
+  buildStopBody,
+  buildSwitchAllBody,
+  nextPollState,
+  pollStateOnVisible,
+  worryAttr,
+  fmtPercent,
+  localTime,
+  earliestWeeklyReset,
+  chosenAccount,
+  accountRowHtml,
+  sessionRowHtml,
+  formatSwitchAll,
+];
+
+/** The names the page's own script depends on being present, verbatim, in
+ *  whatever ships. The served page is checked against this list by
+ *  test/dashboard-server.test.ts, and the BUILT bundle by
+ *  `scripts/check-dist.mjs` (which esbuild would happily rename `esc` to
+ *  `esc2` behind, silently, if a second top-level `esc` ever appeared). */
+export const EMBEDDED_FUNCTION_NAMES = EMBEDDED.map((fn) => fn.name);
+
+const EMBEDDED_FUNCTIONS = EMBEDDED.map((fn) => fn.toString()).join("\n\n");
 
 // Kept as one string so the whole client is visible in one place, the way
 // the page's own tables read as one instrument rather than assembled parts.
@@ -85,41 +129,24 @@ ${EMBEDDED_FUNCTIONS}
   var MSG_MS = 10000;
   var DASH = ${JSON.stringify(DASH)};
   var MAX_POLL_FAILURES = ${MAX_POLL_FAILURES};
-  // Amber-worry cells: session STATE ("walled"/"parked"), account STATE
-  // ("auth"), session WALLED? ("unreported"). Everything else stays ink.
-  var WORRY = { walled: 1, parked: 1, auth: 1, unreported: 1 };
 
   var rowMessages = Object.create(null);
+  // Finding C5: which account each row's "Switch to" select is showing,
+  // kept across the 5s re-render by session id — a fresh <select> shows its
+  // first option, so without this a human who picked the third account and
+  // read the row for six seconds sent a move to whichever sorted first.
+  var rowChoice = Object.create(null);
+  // Finding C6's page half: a session whose verb is still in flight from this
+  // tab. Its buttons are disabled until the answer lands, so the second click
+  // that used to be a second handoff cannot be made.
+  var busySessions = Object.create(null);
   var moveMsg = null;
+  var moveBusy = false;
   var lastTakenAt = null;
   var currentAccounts = [];
   var currentSessions = [];
   var pollState = { failures: 0, stopped: false };
   var pollTimer = null;
-
-  function worryAttr(v) { return WORRY[v] ? ' class="worry"' : ""; }
-
-  function fmtPercent(w) {
-    if (!w || typeof w.usedPercent !== "number" || !isFinite(w.usedPercent)) return DASH;
-    var v = Math.round(w.usedPercent * 10) / 10;
-    return (Math.floor(v) === v ? String(v) : v.toFixed(1)) + "%";
-  }
-
-  function pad(n) { return n < 10 ? "0" + n : String(n); }
-
-  function localTime(ms) {
-    var d = new Date(ms);
-    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
-  }
-
-  function earliestWeeklyReset(u) {
-    if (!u) return null;
-    var c = [];
-    if (u.weeklyAll && u.weeklyAll.resetsAt) c.push(u.weeklyAll.resetsAt);
-    if (u.weeklyFable && u.weeklyFable.resetsAt) c.push(u.weeklyFable.resetsAt);
-    if (!c.length) return null;
-    return c.reduce(function (a, b) { return Date.parse(a) <= Date.parse(b) ? a : b; });
-  }
 
   function el(id) { return document.getElementById(id); }
 
@@ -128,23 +155,13 @@ ${EMBEDDED_FUNCTIONS}
   function renderAccounts(accounts) {
     var tbody = document.querySelector("#accounts-table tbody");
     if (!accounts.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty">no accounts</td></tr>'; return; }
-    tbody.innerHTML = accounts.map(function (a) {
-      var reset = earliestWeeklyReset(a.usage);
-      var u = a.usage || {};
-      return "<tr>" +
-        "<td>" + esc(a.name) + "</td>" +
-        "<td>" + esc(a.label) + "</td>" +
-        "<td>" + fmtPercent(u.session) + "</td>" +
-        "<td>" + fmtPercent(u.weeklyAll) + "</td>" +
-        "<td>" + fmtPercent(u.weeklyFable) + "</td>" +
-        "<td>" + (reset ? localTime(Date.parse(reset)) : DASH) + "</td>" +
-        "<td" + worryAttr(a.state) + ">" + esc(a.state) + "</td>" +
-        "</tr>";
-    }).join("");
+    tbody.innerHTML = accounts.map(function (a) { return accountRowHtml(a, DASH); }).join("");
   }
 
   function otherAccounts(accounts, provider, exclude) {
-    return accounts.filter(function (a) { return a.provider === provider && a.name !== exclude; });
+    var out = [];
+    accounts.forEach(function (a) { if (a.provider === provider && a.name !== exclude) out.push(a.name); });
+    return out;
   }
 
   // PENDING and WALLED? are statusJson()'s own computed words too
@@ -154,36 +171,23 @@ ${EMBEDDED_FUNCTIONS}
     var tbody = document.querySelector("#sessions-table tbody");
     if (!sessions.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty">no sessions</td></tr>'; return; }
     tbody.innerHTML = sessions.map(function (s) {
-      var msg = rowMessages[s.id];
-      var msgHtml = (msg && msg.expiresAt > Date.now())
-        ? '<span class="rowmsg' + (msg.error ? " error" : "") + '">' + esc(msg.text) + "</span>"
-        : "";
+      var m = rowMessages[s.id];
+      var msg = (m && m.expiresAt > Date.now()) ? { text: m.text, error: m.error } : null;
       var others = otherAccounts(accounts, s.provider, s.account);
-      var options = others.map(function (a) { return '<option value="' + esc(a.name) + '">' + esc(a.name) + "</option>"; }).join("");
-      var switchCell = others.length
-        ? '<select data-switch-select>' + options + '</select><button data-act="switch">Go</button>'
-        : "";
-      var wakeup = s.wakeupAt != null ? localTime(s.wakeupAt * 1000) : DASH;
-      var pending = s.pending == null ? DASH : esc(s.pending);
-      return "<tr>" +
-        "<td>" + esc(s.id) + "</td>" +
-        "<td>" + esc(s.pane || DASH) + "</td>" +
-        "<td>" + esc(s.provider) + "</td>" +
-        "<td>" + esc(s.account) + "</td>" +
-        "<td>" + esc(s.need) + "</td>" +
-        "<td" + worryAttr(s.state) + ">" + esc(s.state) + "</td>" +
-        "<td>" + esc(String(s.generation)) + "</td>" +
-        "<td>" + pending + "</td>" +
-        "<td>" + wakeup + "</td>" +
-        "<td" + worryAttr(s.walled) + ">" + esc(s.walled || DASH) + "</td>" +
-        '<td class="actions" data-session="' + esc(s.id) + '">' +
-          '<button data-act="rotate">Rotate</button>' +
-          switchCell +
-          '<button data-act="stop">Stop</button>' +
-          msgHtml +
-        "</td>" +
-        "</tr>";
+      return sessionRowHtml(s, others, rowChoice[s.id] || "", msg, DASH);
     }).join("");
+    applyBusy();
+  }
+
+  // One place decides what a row's controls may do, so a re-render mid-verb
+  // cannot quietly hand the buttons back.
+  function applyBusy() {
+    var cells = document.querySelectorAll("#sessions-table td[data-session]");
+    Array.prototype.forEach.call(cells, function (cell) {
+      var busy = !!busySessions[cell.getAttribute("data-session")];
+      Array.prototype.forEach.call(cell.querySelectorAll("button, select"), function (c) { c.disabled = busy; });
+    });
+    el("moveall-go").disabled = moveBusy;
   }
 
   function uniqueProviders(accounts) {
@@ -213,6 +217,7 @@ ${EMBEDDED_FUNCTIONS}
 
   function renderMoveMsg() {
     var span = el("moveall-msg");
+
     if (moveMsg && moveMsg.expiresAt > Date.now()) {
       span.textContent = moveMsg.text;
       span.className = "rowmsg" + (moveMsg.error ? " error" : "");
@@ -266,31 +271,57 @@ ${EMBEDDED_FUNCTIONS}
   // force argument, so there is no way to build a body that sends one.
   function forceChecked() { return el("force").checked; }
 
+  // Finding C5: the human's own choice, recorded the moment they make it, so
+  // the next poll's re-render puts it back rather than resetting the row.
+  document.querySelector("#sessions-table tbody").addEventListener("change", function (e) {
+    var sel = e.target;
+    if (!sel || !sel.matches || !sel.matches("select[data-switch-select]")) return;
+    var cell = sel.closest("td[data-session]");
+    if (cell) rowChoice[cell.getAttribute("data-session")] = sel.value;
+  });
+
   document.querySelector("#sessions-table tbody").addEventListener("click", function (e) {
     var btn = e.target.closest ? e.target.closest("button[data-act]") : null;
     if (!btn) return;
     var cell = btn.closest("td[data-session]");
     if (!cell) return;
     var id = cell.getAttribute("data-session");
+    if (busySessions[id]) return; // finding C6: one move at a time, per session
     var act = btn.getAttribute("data-act");
+    var sent = null;
     if (act === "rotate") {
-      post("/api/rotate", buildRotateBody(id)).then(function (r) { setRowMessage(id, r); });
+      sent = post("/api/rotate", buildRotateBody(id));
     } else if (act === "stop") {
-      post("/api/stop", buildStopBody(id)).then(function (r) { setRowMessage(id, r); });
+      sent = post("/api/stop", buildStopBody(id));
     } else if (act === "switch") {
       var sel = cell.querySelector("select[data-switch-select]");
       var to = sel ? sel.value : "";
       if (!to) return;
-      post("/api/switch", buildSwitchBody(id, to)).then(function (r) { setRowMessage(id, r); });
+      rowChoice[id] = to;
+      sent = post("/api/switch", buildSwitchBody(id, to));
     }
+    if (!sent) return;
+    busySessions[id] = 1;
+    applyBusy();
+    sent.then(function (r) {
+      delete busySessions[id];
+      setRowMessage(id, r); // re-renders, and applyBusy() with it
+    });
   });
 
   el("moveall-provider").addEventListener("change", refreshMoveAllAccounts);
   el("moveall-go").addEventListener("click", function () {
     var to = el("moveall-account").value;
-    if (!to) return;
+    if (!to || moveBusy) return;
+    moveBusy = true;
+    applyBusy();
     post("/api/switch-all", buildSwitchAllBody(to, forceChecked())).then(function (r) {
-      moveMsg = { text: resultText(r), error: resultIsError(r), expiresAt: Date.now() + MSG_MS };
+      moveBusy = false;
+      applyBusy();
+      // Finding C3: one line per session and the same summary the CLI
+      // prints — never "HTTP 200", which is all this used to say whether
+      // three moved or three were refused.
+      moveMsg = { text: formatSwitchAll(r.status, r.json), error: resultIsError(r), expiresAt: Date.now() + MSG_MS };
       renderMoveMsg();
     });
   });
@@ -374,8 +405,8 @@ export function renderDashboardPage(): string {
       <select id="moveall-account"></select>
       <label class="force"><input type="checkbox" id="force"> Force (governs "Move every…" only)</label>
       <button id="moveall-go">Go</button>
-      <span class="rowmsg" id="moveall-msg"></span>
     </div>
+    <div class="rowmsg" id="moveall-msg"></div>
     <table id="sessions-table">
       <thead><tr>
         <th>SESSION</th><th>PANE</th><th>PROVIDER</th><th>ACCOUNT</th><th>NEED</th>

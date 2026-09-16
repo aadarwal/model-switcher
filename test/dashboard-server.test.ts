@@ -25,6 +25,7 @@ import path from "node:path";
 import { tempHome, stubDir, run } from "./helpers.ts";
 import { openState } from "../src/state.ts";
 import { startDashboard, DEFAULT_IDLE_MS } from "../src/dashboard/server.ts";
+import { EMBEDDED_FUNCTION_NAMES } from "../src/dashboard/page.ts";
 
 const PANE = "%7";
 const SOCKET = "/tmp/ms-dashboard-server-test.sock";
@@ -238,7 +239,11 @@ test("startDashboard binds 127.0.0.1 and GET / returns HTML with both table head
   // Review round 1, finding 8: the served page embeds client-logic.ts's OWN
   // functions (via `.toString()`), not a hand-written copy — if page.ts ever
   // stops importing one of these, its name disappears from the script too.
-  for (const name of ["esc", "buildRotateBody", "buildSwitchBody", "buildStopBody", "buildSwitchAllBody", "nextPollState", "pollStateOnVisible"]) {
+  // The list is page.ts's own, so a function ADDED to the client and not
+  // embedded fails here too — the row builders call each other by name in the
+  // page's script scope, where a missing one is a silent ReferenceError.
+  assert.ok(EMBEDDED_FUNCTION_NAMES.length >= 15, `only ${EMBEDDED_FUNCTION_NAMES.length} functions are embedded`);
+  for (const name of EMBEDDED_FUNCTION_NAMES) {
     assert.ok(html.includes(`function ${name}(`), `missing embedded function: ${name}`);
   }
 

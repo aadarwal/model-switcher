@@ -12,9 +12,10 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
+import { appendEvent } from "../src/events.ts";
 import { openState } from "../src/state.ts";
 import { saveLaunchToken } from "../src/launch-credentials.ts";
 import type { Verb } from "../src/cli.ts";
@@ -26,6 +27,7 @@ const IDENTITY = "1:2";
 const SHELL = "/bin/bash";
 const ORIGINAL_PATH = process.env.PATH ?? "";
 const HOUR = 3_600_000;
+const nowSeconds = (): number => Math.floor(Date.now() / 1000);
 
 // Same stub as test/manual.test.ts's TMUX_STUB: a bash `tmux` on PATH that
 // keeps one pane's state in a temp file, and logs every call it sees.
@@ -269,6 +271,12 @@ test("a malformed body is refused with 400, per route", async (t) => {
     { method: "POST", path: "/api/stop", body: {} }, // missing session
     { method: "POST", path: "/api/stop" }, // no body at all
     { method: "POST", path: "/api/switch-all", body: { to: 1 } }, // wrong type
+    { method: "POST", path: "/api/switch-all", body: {} }, // missing to
+    { method: "POST", path: "/api/switch-all" }, // no body at all
+    { method: "POST", path: "/api/switch-all", body: "home" }, // not an object
+    { method: "POST", path: "/api/switch-all", body: { to: "home", force: "yes" } }, // wrong type
+    { method: "POST", path: "/api/switch-all", body: { to: "home", timeoutMs: -1 } }, // not positive
+    { method: "POST", path: "/api/switch-all", body: { to: "home", timeoutMs: "600000" } }, // wrong type
   ];
 
   for (const req of cases) {
@@ -295,14 +303,209 @@ test("an unknown route is 404", async (t) => {
 });
 
 // --- POST /api/switch-all ------------------------------------------------
+//
+// A fleet move touches more than one pane at once, so it needs the same
+// pane-KEYED stub test/manual.test.ts's `--all` tests use (`FLEET_STUB`
+// below is that stub, trimmed to what this file needs) — the single-pane
+// stub above would have one session's `/exit` answer for both.
 
-test("POST /api/switch-all is not yet implemented (Task 3)", async (t) => {
-  await world(t);
+const FLEET_STUB = String.raw`printf '%s\n' "$*" >> "$MS_TMUX_LOG"
+if [ "$1" = "-S" ]; then shift 2; fi
+st="$MS_TMUX_STATE"
+pane=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-t" ]; then pane="$a"; fi
+  prev="$a"
+done
+get() { grep "^$1=" "$st" 2>/dev/null | tail -1 | cut -d= -f2-; }
+put() { printf '%s=%s\n' "$1" "$2" >> "$st"; }
+case "$1" in
+  list-panes) get panes | tr ' ' '\n' ;;
+  display-message)
+    case "$*" in
+      *pane_pid*) printf '%s\t%s\t%s\t%s\n' "$(get "pid$pane")" claude "$(get "dead$pane")" "$(get cwd)" ;;
+      *pane_dead_status*) printf '\n' ;;
+      *pane_dead*) get "dead$pane" ;;
+      *) get identity ;;
+    esac ;;
+  capture-pane) cat "$MS_TMUX_SCREENS/$pane" 2>/dev/null ;;
+  send-keys) case "$*" in */exit*) put "dead$pane" 1 ;; esac ;;
+  respawn-pane) put "dead$pane" 0 ;;
+esac
+exit 0`;
 
-  const res = await handle({ method: "POST", path: "/api/switch-all", body: { to: "gmail" } });
+const FLEET_SOCKET = "/tmp/ms-dashboard-api-fleet-test.sock";
 
-  assert.equal(res.status, 501);
-  assert.deepEqual(res.json, { error: "not yet" });
+type FleetSession = { id: string; pane: string; cliSessionId: string; generation: number };
+type FleetWorld = { home: string; msHome: string; log: string; sessions: FleetSession[] };
+
+/** Two sessions, both on `away`, in their own panes — `to: "home"` moves both. */
+const FLEET_SESSIONS: FleetSession[] = [
+  { id: "f1", pane: "%1", cliSessionId: "c-f1", generation: 1 },
+  { id: "f2", pane: "%2", cliSessionId: "c-f2", generation: 1 },
+];
+
+async function fleetWorld(t: TestContext): Promise<FleetWorld> {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  stub("tmux", FLEET_STUB);
+  const log = path.join(dir, "tmux.log");
+  const state = path.join(dir, "tmux.state");
+  const screens = path.join(dir, "screens");
+  mkdirSync(screens, { recursive: true });
+  const pid = liveProcess(t);
+  const cwd = home;
+  const sessions = FLEET_SESSIONS;
+
+  writeFileSync(log, "");
+  writeFileSync(
+    state,
+    [
+      `panes=${sessions.map((s) => s.pane).join(" ")}`,
+      ...sessions.map((s) => `pid${s.pane}=${pid}`),
+      ...sessions.map((s) => `dead${s.pane}=0`),
+      `cwd=${cwd}`,
+      `identity=${IDENTITY}`,
+      "",
+    ].join("\n"),
+  );
+  for (const s of sessions) writeFileSync(path.join(screens, s.pane), IDLE_SCREEN);
+  writeFileSync(
+    path.join(msHome, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: [
+        { name: "home", provider: "claude", label: "Home", shared: false },
+        { name: "away", provider: "claude", label: "Away", shared: false },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+
+  process.env.HOME = home;
+  process.env.MS_HOME = msHome;
+  process.env.MS_TMUX_LOG = log;
+  process.env.MS_TMUX_STATE = state;
+  process.env.MS_TMUX_SCREENS = screens;
+  process.env.MS_TMUX_SCREEN = "";
+  process.env.MS_TMUX_SNAP = "";
+  process.env.MS_TMUX_REVIVE = "";
+  process.env.MS_TMUX_FAIL = "";
+  process.env.MS_POLL_MS = "20";
+  process.env.MS_READY_MS = "5000";
+  process.env.MS_SETTLE_MS = "";
+  process.env.MS_LOCK_WAIT_MS = "";
+  process.env.SHELL = SHELL;
+  process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
+  delete process.env.TMUX;
+  delete process.env.TMUX_PANE;
+
+  saveLaunchToken("home", "sk-ant-oat01-home0123456789abcdefghijklmn");
+  saveLaunchToken("away", "sk-ant-oat01-away0123456789abcdefghijklmn");
+
+  const st = openState();
+  try {
+    for (const s of sessions) {
+      st.createSession({
+        id: s.id,
+        provider: "claude",
+        cliSessionId: s.cliSessionId,
+        cwd,
+        socket: FLEET_SOCKET,
+        pane: s.pane,
+        serverStart: IDENTITY,
+        need: "any",
+        account: "away",
+        generation: s.generation,
+        state: "running",
+        desired: "running",
+        flags: [],
+      });
+    }
+  } finally {
+    st.close();
+  }
+
+  return { home, msHome, log, sessions };
+}
+
+/**
+ * Claude Code's own SessionStart hook, for a fleet of panes at once: as soon
+ * as the stub tmux shows a pane respawned, report that session's next
+ * generation back under its ORIGINAL cli session id — `switchOne` resumes
+ * rather than starts fresh, so `recoverSession`'s readiness wait
+ * (`waitForReady`, src/recover.ts) is watching for exactly this. With no
+ * report at all it would wait out the full `MS_READY_MS` per session.
+ */
+function reportFleet(w: FleetWorld): () => void {
+  const byPane = new Map(w.sessions.map((s) => [s.pane, s]));
+  const done = new Set<string>();
+  const timer = setInterval(() => {
+    for (const line of readFileSync(w.log, "utf8").split("\n")) {
+      if (!line.includes("respawn-pane")) continue;
+      const m = line.match(/ -t (%\d+)/);
+      const pane = m?.[1];
+      const s = pane ? byPane.get(pane) : undefined;
+      if (!s || done.has(s.pane)) continue;
+      done.add(s.pane);
+      appendEvent({ t: nowSeconds(), kind: "resumed", session: s.id, generation: s.generation + 1, cliSessionId: s.cliSessionId });
+    }
+  }, 10);
+  return () => clearInterval(timer);
+}
+
+test("POST /api/switch-all moves every session not already on the destination", async (t) => {
+  const w = await fleetWorld(t);
+  const stop = reportFleet(w);
+  t.after(stop);
+
+  const res = await handle({ method: "POST", path: "/api/switch-all", body: { to: "home" } });
+
+  assert.equal(res.status, 200);
+  const json = res.json as { code: number; message: string | null; results: { session: string; code: number; message: string }[] };
+  assert.equal(json.code, 0);
+  assert.equal(json.message, null);
+  assert.equal(json.results.length, 2);
+  for (const s of w.sessions) {
+    const r = json.results.find((x) => x.session === s.id);
+    assert.ok(r, `${s.id} missing from results`);
+    assert.equal(r!.code, 0, `${s.id}: ${r!.message}`);
+  }
+
+  const st = openState();
+  try {
+    for (const s of w.sessions) assert.equal(st.getSession(s.id)!.account, "home", `${s.id} did not move`);
+  } finally {
+    st.close();
+  }
+
+  const lines = readFileSync(w.log, "utf8")
+    .split("\n")
+    .filter((l) => l.trim());
+  for (const s of w.sessions) {
+    assert.ok(
+      lines.some((l) => l.includes(`send-keys -t ${s.pane}`) && l.includes("/exit")),
+      `${s.id}'s pane was never asked to exit`,
+    );
+    assert.ok(
+      lines.some((l) => l.includes(`respawn-pane`) && l.includes(s.pane)),
+      `${s.id}'s pane was never respawned`,
+    );
+  }
+});
+
+test("POST /api/switch-all to an account nobody registered moves nothing", async (t) => {
+  const w = await fleetWorld(t);
+
+  const res = await handle({ method: "POST", path: "/api/switch-all", body: { to: "nobody" } });
+
+  assert.equal(res.status, 200);
+  const json = res.json as { code: number; message: string | null; results: unknown[] };
+  assert.equal(json.code, 1);
+  assert.match(json.message ?? "", /no such/);
+  assert.deepEqual(json.results, []);
+  assert.deepEqual(readFileSync(w.log, "utf8").split("\n").filter((l) => l.trim()), [], "tmux was never even asked a question");
 });
 
 // --- captureVerb ----------------------------------------------------------

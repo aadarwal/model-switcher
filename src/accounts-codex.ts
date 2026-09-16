@@ -28,7 +28,8 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import { mightCarryToken, redact } from "./accounts.ts";
-import { ensureStore, p } from "./paths.ts";
+import { ensureCodexHooks } from "./hooks/codex-install.ts";
+import { ensureStore, msBinary, p } from "./paths.ts";
 import { type Account, findAccount, loadRegistry, saveRegistry } from "./registry.ts";
 import { probeCodexUsage, readCodexAuth } from "./providers/codex-probe.ts";
 
@@ -230,6 +231,23 @@ function report(name: string, accountId: string, email: string | null): void {
 }
 
 /**
+ * Install `ms _hook codex` into this account's home, and say what happened.
+ *
+ * A refusal is a warning, not a failure: it names the file and the remedy
+ * (`ms doctor --fix` reports the same refusal verbatim), and the credential
+ * this login just minted is unaffected by it.
+ */
+function installHooks(name: string, dir: string): void {
+  const res = ensureCodexHooks(dir, msBinary());
+  if (res.problem) {
+    warn(`warning: could not install the codex hooks for ${name}: ${res.problem}`);
+    warn(`warning: ${name} will not report its sessions until that is fixed — then run: ms doctor --fix`);
+    return;
+  }
+  if (res.changed) out(`${name}: codex hooks installed in ${p.codexHome(name)}/config.toml${res.backup ? ` (backup ${res.backup})` : ""}\n`);
+}
+
+/**
  * Mint the one credential and record whose it is.
  *
  * `--device-auth` is forced whenever stdin is not a TTY, because the browser
@@ -244,6 +262,14 @@ export async function loginCodex(name: string, opts: { deviceAuth?: boolean } = 
   // A login that exits 0 without writing the file did not log in. Say which
   // directory is empty; it is the only thing the human can act on.
   if (!readCodexAuth(dir)) throw new Error(`codex login left no auth.json in ${dir}`);
+  // The hooks, into the home this login just filled. A Codex home without them
+  // launches silently and looks healthy — no SessionStart ever fires, so the
+  // row never learns its conversation id, and the first `ms rotate` respawns a
+  // plain `codex` over the human's conversation. `ms doctor --fix` installs
+  // them too, but nothing sends the human there, so this is where they land.
+  // Never fatal: the credential is good, and the remedy for a config.toml this
+  // installer will not touch is a person editing that file.
+  installHooks(name, dir);
   // Identity (and the duplicate refusal) before anything is written: a refused
   // account keeps its unverified row and its home, and claims nothing.
   const { accountId, email } = identifyOrRefuse(name, dir);
@@ -283,6 +309,24 @@ export function removeCodex(name: string): number {
   const dir = p.codexHome(name);
   if (path.resolve(dir) === path.resolve(p.codexSessions())) {
     throw new Error(`refusing to remove ${name}: its home is the shared rollout store ${dir}`);
+  }
+  // `<home>/sessions` is normally a SYMLINK to the shared store, and `rmSync`
+  // unlinks a link without following it. A real directory there is this
+  // account's own transcripts — written by a `codex` that ran before the link
+  // existed, or put there by hand — and `ensureCodexHome` and `ms doctor`
+  // both deliberately leave it alone rather than replace it. Deleting the
+  // tree would take it with them, so this refuses instead and names it: a
+  // transcript is never this tool's to throw away.
+  const sessions = p.codexSessionsLink(name);
+  try {
+    if (lstatSync(sessions).isDirectory()) {
+      throw new Error(
+        `refusing to remove ${name}: ${sessions} is a real directory of transcripts, not the shared-store link — move or delete it yourself first`,
+      );
+    }
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("refusing to remove")) throw e;
+    // No `sessions` entry at all: nothing to protect.
   }
   // The credential first: the row is what NAMES it, so dropping the row before
   // the directory could strand a live `auth.json` nothing points at.

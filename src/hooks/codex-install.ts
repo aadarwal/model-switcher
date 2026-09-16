@@ -338,6 +338,32 @@ export function installCodexHooks(homeDir: string, msBin: string): InstallResult
   return { changed: true, backup };
 }
 
+/**
+ * Make sure this home's hooks are installed AND trusted, or say why not.
+ *
+ * The one call both the account wizard and a launch make, because a Codex home
+ * with no hooks is the worst kind of broken: nothing fails. No SessionStart
+ * ever fires, so the row's `cliSessionId` and `transcriptPath` stay null;
+ * reconcile adopts the row as `running` after five minutes, so `ms status`
+ * reads healthy; the watchdog never arms, so no wall is ever noticed — and
+ * the first `ms rotate` finds no conversation to resume and respawns a plain
+ * `codex`, replacing the human's conversation with an empty one.
+ *
+ * Idempotent, and cheap when there is nothing to do: an already-correct home
+ * writes nothing and backs nothing up. `problem` is the installer's own
+ * refusal, verbatim, plus the case where a write that claimed to succeed did
+ * not produce an installed home — which is a refusal too, not a shrug.
+ */
+export function ensureCodexHooks(homeDir: string, msBin: string): InstallResult {
+  if (codexHooksInstalled(homeDir, msBin)) return { changed: false, backup: null };
+  const res = installCodexHooks(homeDir, msBin);
+  if (res.problem) return res;
+  if (!codexHooksInstalled(homeDir, msBin)) {
+    return { ...res, problem: `${codexConfigPath(homeDir)}: the hooks are still not installed after writing them` };
+  }
+  return res;
+}
+
 /** One `[[hooks.<Event>]]` table as the scan below sees it: its position
  * among the tables for that event (the trust key's matcher index) and the
  * `hooks = [...]` line it carried, if any. */

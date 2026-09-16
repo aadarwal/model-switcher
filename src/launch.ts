@@ -38,6 +38,7 @@ import { openState } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
 import { codexLaunchCommand, ensureCodexTrust } from "./providers/codex-cli.ts";
+import { ensureCodexHooks } from "./hooks/codex-install.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
 
 /** Exit codes, fixed by spec §7 so a caller can branch on them. */
@@ -304,10 +305,26 @@ function planFor(provider: Provider, parsed: Parsed): ProviderPlan {
         const home = p.codexHome(account);
         try {
           const { problem } = ensureCodexTrust(home, cwd);
-          return problem ? { error: problem } : null;
+          if (problem) return { error: problem };
         } catch (e) {
           return { error: `cannot record directory trust for '${account}' in ${home}: ${(e as Error).message}` };
         }
+        // And the hooks, for the same reason and with less warning. A Codex
+        // home with no hooks starts fine and reports NOTHING: no SessionStart,
+        // so the row never learns its conversation id or its rollout path;
+        // reconcile adopts it as `running` after five minutes, so `ms status`
+        // reads healthy; the watchdog never arms, so no wall is ever noticed.
+        // The bill comes at the first `ms rotate`, which finds no conversation
+        // to resume and respawns a plain `codex` over the human's own. So the
+        // installer runs here, once, and a home it will not touch refuses the
+        // launch rather than opening a pane that cannot be rotated.
+        try {
+          const { problem } = ensureCodexHooks(home, msBinary());
+          if (problem) return { error: `${problem} — then run: ms doctor --fix` };
+        } catch (e) {
+          return { error: `cannot install the codex hooks for '${account}' in ${home}: ${(e as Error).message} (run: ms doctor --fix)` };
+        }
+        return null;
       },
       cliSessionId: () => null, // there is no `--session-id`; the hook reports it
       command: (_id, args) => codexLaunchCommand(args),

@@ -174,3 +174,49 @@ test("a binary path containing a single quote is escaped, not left to break the 
   installStatusline(settings, quoted);
   assert.equal(JSON.parse(readFileSync(settings, "utf8")).statusLine.command, `'/Users/it'\\''s/ms' _statusline`);
 });
+
+test("the Codex trust writer also keeps a symlinked config.toml a symlink", async () => {
+  const { home } = tempHome();
+  const codexHome = path.join(home, "codex-home");
+  mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+  const realDir = path.join(home, "dotfiles");
+  mkdirSync(realDir, { recursive: true });
+  const real = path.join(realDir, "config.toml");
+  writeFileSync(real, 'model = "gpt-5"\n');
+  const link = path.join(codexHome, "config.toml");
+  symlinkSync(real, link);
+
+  const { ensureCodexTrust, removeCodexTrust } = await import("../src/providers/codex-cli.ts");
+  const project = path.join(home, "a-project");
+  mkdirSync(project, { recursive: true });
+
+  const r = ensureCodexTrust(codexHome, project);
+  assert.equal(r.problem, undefined, r.problem ?? "");
+  assert.equal(r.changed, true);
+  assert.equal(lstatSync(link).isSymbolicLink(), true, "the trust write severed the link");
+  assert.match(readFileSync(real, "utf8"), /trust_level = "trusted"/);
+  assert.ok(readFileSync(real, "utf8").includes('model = "gpt-5"'));
+
+  // ...and the probe's own cleanup finds it back through the link.
+  assert.equal(removeCodexTrust(codexHome, project).changed, true);
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+  const after = readFileSync(real, "utf8");
+  assert.ok(!after.includes("trust_level"), after);
+  assert.ok(after.includes('model = "gpt-5"'), after);
+});
+
+test("removeCodexTrust never removes a project table the human has added to", async () => {
+  const { home } = tempHome();
+  const codexHome = path.join(home, "codex-home");
+  mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+  const project = path.join(home, "a-project");
+  mkdirSync(project, { recursive: true });
+  const { ensureCodexTrust, removeCodexTrust } = await import("../src/providers/codex-cli.ts");
+  ensureCodexTrust(codexHome, project);
+  const config = path.join(codexHome, "config.toml");
+  writeFileSync(config, readFileSync(config, "utf8").replace('trust_level = "trusted"', 'trust_level = "trusted"\nsandbox_mode = "danger-full-access"'));
+  const before = readFileSync(config, "utf8");
+
+  assert.equal(removeCodexTrust(codexHome, project).changed, false);
+  assert.equal(readFileSync(config, "utf8"), before, "a table the human added a key to is theirs");
+});

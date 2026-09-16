@@ -25,8 +25,9 @@
 // this tool creates is never wider than the credential it sits next to. A
 // home the human keeps themselves is theirs, and nothing here widens it.
 
-import { mkdirSync, readFileSync, renameSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { writeAtomicThroughLink } from "../fsx.ts";
 import { p } from "../paths.ts";
 
 /** This account's CODEX_HOME. Re-exported from src/paths.ts so everything
@@ -232,18 +233,14 @@ function trustValue(rhs: string): string {
   return q ? q[2]! : v;
 }
 
-/** Atomic within the home (temp + rename), 0600 — the file sits beside
- *  `auth.json` in a 0700 directory this tool owns, and is never wider than
- *  the credential it sits next to. */
+/** Atomic (temp + rename), 0600 — the file sits beside `auth.json` in a 0700
+ *  directory this tool owns, and is never wider than the credential it sits
+ *  next to. Through any symlink, like every other writer to this same
+ *  `config.toml` (src/hooks/codex-install.ts): a home whose config is linked
+ *  into a dotfiles checkout must not have that link replaced by the next
+ *  launch's trust write, undoing what the installer was careful about. */
 function writeConfig(file: string, text: string): void {
-  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-  try {
-    writeFileSync(tmp, text, { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch (e) {
-    rmSync(tmp, { force: true });
-    throw e;
-  }
+  writeAtomicThroughLink(file, text, { forceMode: 0o600 });
 }
 
 /** What `ensureCodexTrust` decided. `problem` is a refusal the caller reports

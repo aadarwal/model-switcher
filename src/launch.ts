@@ -39,6 +39,7 @@ import { readLaunchToken } from "./launch-credentials.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
 import { codexLaunchCommand } from "./providers/codex-cli.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
+import { CONTINUATION } from "./recover.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
 
 /** Exit codes, fixed by spec §7 so a caller can branch on them. */
@@ -74,25 +75,53 @@ function sayFor(provider: Provider) {
 
 // --- The command line --------------------------------------------------
 
-type Parsed = { as: string | null; need: Need | null; args: string[] };
+type Parsed = { as: string | null; need: Need | null; continueAfter: boolean; args: string[] };
 
 /**
- * `ms <cli> [--as name] [--need any|fable] [-- <cli args>]`.
+ * Does this command line bring an existing conversation back?
+ *
+ * It is the only question `--continue` may be asked, because the continuation
+ * says "continue the unfinished work from this conversation" — handed to a
+ * conversation that has none, it is an instruction to invent some, which is
+ * the exact failure `CONTINUATION`'s own doc comment records from a live
+ * rotation. So a `--continue` with nothing to continue is a refusal, not a
+ * prompt sent into an empty session.
+ *
+ * Read off the CLI's own resume spelling: Codex's `resume` subcommand, and
+ * Claude Code's `--resume`/`-r` (or its own `--continue`/`-c`, which is the
+ * same intent said its way). `ms adopt` always qualifies — it appends
+ * `resume <id>` itself.
+ */
+function namesAResume(provider: Provider, args: string[]): boolean {
+  if (provider === "codex") return args.includes("resume");
+  return args.some((a) => a === "--resume" || a === "-r" || a === "--continue" || a === "-c" || a.startsWith("--resume="));
+}
+
+/**
+ * `ms <cli> [--as name] [--need any|fable] [--continue] [-- <cli args>]`.
  *
  * `--` is the boundary, and it is a hard one: everything after it is the
  * user's own command line for the CLI and passes through untouched, and
- * anything before it that is not one of our two flags is a mistake rather
+ * anything before it that is not one of our flags is a mistake rather
  * than a guess (a mistyped `--need` must not silently become an argument to
  * the CLI). `cli` appears only in that refusal, so the human is told where
  * their own argument belongs in the command they actually typed.
+ *
+ * `--continue` is the launch-time half of what a rotation does for free: the
+ * SAME `CONTINUATION` (src/recover.ts), submitted the SAME way — as the
+ * resumed command line's own prompt argument, never typed into a composer.
+ * It is for a resume a human drove themselves, where nothing else would send
+ * one at all.
  */
 export function parseLaunchArgs(argv: string[], cli = "claude"): Parsed | { error: string } {
   let as: string | null = null;
   let need: Need | null = null;
+  let continueAfter = false;
   const args: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--") { args.push(...argv.slice(i + 1)); break; }
+    if (a === "--continue") { continueAfter = true; continue; }
     if (a === "--as" || a.startsWith("--as=")) {
       const v = a.startsWith("--as=") ? a.slice("--as=".length) : argv[++i];
       if (!v) return { error: "--as needs an account name" };
@@ -113,7 +142,7 @@ export function parseLaunchArgs(argv: string[], cli = "claude"): Parsed | { erro
   if (args.some((a) => a === "--session-id" || a.startsWith("--session-id="))) {
     return { error: "--session-id is set by ms; remove it" };
   }
-  return { as, need, args };
+  return { as, need, continueAfter, args };
 }
 
 // --- What the run needs ------------------------------------------------
@@ -275,7 +304,21 @@ type ProviderPlan = {
   label(need: Need): string;
 };
 
-function planFor(provider: Provider, parsed: Parsed): ProviderPlan {
+/**
+ * What a caller that is not the human's own `ms claude`/`ms codex` adds to a
+ * launch. Today there is one: `ms adopt`, which knows the conversation the
+ * pane is being started on before the CLI does.
+ */
+export type LaunchExtras = {
+  /** The CLI conversation this launch RESUMES. It does two things nothing
+   *  else can do for a Codex launch: it appends `resume <id>` to the command
+   *  line, and it puts the id on the session row at creation — where Codex
+   *  normally leaves null until its hook first reports, which is a row no
+   *  rotation could resume in the meantime. */
+  resumeId?: string | null;
+};
+
+function planFor(provider: Provider, parsed: Parsed, extras: LaunchExtras = {}): ProviderPlan {
   if (provider === "codex") {
     return {
       // Codex reports ONE subscription's windows and no model-scoped window
@@ -303,7 +346,9 @@ function planFor(provider: Provider, parsed: Parsed): ProviderPlan {
         const refusal = ensureCodexReady(p.codexHome(account), cwd, msBinary());
         return refusal ? { error: refusal.problem } : null;
       },
-      cliSessionId: () => null, // there is no `--session-id`; the hook reports it
+      // There is no `--session-id`: normally the hook reports the id Codex
+      // chose. A launch that RESUMES is the one case the id is known first.
+      cliSessionId: () => extras.resumeId ?? null,
       command: (_id, args) => codexLaunchCommand(args),
       label: () => "codex",
     };
@@ -328,13 +373,37 @@ function planFor(provider: Provider, parsed: Parsed): ProviderPlan {
  * sequence that must not vary — because it is the sequence that keeps a pane
  * accounted for before anything can run in it.
  */
-async function launchWith(provider: Provider, argv: string[]): Promise<number> {
+export async function launchWith(provider: Provider, argv: string[], extras: LaunchExtras = {}): Promise<number> {
   const say = sayFor(provider);
   const parsed = parseLaunchArgs(argv, provider);
   if ("error" in parsed) { say(parsed.error); return EXIT_USAGE_ERROR; }
-  const plan = planFor(provider, parsed);
+  const plan = planFor(provider, parsed, extras);
   if (typeof plan.need !== "string") { say(plan.need.error); return EXIT_USAGE_ERROR; }
   const need = plan.need;
+
+  // The command line the CLI actually gets: the human's own arguments, then
+  // the resume this launch is (when a caller knew one), then the
+  // continuation. That order is the rotation's own — `codexResumeCommand`
+  // puts the prompt straight after the id — and it is why `resume <id>` is
+  // NOT folded into `parsed.args`: `args` becomes the row's `flags`, which a
+  // later rotation re-applies through `flagsForResume`, and a stray `resume`
+  // positional there would be re-appended to a command line that already has
+  // one.
+  const resumeId = extras.resumeId ?? null;
+  const cliArgs = [
+    ...parsed.args,
+    ...(resumeId ? ["resume", resumeId] : []),
+    ...(parsed.continueAfter ? [CONTINUATION] : []),
+  ];
+  if (parsed.continueAfter && !resumeId && !namesAResume(provider, parsed.args)) {
+    say(
+      "--continue needs something to continue",
+      provider === "codex"
+        ? ["it carries the unfinished work of a conversation you are resuming", `try: ms codex --continue -- resume <id>`]
+        : ["it carries the unfinished work of a conversation you are resuming", `try: ms claude --continue -- --resume <id>`],
+    );
+    return EXIT_USAGE_ERROR;
+  }
 
   // An unreadable accounts.json is "could not look", never "nothing is
   // there": reporting it as an empty pool would send the human hunting for a
@@ -408,7 +477,7 @@ async function launchWith(provider: Provider, argv: string[]): Promise<number> {
   const sessionId = randomUUID();
   const cliSessionId = plan.cliSessionId();
   const launchId = randomUUID();
-  const command = plan.command(cliSessionId, parsed.args);
+  const command = plan.command(cliSessionId, cliArgs);
   const label = plan.label(need);
   const inside = !!process.env.TMUX && !!process.env.TMUX_PANE;
   const tmux = inside ? tmuxFromEnv() : new Tmux(TOOL_SOCKET());

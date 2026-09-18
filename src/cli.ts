@@ -5,6 +5,7 @@ import { execLaunch } from "./exec.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
 import { codexHook, codexWatch } from "./hooks/codex-hook.ts";
 import { attachVerb, launchClaude, launchCodex } from "./launch.ts";
+import { adoptVerb } from "./adopt.ts";
 import { dashboard } from "./dashboard.ts";
 import { statuslineVerb } from "./setup/statusline.ts";
 import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
@@ -29,6 +30,8 @@ registerVerb("_statusline", statuslineVerb);
 registerVerb("claude", launchClaude);
 registerVerb("codex", launchCodex);
 registerVerb("attach", attachVerb);
+// `ms adopt`: take over a Codex conversation this tool did not start.
+registerVerb("adopt", adoptVerb);
 registerVerb("_recover", recoverVerb);
 registerVerb("status", status);
 registerVerb("doctor", doctor);
@@ -40,7 +43,7 @@ registerVerb("stop", stopVerb);
 registerVerb("dashboard", dashboard);
 
 const USAGE = `usage: ms <verb> [args]
-  setup | claude | codex | status | accounts | rotate | switch | stop | doctor | attach | dashboard
+  setup | claude | codex | adopt | status | accounts | rotate | switch | stop | doctor | attach | dashboard
   (internal: _exec _hook _codex_watch _recover _pane_died _statusline)`;
 
 function version(): string {

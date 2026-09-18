@@ -883,3 +883,12 @@ test("the served page's own script hides the toggle entirely when nothing is fin
   assert.equal(toggle.textContent, "");
   assert.equal((toggle as unknown as { style: { display: string } }).style.display, "none");
 });
+
+test("the worry set: an account with no room is amber — the page says what ms status says (0.2.5)", () => {
+  assert.equal(worryAttr("no room"), ' class="worry"');
+  assert.equal(chipClass("no room"), "ms-chip worry");
+  assert.equal(isWorry("no room"), true);
+  assert.ok(
+    accountRowHtml({ ...ACCOUNT, state: "no room" }, "—").includes('<span class="ms-chip worry">no room</span>'),
+  );
+});

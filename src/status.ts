@@ -29,13 +29,35 @@ const DASH = "—";
 
 // --- Accounts table ------------------------------------------------------
 
-export type AccountState = "ok" | "stale" | "auth" | "transient" | "no-grant" | "no-token";
+export type AccountState = "ok" | "stale" | "auth" | "transient" | "no-grant" | "no-token" | "no room";
 
 /** `pollOne` (src/snapshot.ts) names a missing poll grant with this exact
  *  phrase for Claude ("no poll grant …") and Codex ("no credentials …");
  *  anything else classified `auth` is a live credential that the provider
  *  itself rejected (a dead refresh token, a revoked grant). */
 const NO_GRANT_RE = /no poll grant|credentials missing|no credentials/i;
+
+/**
+ * "The chooser would pass this account over", read off the same numbers the
+ * chooser reads.
+ *
+ * `pickAccounts` (src/pick.ts) gates on a window at 100 and nothing softer —
+ * no projection, no threshold below it — so this is that rule and only that
+ * rule: the 5 h session window, and the weekly one. The FABLE window is
+ * deliberately not here, because the chooser only gates on it for a run that
+ * asked for it (`--need fable`); an account with Fable at 100 and room in the
+ * other two still runs every ordinary `ms claude`, and calling it "no room"
+ * would be this table inventing a refusal the tool would never make.
+ *
+ * A window we have no number for says nothing either way: `pickAccounts`
+ * passes such an account over for its own reason ("no weekly window",
+ * "malformed weekly percent"), which is a broken READING, not a full account,
+ * and the row's own error/stale words already carry that.
+ */
+function noRoom(u: AccountUsage["usage"]): boolean {
+  const full = (w: Window | null | undefined): boolean => !!w && Number.isFinite(w.usedPercent) && w.usedPercent >= 100;
+  return full(u?.session) || full(u?.weeklyAll);
+}
 
 /**
  * The single STATE word for an account row.
@@ -61,7 +83,12 @@ export function accountState(a: AccountUsage, hasToken: boolean): AccountState {
   // later.
   if (a.errorKind === "transient" || a.errorKind === "other") return "transient";
   if (a.stale) return "stale";
-  return "ok";
+  // Last, and only ever in place of `ok`: everything above describes the
+  // READING (missing, refused, old), and a fact about the reading outranks a
+  // fact about the numbers in it. `ok` was the one word this row could say
+  // that was simply wrong — an account at 100 is not ok, it is the account
+  // every launch and every rotation is about to skip.
+  return noRoom(a.usage) ? "no room" : "ok";
 }
 
 /** One decimal only when the value isn't integral (42, not 42.0; 42.5, not

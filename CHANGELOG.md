@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.5
+
+- `ms adopt <rollout-id>` takes over a Codex conversation ms did not start: it
+  copies the rollout and everything its history points at into the shared
+  store, then relaunches the pane on `codex … resume <id>`
+- `ms claude`/`ms codex`/`ms adopt --continue` hand a resume you drove
+  yourself the same continuation a rotation sends
+- an account whose 5h or weekly window reads 100 is `no room`, not `ok`, in
+  ms status and on the page
+- a session launched on a resume reads `running` once its hook reports, rather
+  than sitting in `launching` until reconciliation parks it
+
 ## 0.2.4
 
 - Automatic Codex recovery is on by default (MS_CODEX_AUTOROTATE=0 disables):

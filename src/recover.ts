@@ -1178,12 +1178,37 @@ function claimManual(st: State, session: SessionRow, tmux: Tmux, opts: RecoverOp
  * sonnet`), and everything after a `--`. The remaining ambiguity —
  * `--boolean-flag word` — keeps the word, which is exactly the old behaviour
  * and never drops something the human asked for.
+ *
+ * With ONE exception, and it is a resume of its own (0.2.5). A launch may
+ * itself have been a resume — `ms codex --continue -- --yolo resume <id>` is
+ * the shape this tool's own refusal hint teaches — and that `resume <id>` is
+ * recorded in `flags` like anything else the human typed. The command line
+ * built below already carries a resume; a second one from the flags is not a
+ * duplicate argument, it is a different conversation appended to the same
+ * command (live shape: `codex resume <id> <CONT> --yolo resume`, because the
+ * ambiguity rule keeps `resume` as `--yolo`'s value). The rotation always
+ * supplies its own resume, so a stored one is always the wrong one — for both
+ * CLIs, hence `--resume`/`-r` as well as Codex's bare subcommand. The id that
+ * follows it goes too, and only when it is not itself a flag.
  */
+const RESUME_TOKENS = new Set(["resume", "--resume", "-r"]);
+
 export function flagsForResume(flags: string[]): string[] {
   const out: string[] = [];
   let mayBeAValue = false;
-  for (const a of flags) {
+  for (let i = 0; i < flags.length; i++) {
+    const a = flags[i]!;
     if (a === "--") break; // everything past it is positional by definition
+    // Before the flag/value rules, because `--yolo resume` would otherwise
+    // read `resume` as `--yolo`'s value and keep it.
+    if (RESUME_TOKENS.has(a) || a.startsWith("--resume=")) {
+      if (!a.includes("=")) {
+        const next = flags[i + 1];
+        if (next !== undefined && !next.startsWith("-")) i++; // its conversation id
+      }
+      mayBeAValue = false;
+      continue;
+    }
     if (a.length > 1 && a.startsWith("-")) {
       out.push(a);
       mayBeAValue = !a.includes("=");

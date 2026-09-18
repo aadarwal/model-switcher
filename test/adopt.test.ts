@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { run, stubDir, tempHome } from "./helpers.ts";
@@ -108,26 +108,52 @@ test("copyLineage copies the whole chain into the store's own YYYY/MM/DD, 0600 u
   assert.equal(readFileSync(c.root, "utf8"), before.root);
 });
 
-test("copyLineage never overwrites a rollout already in the store", async () => {
+test("copyLineage never overwrites a rollout already in the store, and keeps only one that is byte-for-byte the same", async () => {
   const { copyLineage } = await import("../src/adopt.ts");
   const { home } = tempHome();
   const sessions = path.join(home, ".codex", "sessions");
   const store = path.join(home, "store", "codex", "sessions");
   const c = chain(sessions);
-  // MID is already there, and is the file a live CLI might be appending to.
+  // MID is already there, identical — the ordinary case, and the file a live
+  // CLI might be appending to.
   const midDir = path.join(store, "2026", "09", "16");
   mkdirSync(midDir, { recursive: true, mode: 0o700 });
   const midDest = path.join(midDir, rolloutName("2026-09-16", MID));
-  writeFileSync(midDest, "ALREADY HERE\n", { mode: 0o600 });
+  writeFileSync(midDest, readFileSync(c.mid), { mode: 0o600 });
 
   const out = copyLineage(sessions, store, c.leaf);
 
-  assert.equal(readFileSync(midDest, "utf8"), "ALREADY HERE\n", "an existing rollout was replaced");
+  assert.equal(readFileSync(midDest, "utf8"), readFileSync(c.mid, "utf8"), "an existing rollout was replaced");
   assert.deepEqual(out.kept, [midDest]);
+  assert.deepEqual(out.mismatched, []);
   assert.equal(out.copied.length, 2, "the leaf and the root still land");
 });
 
-test("copyLineage reports a lineage whose source rollout is nowhere, rather than copying a chain codex will refuse", async () => {
+test("copyLineage names a store file that DIFFERS from the source, and copies nothing at all", async () => {
+  // What a killed `ms adopt` leaves behind: a truncated rollout under a real
+  // conversation's name. Reporting it as "already there" is how Codex ends up
+  // resuming a torn conversation with nothing having said a word.
+  const { copyLineage } = await import("../src/adopt.ts");
+  const { home } = tempHome();
+  const sessions = path.join(home, ".codex", "sessions");
+  const store = path.join(home, "store", "codex", "sessions");
+  const c = chain(sessions);
+  const midDir = path.join(store, "2026", "09", "16");
+  mkdirSync(midDir, { recursive: true, mode: 0o700 });
+  const midDest = path.join(midDir, rolloutName("2026-09-16", MID));
+  writeFileSync(midDest, readFileSync(c.mid, "utf8").slice(0, 40), { mode: 0o600 }); // truncated
+
+  const out = copyLineage(sessions, store, c.leaf);
+
+  assert.deepEqual(out.mismatched.map((m) => m.dest), [midDest]);
+  assert.deepEqual(out.mismatched.map((m) => m.from), [c.mid]);
+  assert.deepEqual(out.kept, []);
+  assert.deepEqual(out.copied, [], "one disagreeing file stops the whole rescue");
+  assert.equal(readFileSync(midDest, "utf8").length, 40, "and the store's file is untouched");
+  assert.ok(!existsSync(path.join(store, "2026", "09", "17")), "the leaf was not written either");
+});
+
+test("copyLineage copies nothing when a lineage source is nowhere — codex refuses that resume outright", async () => {
   const { copyLineage } = await import("../src/adopt.ts");
   const { home } = tempHome();
   const sessions = path.join(home, ".codex", "sessions");
@@ -137,8 +163,24 @@ test("copyLineage reports a lineage whose source rollout is nowhere, rather than
 
   const out = copyLineage(sessions, store, leaf);
 
-  assert.equal(out.copied.length, 1);
   assert.deepEqual(out.missing, [MID]);
+  assert.deepEqual(out.copied, [], "half a chain in the store enables nothing");
+  assert.ok(!existsSync(path.join(store, "2026")));
+});
+
+test("a lineage that points back at itself terminates instead of walking for ever", async () => {
+  // Codex's own resolve_rollout_lineage calls this "cycle detected" and
+  // errors; here it simply stops, because the walk is what has to terminate.
+  const { resolveLineage } = await import("../src/adopt.ts");
+  const { home } = tempHome();
+  const sessions = path.join(home, ".codex", "sessions");
+  const a = writeRollout(sessions, "2026-09-17", LEAF, MID);
+  const b = writeRollout(sessions, "2026-09-16", MID, LEAF); // back at A
+
+  const out = resolveLineage(sessions, a);
+
+  assert.deepEqual(out.files, [a, b], "each file once, and then it is done");
+  assert.deepEqual(out.missing, []);
 });
 
 test("parseAdoptArgs: an id, our flags, and everything after -- belongs to codex", async () => {
@@ -377,4 +419,111 @@ test("ms adopt takes a path, and still finds that rollout's sources under its ow
   assert.ok(existsSync(path.join(store, "2026", "09", "15", rolloutName("2026-09-15", ROOT))), "the chain's root came too");
   const { launch } = await readLaunch(w, launchIdFrom(w.log));
   assert.deepEqual(launch!.command, ["codex", "resume", LEAF], "the id comes from the file's own name");
+});
+
+// --- What the verb refuses (review round 1) --------------------------------
+
+test("ms adopt refuses a symlink named like a rollout, rather than copying whatever it points at", async () => {
+  // The reviewer's own scenario: `ms adopt ~/backup/rollout-….jsonl`, where
+  // that name is a link. `statSync` follows it and cannot tell the two apart,
+  // so an arbitrary file's bytes land in MS_HOME under a conversation's name.
+  const w = await adoptWorld();
+  const c = chain(w.sessions);
+  const secret = path.join(w.home, "secret.txt");
+  writeFileSync(secret, "not a rollout at all\n", { mode: 0o600 });
+  const link = path.join(path.dirname(c.leaf), rolloutName("2026-09-14", ROOT));
+  symlinkSync(secret, link);
+
+  const r = run(["adopt", link], w.env());
+
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /is a symlink/);
+  assert.ok(!existsSync(path.join(w.msHome, "codex", "sessions", "2026")), "nothing was copied");
+});
+
+test("ms adopt refuses a file that is not a rollout in a sessions tree", async () => {
+  const w = await adoptWorld();
+  chain(w.sessions);
+
+  const notes = path.join(w.home, "notes.txt");
+  writeFileSync(notes, "hello\n", { mode: 0o600 });
+  const a = run(["adopt", notes], w.env());
+  assert.equal(a.code, 1);
+  assert.match(a.stderr, /is not a rollout filename/);
+
+  // A correctly named rollout that is simply not where codex keeps them: its
+  // own history sources would be nowhere to look for.
+  const loose = path.join(w.home, rolloutName("2026-09-17", LEAF));
+  writeFileSync(loose, "{}\n", { mode: 0o600 });
+  const b = run(["adopt", loose], w.env());
+  assert.equal(b.code, 1);
+  assert.match(b.stderr, /is not inside a sessions\/YYYY\/MM\/DD tree/);
+
+  assert.ok(!existsSync(path.join(w.msHome, "codex", "sessions", "2026")), "nothing was copied");
+});
+
+test("ms adopt refuses — and launches nothing — when the history needs a rollout that is gone", async () => {
+  const w = await adoptWorld();
+  const c = chain(w.sessions);
+  rmSync(c.mid); // the compacted conversation's prefix, deleted
+
+  const r = run(["adopt", LEAF, "--", "--yolo"], w.env());
+
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, new RegExp(`history needs 1 rollout\\(s\\)`));
+  assert.match(r.stderr, new RegExp(MID));
+  assert.match(r.stderr, /nothing was copied and nothing was launched/);
+  assert.ok(!existsSync(path.join(w.msHome, "codex", "sessions", "2026")), "nothing was copied");
+  assert.ok(!existsSync(w.log) || !readFileSync(w.log, "utf8").includes("respawn-pane"), "the pane was not burned");
+});
+
+test("ms adopt refuses — and launches nothing — when the store holds a different file for this conversation", async () => {
+  const w = await adoptWorld();
+  const c = chain(w.sessions);
+  const dir = path.join(w.msHome, "codex", "sessions", "2026", "09", "16");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stale = path.join(dir, rolloutName("2026-09-16", MID));
+  writeFileSync(stale, readFileSync(c.mid, "utf8").slice(0, 40), { mode: 0o600 });
+
+  const r = run(["adopt", LEAF], w.env());
+
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /the store already holds a different file/);
+  assert.match(r.stderr, /differs from/);
+  assert.equal(readFileSync(stale, "utf8").length, 40, "the store's file was not overwritten");
+  assert.ok(!existsSync(w.log) || !readFileSync(w.log, "utf8").includes("respawn-pane"), "the pane was not burned");
+});
+
+test("a launch that was itself a resume survives a rotation: the rebuilt command line carries one resume", async () => {
+  // `ms codex --continue -- --yolo resume <id>` is the shape this tool's own
+  // refusal hint teaches. `flagsForResume`'s ambiguity rule used to keep
+  // `resume` as `--yolo`'s value, so the next rotation ran
+  // `codex resume <id> <CONT> --yolo resume` — a second, different
+  // conversation appended to the same command line.
+  const w = await adoptWorld();
+  const r = run(["codex", "--continue", "--", "--yolo", "resume", LEAF], w.env());
+  assert.equal(r.code, 0, r.stderr);
+
+  const { sessions } = await readLaunch(w, launchIdFrom(w.log));
+  const stored = sessions[0]!.flags;
+  assert.deepEqual(stored, ["--yolo", "resume", LEAF], "the row records what the human typed, verbatim");
+
+  const { flagsForResume, CONTINUATION } = await import("../src/recover.ts");
+  const { codexResumeCommand } = await import("../src/providers/codex-cli.ts");
+  const rebuilt = codexResumeCommand(LEAF, CONTINUATION, flagsForResume(stored));
+  assert.equal(rebuilt.filter((a) => a === "resume").length, 1, `two resumes: ${JSON.stringify(rebuilt)}`);
+  assert.deepEqual(rebuilt, ["codex", "resume", LEAF, CONTINUATION, "--yolo"]);
+});
+
+test("flagsForResume drops a stored resume for either CLI, and keeps every other flag and its value", async () => {
+  const { flagsForResume } = await import("../src/recover.ts");
+  assert.deepEqual(flagsForResume(["--yolo", "resume", LEAF]), ["--yolo"]);
+  assert.deepEqual(flagsForResume(["resume", LEAF]), []);
+  assert.deepEqual(flagsForResume(["--resume", LEAF, "--model", "gpt-5"]), ["--model", "gpt-5"]);
+  assert.deepEqual(flagsForResume([`--resume=${LEAF}`, "--verbose"]), ["--verbose"]);
+  assert.deepEqual(flagsForResume(["-r", LEAF]), []);
+  // A resume with no id after it takes nothing else with it.
+  assert.deepEqual(flagsForResume(["--resume", "--yolo"]), ["--yolo"]);
+  // And nothing else changed: a value-taking flag still keeps its value.
+  assert.deepEqual(flagsForResume(["--model", "gpt-5", "do the thing"]), ["--model", "gpt-5"]);
 });

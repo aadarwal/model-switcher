@@ -33,7 +33,8 @@
 // of the same conversation is a no-op rather than a file swap under a running
 // CLI.
 
-import { chmodSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
@@ -195,57 +196,137 @@ export function lineageIds(file: string): string[] {
 export type AdoptCopy = {
   /** Files written into the store by this run. */
   copied: string[];
-  /** Files already in the store, left exactly as they were. */
+  /** Files already in the store, byte for byte, and left exactly as they were. */
   kept: string[];
-  /** Lineage ids named by a rollout we copied, with no file to copy for them.
-   *  Codex will refuse the resume for these; saying so beats the resume's own
-   *  message, which names an id and no reason. */
+  /** A destination that exists and is NOT the source. Never silently kept: the
+   *  store's copy is what Codex will read, so a rollout that disagrees with the
+   *  conversation it claims to be is the one thing a rescue must not resume
+   *  over. Named, and refused by the verb. */
+  mismatched: { dest: string; from: string }[];
+  /** Lineage ids this chain names with no file to copy for them. Codex refuses
+   *  such a resume outright, so nothing is copied and nothing is launched. */
   missing: string[];
 };
+
+/** Content identity, for a destination that already exists. Size first because
+ *  it settles almost every case without reading a byte; the digest is what
+ *  makes "already there" a fact rather than a filename coincidence — and it is
+ *  what catches the file a killed `ms adopt` left half-written. */
+function sameFile(a: string, b: string): boolean {
+  try {
+    if (statSync(a).size !== statSync(b).size) return false;
+    const digest = (f: string) => createHash("sha256").update(readFileSync(f)).digest("hex");
+    return digest(a) === digest(b);
+  } catch {
+    return false; // unreadable is not "the same"
+  }
+}
+
+/**
+ * The whole chain of rollout FILES one rollout needs, leaf first.
+ *
+ * Resolving before copying is the point: a lineage Codex cannot complete is a
+ * resume it refuses, so the verb has to know that BEFORE it writes anything
+ * into the store or touches a pane. `seen` bounds the walk — a cycle is
+ * malformed (Codex's own `resolve_rollout_lineage` errors "cycle detected")
+ * and here it simply terminates.
+ */
+export function resolveLineage(sourceRoot: string, leaf: string): { files: string[]; missing: string[] } {
+  const files: string[] = [];
+  const missing: string[] = [];
+  const seen = new Set<string>();
+  const queue: string[] = [path.resolve(leaf)];
+  while (queue.length) {
+    const file = queue.shift()!;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    files.push(file);
+    for (const id of lineageIds(file)) {
+      const found = findRollout(sourceRoot, id);
+      if (found) queue.push(path.resolve(found));
+      else if (!missing.includes(id)) missing.push(id);
+    }
+  }
+  return { files, missing };
+}
+
+/**
+ * Put resolved rollouts into the store, in Codex's own `YYYY/MM/DD` layout.
+ *
+ * Two rules, and they are the ones a rescue is judged on:
+ *
+ *   * **Never overwrite.** A destination that already exists is compared, not
+ *     replaced — identical is `kept`, anything else is `mismatched` and the
+ *     run refuses. The store's copy may be a file a live CLI is appending to.
+ *   * **Never leave a partial file.** The bytes land on a temp name in the
+ *     DESTINATION directory (same filesystem, so the rename is atomic) and are
+ *     renamed into place only once the whole copy has succeeded. A run killed
+ *     mid-copy leaves a `.tmp` nobody reads, never a truncated rollout under a
+ *     real conversation's name — which the first version of this did, and
+ *     which the next run then reported as "already there".
+ *
+ *     That second rule is deliberately untested, because on this platform it
+ *     is untestable: every way `copyFileSync` can FAIL (a missing source, a
+ *     directory, an unreadable file) errors before the destination is created
+ *     at all, a FIFO source returns immediately rather than blocking, and APFS
+ *     clones rather than streams — so no test here can hold a copy open long
+ *     enough to kill it. The hazard is real anyway (a large rollout, a slower
+ *     volume, a SIGKILL), and costs one rename to remove. The rule that IS
+ *     tested is the one above it.
+ */
+export function copyResolved(store: string, files: string[]): AdoptCopy {
+  const out: AdoptCopy = { copied: [], kept: [], mismatched: [], missing: [] };
+  // Classify every destination BEFORE writing any of them, so one rollout the
+  // store disagrees with stops the whole rescue rather than being reported
+  // beside files this run had already added.
+  const todo: { file: string; dest: string; dir: string }[] = [];
+  for (const file of files) {
+    const name = path.basename(file);
+    const parts = datePartsFromName(name);
+    const dir = parts ? path.join(store, ...parts) : store;
+    const dest = path.join(dir, name);
+    if (existsSync(dest)) {
+      if (sameFile(file, dest)) out.kept.push(dest);
+      else out.mismatched.push({ dest, from: file });
+      continue;
+    }
+    todo.push({ file, dest, dir });
+  }
+  if (out.mismatched.length) return out;
+  for (const { file, dest, dir } of todo) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const tmp = `${dest}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+    try {
+      // The store is ours and is 0700/0600 throughout, whatever mode the
+      // source wears.
+      copyFileSync(file, tmp, constants.COPYFILE_EXCL);
+      chmodSync(tmp, 0o600);
+      // `existsSync` above is the never-overwrite rule; this rename is the
+      // never-partial one. The only way the two disagree is a second `ms
+      // adopt` of the same conversation running at this instant — which is
+      // writing identical bytes from the same source file.
+      renameSync(tmp, dest);
+    } catch (e) {
+      rmSync(tmp, { force: true });
+      throw e;
+    }
+    out.copied.push(dest);
+  }
+  return out;
+}
 
 /**
  * Copy one rollout and everything its history points at into the shared store.
  *
- * `COPYFILE_EXCL` is the "never overwrite" rule, spelled as the one thing the
- * filesystem itself can promise: a destination that exists is left untouched
- * and reported as kept, with no read of it and no window in which a running
- * CLI's own file is half-replaced.
+ * A lineage with a missing source copies NOTHING: Codex refuses that resume
+ * (`invalid paginated history lineage for <id>: missing source rollout`), so
+ * putting half a chain in the store would be writing files to enable a launch
+ * that cannot work.
  */
 export function copyLineage(sourceRoot: string, store: string, leaf: string): AdoptCopy {
-  const out: AdoptCopy = { copied: [], kept: [], missing: [] };
-  const seen = new Set<string>();
-  const queue: string[] = [leaf];
-  while (queue.length) {
-    const file = queue.shift()!;
-    const real = path.resolve(file);
-    if (seen.has(real)) continue; // a cycle, which Codex itself refuses too
-    seen.add(real);
-
-    const name = path.basename(file);
-    const parts = datePartsFromName(name);
-    const dir = parts ? path.join(store, ...parts) : store;
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const dest = path.join(dir, name);
-    if (existsSync(dest)) out.kept.push(dest);
-    else {
-      copyFileSync(file, dest, constants.COPYFILE_EXCL);
-      // The source's own mode is not what this file should wear: the store is
-      // ours and is 0700/0600 throughout.
-      try {
-        chmodSync(dest, 0o600);
-      } catch {
-        /* a mode we could not set is not a copy that failed */
-      }
-      out.copied.push(dest);
-    }
-
-    for (const id of lineageIds(file)) {
-      const found = findRollout(sourceRoot, id);
-      if (found) queue.push(found);
-      else if (!out.missing.includes(id)) out.missing.push(id);
-    }
-  }
-  return out;
+  const { files, missing } = resolveLineage(sourceRoot, leaf);
+  if (missing.length) return { copied: [], kept: [], mismatched: [], missing };
+  return copyResolved(store, files);
 }
 
 // --- The verb -----------------------------------------------------------
@@ -328,8 +409,34 @@ export const adoptVerb: Verb = async (argv) => {
   const direct = parsed.id.includes(path.sep) || parsed.id.endsWith(".jsonl");
   let leaf: string | null;
   if (direct) {
-    leaf = existsSync(parsed.id) && statSync(parsed.id).isFile() ? path.resolve(parsed.id) : null;
-    if (!leaf) { say(`no rollout file at ${parsed.id}`); return EXIT_REFUSED; }
+    // `lstatSync`, never `statSync`: a path is the one input a human hands
+    // this verb that we do not derive ourselves, and a SYMLINK named
+    // `rollout-<date>-<id>.jsonl` would copy whatever it points at into the
+    // store under a conversation's name. `statSync` follows the link and
+    // cannot tell the two apart. A regular file, or nothing.
+    const st = existsSync(parsed.id) ? lstatSync(parsed.id) : null;
+    if (!st) { say(`no rollout file at ${parsed.id}`); return EXIT_REFUSED; }
+    if (st.isSymbolicLink()) {
+      say(`${parsed.id} is a symlink`, ["pass the real rollout file; ms adopt copies bytes into MS_HOME and will not follow a link there"]);
+      return EXIT_REFUSED;
+    }
+    if (!st.isFile()) { say(`${parsed.id} is not a file`); return EXIT_REFUSED; }
+    leaf = path.resolve(parsed.id);
+    // A rollout is a file IN a sessions tree, and that is not a formality: the
+    // name carries the id Codex resumes by and the date its layout is keyed
+    // on, and the tree is where this file's own lineage lives. Anything else
+    // — `./notes.txt`, a loose download — would land at the store root under
+    // whatever name it had and be handed to `codex resume` as an id.
+    if (!rolloutIdsFromName(path.basename(leaf)) || !datePartsFromName(path.basename(leaf))) {
+      say(`${parsed.id} is not a rollout filename`, ["a rollout is rollout-<YYYY-MM-DD>T<hh-mm-ss>-<id>.jsonl"]);
+      return EXIT_REFUSED;
+    }
+    if (!lineageRootFor(leaf)) {
+      say(`${parsed.id} is not inside a sessions/YYYY/MM/DD tree`, [
+        "ms adopt reads a rollout where codex keeps it, because that is where its own history sources are",
+      ]);
+      return EXIT_REFUSED;
+    }
   } else {
     leaf = findRollout(sourceRoot, parsed.id);
     if (!leaf) {
@@ -349,21 +456,43 @@ export const adoptVerb: Verb = async (argv) => {
 
   ensureStore();
   const store = p.codexSessions();
+  const lineageRoot = direct ? (lineageRootFor(leaf) ?? sourceRoot) : sourceRoot;
   let copy: AdoptCopy;
   try {
-    copy = copyLineage(direct ? (lineageRootFor(leaf) ?? sourceRoot) : sourceRoot, store, leaf);
+    copy = copyLineage(lineageRoot, store, leaf);
   } catch (e) {
     say(`could not copy the rollout into the store: ${(e as Error).message}`);
     return EXIT_REFUSED;
   }
+
+  // A lineage Codex cannot complete is a resume Codex will refuse, by name and
+  // by id. Launching anyway spends an account pick, kills the pane the human
+  // is standing in, and leaves a row that sits `launching` until
+  // reconciliation parks it — all to arrive at an error we could already read.
+  // Nothing was copied, so the store is untouched and a re-run once the file
+  // is back does the whole thing.
+  if (copy.missing.length) {
+    say(`${resumeId}'s history needs ${copy.missing.length} rollout(s) that are not under ${lineageRoot}`, [
+      ...copy.missing,
+      "codex refuses a resume whose paginated history it cannot complete, so nothing was copied and nothing was launched",
+    ]);
+    return EXIT_REFUSED;
+  }
+
+  // A file already in the store that is NOT this conversation's is the one
+  // thing a rescue must never resume over: it is what a killed copy leaves
+  // behind, and Codex would read it as the history. Name it and stop; the
+  // human decides whether to remove it.
+  if (copy.mismatched.length) {
+    say(`the store already holds a different file for ${copy.mismatched.length} rollout(s) of this conversation`, [
+      ...copy.mismatched.map((m) => `${m.dest} differs from ${m.from}`),
+      "nothing was overwritten and nothing was launched; remove the store's copy if it is the stale one",
+    ]);
+    return EXIT_REFUSED;
+  }
+
   const counted = `${copy.copied.length} copied, ${copy.kept.length} already there`;
   process.stderr.write(`ms adopt: ${resumeId} → ${store} (${counted})\n`);
-  if (copy.missing.length) {
-    say(`the history points at ${copy.missing.length} rollout(s) with no file under ${sourceRoot}`, [
-      ...copy.missing,
-      "codex will refuse the resume for a lineage it cannot complete",
-    ]);
-  }
 
   // From here it is an ordinary `ms codex`, and deliberately nothing else: the
   // account is chosen the same way, the home is prepared the same way, the row

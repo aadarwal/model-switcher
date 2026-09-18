@@ -330,9 +330,11 @@ async function onRow<T>(session: string, gen: number, fn: (st: State, s: Session
  * byte offset into the old one is meaningless and is reset with it — carrying
  * it over would make the watch skip the first N bytes of a fresh rollout.
  *
- * The state half is unchanged: a `startup` report for this generation is the
- * launch answering (`launching → running`), and a `resume`/`startup` report
- * for a row still in `resuming` is the replacement CLI saying it is up, which
+ * The state half: a `startup` OR `resume` report for this generation is the
+ * launch answering (`launching → running`) — a launch can itself be a resume,
+ * which is what `ms adopt` and `ms codex -- resume <id>` are — and a
+ * `resume`/`startup` report for a row still in `resuming` is the replacement
+ * CLI the recovery worker respawned saying it is up, which
  * adopts it (`continuing` for a resume that carries a continuation, `running`
  * for one that does not) and drops the wake-up. Only from `resuming`: every
  * other state belongs to somebody else.

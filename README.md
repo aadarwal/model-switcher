@@ -44,7 +44,7 @@ ms attach
 
 - `ms claude` / `ms codex` — pick an account with room and start that CLI in the current tmux pane under the account's credential. Everything after `--` goes to the CLI unchanged.
 - `--as <account>` — use the named account instead of choosing one. `--need fable` — also require room in the Fable window; `ms codex` rejects it, because Codex reports no such window.
-- `--continue` — for a resume you drove yourself (`ms codex --continue -- resume <id>`, `ms claude --continue -- --resume <id>`): hand the resumed conversation the same continuation a rotation sends, as the command line's own prompt. Refused when there is nothing to continue.
+- `--continue` — for a resume you drove yourself (`ms codex --continue -- resume <id>`): hand the resumed conversation the same continuation a rotation sends, as the command line's own prompt. Refused when there is nothing to continue. It parses for `ms claude` too, but a Claude launch is always given its own `--session-id`, so `ms claude -- --resume <id>` is **not verified** — use `ms rotate`/`ms switch --continue` for a Claude session ms already manages.
 - `ms adopt` — take over a **Codex** conversation `ms` did not start, so it can be rotated like any other. See [rescuing a pane you didn't start with ms](#rescuing-a-pane-you-didnt-start-with-ms).
 - `ms attach` — re-attach to the tool's own tmux server (`MS_HOME/tmux.sock`, session `ms`), where a launch from outside tmux puts the pane.
 

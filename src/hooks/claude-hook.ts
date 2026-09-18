@@ -140,7 +140,16 @@ async function noteSessionStart(session: string, gen: number, kind: EventKind, c
     }
     // A launch is `running` only once the CLI reports itself under this
     // generation (spec §7 step 5); until then it is `launching`.
-    if (kind === "started" && s.state === "launching") patch.state = "running";
+    //
+    // EITHER word is the launch reporting itself, because a launch can be a
+    // resume: `ms claude -- --resume <id>` and `ms adopt` (0.2.5) start a CLI
+    // that comes up on an existing conversation and says `resume`. Matching
+    // only `started` left every such row in `launching` with a healthy CLI in
+    // front of the human, until reconciliation's five-minute stuck rule parked
+    // it — which is how a rescue looked like a failure. `resuming` is a
+    // different question (the recovery worker's), answered by its own clause
+    // below; this one fires only from `launching`.
+    if ((kind === "started" || kind === "resumed") && s.state === "launching") patch.state = "running";
     // A handoff's replacement, reporting in. Adopt it now rather than leaving
     // the row to reconciliation's stuck-state threshold.
     //

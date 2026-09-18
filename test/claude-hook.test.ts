@@ -128,15 +128,18 @@ test("a launch is running once the CLI reports itself, and a continuation once t
     stB.close();
   }
 
-  // And neither transition invents one from a state that is not its own: a
-  // `resume` report is the worker's to act on (readiness), and a turn in a
-  // session being stopped does not un-stop it.
+  // A LAUNCH that resumes reports `resume`, and it is still the launch
+  // answering for itself (0.2.5): `ms claude -- --resume <id>` and `ms adopt`
+  // both start a CLI that reports SessionStart with source `resume`, and a row
+  // that only accepted `startup` sat in `launching` until reconciliation's
+  // five-minute rule parked it. Only `launching` is touched — `resuming`
+  // belongs to the recovery worker, and its own clause is below.
   const c = setup();
   const openC = await seedSession(c.env, { state: "launching" });
   assert.equal(run(["_hook", "claude"], c.env, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "c-42" })).code, 0);
   const stC = openC();
   try {
-    assert.equal(stC.getSession("s1")!.state, "launching", "a resume report is the worker's to act on");
+    assert.equal(stC.getSession("s1")!.state, "running", "a launch that resumed answered for itself");
   } finally {
     stC.close();
   }

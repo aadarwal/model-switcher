@@ -488,10 +488,15 @@ function stuck(st: State, servers: Servers, s: SessionRow, presence: Presence): 
     }
     return [park(st, s, `${s.state} for over ${minutes} minutes with no resumed event`)];
   }
-  if (events.some((e) => e.kind === "started")) return [];
+  // `resumed` counts as well as `started`, for the same reason the `resuming`
+  // branch above accepts both (0.2.5): a launch can be a resume — `ms adopt`,
+  // or `ms codex -- resume <id>` — and that CLI reports SessionStart with
+  // source `resume`. Parking a session that told us it was up, in the other
+  // word, is a repair that is itself the damage.
+  if (events.some((e) => e.kind === "started" || e.kind === "resumed")) return [];
   const adopted = adoptIdleCodex(st, servers, s, presence);
   if (adopted) return adopted;
-  return [park(st, s, `launching for over ${minutes} minutes with no started event`)];
+  return [park(st, s, `launching for over ${minutes} minutes with no started or resumed event`)];
 }
 
 /** (d) A wake-up scheduled by a recovery that ran out of accounts. tmux holds

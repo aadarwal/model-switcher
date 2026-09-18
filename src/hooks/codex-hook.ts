@@ -354,7 +354,12 @@ async function noteSessionStart(session: string, gen: number, kind: EventKind, c
       // bytes this file does not have.
       patch.rolloutOffset = 0;
     }
-    if (kind === "started" && s.state === "launching") patch.state = "running";
+    // Either word is the launch itself answering (0.2.5): `ms adopt` and a
+    // hand-written `ms codex -- resume <id>` bring the pane up ON an existing
+    // conversation, so the TUI's first SessionStart carries `resume`. A row
+    // that only promoted on `startup` sat in `launching` while the rescued
+    // conversation was up and answering, until reconciliation parked it.
+    if ((kind === "started" || kind === "resumed") && s.state === "launching") patch.state = "running";
     // A `started` adopts only when it carries the row's own id — but a Codex
     // row that has never been told an id carries null, and a first report
     // against null is the launch itself, not a resume that landed elsewhere.

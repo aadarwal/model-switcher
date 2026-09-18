@@ -527,14 +527,20 @@ test("(f) launching for over five minutes with no started event is parked", () =
   withState((st) => {
     st.createSession({ id: "s-never", ...base, state: "launching" });
     st.createSession({ id: "s-started", ...base, state: "launching" });
+    // 0.2.5: a launch can BE a resume (`ms adopt`, `ms codex -- resume <id>`),
+    // and that CLI reports SessionStart with source `resume`. It came back;
+    // parking it for saying so in the other word is the damage, not the repair.
+    st.createSession({ id: "s-resumed", ...base, state: "launching" });
   });
   appendEvent({ t: nowSec() - 400, kind: "started", session: "s-started", generation: 1, cliSessionId: "c1" });
+  appendEvent({ t: nowSec() - 400, kind: "resumed", session: "s-resumed", generation: 1, cliSessionId: "c2" });
   planted(w.msHome, "UPDATE sessions SET updatedAt=?", nowSec() - 400);
 
   const repaired = reconcile();
 
   assert.equal(stateOf("s-never"), "parked");
   assert.equal(stateOf("s-started"), "launching", "it did start; the hook will move it on");
+  assert.equal(stateOf("s-resumed"), "launching", "it did resume; the hook will move it on");
   assert.ok(repaired.some((l) => l.includes("s-never")), repaired.join("\n"));
 });
 

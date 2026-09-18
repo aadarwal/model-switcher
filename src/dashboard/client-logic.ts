@@ -116,9 +116,12 @@ export type RowMessage = { text: string; error: boolean } | null;
  * and were reading as ordinary ink), and a WALLED? of `unreported`. Colour is
  * worry only; everything else stays ink, because a table where most cells are
  * coloured says nothing with colour at all.
+ *
+ * `no room` (0.2.5) joins them: an account the chooser is about to pass over
+ * is the one thing a pool panel exists to show, and it used to read `ok`.
  */
 export function isWorry(v: unknown): boolean {
-  var worry: { [k: string]: number } = { walled: 1, parked: 1, auth: 1, unreported: 1, "no-token": 1, "no-grant": 1 };
+  var worry: { [k: string]: number } = { walled: 1, parked: 1, auth: 1, unreported: 1, "no-token": 1, "no-grant": 1, "no room": 1 };
   return !!worry[String(v)];
 }
 

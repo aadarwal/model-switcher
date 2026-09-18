@@ -330,9 +330,11 @@ async function onRow<T>(session: string, gen: number, fn: (st: State, s: Session
  * byte offset into the old one is meaningless and is reset with it — carrying
  * it over would make the watch skip the first N bytes of a fresh rollout.
  *
- * The state half is unchanged: a `startup` report for this generation is the
- * launch answering (`launching → running`), and a `resume`/`startup` report
- * for a row still in `resuming` is the replacement CLI saying it is up, which
+ * The state half: a `startup` OR `resume` report for this generation is the
+ * launch answering (`launching → running`) — a launch can itself be a resume,
+ * which is what `ms adopt` and `ms codex -- resume <id>` are — and a
+ * `resume`/`startup` report for a row still in `resuming` is the replacement
+ * CLI the recovery worker respawned saying it is up, which
  * adopts it (`continuing` for a resume that carries a continuation, `running`
  * for one that does not) and drops the wake-up. Only from `resuming`: every
  * other state belongs to somebody else.
@@ -354,7 +356,12 @@ async function noteSessionStart(session: string, gen: number, kind: EventKind, c
       // bytes this file does not have.
       patch.rolloutOffset = 0;
     }
-    if (kind === "started" && s.state === "launching") patch.state = "running";
+    // Either word is the launch itself answering (0.2.5): `ms adopt` and a
+    // hand-written `ms codex -- resume <id>` bring the pane up ON an existing
+    // conversation, so the TUI's first SessionStart carries `resume`. A row
+    // that only promoted on `startup` sat in `launching` while the rescued
+    // conversation was up and answering, until reconciliation parked it.
+    if ((kind === "started" || kind === "resumed") && s.state === "launching") patch.state = "running";
     // A `started` adopts only when it carries the row's own id — but a Codex
     // row that has never been told an id carries null, and a first report
     // against null is the launch itself, not a resume that landed elsewhere.

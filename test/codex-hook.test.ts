@@ -335,3 +335,32 @@ test("an exported MS_CODEX_AUTOROTATE is written into the store, which is what t
   assert.equal(run(["_hook", "codex"], { ...anon, MS_SESSION: "" }, JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-1" })).code, 0);
   assert.equal(existsSync(path.join(bare.msHome, "state.sqlite")), false, "no store is even opened");
 });
+
+test("a codex launch that RESUMED is running once its hook reports (0.2.5)", async () => {
+  // The rescue `ms adopt` automates: the pane is launched on `codex resume
+  // <id>`, so the TUI's first SessionStart carries source `resume`, not
+  // `startup`. A row that only promoted on `startup` read `launching` until
+  // reconciliation's stuck rule got to it — while the conversation was up and
+  // answering.
+  const a = setup();
+  const openA = await seedSession(a.env, { state: "launching", cliSessionId: "cx-7" });
+  assert.equal(run(["_hook", "codex"], a.env, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "cx-7" })).code, 0);
+  const stA = openA();
+  try {
+    assert.equal(stA.getSession("s1")!.state, "running");
+  } finally {
+    stA.close();
+  }
+
+  // `resuming` is still the recovery worker's state and still becomes
+  // `continuing` on a resume report — this must not have swallowed that.
+  const b = setup();
+  const openB = await seedSession(b.env, { state: "resuming", cliSessionId: "cx-7" });
+  assert.equal(run(["_hook", "codex"], b.env, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", session_id: "cx-7" })).code, 0);
+  const stB = openB();
+  try {
+    assert.equal(stB.getSession("s1")!.state, "continuing");
+  } finally {
+    stB.close();
+  }
+});

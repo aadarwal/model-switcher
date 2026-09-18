@@ -747,3 +747,40 @@ test("ms status: an unreadable registry prints its parse error as the first line
   // nothing this run can vouch is still registered).
   assert.ok(r.stdout.includes("NAME"), r.stdout);
 });
+
+// --- STATE: no room (0.2.5) ------------------------------------------------
+
+test("accountState: a codex account whose only weekly window reads 100 is 'no room', not 'ok' — the same gate pick.ts applies", async () => {
+  const { accountState } = await import("../src/status.ts");
+  const row = (weekly: number) => ({
+    name: "home", provider: "codex" as const, shared: false,
+    usage: { session: null, weeklyAll: { usedPercent: weekly, resetsAt: "2026-09-20T00:00:00Z" }, weeklyFable: null },
+    error: null, errorKind: null, observedAt: Date.now(), stale: false,
+  });
+  assert.equal(accountState(row(100), true), "no room");
+  assert.equal(accountState(row(99), true), "ok");
+});
+
+test("accountState: a claude 5h window at 100 is 'no room' too, and a full FABLE window is not — the chooser only gates on fable for --need fable", async () => {
+  const { accountState } = await import("../src/status.ts");
+  const base = {
+    name: "gmail", provider: "claude" as const, shared: false,
+    error: null, errorKind: null, observedAt: Date.now(), stale: false,
+  };
+  const w = (p: number) => ({ usedPercent: p, resetsAt: "2026-09-20T00:00:00Z" });
+  assert.equal(accountState({ ...base, usage: { session: w(100), weeklyAll: w(10), weeklyFable: null } }, true), "no room");
+  assert.equal(accountState({ ...base, usage: { session: w(10), weeklyAll: w(100), weeklyFable: null } }, true), "no room");
+  // Fable at 100 with room in the windows every run gates on: still runnable.
+  assert.equal(accountState({ ...base, usage: { session: w(10), weeklyAll: w(10), weeklyFable: w(100) } }, true), "ok");
+});
+
+test("accountState: 'no room' replaces ok and nothing else — a missing launch token, a dead grant and a stale reading all still win", async () => {
+  const { accountState } = await import("../src/status.ts");
+  const w = (p: number) => ({ usedPercent: p, resetsAt: null });
+  const full = { session: w(100), weeklyAll: w(100), weeklyFable: null };
+  const base = { name: "gmail", provider: "claude" as const, shared: false, usage: full, observedAt: Date.now() };
+  assert.equal(accountState({ ...base, error: null, errorKind: null, stale: false }, false), "no-token");
+  assert.equal(accountState({ ...base, error: "refresh rejected", errorKind: "auth", stale: false }, true), "auth");
+  assert.equal(accountState({ ...base, error: "timeout", errorKind: "transient", stale: false }, true), "transient");
+  assert.equal(accountState({ ...base, error: null, errorKind: null, stale: true }, true), "stale");
+});

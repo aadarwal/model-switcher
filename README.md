@@ -36,13 +36,16 @@ ms codex
 ### Launch
 
 ```
-ms claude [--as <account>] [--need any|fable] [-- <claude args>]
-ms codex  [--as <account>] [--need any|fable] [-- <codex args>]
+ms claude [--as <account>] [--need any|fable] [--continue] [-- <claude args>]
+ms codex  [--as <account>] [--need any|fable] [--continue] [-- <codex args>]
+ms adopt  <rollout-id|path> [--as <account>] [--continue] [-- <codex args>]
 ms attach
 ```
 
 - `ms claude` / `ms codex` — pick an account with room and start that CLI in the current tmux pane under the account's credential. Everything after `--` goes to the CLI unchanged.
 - `--as <account>` — use the named account instead of choosing one. `--need fable` — also require room in the Fable window; `ms codex` rejects it, because Codex reports no such window.
+- `--continue` — for a resume you drove yourself (`ms codex --continue -- resume <id>`): hand the resumed conversation the same continuation a rotation sends, as the command line's own prompt. Refused when there is nothing to continue. It parses for `ms claude` too, but a Claude launch is always given its own `--session-id`, so `ms claude -- --resume <id>` is **not verified** — use `ms rotate`/`ms switch --continue` for a Claude session ms already manages.
+- `ms adopt` — take over a **Codex** conversation `ms` did not start, so it can be rotated like any other. See [rescuing a pane you didn't start with ms](#rescuing-a-pane-you-didnt-start-with-ms).
 - `ms attach` — re-attach to the tool's own tmux server (`MS_HOME/tmux.sock`, session `ms`), where a launch from outside tmux puts the pane.
 
 ### Running sessions
@@ -149,6 +152,25 @@ Export `MS_CODEX_AUTOROTATE=0` in the shell that runs `codex` to turn it off; `m
 `ms switch` and `ms stop` move a Codex session either way. Their moves DO count towards the
 three-changes window — what is capped is how often a conversation is torn down and brought
 back, not who asked — but the cap never refuses a person: it parks only the automatic path.
+
+### Rescuing a pane you didn't start with ms
+
+A `codex` you launched yourself — plain `codex --yolo`, in your own `~/.codex` — has no
+session row, no account of ours, and no rollout in the shared store that lets a resume
+cross accounts, so `ms rotate` has nothing to move. When such a pane hits a wall, exit the
+CLI (Ctrl-C twice) and run **`ms adopt <rollout-id>`** in that same pane. It finds the
+rollout under `$CODEX_HOME`/`~/.codex` by id (or takes a path), copies it into
+`MS_HOME/codex/sessions` keeping Codex's own `YYYY/MM/DD` layout — together with every
+rollout its history points at, because a compacted conversation's file carries only a
+`history_base` pointer at the one holding the prefix, and resuming without it fails with
+`invalid paginated history lineage for <id>: missing source rollout` — and then launches
+the pane exactly as `ms codex [--as <account>] -- <your codex args> resume <id>`. Nothing
+in your own Codex home is moved, modified, or overwritten, and a rollout already in the
+store is left as it is. Add `--continue` to hand the conversation the rotation's own
+continuation; a resume you type yourself sends none. The id is the one `codex resume`
+takes: `ls ~/.codex/sessions/*/*/*/` — each file is `rollout-<date>-<id>.jsonl`. Codex
+only in this release, and it refuses while a `codex` is still running in the pane, because
+it respawns that pane.
 
 ### The chooser
 

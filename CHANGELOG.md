@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `ms import` brings conversations running outside tmux into it: it finds every Claude
+  Code and Codex conversation on the machine (`--since 30m|2h|1d|all`, `--dir <path>`),
+  plans a tmux layout of one session per repo root and one window per worktree, stops each
+  original process, and resumes the same conversation in a pane under `ms`
+- every run writes a manifest (`MS_HOME/imports/<timestamp>.json`, 0600) that records what
+  became of each row and can be re-run (`--plan`) or printed back (`--status`);
+  `--dry-run` plans without moving anything, and without a terminal to confirm in the verb
+  refuses rather than assuming yes
+- flags are carried into an imported pane by whitelist, so a credential on the original
+  command line reaches neither the new command line nor the manifest
+
 ## 0.2.6
 
 - `npm test` scrubs `CLAUDE_CONFIG_DIR`, `MS_HOME`, `CODEX_HOME` and `MS_BIN` from its own environment, so a developer's real Claude config is never written by the suite

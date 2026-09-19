@@ -128,7 +128,7 @@ test("the longest matching worktree path wins, so a nested worktree is not swall
 
 // --- Four panes per window -------------------------------------------------
 
-test("a window holds four panes; the fifth opens `name:2` and the ninth `name:3`", async () => {
+test("a window holds four panes; the fifth opens `name-2` and the ninth `name-3`", async () => {
   const { planImport } = await import("../src/import/plan.ts");
   const root = "/Users/x/src/data";
   const nine = Array.from({ length: 9 }, (_, i) =>
@@ -138,13 +138,18 @@ test("a window holds four panes; the fifth opens `name:2` and the ninth `name:3`
   }));
 
   const windows = plan.sessions[0]!.windows;
-  assert.deepEqual(windows.map((w) => w.name), ["main", "main:2", "main:3"]);
+  assert.deepEqual(
+    windows.map((w) => w.name),
+    ["main", "main-2", "main-3"],
+    "a colon is tmux's own session:window separator; an overflow window must still be nameable in a target",
+  );
+  for (const w of windows) assert.ok(!w.name.includes(":"), `window ${JSON.stringify(w.name)} carries tmux's own separator`);
   assert.deepEqual(windows.map((w) => w.panes.length), [4, 4, 1]);
   assert.deepEqual(windows.map((w) => w.panes.map((p) => p.index)), [[0, 1, 2, 3], [0, 1, 2, 3], [0]]);
   assert.deepEqual(paneIds(plan), ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9"]);
   assert.deepEqual(windows.map((w) => w.worktree), [root, root, root]);
   for (const w of windows) for (const p of w.panes) assert.equal(p.session, "data");
-  assert.equal(windows[1]!.panes[0]!.window, "main:2");
+  assert.equal(windows[1]!.panes[0]!.window, "main-2");
 });
 
 test("four is exactly four: a fourth pane does not overflow", async () => {
@@ -225,7 +230,7 @@ test("a Claude pane resumes through `ms claude`, keeping only whitelisted flags"
     opts({ git: fakeGit({ roots: { [root]: root }, worktrees: { [root]: porcelain([[root, "main"]]) } }) }),
   );
   assert.deepEqual(plan.sessions[0]!.windows[0]!.panes[0]!.command, [
-    "ms", "claude", "--", "--model", "opus", "--dangerously-skip-permissions", "--resume", "sess-1",
+    "ms", "claude", "--continue", "--", "--model", "opus", "--dangerously-skip-permissions", "--resume", "sess-1",
   ]);
   assert.ok(KEPT_FLAGS.claude.includes("--model"));
   assert.ok(!KEPT_FLAGS.claude.includes("--api-key"));
@@ -246,7 +251,7 @@ test("a Codex pane resumes through `ms adopt`, which copies the rollout and its 
   ]);
 });
 
-test("`--as` names the account on every pane, and an idle conversation carries no flags", async () => {
+test("`--as` names the account on every pane, and an idle conversation carries no flags and no continuation", async () => {
   const { planImport } = await import("../src/import/plan.ts");
   const root = "/Users/x/src/data";
   const plan = planImport(
@@ -258,7 +263,46 @@ test("`--as` names the account on every pane, and an idle conversation carries n
   );
   const [claude, codex] = plan.sessions[0]!.windows[0]!.panes;
   assert.deepEqual(claude!.command, ["ms", "claude", "--as", "work", "--", "--resume", "c-1"]);
-  assert.deepEqual(codex!.command, ["ms", "adopt", "r-1", "--as", "work", "--continue"]);
+  assert.deepEqual(
+    codex!.command,
+    ["ms", "adopt", "r-1", "--as", "work"],
+    "neither was running: there is no unfinished turn for a continuation to name",
+  );
+});
+
+// --- The continuation ------------------------------------------------------
+
+test("only a conversation this import stops carries the continuation", async () => {
+  const { planImport } = await import("../src/import/plan.ts");
+  const root = "/Users/x/src/data";
+  const git = fakeGit({ roots: { [root]: root }, worktrees: { [root]: porcelain([[root, "main"]]) } });
+  const rows = [
+    cand({ cwd: root, id: "live-c", provider: "claude", pid: 11, argv: ["claude"], lastActivity: T0 }),
+    cand({ cwd: root, id: "idle-c", provider: "claude", lastActivity: T0 - 1000 }),
+    cand({ cwd: root, id: "live-x", provider: "codex", pid: 12, argv: ["codex"], lastActivity: T0 - 2000 }),
+    cand({ cwd: root, id: "idle-x", provider: "codex", lastActivity: T0 - 3000 }),
+  ];
+  const commands = (mode?: "live" | "all" | "none"): string[][] =>
+    planImport(rows, opts({ git, ...(mode ? { continueFor: mode } : {}) })).sessions[0]!.windows[0]!.panes.map((p) => p.command);
+
+  assert.deepEqual(commands(), [
+    ["ms", "claude", "--continue", "--", "--resume", "live-c"],
+    ["ms", "claude", "--", "--resume", "idle-c"],
+    ["ms", "adopt", "live-x", "--continue"],
+    ["ms", "adopt", "idle-x"],
+  ], "the default carries it for a stopped process and for nothing else, both providers alike");
+
+  assert.deepEqual(commands("all").map((c) => c.includes("--continue")), [true, true, true, true]);
+  assert.deepEqual(commands("none").map((c) => c.includes("--continue")), [false, false, false, false]);
+});
+
+test("a continuation sits before the `--`, where ms's own parser reads it", async () => {
+  const { paneCommand } = await import("../src/import/plan.ts");
+  const c = cand({ cwd: "/x", id: "s-1", provider: "claude", argv: ["claude", "--model", "opus"] });
+  assert.deepEqual(paneCommand(c, null, true),
+    ["ms", "claude", "--continue", "--", "--model", "opus", "--resume", "s-1"]);
+  assert.deepEqual(paneCommand(c, null, false),
+    ["ms", "claude", "--", "--model", "opus", "--resume", "s-1"]);
 });
 
 test("the whitelist keeps a flag's value with it, and drops a secret whatever shape it arrives in", async () => {

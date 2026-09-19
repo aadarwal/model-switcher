@@ -14,7 +14,7 @@
 // work rather than about tmux: one session per repo ROOT (that is the project
 // you are in), one window per WORKTREE (that is the branch you are on), four
 // panes to a window (past four a pane is too small to read a CLI in). The
-// fifth conversation in a worktree does not squeeze in; it opens `name:2`.
+// fifth conversation in a worktree does not squeeze in; it opens `name-2`.
 //
 // The one rule here with a security edge is the flag whitelist. A live CLI's
 // argv is carried into the new pane's command line so the conversation resumes
@@ -57,8 +57,16 @@ export interface Plan {
   skipped: { candidate: Candidate; reason: string }[];
 }
 
+/** Which rows resume with the rotation's continuation on their command line.
+ *  `live` — only a conversation whose process this import stops, because that
+ *  is the one with work left mid-flight; `all` — the human said `--continue`;
+ *  `none` — nobody is continued. */
+export type ContinueFor = "live" | "all" | "none";
+
 export interface PlanOptions {
   as: string | null;
+  /** Default `live`. */
+  continueFor?: ContinueFor;
   /** `git(args, cwd)` → stdout, or null when git failed or there is no repo. */
   git: (args: string[], cwd: string) => string | null;
   existingSessions: Set<string>;
@@ -67,7 +75,7 @@ export interface PlanOptions {
   msSocket: string;
 }
 
-/** How many panes a window may hold before the next one opens `name:2`. */
+/** How many panes a window may hold before the next one opens `name-2`. */
 export const PANES_PER_WINDOW = 4;
 
 /**
@@ -124,22 +132,45 @@ export function keptFlags(provider: ImportProvider, argv: string[] | null): stri
 }
 
 /**
+ * Does this row's resumed command line carry the continuation?
+ *
+ * A continuation says "continue the unfinished work from this conversation",
+ * and that is only true of a conversation whose CLI was RUNNING when this
+ * import stopped it — the turn it was mid-way through is the work to pick up.
+ * An idle transcript from three hours ago has none: handed the continuation,
+ * the resumed CLI is being told to invent some, which is the exact failure
+ * `CONTINUATION`'s own doc comment (src/recover.ts) records from a live
+ * rotation. So the default is `live`, and `--continue` (`all`) is the human
+ * saying they know better for this run.
+ */
+export function shouldContinue(candidate: Candidate, mode: ContinueFor = "live"): boolean {
+  if (mode === "all") return true;
+  if (mode === "none") return false;
+  return candidate.pid !== null;
+}
+
+/**
  * The command line a pane runs, as argv for `ms`.
  *
  * Claude resumes in place (`ms claude … --resume <id>`). Codex goes through
  * `ms adopt`, which is not a detour: a rollout started outside this tool is
  * not in the shared store every `ms` Codex home reads, and a COMPACTED one
  * needs its whole lineage copied with it or the resume dies on a missing
- * source rollout (see src/adopt.ts). `--continue` is how the resumed
- * conversation is told to pick up its unfinished work rather than sit idle.
+ * source rollout (see src/adopt.ts).
+ *
+ * `command[0]` is the literal string `ms`, never a path: the plan is written
+ * to a manifest and may be run later, and baking one install's binary path
+ * into it would outlive that install. The executor substitutes `msBinary()`
+ * at send time (src/import/execute.ts).
  */
-export function paneCommand(candidate: Candidate, as: string | null): string[] {
+export function paneCommand(candidate: Candidate, as: string | null, continueAfter: boolean): string[] {
   const flags = keptFlags(candidate.provider, candidate.argv);
   const account = as ? ["--as", as] : [];
+  const carry = continueAfter ? ["--continue"] : [];
   if (candidate.provider === "claude") {
-    return ["ms", "claude", ...account, "--", ...flags, "--resume", candidate.id];
+    return ["ms", "claude", ...account, ...carry, "--", ...flags, "--resume", candidate.id];
   }
-  return ["ms", "adopt", candidate.id, ...account, "--continue", ...(flags.length ? ["--", ...flags] : [])];
+  return ["ms", "adopt", candidate.id, ...account, ...carry, ...(flags.length ? ["--", ...flags] : [])];
 }
 
 /** Why a candidate is not moved. Checked in this order, so a row that is two
@@ -263,10 +294,15 @@ export function planImport(candidates: Candidate[], opts: PlanOptions): Plan {
     const windows: PlanWindow[] = [];
     for (const group_ of group.windows) {
       for (let start = 0, part = 1; start < group_.items.length; start += PANES_PER_WINDOW, part++) {
-        const windowName = part === 1 ? group_.name : `${group_.name}:${part}`;
+        // `-2`, never `:2`: a colon is tmux's OWN `session:window` separator,
+        // so a window called `main:2` cannot be named in a target at all —
+        // `-t data:main:2` parses as window `main` of session `data`. The
+        // executor addresses panes by `%id` for exactly this class of reason,
+        // but the NAME still has to be one tmux can hold.
+        const windowName = part === 1 ? group_.name : `${group_.name}-${part}`;
         const panes = group_.items.slice(start, start + PANES_PER_WINDOW).map((candidate, index) => ({
           candidate,
-          command: paneCommand(candidate, opts.as),
+          command: paneCommand(candidate, opts.as, shouldContinue(candidate, opts.continueFor)),
           session: name,
           window: windowName,
           index,

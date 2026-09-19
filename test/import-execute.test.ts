@@ -31,15 +31,29 @@ const T0 = Date.UTC(2026, 8, 19, 12, 0, 0);
 const ORIGINAL_PATH = process.env.PATH ?? "";
 
 /** tmux, as far as the executor drives it: every call logged, every
- *  window/split answered with a fresh pane id, `has-session` answered from a
- *  file, `#{pane_dead}` answered from another. */
+ *  window/split answered with a fresh pane id AND tmux's own `#{pane_index}`
+ *  for it, `has-session` answered from a file, `#{pane_dead}` answered from
+ *  another.
+ *
+ *  The index is per-WINDOW, reset to a base of 5 (never 0 or 1 — an
+ *  arbitrary base is the only way a test can prove the executor reads
+ *  tmux's real answer rather than deriving it from `PaneSpec.index`) on
+ *  every `new-session`/`new-window`, and incremented on every
+ *  `split-window` — which is safe only because the executor always finishes
+ *  one window's panes before starting the next (proven by the other tests
+ *  in this file), so "the current window" needs no id of its own here. */
 const TMUX_STUB = String.raw`printf '%s\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
 if [ -n "$MS_TMUX_FAIL" ]; then case "$1" in $MS_TMUX_FAIL) echo "tmux: stub refuses $1" >&2; exit 1 ;; esac; fi
 case "$1" in
-  new-session|new-window|split-window)
+  new-session|new-window)
     n=$(cat "$MS_TMUX_PANES" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$MS_TMUX_PANES"
-    printf '%%%s\n' "$n" ;;
+    printf '5' > "$MS_TMUX_WIN_INDEX"
+    printf '%%%s 5\n' "$n" ;;
+  split-window)
+    n=$(cat "$MS_TMUX_PANES" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$MS_TMUX_PANES"
+    i=$(cat "$MS_TMUX_WIN_INDEX" 2>/dev/null || echo 5); i=$((i + 1)); printf '%s' "$i" > "$MS_TMUX_WIN_INDEX"
+    printf '%%%s %s\n' "$n" "$i" ;;
   has-session)
     grep -qxF "$3" "$MS_TMUX_SESSIONS" 2>/dev/null || exit 1 ;;
   list-sessions) cat "$MS_TMUX_SESSIONS" 2>/dev/null ;;
@@ -145,6 +159,7 @@ async function world(t: TestContext, plan: Plan, over: Partial<ExecuteDeps> = {}
   stub("tmux", TMUX_STUB);
   const tmuxLog = path.join(dir, "tmux.log");
   const panes = path.join(dir, "panes");
+  const winIndex = path.join(dir, "win-index");
   const sessions = path.join(dir, "sessions");
   const dead = path.join(dir, "dead");
   writeFileSync(tmuxLog, "");
@@ -157,10 +172,11 @@ async function world(t: TestContext, plan: Plan, over: Partial<ExecuteDeps> = {}
   process.env.MS_HOME = msHome;
   process.env.MS_TMUX_LOG = tmuxLog;
   process.env.MS_TMUX_PANES = panes;
+  process.env.MS_TMUX_WIN_INDEX = winIndex;
   process.env.MS_TMUX_SESSIONS = sessions;
   process.env.MS_TMUX_DEAD = dead;
   t.after(() => {
-    for (const k of ["PATH", "HOME", "MS_HOME", "MS_TMUX_LOG", "MS_TMUX_PANES", "MS_TMUX_SESSIONS", "MS_TMUX_DEAD", "MS_TMUX_FAIL"]) {
+    for (const k of ["PATH", "HOME", "MS_HOME", "MS_TMUX_LOG", "MS_TMUX_PANES", "MS_TMUX_WIN_INDEX", "MS_TMUX_SESSIONS", "MS_TMUX_DEAD", "MS_TMUX_FAIL"]) {
       if (prev[k] === undefined) delete process.env[k];
       else process.env[k] = prev[k]!;
     }
@@ -242,17 +258,27 @@ test("a live row is stopped, a pane is made for every row, and each is sent its 
     "the window is made once, the second pane splits it, and each pane is typed into as it is made",
   );
   const lines = w.tmuxLog();
-  assert.match(lines[1]!, /new-session -d -P -F #\{pane_id\} -s data -c \/tmp -n main/);
+  assert.match(lines[1]!, /new-session -d -P -F #\{pane_id\} #\{pane_index\} -s data -c \/tmp -n main/);
   assert.match(lines[2]!, /send-keys -t %1 /, "the first pane is named by the id tmux handed back");
-  assert.match(lines[3]!, /split-window -P -F #\{pane_id\} -t %1 -c \/tmp/);
+  assert.match(lines[3]!, /split-window -P -F #\{pane_id\} #\{pane_index\} -t %1 -c \/tmp/);
   assert.match(lines[4]!, /select-layout -t %1 tiled/);
   assert.match(lines[5]!, /send-keys -t %2 /);
 
   const rows = w.manifest().rows;
-  assert.deepEqual(rows.map((r) => r.outcome), ["resumed in data:main.0", "resumed in data:main.1"]);
+  assert.deepEqual(
+    rows.map((r) => r.outcome),
+    ["resumed in data:main.5 (%1)", "resumed in data:main.6 (%2)"],
+    "the outcome carries tmux's own pane index (5, 6 — this stub's arbitrary base) and id, never the planner's 0-based slot",
+  );
   assert.deepEqual(rows.map((r) => r.target!.paneId), ["%1", "%2"]);
+  assert.deepEqual(rows.map((r) => r.target!.paneIndex), [5, 6]);
   assert.ok(!w.deps.alive(pid), "the live CLI was stopped before its conversation was resumed");
   assert.deepEqual(w.ready.calls.map((c) => c[0]), ["sess-live", "sess-idle"]);
+
+  const { formatManifest } = await import("../src/import/manifest.ts");
+  const table = formatManifest(w.manifest());
+  assert.match(table, /main\.#1\s+resumed in data:main\.5 \(%1\)/, "the TARGET column shows the planner's 1-based slot (#1), never tmux's own number, and the OUTCOME carries tmux's real answer");
+  assert.match(table, /main\.#2\s+resumed in data:main\.6 \(%2\)/);
 });
 
 test("the command line is this install's own ms, shell-quoted, and carries no secret", async (t) => {
@@ -278,7 +304,7 @@ test("an existing session is appended to rather than created", async (t) => {
   const { executeImport } = await import("../src/import/execute.ts");
   await executeImport(plan, w.file, w.deps);
   assert.deepEqual(verbs(w.tmuxLog()), ["has-session", "new-window", "send-keys"]);
-  assert.match(w.tmuxLog()[1]!, /new-window -P -F #\{pane_id\} -t data: -c \/tmp -n main/);
+  assert.match(w.tmuxLog()[1]!, /new-window -P -F #\{pane_id\} #\{pane_index\} -t data: -c \/tmp -n main/);
 });
 
 test("a fifth conversation lands in its own window, and that window's panes split ITS first pane", async (t) => {
@@ -297,6 +323,11 @@ test("a fifth conversation lands in its own window, and that window's panes spli
   ]);
   assert.match(w.tmuxLog().find((l) => l.includes("new-window"))!, /-n main-2/);
   assert.deepEqual(w.manifest().rows.map((r) => r.target!.paneId), ["%1", "%2", "%3", "%4", "%5"]);
+  assert.deepEqual(
+    w.manifest().rows.map((r) => r.target!.paneIndex),
+    [5, 6, 7, 8, 5],
+    "the new window's own first pane resets tmux's index — it is not a continuation of the first window's count",
+  );
 });
 
 // --- Stopping --------------------------------------------------------------
@@ -338,7 +369,7 @@ test("a process that cannot be signalled fails its own row and stops nothing els
   const rows = w.manifest().rows;
   assert.equal(rows[0]!.outcome, "stop failed: could not signal pid 1");
   assert.equal(rows[0]!.target!.paneId, null, "a row whose CLI is still writing that transcript gets no pane");
-  assert.equal(rows[1]!.outcome, "resumed in data:main.1");
+  assert.equal(rows[1]!.outcome, "resumed in data:main.5 (%1)", "the surviving row becomes the window's first pane, made by new-session");
   assert.deepEqual(verbs(w.tmuxLog()), ["has-session", "new-session", "send-keys"], "only the second row reached tmux");
   assert.ok(!w.deps.alive(pid));
 });
@@ -365,7 +396,7 @@ test("a pid that is no longer the process the plan recorded is not signalled", a
   const rows = w.manifest().rows;
   assert.equal(rows[0]!.outcome, `stop refused: pid ${pid} is not the process the plan recorded`);
   assert.equal(rows[0]!.target!.paneId, null, "and no pane is made for a conversation still being written");
-  assert.equal(rows[1]!.outcome, "resumed in data:main.1", "the next row still runs");
+  assert.equal(rows[1]!.outcome, "resumed in data:main.5 (%1)", "the next row still runs");
 });
 
 test("a manifest that does not say when the process started cannot re-identify it, and refuses", async (t) => {
@@ -429,7 +460,7 @@ test("a resume that never reports is a failed row, and the next row still runs",
   const rows = w.manifest().rows;
   assert.match(rows[0]!.outcome, /^resume failed: no report within 60s/);
   assert.match(rows[0]!.outcome, /%1/, "the row still says where the pane is, so it can be finished by hand");
-  assert.equal(rows[1]!.outcome, "resumed in data:main.1");
+  assert.equal(rows[1]!.outcome, "resumed in data:main.6 (%2)", "the second row still split the same window, even though the first row's pane never reported");
 });
 
 test("a pane that died says so, rather than waiting out a silence tmux could explain", async (t) => {
@@ -481,8 +512,8 @@ test("the manifest is on disk after every step, not at the end of the run", asyn
 
   assert.deepEqual(seen, [
     ["stopped", "planned"],
-    ["resumed in data:main.0", "planned"],
-    ["resumed in data:main.0", "resumed in data:main.1"],
+    ["resumed in data:main.5 (%1)", "planned"],
+    ["resumed in data:main.5 (%1)", "resumed in data:main.6 (%2)"],
   ], "the stop is recorded before the pane exists — that is the moment the record matters most");
 });
 
@@ -509,7 +540,7 @@ test("the manifest round-trips through a plan and keeps what the run was asked f
   const table = formatManifest(readManifest(file));
   assert.match(table, /2 conversations to move, stopping 1 live process/);
   assert.match(table, /since 2h/);
-  assert.match(table, /data:main\.0/);
+  assert.match(table, /data:main\.#1/, "the TARGET column is the planner's own 1-based slot, marked with a leading # so it is never mistaken for tmux's own pane number");
   assert.match(table, /skipped: in tmux/);
 });
 

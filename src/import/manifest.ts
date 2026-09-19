@@ -33,15 +33,23 @@ import { keptFlags } from "./plan.ts";
 import type { Candidate, ImportProvider } from "./scan.ts";
 import type { Plan, PlanSession, PlanWindow, PaneSpec } from "./plan.ts";
 
-/** Where a row's pane goes, in the plan's own words. `paneId` is filled in by
- *  the executor the moment tmux hands one back — it is the only handle that
- *  survives a window being renamed or moved, and the one every later tmux
- *  target is built from. */
+/** Where a row's pane goes, in the plan's own words. `paneId` and
+ *  `paneIndex` are filled in by the executor the moment tmux hands them
+ *  back — both in the same `-P -F '#{pane_id} #{pane_index}'` call that
+ *  makes the pane (`src/import/execute.ts`). `paneId` is the only handle
+ *  that survives a window being renamed or moved, and the one every later
+ *  tmux target is built from. `paneIndex` is tmux's own `#{pane_index}` for
+ *  that pane — deliberately NOT `pane` below: `pane` is the planner's
+ *  0-based slot (`PaneSpec.index`), and the two agree only when the tmux
+ *  server's `pane-base-index` happens to be 0. Under the author's own
+ *  `pane-base-index 1`, slot 0 is tmux's pane 1 — which is exactly the bug
+ *  this field exists to stop the report from repeating. */
 export interface ManifestTarget {
   session: string;
   window: string;
   pane: number;
   paneId: string | null;
+  paneIndex: number | null;
 }
 
 export interface ManifestRow {
@@ -78,9 +86,10 @@ export interface ManifestRow {
   /** The argv the pane runs, `ms` first. Null for a row nothing will run. */
   command: string[] | null;
   target: ManifestTarget | null;
-  /** `planned` | `stopped` | `resumed in <session>:<window>.<pane>` |
-   *  `stop refused: …` | `stop failed: …` | `resume failed: …` |
-   *  `skipped: <reason>` */
+  /** `planned` | `stopped` | `resumed in <session>:<window>.<paneIndex>
+   *  (<paneId>)` — tmux's own numbers, read back when the pane was made,
+   *  never the planner's 0-based slot | `stop refused: …` |
+   *  `stop failed: …` | `resume failed: …` | `skipped: <reason>` */
   outcome: string;
 }
 
@@ -97,7 +106,12 @@ export interface Manifest {
 
 export const OUTCOME_PLANNED = "planned";
 export const OUTCOME_STOPPED = "stopped";
-export const resumedOutcome = (t: ManifestTarget): string => `resumed in ${targetName(t)}`;
+/** `resumed in data:main.2 (%58)` — tmux's OWN pane index and id, read back
+ *  the moment the pane was made, not `targetName` below: a row is only ever
+ *  resumed after `paneId`/`paneIndex` are set, and the whole point of
+ *  carrying both is that this string, unlike `targetName`'s, is something a
+ *  human can hand to `tmux select-window -t`. */
+export const resumedOutcome = (t: ManifestTarget): string => `resumed in ${t.session}:${t.window}.${t.paneIndex} (${t.paneId})`;
 export const stopFailed = (why: string): string => `stop failed: ${why}`;
 export const resumeFailed = (why: string): string => `resume failed: ${why}`;
 export const skipped = (why: string): string => `skipped: ${why}`;
@@ -105,9 +119,14 @@ export const skipped = (why: string): string => `skipped: ${why}`;
  *  work: the pid on the row is not the process the plan was made against. */
 export const stopRefused = (why: string): string => `stop refused: ${why}`;
 
-/** `data:main.2` — how the spec spells a target in an outcome, and how the
- *  human will name it to `tmux select-window`. */
-export const targetName = (t: ManifestTarget): string => `${t.session}:${t.window}.${t.pane}`;
+/** `data:main.#2` — the TARGET column, printed before anything has run: the
+ *  planner's own 1-based position within the window (`PaneSpec.index + 1`),
+ *  marked with a leading `#` so it is never mistaken for a number tmux would
+ *  recognise. It is NOT what the human hands to `tmux select-window` — under
+ *  a `pane-base-index` other than 0, tmux numbers the same panes
+ *  differently, and `resumedOutcome` above is the only place that carries
+ *  tmux's own answer for it. */
+export const targetName = (t: ManifestTarget): string => `${t.session}:${t.window}.#${t.pane + 1}`;
 
 /** Where a run's manifest goes: `MS_HOME/imports/<ISO timestamp>.json`, with
  *  the colons of the timestamp flattened so the name is one word in a shell
@@ -137,7 +156,7 @@ export function manifestFromPlan(plan: Plan, meta: { since: string; dirs: string
           root: session.root,
           worktree: window.worktree,
           command: [...pane.command],
-          target: { session: pane.session, window: pane.window, pane: pane.index, paneId: null },
+          target: { session: pane.session, window: pane.window, pane: pane.index, paneId: null, paneIndex: null },
           outcome: OUTCOME_PLANNED,
         });
       }

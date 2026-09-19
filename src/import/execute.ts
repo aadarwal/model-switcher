@@ -20,8 +20,12 @@
 // `MS_HOME/imports/<stamp>.json` still says which conversation that was, in
 // which directory, and the exact command line to bring it back by hand.
 //
-// **Every tmux target is a pane id.** `split-window -P -F '#{pane_id}'` hands
-// back `%47`, and `%47` is what every later call names. Not `data:main.2` —
+// **Every tmux target is a pane id.** `split-window -P -F '#{pane_id}
+// #{pane_index}'` hands back `%47 3`, and `%47` is what every later call
+// names. `3` — tmux's OWN pane index — is recorded too (`ManifestTarget.
+// paneIndex`), but only for the report a human reads; it is never derived
+// from `PaneSpec.index`, the planner's 0-based slot, because the two agree
+// only when the tmux server's `pane-base-index` is 0. Not `data:main.2` —
 // a window can be renamed, moved between sessions or renumbered by the human
 // in the seconds this loop is running, and a target built from names would
 // then aim at somebody else's pane and type a command line into it.
@@ -236,7 +240,7 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
     for (const window of session.windows) {
       for (const pane of window.panes) {
         const c = pane.candidate;
-        const target: ManifestTarget = { session: pane.session, window: pane.window, pane: pane.index, paneId: null };
+        const target: ManifestTarget = { session: pane.session, window: pane.window, pane: pane.index, paneId: null, paneIndex: null };
         let row = byKey.get(rowKey(c.provider, c.id, target));
         if (!row) {
           row = {
@@ -268,7 +272,10 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
         // 2. The pane, born holding a shell, in the conversation's own cwd.
         let paneId: string;
         try {
-          paneId = makePane(deps.tmux, pane, session.name, firstPaneOf, sessionsMade);
+          const created = makePane(deps.tmux, pane, session.name, firstPaneOf, sessionsMade);
+          paneId = created.id;
+          row.target!.paneId = created.id;
+          row.target!.paneIndex = created.index;
         } catch (e) {
           row.outcome = resumeFailed((e as Error).message);
           result.failed += 1;
@@ -276,7 +283,6 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
           deps.log(`${short(c)}: ${row.outcome}`);
           continue;
         }
-        row.target!.paneId = paneId;
         save();
 
         // 3. The command line, and the conversation reporting itself back.
@@ -319,12 +325,37 @@ function short(c: { provider: string; id: string; cwd: string }): string {
   return `${c.provider} ${id || "?"} in ${path.basename(c.cwd) || c.cwd}`;
 }
 
+/** `-F` for every pane-creation call this module makes: the id AND tmux's
+ *  own index for the pane, in the same call, so the two numbers are read
+ *  from the same moment rather than a second query that could race a human
+ *  renumbering the window in between. `Tmux.newSession`/`newWindow`/
+ *  `splitWindow` only ever ask for `#{pane_id}`, which is why `makePane`
+ *  below drives `tmux.run` directly instead of those three. */
+const PANE_FORMAT = "#{pane_id} #{pane_index}";
+
 /**
- * The pane this row runs in, made the way the plan says.
+ * Runs one tmux pane-creation command and parses both fields `PANE_FORMAT`
+ * asked for. The error text matches what `Tmux`'s own (private) `must` would
+ * have thrown for the same failure — `args[0]` is the tmux verb — because a
+ * manifest row that fails here still needs to say which one refused.
+ */
+function paneCreated(tmux: Tmux, args: string[]): { id: string; index: number } {
+  const r = tmux.run(args);
+  if (r.code !== 0) throw new Error(`tmux ${args[0]} failed: ${r.stderr.trim() || r.code}`);
+  const [id, index] = r.stdout.trim().split(/\s+/);
+  return { id: id!, index: Number(index) };
+}
+
+/**
+ * The pane this row runs in, made the way the plan says — and BOTH numbers
+ * tmux hands back for it: the id (the only address that survives a rename)
+ * and tmux's own `#{pane_index}` in that window, never derived from
+ * `PaneSpec.index` (the planner's 0-based slot — see the module doc comment
+ * and `ManifestTarget.paneIndex`).
  *
  * The window's FIRST pane makes the window (and the session, when this is the
  * first window of a session that is not already open); the rest split that
- * pane and re-tile. `newWindow` is given `"<session>:"` rather than the bare
+ * pane and re-tile. `new-window` is given `"<session>:"` rather than the bare
  * name because a bare target is looked up as a window of the CURRENT session
  * first — and our session names are basenames, which is exactly the class of
  * word somebody's current session already has a window called.
@@ -335,19 +366,20 @@ function makePane(
   sessionName: string,
   firstPaneOf: Map<string, string>,
   sessionsMade: Set<string>,
-): string {
+): { id: string; index: number } {
   const key = windowKey(pane);
+  const cwd = pane.candidate.cwd;
   const first = firstPaneOf.get(key);
   if (first) {
-    const id = tmux.splitWindow(first, pane.candidate.cwd, []);
+    const created = paneCreated(tmux, ["split-window", "-P", "-F", PANE_FORMAT, "-t", first, "-c", cwd]);
     tmux.selectLayout(first, "tiled");
-    return id;
+    return created;
   }
   const open = sessionsMade.has(sessionName) || tmux.hasSession(sessionName);
-  const id = open
-    ? tmux.newWindow(`${sessionName}:`, pane.candidate.cwd, [], pane.window)
-    : tmux.newSession(sessionName, pane.candidate.cwd, [], pane.window);
+  const created = open
+    ? paneCreated(tmux, ["new-window", "-P", "-F", PANE_FORMAT, "-t", `${sessionName}:`, "-c", cwd, ...(pane.window ? ["-n", pane.window] : [])])
+    : paneCreated(tmux, ["new-session", "-d", "-P", "-F", PANE_FORMAT, "-s", sessionName, "-c", cwd, ...(pane.window ? ["-n", pane.window] : [])]);
   sessionsMade.add(sessionName);
-  firstPaneOf.set(key, id);
-  return id;
+  firstPaneOf.set(key, created.id);
+  return created;
 }

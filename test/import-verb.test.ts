@@ -25,13 +25,21 @@ import type { ImportIo } from "../src/import.ts";
 const T0 = Date.UTC(2026, 8, 19, 12, 0, 0);
 
 /** tmux, for a verb that mostly must NOT call it: every call logged, panes
- *  answered with fresh ids, no server anybody has a session on. */
+ *  answered with fresh ids AND tmux's own `#{pane_index}` (base 5 — an
+ *  arbitrary, never-0-or-1 base, so a test can tell the executor's real tmux
+ *  read apart from the planner's own 0-based `PaneSpec.index`), no server
+ *  anybody has a session on. */
 const TMUX_STUB = String.raw`printf '%s\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
 case "$1" in
-  new-session|new-window|split-window)
+  new-session|new-window)
     n=$(cat "$MS_TMUX_PANES" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$MS_TMUX_PANES"
-    printf '%%%s\n' "$n" ;;
+    printf '5' > "$MS_TMUX_WIN_INDEX"
+    printf '%%%s 5\n' "$n" ;;
+  split-window)
+    n=$(cat "$MS_TMUX_PANES" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$MS_TMUX_PANES"
+    i=$(cat "$MS_TMUX_WIN_INDEX" 2>/dev/null || echo 5); i=$((i + 1)); printf '%s' "$i" > "$MS_TMUX_WIN_INDEX"
+    printf '%%%s %s\n' "$n" "$i" ;;
   has-session) exit 1 ;;
   list-sessions) : ;;
   # "could not ask", never "there is nothing there": reconciliation must not
@@ -96,6 +104,7 @@ function machine(t: TestContext, opts: { mtime?: number } = {}): World {
     CODEX_HOME: path.join(home, ".codex"),
     MS_TMUX_LOG: tmuxLog,
     MS_TMUX_PANES: path.join(dir, "panes"),
+    MS_TMUX_WIN_INDEX: path.join(dir, "win-index"),
     MS_BIN: path.resolve("bin/ms"),
     // No TMUX: the import lands on the tool's own server, which is where a
     // launch from outside tmux already goes.
@@ -232,7 +241,7 @@ test("--dry-run writes the manifest, prints the table, and touches nothing", asy
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, /1 conversation to move/);
   assert.match(r.stdout, /fix the tests/);
-  assert.match(r.stdout, /data:data\.0/, "no git here, so the window takes the directory's own name");
+  assert.match(r.stdout, /data:data\.#1/, "no git here, so the window takes the directory's own name; the slot is the planner's own 1-based position, marked with #, never tmux's own pane number");
   assert.match(r.stdout, /planned/);
   assert.match(r.stderr, /ms import: manifest /);
 
@@ -307,7 +316,7 @@ test("--plan runs a manifest written earlier, with no scan and no question", asy
   assert.equal(sent.length, 1);
   assert.match(sent[0]!, /send-keys -t %1 /);
   assert.ok(sent[0]!.includes("'claude' '--' '--resume' 'conv-1'"), sent[0]);
-  assert.equal(JSON.parse(readFileSync(file, "utf8")).rows[0].outcome, "resumed in data:data.0");
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).rows[0].outcome, "resumed in data:data.5 (%1)", "the outcome carries tmux's own pane index and id, not the planner's 0-based slot");
 });
 
 test("a run whose rows all fail exits 1 and says so in the manifest", async (t) => {
@@ -386,7 +395,7 @@ test("a conversation is only ever reported back by its own row, never a neighbou
   assert.match(r.stderr, /moved 1, stopped 0, failed 1/);
   const outcomes = JSON.parse(readFileSync(file, "utf8")).rows.map((row: { id: string; outcome: string }) => [row.id, row.outcome]);
   const byId = new Map<string, string>(outcomes);
-  assert.equal(byId.get("conv-1"), "resumed in data:data.0");
+  assert.equal(byId.get("conv-1"), "resumed in data:data.5 (%1)");
   assert.match(
     byId.get("conv-2")!,
     /^resume failed: no report within/,

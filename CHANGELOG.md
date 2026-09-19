@@ -12,6 +12,11 @@
   refuses rather than assuming yes
 - flags are carried into an imported pane by whitelist, so a credential on the original
   command line reaches neither the new command line nor the manifest
+- an import never signals a pid it cannot re-identify: the manifest records when each
+  process started, and `--plan` re-reads the process table and refuses (`stop refused: …`)
+  when the pid has since been re-used, so a manifest run hours later cannot kill a stranger
+- a conversation is reported resumed only on the store row that names it, so two
+  conversations in one directory can never be reported back on one row
 - a Claude launch that RESUMES is no longer given a `--session-id`: `ms claude --
   --resume <id>` now runs `claude --resume <id>` and records that conversation's own id,
   instead of running two contradictory answers to which conversation it is and recording

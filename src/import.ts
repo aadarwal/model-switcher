@@ -36,7 +36,8 @@ import type { Verb } from "./cli.ts";
 import { ensureStore, msHome } from "./paths.ts";
 import { openState } from "./state.ts";
 import { Tmux } from "./tmux.ts";
-import { defaultScanDeps, scanConversations, type Candidate } from "./import/scan.ts";
+import { rolloutIdsFromName } from "./adopt.ts";
+import { defaultScanDeps, scanConversations } from "./import/scan.ts";
 import { planImport, type ContinueFor, type Plan } from "./import/plan.ts";
 import { formatManifest, manifestFromPlan, manifestPath, planFromManifest, readManifest, writeManifest } from "./import/manifest.ts";
 import { executeImport, pidAlive, signalPid, type ExecuteDeps } from "./import/execute.ts";
@@ -133,7 +134,7 @@ export function parseImportArgs(argv: string[]): ImportArgs | { error: string } 
     i += 1;
   }
   if (out.plan && out.status) return { error: "--plan and --status name two different jobs; pick one" };
-  if ((out.plan || out.status) && (out.dirs.length || out.as || out.includeTmux || out.since !== "2h")) {
+  if ((out.plan || out.status) && (out.dirs.length || out.as || out.includeTmux || out.since !== "2h" || out.continueFor !== "live")) {
     return { error: "--plan and --status run a manifest that was already scanned; the scan's own flags do not apply" };
   }
   return out;
@@ -203,21 +204,30 @@ export function runGit(args: string[], cwd: string): string | null {
  */
 const CODEX_SETTLE_MS = 5_000;
 
-export function storeWaitReady(plan: Plan, tmux: Tmux, startedAtSeconds: number): ExecuteDeps["waitReady"] {
-  const known = new Map<string, Candidate>();
-  for (const s of plan.sessions) for (const w of s.windows) for (const p of w.panes) known.set(p.candidate.id, p.candidate);
+export function storeWaitReady(plan: Plan, tmux: Tmux): ExecuteDeps["waitReady"] {
+  // A store row belongs to ONE conversation. Once a row has answered for a
+  // conversation, no other conversation may be reported back on it — the
+  // failure that guards against is worse than a slow wait: two conversations
+  // in one directory, one launch that worked and one that did not, and a
+  // manifest saying both came back. The manifest is the rollback record; a
+  // false `resumed in …` is the one entry a human cannot recover from,
+  // because it is the one they will not read twice.
+  const claimedBy = new Map<string, string>();
 
   return async (candidateId, deadlineMs) => {
-    const c = known.get(candidateId) ?? null;
     let firstSeen: number | null = null;
     for (;;) {
       const st = openState();
       let verdict: "ready" | "died" | null = null;
       let present = false;
+      let claim: string | null = null;
       try {
         for (const row of st.listSessions()) {
-          if (!rowIsFor(row, candidateId, c, startedAtSeconds)) continue;
+          const owner = claimedBy.get(row.id);
+          if (owner !== undefined && owner !== candidateId) continue;
+          if (!rowIsFor(row, candidateId)) continue;
           present = true;
+          claim = row.id;
           if (row.state === "running" || row.state === "continuing") { verdict = "ready"; break; }
           if (row.pane && tmux.paneDead(row.pane) === true) { verdict = "died"; break; }
           if (row.provider === "codex" && row.state === "launching") {
@@ -228,7 +238,10 @@ export function storeWaitReady(plan: Plan, tmux: Tmux, startedAtSeconds: number)
       } finally {
         st.close();
       }
-      if (verdict) return verdict;
+      if (verdict) {
+        if (claim) claimedBy.set(claim, candidateId);
+        return verdict;
+      }
       if (!present) firstSeen = null;
       if (Date.now() >= deadlineMs) return "timeout";
       await sleepMs(Math.min(500, Math.max(50, deadlineMs - Date.now())));
@@ -236,16 +249,31 @@ export function storeWaitReady(plan: Plan, tmux: Tmux, startedAtSeconds: number)
   };
 }
 
-function rowIsFor(
-  row: { provider: string; cliSessionId: string | null; cwd: string; transcriptPath: string | null; createdAt: number },
+/**
+ * Is this store row THIS conversation's?
+ *
+ * By name, and only by name. Both halves are the id the human's conversation
+ * already has: `ms claude --resume <id>` and `ms adopt <id>` both write the
+ * row on that id (`claudeResumeId`, src/launch.ts; `extras.resumeId`, for
+ * Codex), and Codex's hook later reports the rollout the conversation is in,
+ * which is the second spelling of the same fact — matched through the rollout
+ * filename's own parser rather than by substring, so a shorter id that happens
+ * to sit inside a longer one's filename is not a match.
+ *
+ * There is deliberately no "a row for this provider, in this directory,
+ * started since the run began" fallback. It matched any row in the directory,
+ * so two conversations in one project reported the SAME row and the manifest
+ * claimed both had come back when one had.
+ */
+export function rowIsFor(
+  row: { provider: string; cliSessionId: string | null; transcriptPath: string | null },
   id: string,
-  c: Candidate | null,
-  startedAtSeconds: number,
 ): boolean {
-  if (id && row.cliSessionId === id) return true;
-  if (id && row.transcriptPath && path.basename(row.transcriptPath).includes(id)) return true;
-  if (!c) return false;
-  return row.provider === c.provider && row.cwd === c.cwd && row.createdAt >= startedAtSeconds;
+  if (!id) return false;
+  if (row.cliSessionId === id) return true;
+  if (row.provider !== "codex" || !row.transcriptPath) return false;
+  const ids = rolloutIdsFromName(path.basename(row.transcriptPath));
+  return !!ids && (ids.threadId === id || ids.rolloutId === id);
 }
 
 const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -385,14 +413,13 @@ export async function runImport(argv: string[], io: ImportIo = processIo()): Pro
   }
 
   const tmux = new Tmux(plan.socket);
-  const startedAtSeconds = Math.floor(Date.now() / 1000);
   const result = await executeImport(plan, file, {
     tmux,
     kill: signalPid,
     alive: pidAlive,
     now: () => Date.now(),
     sleep: sleepMs,
-    waitReady: storeWaitReady(plan, tmux, startedAtSeconds),
+    waitReady: storeWaitReady(plan, tmux),
     log: (line) => io.err(`ms import: ${line}\n`),
   });
 

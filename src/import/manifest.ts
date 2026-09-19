@@ -56,6 +56,18 @@ export interface ManifestRow {
   compacted: boolean;
   pid: number | null;
   /**
+   * When that process started, ISO 8601, as `ps lstart` reported it at scan
+   * time — and the only thing that makes `pid` safe to act on later.
+   *
+   * A pid is a number the kernel re-uses. A manifest planned at 09:00 and run
+   * at 17:00 names a pid that may by then be somebody's `npm run dev`, and a
+   * SIGTERM sent on the strength of the number alone would kill it. The
+   * executor re-reads the process table before it signals anything and
+   * refuses when this does not match (src/import/execute.ts). Null when there
+   * was no process.
+   */
+  startedAt: string | null;
+  /**
    * The original process's command line AS CARRIED OVER — the planner's launch
    * whitelist already applied, which is the only form of it this file may
    * hold. The raw argv is exactly where a human's `--api-key` lives, and a
@@ -67,7 +79,8 @@ export interface ManifestRow {
   command: string[] | null;
   target: ManifestTarget | null;
   /** `planned` | `stopped` | `resumed in <session>:<window>.<pane>` |
-   *  `stop failed: …` | `resume failed: …` | `skipped: <reason>` */
+   *  `stop refused: …` | `stop failed: …` | `resume failed: …` |
+   *  `skipped: <reason>` */
   outcome: string;
 }
 
@@ -88,6 +101,9 @@ export const resumedOutcome = (t: ManifestTarget): string => `resumed in ${targe
 export const stopFailed = (why: string): string => `stop failed: ${why}`;
 export const resumeFailed = (why: string): string => `resume failed: ${why}`;
 export const skipped = (why: string): string => `skipped: ${why}`;
+/** A stop that was never attempted, as distinct from one that was and did not
+ *  work: the pid on the row is not the process the plan was made against. */
+export const stopRefused = (why: string): string => `stop refused: ${why}`;
 
 /** `data:main.2` — how the spec spells a target in an outcome, and how the
  *  human will name it to `tmux select-window`. */
@@ -152,6 +168,7 @@ export function candidateFields(c: Candidate): Omit<ManifestRow, "root" | "workt
     title: c.title,
     compacted: c.compacted,
     pid: c.pid,
+    startedAt: c.startedAt === null ? null : new Date(c.startedAt).toISOString(),
     argv: c.argv ? keptFlags(c.provider, c.argv) : null,
   };
 }
@@ -206,12 +223,22 @@ export function planFromManifest(m: Manifest): Plan {
   };
 }
 
-/** A row read back as the candidate it came from. `transcriptPath`,
- *  `startedAt`, `inTmux` and `managed` are scan-time facts with no meaning at
- *  execution time, and are deliberately not carried in the file: a manifest
- *  read tomorrow must not claim yesterday's process table is still true. */
+/**
+ * A row read back as the candidate it came from.
+ *
+ * `transcriptPath`, `inTmux` and `managed` are scan-time facts with no meaning
+ * at execution time and are deliberately not in the file: a manifest read
+ * tomorrow must not claim yesterday's tmux server or yesterday's store are
+ * still true.
+ *
+ * `startedAt` is the exception, and for the same reason. It is precisely
+ * yesterday's process table — which is why it has to travel: it is what lets
+ * the executor ask whether the pid on this row is still the process that was
+ * planned against, instead of taking the number on trust.
+ */
 function candidateFromRow(row: ManifestRow): Candidate {
   const t = Date.parse(row.lastActivity);
+  const started = row.startedAt === null || row.startedAt === undefined ? NaN : Date.parse(row.startedAt);
   return {
     provider: row.provider,
     id: row.id,
@@ -222,7 +249,7 @@ function candidateFromRow(row: ManifestRow): Candidate {
     compacted: row.compacted,
     pid: row.pid,
     argv: row.argv ? [...row.argv] : null,
-    startedAt: null,
+    startedAt: Number.isFinite(started) ? started : null,
     inTmux: false,
     managed: false,
   };

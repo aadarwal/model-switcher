@@ -33,11 +33,12 @@
 
 import path from "node:path";
 import { msBinary } from "../paths.ts";
+import { defaultPs, providerOfArgv, type Candidate, type ProcessRow } from "./scan.ts";
 import { shellQuote, type Tmux } from "../tmux.ts";
 import type { Plan, PaneSpec } from "./plan.ts";
 import {
   OUTCOME_PLANNED, OUTCOME_STOPPED, candidateFields, readManifest, resumeFailed, resumedOutcome,
-  stopFailed, targetName, writeManifest, type Manifest, type ManifestRow, type ManifestTarget,
+  stopFailed, stopRefused, targetName, writeManifest, type Manifest, type ManifestRow, type ManifestTarget,
 } from "./manifest.ts";
 
 /** How long the original CLI gets to leave on SIGTERM before SIGKILL (spec's
@@ -73,6 +74,14 @@ export interface ExecuteDeps {
    */
   waitReady: (candidateId: string, deadlineMs: number) => Promise<"ready" | "timeout" | "died">;
   log: (line: string) => void;
+  /**
+   * The process table, NOW — read again just before anything is signalled, so
+   * a pid can be re-identified rather than taken on trust. Optional: the
+   * default is the scanner's own bounded `ps` (`defaultPs`), which is where
+   * the recorded `startedAt` came from in the first place, so the two readings
+   * are the same reading twice.
+   */
+  ps?: () => ProcessRow[];
 }
 
 export interface ExecuteResult {
@@ -122,6 +131,36 @@ async function waitGone(pid: number, budgetMs: number, deps: ExecuteDeps): Promi
 }
 
 /**
+ * Is the pid on this row still the process the plan was made against?
+ *
+ * A pid is a number the kernel re-uses, and a manifest is a file that outlives
+ * the moment it was written: `--dry-run` at 09:00 and `--plan` at 17:00 is a
+ * documented way to use this verb, and by 17:00 pid 4242 may be somebody's
+ * `npm run dev`. `alive(pid)` cannot tell the two apart — it answers "some
+ * process has this number", which is the question that matters least.
+ *
+ * So the process table is read again and the row's own record checked against
+ * it: the START TIME (to the second — `ps lstart` has no finer resolution),
+ * and that the command is still that CLI. Either one differing is a stranger.
+ *
+ * Both of the "cannot tell" cases refuse, deliberately. A row with no recorded
+ * start time cannot be re-identified at all, and a pid that `alive` accepts
+ * but the table does not list is two readings that disagree. Nothing is lost
+ * by refusing: the conversation is on disk, the manifest says where, and the
+ * human can re-run the scan — which is not true of a SIGKILL sent to the wrong
+ * process.
+ */
+function sameProcess(c: Candidate, deps: ExecuteDeps): { ok: true } | { ok: false; why: string } {
+  const pid = c.pid!;
+  if (c.startedAt === null) return { ok: false, why: `pid ${pid} has no recorded start time to check against` };
+  const table = (deps.ps ?? defaultPs)();
+  const row = table.find((r) => r.pid === pid);
+  if (!row) return { ok: false, why: `pid ${pid} is not in the process table any more` };
+  const stranger = Math.abs(row.startedAt - c.startedAt) > 1000 || providerOfArgv(row.argv) !== c.provider;
+  return stranger ? { ok: false, why: `pid ${pid} is not the process the plan recorded` } : { ok: true };
+}
+
+/**
  * Stop the CLI that is holding this conversation open.
  *
  * SIGTERM, ten seconds, then SIGKILL — the spec's own sequence, and the reason
@@ -130,14 +169,21 @@ async function waitGone(pid: number, budgetMs: number, deps: ExecuteDeps): Promi
  * signal did it. There is no "ask it nicely" step here the way there is in a
  * rotation (`/exit`, Ctrl-C): that path types into a pane, and the whole point
  * of an import is a CLI that is NOT in a pane we can type into.
+ *
+ * `refused` is not `ok: false` with a nicer word: nothing was signalled, and
+ * the row says so, because "we would not touch this pid" and "we tried and it
+ * would not go" are different things to read in a rollback record.
  */
-async function stopProcess(pid: number, deps: ExecuteDeps): Promise<{ ok: true; forced: boolean } | { ok: false; why: string }> {
+async function stopProcess(c: Candidate, deps: ExecuteDeps): Promise<{ ok: true; forced: boolean } | { ok: false; refused: boolean; why: string }> {
+  const pid = c.pid!;
   if (!deps.alive(pid)) return { ok: true, forced: false }; // it left while we were planning
-  if (!deps.kill(pid, "SIGTERM") && deps.alive(pid)) return { ok: false, why: `could not signal pid ${pid}` };
+  const same = sameProcess(c, deps);
+  if (!same.ok) return { ok: false, refused: true, why: same.why };
+  if (!deps.kill(pid, "SIGTERM") && deps.alive(pid)) return { ok: false, refused: false, why: `could not signal pid ${pid}` };
   if (await waitGone(pid, termMs(), deps)) return { ok: true, forced: false };
   deps.kill(pid, "SIGKILL");
   if (await waitGone(pid, killMs(), deps)) return { ok: true, forced: true };
-  return { ok: false, why: `pid ${pid} is still running after SIGKILL` };
+  return { ok: false, refused: false, why: `pid ${pid} is still running after SIGKILL` };
 }
 
 /**
@@ -205,9 +251,9 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
 
         // 1. The original process, if there still is one.
         if (c.pid !== null) {
-          const stop = await stopProcess(c.pid, deps);
+          const stop = await stopProcess(c, deps);
           if (!stop.ok) {
-            row.outcome = stopFailed(stop.why);
+            row.outcome = stop.refused ? stopRefused(stop.why) : stopFailed(stop.why);
             result.failed += 1;
             save();
             deps.log(`${short(c)}: ${row.outcome}`);

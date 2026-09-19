@@ -243,7 +243,9 @@ moved even though the process cannot. That is what **`ms import`** does, in one 
 4. **Move them.** Per row: re-read the process table and refuse to signal a pid whose
    start time or command is not the one the plan recorded (a manifest planned this morning
    and run this evening names pids the kernel has since re-used); SIGTERM the original,
-   SIGKILL after ten seconds, and never make the pane at all if it will not go; then type
+   SIGKILL after ten seconds — and on that fallback its descendants too, leaves first,
+   because a CLI installed from npm is a wrapper plus the process doing the work and only
+   a SIGTERM can be forwarded; never make the pane at all if it will not go; then type
    the command and wait up to a minute for the conversation to report itself through the
    CLI's own hook — by its own conversation id, never a neighbour's. A row that fails never
    stops the next one, and a launch that fails inside the pane (no account has room, a

@@ -36,12 +36,13 @@
 // or waiting out a real ten seconds.
 
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { msBinary } from "../paths.ts";
 import { defaultPs, providerOfArgv, type Candidate, type ProcessRow } from "./scan.ts";
 import { shellQuote, type Tmux } from "../tmux.ts";
 import type { Plan, PaneSpec } from "./plan.ts";
 import {
-  OUTCOME_PLANNED, OUTCOME_STOPPED, candidateFields, readManifest, resumeFailed, resumedOutcome,
+  OUTCOME_PLANNED, OUTCOME_STOPPED, candidateFields, killedOutcome, readManifest, resumeFailed, resumedOutcome,
   stopFailed, stopRefused, targetName, writeManifest, type Manifest, type ManifestRow, type ManifestTarget,
 } from "./manifest.ts";
 
@@ -163,6 +164,12 @@ export interface ExecuteDeps {
   waitReady: (candidateId: string, deadlineMs: number, paneId: string) => Promise<"ready" | "timeout" | "died" | "returned">;
   log: (line: string) => void;
   /**
+   * Every descendant of a pid, deepest first — read once, just before the
+   * SIGKILL fallback, and never for a SIGTERM (see `stopProcess`). Optional:
+   * the default walks `ps -axo pid=,ppid=`.
+   */
+  descendants?: (pid: number) => number[];
+  /**
    * The process table, NOW — read again just before anything is signalled, so
    * a pid can be re-identified rather than taken on trust. Optional: the
    * default is the scanner's own bounded `ps` (`defaultPs`), which is where
@@ -206,6 +213,73 @@ export function pidAlive(pid: number): boolean {
     return (e as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
+
+/**
+ * `ps -axo pid=,ppid=` as a pid → ppid map. A line that is not two numbers is
+ * skipped rather than fatal: this decides what gets SIGKILLed, so a line we
+ * cannot read must mean "not in the tree", never a guess.
+ */
+export function parsePidParents(stdout: string): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const line of stdout.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 2) continue;
+    const pid = Number(parts[0]);
+    const ppid = Number(parts[1]);
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || ppid < 0) continue;
+    out.set(pid, ppid);
+  }
+  return out;
+}
+
+/**
+ * Everything under `pid`, deepest first, never including `pid` itself.
+ *
+ * Deepest first because a tree is killed from the leaves: signalling a parent
+ * before the child it owns is how a grandchild is reparented mid-walk and
+ * survives. `seen` bounds it — a table that claims a process is its own
+ * ancestor is malformed, and here it simply terminates.
+ */
+export function descendantsOf(pid: number, parents: Map<number, number>): number[] {
+  const children = new Map<number, number[]>();
+  for (const [child, parent] of parents) {
+    const list = children.get(parent);
+    if (list) list.push(child);
+    else children.set(parent, [child]);
+  }
+  const levels: number[][] = [];
+  const seen = new Set<number>([pid]);
+  let frontier = [pid];
+  while (frontier.length) {
+    const next: number[] = [];
+    for (const p of frontier) {
+      for (const child of children.get(p) ?? []) {
+        if (seen.has(child)) continue;
+        seen.add(child);
+        next.push(child);
+      }
+    }
+    if (next.length) levels.push(next);
+    frontier = next;
+  }
+  return levels.reverse().flat();
+}
+
+/**
+ * The default descendant lookup: one bounded `ps`, walked in process.
+ *
+ * One reading, not a `pgrep` per level: a tree read across several calls is a
+ * tree that changed between them, and the pids this returns are about to be
+ * SIGKILLed.
+ */
+export function defaultDescendants(pid: number): number[] {
+  const r = spawnSync("ps", ["-axo", "pid=,ppid="], {
+    encoding: "utf8", timeout: SUBPROCESS_TIMEOUT_MS, maxBuffer: 16 << 20,
+  });
+  return r.stdout ? descendantsOf(pid, parsePidParents(r.stdout)) : [];
+}
+
+const SUBPROCESS_TIMEOUT_MS = 10_000;
 
 /** Wait for a pid to go, on the injected clock. True when it is gone. */
 async function waitGone(pid: number, budgetMs: number, deps: ExecuteDeps): Promise<boolean> {
@@ -261,16 +335,28 @@ function sameProcess(c: Candidate, deps: ExecuteDeps): { ok: true } | { ok: fals
  * `refused` is not `ok: false` with a nicer word: nothing was signalled, and
  * the row says so, because "we would not touch this pid" and "we tried and it
  * would not go" are different things to read in a rollback record.
+ *
+ * The SIGKILL fallback takes the DESCENDANTS with it, and SIGTERM deliberately
+ * does not. A CLI installed from npm is a wrapper and the process doing the
+ * work — `node …/codex` and its native child — and a wrapper forwards a
+ * SIGTERM, which is why the polite path stays the parent's alone. SIGKILL
+ * cannot be forwarded by anything, so killing the wrapper there leaves the
+ * child orphaned onto launchd, still holding the conversation this import is
+ * about to resume in a pane. The tree is read BEFORE the first signal, because
+ * once the parent is gone its children are reparented and the link that names
+ * them is lost, and it is signalled leaves first for the same reason.
  */
-async function stopProcess(c: Candidate, deps: ExecuteDeps): Promise<{ ok: true; forced: boolean } | { ok: false; refused: boolean; why: string }> {
+async function stopProcess(c: Candidate, deps: ExecuteDeps): Promise<{ ok: true; forced: boolean; killed: number[] } | { ok: false; refused: boolean; why: string }> {
   const pid = c.pid!;
-  if (!deps.alive(pid)) return { ok: true, forced: false }; // it left while we were planning
+  if (!deps.alive(pid)) return { ok: true, forced: false, killed: [] }; // it left while we were planning
   const same = sameProcess(c, deps);
   if (!same.ok) return { ok: false, refused: true, why: same.why };
   if (!deps.kill(pid, "SIGTERM") && deps.alive(pid)) return { ok: false, refused: false, why: `could not signal pid ${pid}` };
-  if (await waitGone(pid, termMs(), deps)) return { ok: true, forced: false };
+  if (await waitGone(pid, termMs(), deps)) return { ok: true, forced: false, killed: [] };
+  const kin = (deps.descendants ?? defaultDescendants)(pid);
+  for (const child of kin) deps.kill(child, "SIGKILL");
   deps.kill(pid, "SIGKILL");
-  if (await waitGone(pid, killMs(), deps)) return { ok: true, forced: true };
+  if (await waitGone(pid, killMs(), deps)) return { ok: true, forced: true, killed: kin };
   return { ok: false, refused: false, why: `pid ${pid} is still running after SIGKILL` };
 }
 
@@ -348,9 +434,9 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
             continue; // its transcript is still being written; making a pane for it now would resume a live conversation twice
           }
           result.stopped += 1;
-          row.outcome = OUTCOME_STOPPED;
+          row.outcome = stop.forced ? killedOutcome(c.pid, stop.killed.length) : OUTCOME_STOPPED;
           save();
-          deps.log(`${short(c)}: stopped pid ${c.pid}${stop.forced ? " (SIGKILL)" : ""}`);
+          deps.log(`${short(c)}: ${stop.forced ? row.outcome : `stopped pid ${c.pid}`}`);
         }
 
         // 2. The pane, born holding a shell, in the conversation's own cwd.

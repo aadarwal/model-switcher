@@ -338,7 +338,7 @@ test("a fifth conversation lands in its own window, and that window's panes spli
 
 // --- Stopping --------------------------------------------------------------
 
-test("a CLI that ignores SIGTERM is killed once the grace is spent, and still counts as stopped", async (t) => {
+test("a CLI that ignores SIGTERM is killed once the grace is spent, and takes its real children with it", async (t) => {
   const { dir } = stubDir();
   const pid = await liveProcess(t, dir, "stubborn");
   const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid })]);
@@ -349,14 +349,95 @@ test("a CLI that ignores SIGTERM is killed once the grace is spent, and still co
     signals.push([p, sig]);
       return realKill(p, sig);
   };
+  // The real process table, on a real tree: the stubborn script's own
+  // `sleep 30 &`. This is the shape an npm-installed Codex has — a wrapper
+  // and the process doing the work — and in 0.3.0 the child outlived the
+  // SIGKILL as an orphan.
+  const { defaultDescendants, executeImport } = await import("../src/import/execute.ts");
+  w.deps.descendants = defaultDescendants;
+  const kids = defaultDescendants(pid);
+  assert.deepEqual(kids.length, 1, `the script's own sleep: ${JSON.stringify(kids)}`);
+  const result = await executeImport(plan, w.file, w.deps);
+
+  assert.deepEqual(
+    signals,
+    [[pid, "SIGTERM"], [kids[0]!, "SIGKILL"], [pid, "SIGKILL"]],
+    "SIGTERM to the parent alone (a wrapper forwards it), and only then the floor under it — children first",
+  );
+  assert.ok(w.clock() - T0 >= 10_000, "SIGKILL waited out the whole ten-second grace");
+  assert.deepEqual(result, { moved: 1, stopped: 1, failed: 0 });
+  assert.ok(w.log.some((l) => l.includes(`killed pid ${pid} and 1 child`)), w.log.join("\n"));
+  assert.ok(!w.deps.alive(pid));
+  assert.ok(!w.deps.alive(kids[0]!), "and the child is not an orphan that outlived it");
+});
+
+test("the fallback kills descendants deepest-first, before the parent, and the row says how many", async (t) => {
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid: 12 })]);
+  const w = await world(t, plan);
+  const signals: [number, string][] = [];
+  const dead = new Set<number>();
+  w.deps.kill = (p, sig) => {
+    signals.push([p, sig]);
+    if (sig === "SIGKILL") dead.add(p);
+    return true;
+  };
+  w.deps.alive = (p) => !dead.has(p); // nothing leaves on SIGTERM
+  // 12 → 13 → 14: the tree is read BEFORE anything is signalled, because once
+  // the parent is gone its children are reparented and the link is lost.
+  let askedAt: [number, string][] = [];
+  w.deps.descendants = (p) => {
+    askedAt = [...signals];
+    return p === 12 ? [14, 13] : [];
+  };
+  const seen: string[][] = [];
+  const log = w.deps.log;
+  w.deps.log = (line) => { log(line); seen.push(w.manifest().rows.map((r) => r.outcome)); };
   const { executeImport } = await import("../src/import/execute.ts");
   const result = await executeImport(plan, w.file, w.deps);
 
-  assert.deepEqual(signals, [[pid, "SIGTERM"], [pid, "SIGKILL"]], "SIGTERM first, and only then the floor under it");
-  assert.ok(w.clock() - T0 >= 10_000, "SIGKILL waited out the whole ten-second grace");
+  assert.deepEqual(signals, [[12, "SIGTERM"], [14, "SIGKILL"], [13, "SIGKILL"], [12, "SIGKILL"]]);
+  assert.deepEqual(askedAt, [[12, "SIGTERM"]], "the tree is collected before the first SIGKILL, not after");
+  assert.deepEqual(seen[0], ["killed pid 12 and 2 children"], "the manifest says it at the moment it is true");
   assert.deepEqual(result, { moved: 1, stopped: 1, failed: 0 });
-  assert.ok(w.log.some((l) => l.includes("(SIGKILL)")), w.log.join("\n"));
-  assert.ok(!w.deps.alive(pid));
+});
+
+test("a CLI that leaves on SIGTERM is never asked for its descendants", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid })]);
+  const w = await world(t, plan);
+  let asked = 0;
+  w.deps.descendants = (p) => { asked += 1; return [p + 1]; };
+  const seen: string[][] = [];
+  const log = w.deps.log;
+  w.deps.log = (line) => { log(line); seen.push(w.manifest().rows.map((r) => r.outcome)); };
+  const { executeImport } = await import("../src/import/execute.ts");
+  await executeImport(plan, w.file, w.deps);
+  assert.equal(asked, 0, "SIGTERM is the parent's alone: a wrapper forwards it, and a tree we did not have to walk is one we do not kill");
+  assert.deepEqual(seen[0], ["stopped"]);
+});
+
+test("a process tree is read off `ps -axo pid=,ppid=` and walked deepest-first", async () => {
+  const { parsePidParents, descendantsOf } = await import("../src/import/execute.ts");
+  const parents = parsePidParents([
+    "    1     0",
+    "   12     1",
+    "   13    12",
+    "   14    13",
+    "   15    12",
+    "   99     1",
+    "  junk line",
+  ].join("\n"));
+  assert.equal(parents.get(14), 13);
+  assert.deepEqual(descendantsOf(12, parents), [14, 13, 15], "deepest first: a grandchild is signalled before the child that owns it");
+  assert.deepEqual(descendantsOf(99, parents), [], "a leaf has none");
+  assert.deepEqual(descendantsOf(14, parents), []);
+
+  // A table that claims a process is its own ancestor terminates rather than
+  // walking for ever — and never names the pid itself, which the caller kills
+  // separately.
+  const cycle = parsePidParents(["  20   21", "  21   20"].join("\n"));
+  assert.deepEqual(descendantsOf(20, cycle), [21]);
 });
 
 test("a process that cannot be signalled fails its own row and stops nothing else", async (t) => {

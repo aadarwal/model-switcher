@@ -74,16 +74,22 @@ test("toIcs: a valid RFC 5545 calendar — CRLF lines, stable UIDs, escaped text
   assert.ok(ics.endsWith("END:VCALENDAR\r\n"));
   assert.ok(!/[^\r]\n/.test(ics), "every line ends CRLF");
   assert.equal(ics.match(/BEGIN:VEVENT/g)!.length, 2);
-  assert.ok(ics.includes("SUMMARY:ms: a\\,b\;c (claude) 5h limit resets"), "commas and semicolons escaped");
+  assert.ok(ics.includes(String.raw`SUMMARY:ms: a\,b\;c (claude) 5h limit resets`), "commas and semicolons escaped");
   assert.ok(ics.includes("DTSTART:20260918T150000Z") && ics.includes("DTSTAMP:20260918T120000Z"));
   for (const line of ics.split("\r\n")) assert.ok(Buffer.byteLength(line) <= 75, `unfolded line: ${line}`);
   assert.ok(ics.includes("\r\n "), "the long summary is folded with a leading space");
   assert.equal(toIcs(ev, NOW + 5000).match(/^UID:.*$/gm)!.join(), ics.match(/^UID:.*$/gm)!.join(), "re-importing later updates events instead of duplicating them");
 });
 
-test("toIcs: no events is still a valid, empty calendar", async () => {
+test("toIcs: no events is still a valid calendar — RFC 5545 requires a component, so one informational all-day VEVENT stands in for an empty body", async () => {
   const { toIcs } = await import("../src/calendar.ts");
-  assert.equal(toIcs([], NOW), "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//model-switcher//ms calendar//EN\r\nCALSCALE:GREGORIAN\r\nX-WR-CALNAME:model-switcher resets\r\nEND:VCALENDAR\r\n");
+  assert.equal(
+    toIcs([], NOW),
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//model-switcher//ms calendar//EN\r\nCALSCALE:GREGORIAN\r\nX-WR-CALNAME:model-switcher resets\r\n" +
+      "BEGIN:VEVENT\r\nUID:nothing-upcoming-20260918@model-switcher\r\nDTSTAMP:20260918T120000Z\r\nDTSTART;VALUE=DATE:20260918\r\n" +
+      "SUMMARY:ms calendar: no limit resets upcoming\r\nTRANSP:TRANSPARENT\r\nEND:VEVENT\r\n" +
+      "END:VCALENDAR\r\n",
+  );
 });
 
 test("calendarText: grouped by local day, one line per reset; an empty horizon says so instead of printing nothing", async () => {

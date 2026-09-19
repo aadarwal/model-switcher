@@ -222,10 +222,11 @@ h2 { margin: 0; font-size: 13px; font-weight: 500; letter-spacing: -0.01em; colo
 .ms-cal li { display: grid; grid-template-columns: 52px minmax(120px, 1.4fr) minmax(90px, 1fr) 84px auto; gap: 12px; align-items: baseline;
   padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
 .ms-cal li:last-child { border-bottom: 0; }
-.ms-caltime, .ms-calpct { font-family: var(--mono); font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ms-caltime, .ms-calpct { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .ms-calwho { color: var(--ink); overflow-wrap: anywhere; }
 .ms-calprov, .ms-calwin { color: var(--muted); }
 .ms-callink, .ms-calfeed { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--baseline); white-space: nowrap; }
+.ms-calfeed { margin-left: 10px; }
 .ms-callink:hover, .ms-calfeed:hover, .ms-callink:focus-visible, .ms-calfeed:focus-visible { color: var(--ink); border-bottom-color: var(--ink); }
 .ms-calempty { font-size: 12.5px; color: var(--muted); padding: 6px 0; }
 @media (max-width: 640px) { .ms-cal li { grid-template-columns: 52px 1fr; } .ms-calpct, .ms-calwin { grid-column: 2; } .ms-callink { grid-column: 2; justify-self: start; } }

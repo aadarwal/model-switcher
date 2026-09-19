@@ -22,6 +22,7 @@
 // events and text out. It reads the same coalesced snapshot `ms status` does
 // and never polls on its own account.
 
+import { createHash } from "node:crypto";
 import type { Verb } from "./cli.ts";
 import type { Provider } from "./registry.ts";
 import type { Window } from "./pick.ts";
@@ -133,7 +134,7 @@ export function toEventViews(events: ResetEvent[]): ResetEventView[] {
 
 /** RFC 5545 §3.3.11 TEXT: backslash, semicolon, comma and newline are escaped. */
 export function icsEscape(s: string): string {
-  return s.replace(/\\/g, "\\\\").replace(/;/g, "\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+  return s.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
 }
 
 /** RFC 5545 §3.1: a content line is at most 75 OCTETS; a longer one continues
@@ -159,13 +160,34 @@ export function icsFold(line: string): string {
 }
 
 /** A UID that depends only on WHAT resets and WHEN, so importing a newer file
- *  updates the same events instead of stacking duplicates. */
+ *  updates the same events instead of stacking duplicates. Provider, account
+ *  and windows are hashed together as a JSON array rather than joined on
+ *  `-` directly: an account name may itself contain a `-` (`NAME_PATTERN`
+ *  allows it), and a plain join can't tell "a" + ["week","fable"] apart from
+ *  "a-week" + ["fable"]. JSON's own quoting keeps the parts unambiguous. */
 export function eventUid(e: ResetEvent): string {
-  return `${e.provider}-${e.account}-${e.windows.join("-")}-${utcBasic(Date.parse(e.at))}@model-switcher`;
+  const key = createHash("sha256").update(JSON.stringify([e.provider, e.account, e.windows])).digest("hex").slice(0, 16);
+  return `${key}-${utcBasic(Date.parse(e.at))}@model-switcher`;
 }
 
 export function toIcs(events: ResetEvent[], nowMs: number): string {
   const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", `PRODID:${PRODID}`, "CALSCALE:GREGORIAN", "X-WR-CALNAME:model-switcher resets"];
+  if (events.length === 0) {
+    // RFC 5545 §3.4: a VCALENDAR requires at least one component. An empty
+    // body would be invalid (and the README points a subscribed calendar
+    // app straight at this feed), so ship one all-day, informational VEVENT
+    // instead of nothing.
+    const day = utcBasic(nowMs).slice(0, 8);
+    lines.push(
+      "BEGIN:VEVENT",
+      `UID:nothing-upcoming-${day}@model-switcher`,
+      `DTSTAMP:${utcBasic(nowMs)}`,
+      `DTSTART;VALUE=DATE:${day}`,
+      `SUMMARY:${icsEscape("ms calendar: no limit resets upcoming")}`,
+      "TRANSP:TRANSPARENT",
+      "END:VEVENT",
+    );
+  }
   for (const e of events) {
     const start = Date.parse(e.at);
     lines.push(

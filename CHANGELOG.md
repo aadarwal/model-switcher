@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0
+
+- `ms import` brings conversations running outside tmux into it: it finds every Claude
+  Code and Codex conversation on the machine (`--since 30m|2h|1d|all`, `--dir <path>`),
+  plans a tmux layout of one session per repo root and one window per worktree, stops each
+  original process, and resumes the same conversation in a pane under `ms`
+- every run writes a manifest (`MS_HOME/imports/<timestamp>.json`, 0600) that records what
+  became of each row and can be re-run (`--plan`) or printed back (`--status`);
+  `--dry-run` plans without moving anything, and without a terminal to confirm in the verb
+  refuses rather than assuming yes
+- flags are carried into an imported pane by whitelist, so a credential on the original
+  command line reaches neither the new command line nor the manifest
+- an import never signals a pid it cannot re-identify: the manifest records when each
+  process started, and `--plan` re-reads the process table and refuses (`stop refused: …`)
+  when the pid has since been re-used, so a manifest run hours later cannot kill a stranger
+- a conversation is reported resumed only on the store row that names it, so two
+  conversations in one directory can never be reported back on one row
+- a Claude launch that RESUMES is no longer given a `--session-id`: `ms claude --
+  --resume <id>` now runs `claude --resume <id>` and records that conversation's own id,
+  instead of running two contradictory answers to which conversation it is and recording
+  a uuid the CLI never used. This is the path `ms import` resumes every Claude
+  conversation through
+- `ms setup` gains a step, after the hooks and before the opt-ins, offering to move
+  conversations running outside tmux into it (default no): it scans, offers a numbered
+  choice of directories and an activity window, shows the plan, and on confirmation runs
+  the same executor `ms import` does, recording the manifest path in `setup.json`
+
 ## 0.2.6
 
 - `npm test` scrubs `CLAUDE_CONFIG_DIR`, `MS_HOME`, `CODEX_HOME` and `MS_BIN` from its own environment, so a developer's real Claude config is never written by the suite

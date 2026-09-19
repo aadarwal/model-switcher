@@ -47,7 +47,7 @@ Input: candidates (provider, id, cwd, lastActivity, title, live pid or null, arg
 For each row, in plan order:
 1. If the row has a live pid: send `SIGTERM`; wait up to 10 s for exit; then `SIGKILL`; wait 2 s. Both CLIs write their transcript continuously, so the conversation on disk is complete at this point. Record `stopped` (or `stop failed: <reason>` and skip the row).
 2. Create the session/window/pane as planned (`tmux new-session -d`, `new-window`, `split-window`, `select-layout tiled`), with the pane's cwd set to the conversation's cwd.
-3. Run the pane's command via `send-keys` of the command line only (the resume id and flags are argv of `ms`, never a prompt typed into a CLI); wait for the `ms` row to reach `running`/`continuing` (the hook), bounded at 60 s; record `resumed in <session>:<window>.<pane>` or `resume failed: <reason>`.
+3. Run the pane's command via `send-keys` of the command line only (the resume id and flags are argv of `ms`, never a prompt typed into a CLI); wait for the `ms` row to reach `running`/`continuing` (the hook), bounded at 60 s; record `resumed in <session>:<window>.<index> (<pane id>)` (tmux's own index and pane id) or `resume failed: <reason>`.
 4. Write the manifest after every row.
 
 A failure never stops the run. The summary prints `moved N, stopped M, failed K` and the manifest path; exit 1 if any row failed.
@@ -56,11 +56,11 @@ A failure never stops the run. The summary prints `moved N, stopped M, failed K`
 
 `MS_HOME/imports/<ISO timestamp>.json` (0600):
 ```json
-{ "createdAt": "...", "server": "default|ms", "since": "2h", "dirs": ["..."],
+{ "createdAt": "...", "server": "current|ms", "since": "2h", "dirs": ["..."],
   "rows": [{ "provider": "codex", "id": "...", "cwd": "...", "root": "...", "worktree": "...",
              "lastActivity": "...", "title": "...", "pid": 1234, "argv": ["codex","--yolo"],
-             "target": { "session": "data", "window": "main", "pane": 2 },
-             "outcome": "planned|stopped|resumed in data:main.2|stop failed: …|resume failed: …" }] }
+             "target": { "session": "data", "window": "main", "slot": 2 }, "paneId": "%58", "paneIndex": 3,
+             "outcome": "planned|stopped|resumed in data:main.3 (%58)|stop refused: …|stop failed: …|resume failed: …" }] }
 ```
 The manifest is the rollback record: the conversations still exist on disk whatever happened, and each row says where to resume it by hand.
 

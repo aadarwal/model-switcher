@@ -46,6 +46,8 @@ import { ensureCodexTrust, removeCodexTrust } from "../providers/codex-cli.ts";
 import { findAccount, loadRegistry, NAME_PATTERN, type Provider } from "../registry.ts";
 import { status } from "../status.ts";
 import { installAlias, rcPathFor } from "./alias.ts";
+import { importStep, type RunImportFn } from "./import-step.ts";
+import { runImportPlan } from "../import.ts";
 import type { Prompter } from "./prompt.ts";
 import { saveSetup, type SetupState, type SetupStep } from "./state.ts";
 import { installStatusline } from "./statusline.ts";
@@ -58,6 +60,7 @@ export const STEP_ORDER: readonly SetupStep[] = [
   "claude-accounts",
   "codex-accounts",
   "hooks",
+  "import",
   "statusline",
   "alias",
   "finish",
@@ -70,6 +73,7 @@ export const STEP_LABEL: Record<SetupStep, string> = {
   "claude-accounts": "the Claude accounts",
   "codex-accounts": "the ChatGPT accounts",
   hooks: "the hooks",
+  import: "moving conversations into tmux",
   statusline: "the statusline",
   alias: "the shell aliases",
   finish: "the final check",
@@ -674,11 +678,26 @@ export function registeredAccounts(): { claude: string[]; codex: string[] } {
   };
 }
 
+/**
+ * What the `import` step actually runs into once a human says yes to it and
+ * confirms the plan: the same `runImportPlan` (`../import.ts`) the `ms
+ * import` verb calls, so the wizard and the verb can never drift onto two
+ * different executors. `importStep` does not wrap this call in `attempt`'s
+ * Retry/Skip/Abort — the executor's own contract already reports per-row
+ * trouble through its return value (`{moved,stopped,failed}`, never a throw
+ * for an ordinary failed stop or resume), so a throw out of this is meant to
+ * be the exceptional case (a manifest the step failed to write, a tmux that
+ * refuses to start at all), not the routine one.
+ */
+const realRunImport: RunImportFn = (plan, manifestPath) =>
+  runImportPlan(plan, manifestPath, (line) => process.stderr.write(`ms setup: ${line}\n`));
+
 export const STEP_RUNNERS: Record<SetupStep, (ctx: Ctx) => Promise<void>> = {
   prereqs,
   "claude-accounts": claudeAccounts,
   "codex-accounts": codexAccounts,
   hooks,
+  import: importStep({ runImport: realRunImport }),
   statusline,
   alias,
   finish,

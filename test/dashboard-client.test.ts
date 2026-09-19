@@ -14,6 +14,7 @@ import {
   buildSwitchBody,
   buildStopBody,
   buildSwitchAllBody,
+  buildRebalanceBody,
   nextPollState,
   pollStateOnVisible,
   isWorry,
@@ -31,6 +32,8 @@ import {
   providerSegHtml,
   sessionRowHtml,
   formatSwitchAll,
+  formatRebalance,
+  rebalanceWouldMove,
   fleetCandidateIds,
   isFinishedSession,
   visibleSessions,
@@ -42,6 +45,7 @@ import {
 } from "../src/dashboard/client-logic.ts";
 import * as clientLogic from "../src/dashboard/client-logic.ts";
 import { EMBEDDED_FUNCTION_NAMES } from "../src/dashboard/page.ts";
+import { WOULD_MOVE } from "../src/rebalance-verb.ts";
 
 // --- esc() -----------------------------------------------------------------
 
@@ -312,6 +316,21 @@ test("sessionRowHtml: PENDING and the WALLED? reading are rendered as statusJson
   assert.ok(quiet.includes("<td>—</td>"), `a null pending must read as the dash: ${quiet}`);
   assert.ok(quiet.includes('<td class="ms-state">running</td>'), `a quiet state wears no chip: ${quiet}`);
   assert.ok(!quiet.includes("worry"), `a healthy row is all ink: ${quiet}`);
+});
+
+test("sessionRowHtml: BETTER rides beside the account as a QUIET chip — never a worry colour", () => {
+  const html = sessionRowHtml({ ...SESSION, state: "running", pending: null, walled: "", better: "gmail" }, [], "", null, "\u2014");
+  assert.ok(html.includes('<td>dirk <span class="ms-chip">better: gmail</span></td>'), html);
+  // "there is a better account" is never a thing a human must act on — the
+  // rule does, at the next turn end — so the chip must be plain ink.
+  assert.ok(!html.includes("ms-chip worry"), `the better chip must not wear the worry colour: ${html}`);
+
+  // Null (already on the best account) and absent (an older /api/state)
+  // both render no chip at all rather than an empty one.
+  for (const row of [{ ...SESSION, better: null }, { ...SESSION }]) {
+    const quiet = sessionRowHtml(row, [], "", null, "\u2014");
+    assert.ok(!quiet.includes("better:"), `a session with nowhere better named a chip: ${quiet}`);
+  }
 });
 
 test("sessionRowHtml: the id is short and mono, with the whole id kept in the cell's title and the row's own data-session", () => {
@@ -783,6 +802,55 @@ test("the served page sends the PROVIDER the human actually selected — the seg
   assert.deepStrictEqual(lastSwitchAllBody(dom.calls), { to: "tulp", force: false, provider: "codex" });
 });
 
+/** The `fakeDom` fetch stub answers EVERY request with the same object, so
+ *  a fixture that has to serve as both `/api/state` and `/api/rebalance`
+ *  carries both shapes. The page ignores the key it did not ask for. */
+const REBALANCE_STATE = {
+  ...TWO_PROVIDER_STATE,
+  rows: [{ session: "s1", account: "dirk", better: "gmail", reason: "imminent-wall", outcome: WOULD_MOVE }],
+};
+
+function lastRebalanceBody(calls: FetchCall[]): Record<string, unknown> | null {
+  const call = [...calls].reverse().find((c) => c.url === "/api/rebalance");
+  return call?.init?.body ? (JSON.parse(call.init.body) as Record<string, unknown>) : null;
+}
+
+test("the served page's Rebalance control shows the plan first, then runs it — dry run, then the real one", async () => {
+  const dom = await runPage(REBALANCE_STATE);
+
+  // First click: the plan, and nothing else. The control says what it would
+  // do next rather than leaving the human to guess whether it already ran.
+  dom.fire("#rebalance-go", "click");
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(lastRebalanceBody(dom.calls), { dryRun: true });
+  assert.equal(dom.el("#rebalance-go").textContent, "Rebalance now");
+  assert.match(dom.el("#rebalance-msg").textContent, /s1: dirk \u2192 gmail/);
+
+  // Second click: the real run. No confirm dialog — the plan above IS the
+  // confirmation, and this rule never moves a pane mid-turn.
+  dom.fire("#rebalance-go", "click");
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(lastRebalanceBody(dom.calls), { dryRun: false });
+  // …and a real run always disarms, so a third click is a fresh dry run
+  // rather than a second round of moves.
+  assert.equal(dom.el("#rebalance-go").textContent, "Rebalance");
+  dom.fire("#rebalance-go", "click");
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(lastRebalanceBody(dom.calls), { dryRun: true });
+});
+
+test("the served page's Rebalance control stays a dry run when there is nothing to move", async () => {
+  const dom = await runPage({ ...TWO_PROVIDER_STATE, rows: [{ session: "s3", account: "tulp", better: null, reason: "already on the best account", outcome: "\u2014" }] });
+
+  dom.fire("#rebalance-go", "click");
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(dom.el("#rebalance-go").textContent, "Rebalance", "nothing would move: there is nothing to arm");
+
+  dom.fire("#rebalance-go", "click");
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(lastRebalanceBody(dom.calls), { dryRun: true }, "a second click cannot become a real run on its own");
+});
+
 test("the served page's Go control sends the default provider, and the Force checkbox it reads is its own", async () => {
   const dom = await runPage(TWO_PROVIDER_STATE);
 
@@ -796,6 +864,41 @@ test("the served page's Go control sends the default provider, and the Force che
   dom.fire("#moveall-go", "click");
   for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
   assert.deepStrictEqual(lastSwitchAllBody(dom.calls), { to: "dirk", force: true, provider: "claude" });
+});
+
+// --- The Rebalance control -------------------------------------------------
+
+const REBALANCE_ROWS = [
+  { session: "s1", account: "dirk", better: "gmail", reason: "imminent-wall", outcome: WOULD_MOVE },
+  { session: "s3", account: "gmail", better: null, reason: "already on the best account", outcome: "\u2014" },
+];
+
+test("buildRebalanceBody: the whole body, with dryRun always stated — a missing one is a REAL run", () => {
+  assert.deepStrictEqual(buildRebalanceBody(true), { dryRun: true });
+  assert.deepStrictEqual(buildRebalanceBody(false), { dryRun: false });
+});
+
+test("formatRebalance: one line per session — where it is, where it belongs, and the reason even when nothing moves", () => {
+  assert.equal(
+    formatRebalance(200, { rows: REBALANCE_ROWS }),
+    "s1: dirk \u2192 gmail \u2014 would move (imminent-wall)\ns3: gmail \u2014 already on the best account",
+  );
+  // The CLI's own answers, in the page's voice: an error, an empty fleet,
+  // and a response that is not one of ours at all.
+  assert.equal(formatRebalance(500, { error: "the store is locked" }), "the store is locked");
+  assert.equal(formatRebalance(200, { rows: [] }), "no live session to consider");
+  assert.equal(formatRebalance(200, null), "HTTP 200");
+});
+
+test("rebalanceWouldMove: armed only by the server's OWN word for a would-be move", () => {
+  assert.equal(rebalanceWouldMove({ rows: REBALANCE_ROWS }), true);
+  assert.equal(rebalanceWouldMove({ rows: [REBALANCE_ROWS[1]!] }), false);
+  assert.equal(rebalanceWouldMove({ rows: [] }), false);
+  assert.equal(rebalanceWouldMove(null), false);
+  // The pin: the page reads this word off the wire, and `rebalance-verb.ts`
+  // is the one place it is written. A rename there with no rename here
+  // would leave a control that never arms, silently.
+  assert.equal(rebalanceWouldMove({ rows: [{ ...REBALANCE_ROWS[0]!, outcome: WOULD_MOVE }] }), true);
 });
 
 // --- Finding F6: gone/stopped sessions hidden by default --------------------

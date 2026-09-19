@@ -44,6 +44,14 @@ export function buildSwitchAllBody(to: string, force: boolean, provider: string)
   return { to: to, force: force, provider: provider };
 }
 
+/** `POST /api/rebalance`'s whole body (src/dashboard/api.ts's
+ *  `parseRebalanceBody`). `dryRun` is always sent explicitly, never omitted:
+ *  the route reads a missing one as a REAL run, which is the CLI's own
+ *  default and the last thing a click should get by accident. */
+export function buildRebalanceBody(dryRun: boolean): { dryRun: boolean } {
+  return { dryRun: dryRun };
+}
+
 // --- Poll retry/backoff state machine (finding 6) --------------------------
 //
 // "Polling never stops" — the page used to `setInterval` forever, so a
@@ -110,6 +118,9 @@ export type SessionRowView = {
   pending: string | null;
   wakeupAt: number | null;
   walled: string;
+  /** Where the rebalance rule would put this session (src/rebalance.ts), or
+   *  null when it is already there. Absent from an older /api/state. */
+  better?: string | null;
 };
 export type RowMessage = { text: string; error: boolean } | null;
 
@@ -417,13 +428,20 @@ export function sessionRowHtml(s: SessionRowView, others: string[], chosen: stri
     : "";
   var msgHtml = msg ? '<span class="rowmsg' + (msg.error ? " error" : "") + '">' + esc(msg.text) + "</span>" : "";
   var state = isWorry(s.state) ? '<span class="' + chipClass(s.state) + '">' + esc(s.state) + "</span>" : esc(s.state);
+  // BETTER, beside the account it would leave. Deliberately NOT a worry
+  // colour and deliberately not `chipClass` (which could only ever return
+  // the plain pill for this text anyway): "there is a better account" is
+  // never something a human must act on — the rule acts on it, at the next
+  // turn end, or they run `ms rebalance`. An amber chip on every session
+  // whose pool has shifted would be a panel of amber saying nothing.
+  var better = s.better ? ' <span class="ms-chip">better: ' + esc(s.better) + "</span>" : "";
   var walled = s.walled ? '<small class="ms-sub"><span' + worryAttr(s.walled) + ">" + esc(s.walled) + "</span></small>" : "";
   return (
     "<tr>" +
     '<td class="mono" title="' + esc(s.id) + '">' + esc(shortSessionId(s.id)) + "</td>" +
     '<td class="mono">' + esc(s.pane || dash) + "</td>" +
     "<td>" + esc(s.provider) + "</td>" +
-    "<td>" + esc(s.account) + "</td>" +
+    "<td>" + esc(s.account) + better + "</td>" +
     "<td>" + esc(s.need) + "</td>" +
     '<td class="ms-state">' + state + walled + "</td>" +
     '<td class="num">' + esc(String(s.generation)) + "</td>" +
@@ -484,6 +502,56 @@ export function formatSwitchAll(status: number, json: SwitchAllJson): string {
   }
   lines.push("moved " + moved + ", refused " + (results.length - moved));
   return lines.join("\n");
+}
+
+// --- What a rebalance came to ---------------------------------------------
+
+export type RebalanceRowView = { session: string; account: string; better: string | null; reason: string; outcome: string };
+export type RebalanceJson = { rows?: RebalanceRowView[]; error?: string } | null;
+
+/**
+ * `POST /api/rebalance`'s answer, in the CLI's own words.
+ *
+ * One line per live session: where it is, where the rule would put it, and
+ * what happened — with the REASON kept even on the rows that are not going
+ * anywhere, because "nothing moved" and "nothing moved BECAUSE nothing is
+ * near a wall" are different facts and only the second one is an answer.
+ */
+export function formatRebalance(status: number, json: RebalanceJson): string {
+  if (json && typeof json.error === "string") return json.error;
+  var rows = json && json.rows;
+  if (!rows || typeof rows.length !== "number") return "HTTP " + status;
+  if (!rows.length) return "no live session to consider";
+  var lines: string[] = [];
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i]!;
+    var where = r.session + ": " + r.account + (r.better ? " \u2192 " + r.better : "");
+    // A row that is not moving says only why; a row that is says what
+    // happened, with the condition that decided it in brackets.
+    lines.push(where + " \u2014 " + (r.outcome === "\u2014" ? r.reason : r.outcome + " (" + r.reason + ")"));
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Did that dry run find anything to move?
+ *
+ * It is what arms the control's second click: the human sees the plan, and
+ * the real run needs no confirm dialog because a rebalance never moves a
+ * pane mid-turn — the worst a mistaken second click can do is put an idle
+ * session on an account with more room.
+ *
+ * `"would move"` is the server's own word for that outcome
+ * (`rebalance-verb.ts`'s `WOULD_MOVE`, which test/dashboard-client.test.ts
+ * pins this against — nothing here may drift from it).
+ */
+export function rebalanceWouldMove(json: RebalanceJson): boolean {
+  var rows = json && json.rows;
+  if (!rows || typeof rows.length !== "number") return false;
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i] && rows[i]!.outcome === "would move") return true;
+  }
+  return false;
 }
 
 // --- Which rows a fleet move touches (rereview-C.md, defect 3) -------------

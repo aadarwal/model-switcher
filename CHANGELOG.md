@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- rebalance: at the end of a turn, an idle session moves to the account the
+  chooser would pick for it now — when a window it gates on is at 85 % or
+  more and the destination has 30 % room, or when the best account's week
+  resets 24 h earlier and this one's is half spent. Never mid-turn, never a
+  parked/waiting/stopped session, at most one move per hook run, and under
+  the 6 h / 30 min hysteresis guards; the move is the `ms switch`
+  transaction with no continuation. Off unless `MS_REBALANCE=1`
+- `ms status` ends its sessions table with BETTER — where that rule would
+  put each session right now, `—` when it is already there — and
+  `--json` / `/api/state` carry it as `better` (additive)
+- `ms rebalance [--dry-run] [--session <id>]` asks the same question for the
+  whole fleet and prints SESSION, ACCOUNT, BETTER, REASON, OUTCOME; without
+  `--dry-run` it makes the moves, one at a time, waiving the 6 h cooldown for
+  an explicit run but never the wall guard or the mid-turn refusal
+- the dashboard gains a Rebalance control beside "Move every pane" (the plan
+  first, then the run) and a quiet `better:` chip on each session row
+- `ms doctor` prints the rebalance gate's state, like the Codex one
+
 ## 0.2.6
 
 - `npm test` scrubs `CLAUDE_CONFIG_DIR`, `MS_HOME`, `CODEX_HOME` and `MS_BIN` from its own environment, so a developer's real Claude config is never written by the suite

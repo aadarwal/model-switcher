@@ -303,6 +303,9 @@ test("a malformed body is refused with 400, per route", async (t) => {
     { method: "POST", path: "/api/switch-all", body: { to: "home", provider: "gemini" } }, // not claude|codex
     { method: "POST", path: "/api/switch-all", body: { to: "home", provider: "" } }, // empty string
     { method: "POST", path: "/api/switch-all", body: { to: "home", provider: 1 } }, // wrong type
+    { method: "POST", path: "/api/rebalance" }, // no body at all
+    { method: "POST", path: "/api/rebalance", body: "dry" }, // not an object
+    { method: "POST", path: "/api/rebalance", body: { dryRun: "yes" } }, // wrong type
   ];
 
   for (const req of cases) {
@@ -310,6 +313,46 @@ test("a malformed body is refused with 400, per route", async (t) => {
     assert.equal(res.status, 400, `${req.method} ${req.path} with ${JSON.stringify(req.body)}`);
     assert.equal(typeof (res.json as { error: unknown }).error, "string");
   }
+});
+
+// --- POST /api/rebalance ------------------------------------------------
+//
+// The rebalance rule (src/rebalance.ts) for the whole fleet, the same
+// function `ms rebalance` runs (src/rebalance-verb.ts). The fixture pool is
+// deliberately calm — dirk is nowhere near a wall and the two weeks reset
+// together — so the decision is "neither condition holds" and the route can
+// be proved end to end without a handoff.
+
+test("POST /api/rebalance answers one row per live session: where it is, where it belongs, and why it is not going", async (t) => {
+  await world(t);
+
+  const res = await handle({ method: "POST", path: "/api/rebalance", body: { dryRun: true } });
+
+  assert.equal(res.status, 200);
+  const json = res.json as { rows: { session: string; account: string; better: string | null; reason: string; outcome: string }[] };
+  assert.deepEqual(Object.keys(json), ["rows"]);
+  // s2 is parked: not a row at all. s1 is running on dirk, and gmail has
+  // more of its week left on the same reset — so the chooser prefers it,
+  // and neither of the two conditions for moving holds.
+  assert.deepEqual(json.rows, [
+    { session: "s1", account: "dirk", better: "gmail", reason: "neither condition holds", outcome: "—" },
+  ]);
+
+  const serialized = JSON.stringify(res);
+  assert.ok(!serialized.includes("sk-ant-oat01"), `a token-shaped string leaked into the API response: ${serialized}`);
+});
+
+test("POST /api/rebalance with dryRun omitted is a REAL run, and the calm fixture proves it by moving nothing", async (t) => {
+  const w = await world(t);
+
+  const res = await handle({ method: "POST", path: "/api/rebalance", body: {} });
+
+  assert.equal(res.status, 200);
+  const json = res.json as { rows: { outcome: string }[] };
+  assert.deepEqual(json.rows.map((r) => r.outcome), ["—"]);
+  // Nothing was asked of tmux beyond reading the pane.
+  const acted = logLines(w).filter((l) => /send-keys|respawn-pane|run-shell/.test(l));
+  assert.deepEqual(acted, [], `a run with nothing to do touched a pane:\n${logLines(w).join("\n")}`);
 });
 
 // --- Unknown route → 404 -----------------------------------------------

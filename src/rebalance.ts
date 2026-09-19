@@ -340,14 +340,28 @@ const CACHE_ONLY_MS = Number.POSITIVE_INFINITY;
 export const rebalanceArgv = (sessionId: string, to: string): string[] =>
   [msBinary(), "_rebalance", sessionId, "--to", to];
 
+/**
+ * One word for a pane, from a reading somebody else already took.
+ *
+ * `ms status` captures every session's screen once per render, to decide the
+ * STATE column and the WALLED? one; asking tmux a second time per row for
+ * this rule's benefit would double a verb's tmux traffic to learn a fact it
+ * is already holding. `screen === null` is what that caller passes for a
+ * pane it could not capture, which is the same thing as a pane that is gone.
+ */
+export function paneReading(exists: boolean, screen: string | null): PaneReading {
+  if (!exists || screen === null) return "gone";
+  return isBusy(screen) ? "busy" : "idle";
+}
+
 /** One word for a pane, read the way the recovery transaction reads it —
  *  `src/recover.ts`'s own `safeCapture`/`isBusy`, so this rule refuses
  *  exactly the panes that transaction would refuse. */
-function readPane(socket: string, pane: string): PaneReading {
+export function readPane(socket: string, pane: string): PaneReading {
   if (!pane) return "gone";
   const tmux = new Tmux(socket || null);
   if (!tmux.paneExists(pane)) return "gone";
-  return isBusy(safeCapture(tmux, pane)) ? "busy" : "idle";
+  return paneReading(true, safeCapture(tmux, pane));
 }
 
 /**
@@ -388,7 +402,7 @@ function resetTimes(s: Snapshot): number[] {
  * rotation, and this rule's own successful move alike. The later of the two
  * is the answer.
  */
-function lastMoveAtMs(st: State, row: SessionRow): number | null {
+export function lastMoveAtMs(st: State, row: SessionRow): number | null {
   const seconds = [row.lastMoveAt, st.lastAccountChangeAt(row.id)].filter((t): t is number => typeof t === "number");
   return seconds.length ? Math.max(...seconds) * 1000 : null;
 }
@@ -402,7 +416,7 @@ function lastMoveAtMs(st: State, row: SessionRow): number | null {
  * whether or not the rotation then succeeded, which is exactly the case where
  * second-guessing the account would be worst.
  */
-function lastWallAtMs(sessionId: string): number | null {
+export function lastWallAtMs(sessionId: string): number | null {
   const e = lastEvent(sessionId, "rate_limited");
   return e ? e.t * 1000 : null;
 }

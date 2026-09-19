@@ -12,6 +12,7 @@ import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { paneDied, reconcile } from "./reconcile.ts";
 import { recoverVerb } from "./recover.ts";
 import { rebalanceWorkerVerb } from "./rebalance.ts";
+import { rebalanceVerb } from "./rebalance-verb.ts";
 import { status } from "./status.ts";
 import { calendar } from "./calendar.ts";
 import { doctor } from "./doctor.ts";
@@ -40,6 +41,9 @@ registerVerb("_recover", recoverVerb);
 // ended (src/rebalance.ts).
 registerVerb("_rebalance", rebalanceWorkerVerb);
 registerVerb("status", status);
+// `ms rebalance`: the same decision the turn-end hook takes, for the whole
+// fleet, printed — and, without --dry-run, acted on (src/rebalance-verb.ts).
+registerVerb("rebalance", rebalanceVerb);
 registerVerb("calendar", calendar);
 registerVerb("doctor", doctor);
 registerVerb("accounts", accountsVerb);
@@ -50,7 +54,7 @@ registerVerb("stop", stopVerb);
 registerVerb("dashboard", dashboard);
 
 const USAGE = `usage: ms <verb> [args]
-  setup | claude | codex | adopt | status | calendar | accounts | rotate | switch | stop | doctor | attach | dashboard
+  setup | claude | codex | adopt | status | calendar | accounts | rotate | switch | rebalance | stop | doctor | attach | dashboard
   (internal: _exec _hook _codex_watch _recover _rebalance _pane_died _statusline)`;
 
 function version(): string {

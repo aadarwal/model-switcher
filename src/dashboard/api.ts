@@ -13,6 +13,7 @@
 
 import type { Verb } from "../cli.ts";
 import { rotateVerb, stopVerb, switchAll, switchVerb } from "../manual.ts";
+import { rebalanceFleet } from "../rebalance-verb.ts";
 import { reconcile } from "../reconcile.ts";
 import type { Provider } from "../registry.ts";
 import { statusJson } from "../status.ts";
@@ -163,6 +164,10 @@ type RotateBody = { session: string; force: boolean };
 type SwitchBody = { session: string; to: string; continue: boolean; force: boolean };
 type StopBody = { session: string };
 type SwitchAllBody = { to: string; force: boolean; timeoutMs: number; provider?: Provider };
+/** `dryRun` omitted is a REAL run, the same way `ms rebalance` without
+ *  `--dry-run` is: the verb's own default, not a second, safer contract for
+ *  the same name. */
+type RebalanceBody = { dryRun: boolean };
 
 /** `switch-all`'s own `--provider claude|codex` (src/manual.ts): needed only
  *  when `to` is a name both providers hold. `undefined` is "not given" and
@@ -202,6 +207,12 @@ function parseSwitchAllBody(body: unknown): SwitchAllBody | null {
   };
 }
 
+function parseRebalanceBody(body: unknown): RebalanceBody | null {
+  if (!isRecord(body)) return null;
+  if (body.dryRun !== undefined && !isBool(body.dryRun)) return null;
+  return { dryRun: body.dryRun === true };
+}
+
 function badBody(expected: string): ApiResponse {
   return { status: 400, json: { error: `malformed body: expected ${expected}` } };
 }
@@ -221,7 +232,7 @@ async function runVerb(fn: Verb, argv: string[]): Promise<ApiResponse> {
 
 /** The four routes that ACT. A POST to one of them repairs the store first,
  *  the way the CLI does at the start of every public verb. */
-const POST_VERB_PATHS = new Set(["/api/rotate", "/api/switch", "/api/stop", "/api/switch-all"]);
+const POST_VERB_PATHS = new Set(["/api/rotate", "/api/switch", "/api/stop", "/api/switch-all", "/api/rebalance"]);
 
 export async function handle(req: ApiRequest): Promise<ApiResponse> {
   const { method, path, body } = req;
@@ -305,6 +316,27 @@ export async function handle(req: ApiRequest): Promise<ApiResponse> {
       );
       const { results, code, message } = value;
       return { status: 200, json: { code, message, results } };
+    } catch (e) {
+      return { status: 500, json: { error: (e as Error).message } };
+    }
+  }
+
+  if (method === "POST" && path === "/api/rebalance") {
+    const parsed = parseRebalanceBody(body);
+    if (!parsed) return badBody("{ dryRun?: boolean }");
+    // `rebalanceFleet` (src/rebalance-verb.ts) IS the verb — the same
+    // decision over the same snapshot, called in-process like every other
+    // route here. Inside the capture mutex for the same reason
+    // `/api/switch-all` is (finding C2): a real run drives the switch
+    // transaction, and `recoverSession` writes its refusals to
+    // `process.stderr`. Outside the chain those lines land in whatever
+    // capture happens to be in flight — another session's answer, or the
+    // `ms dashboard` terminal. The captured text is discarded: `rows`
+    // already carries one outcome per session, which is what the page
+    // renders and what the CLI prints.
+    try {
+      const { value } = await captured(() => rebalanceFleet({ dryRun: parsed.dryRun }));
+      return { status: 200, json: { rows: value.rows } };
     } catch (e) {
       return { status: 500, json: { error: (e as Error).message } };
     }

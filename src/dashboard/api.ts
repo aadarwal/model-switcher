@@ -16,6 +16,7 @@ import { rotateVerb, stopVerb, switchAll, switchVerb } from "../manual.ts";
 import { reconcile } from "../reconcile.ts";
 import type { Provider } from "../registry.ts";
 import { statusJson } from "../status.ts";
+import { DEFAULT_CALENDAR_DAYS, toEventViews, upcomingResets } from "../calendar.ts";
 
 // The CLI's own `--timeout` default (`ALL_TIMEOUT_SECONDS` in src/manual.ts,
 // 600 s) for a request that never names one — the same 10-minute budget for
@@ -233,6 +234,16 @@ export async function handle(req: ApiRequest): Promise<ApiResponse> {
       // statusJson() fixes that internally, so the dashboard never costs a
       // second poll when a launch or a recovery already took one recently.
       return { status: 200, json: await statusJson() };
+    } catch (e) {
+      return { status: 500, json: { error: (e as Error).message } };
+    }
+  }
+
+  if (method === "GET" && path === "/api/calendar") {
+    try {
+      // The same snapshot /api/state reads (statusJson() inside), so the
+      // panel can never disagree with the accounts above it. Read-only.
+      return { status: 200, json: { days: DEFAULT_CALENDAR_DAYS, events: toEventViews(await upcomingResets(DEFAULT_CALENDAR_DAYS)) } };
     } catch (e) {
       return { status: 500, json: { error: (e as Error).message } };
     }

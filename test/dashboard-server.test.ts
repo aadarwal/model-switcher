@@ -646,3 +646,28 @@ test("finding C4: GETs are unchanged, and no CORS header is ever sent (the brows
     assert.equal(res.headers.get("access-control-allow-credentials"), null);
   }
 });
+
+// --- Calendar --------------------------------------------------------------
+
+test("GET /calendar.ics through the real server is a text/calendar attachment with one VEVENT per upcoming reset", async (t) => {
+  await world(t);
+  const dash = await startDashboard({ port: 0, open: false });
+  t.after(() => dash.close());
+  const res = await fetch(`${dash.url}/calendar.ics`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type") ?? "", /^text\/calendar/);
+  assert.match(res.headers.get("content-disposition") ?? "", /attachment; filename="model-switcher-resets\.ics"/);
+  assert.equal(res.headers.get("access-control-allow-origin"), null, "no CORS header: another origin still cannot read it");
+  const ics = await res.text();
+  assert.ok(ics.startsWith("BEGIN:VCALENDAR\r\n") && ics.endsWith("END:VCALENDAR\r\n"));
+  assert.ok((ics.match(/BEGIN:VEVENT/g) ?? []).length >= 2, ics);
+});
+
+test("the page carries the Calendar section, its .ics link, and the panel function it calls", async (t) => {
+  await world(t);
+  const dash = await startDashboard({ port: 0, open: false });
+  t.after(() => dash.close());
+  const html = await (await fetch(`${dash.url}/`)).text();
+  assert.ok(html.includes("<h2>Calendar</h2>") && html.includes('href="/calendar.ics"') && html.includes('id="calendar"'));
+  assert.ok(html.includes("function calendarHtml(") && html.includes('fetch("/api/calendar")'));
+});

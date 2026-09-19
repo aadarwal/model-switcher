@@ -534,3 +534,54 @@ export function finishedToggleText(sessions: SessionRowView[], showFinished: boo
   if (!n) return "";
   return (showFinished ? "hide " : "show ") + n + " finished";
 }
+
+
+// --- Calendar panel ----------------------------------------------------------
+
+/** One upcoming reset as `/api/calendar` serves it (src/calendar.ts's ResetEventView). */
+export type CalendarEventView = {
+  account: string;
+  provider: string;
+  label: string;
+  windows: string[];
+  at: string;
+  usedPercent: number;
+  title: string;
+  googleUrl: string;
+};
+
+/** `Fri 18 Sep` in LOCAL time: the heading a day's resets sit under. */
+export function calendarDayLabel(ms: number): string {
+  var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  var d = new Date(ms);
+  return days[d.getDay()] + " " + d.getDate() + " " + months[d.getMonth()];
+}
+
+/**
+ * Upcoming limit resets, grouped under local-day headings, soonest first (the
+ * server already sorted them). Each row ends in Google Calendar's own
+ * "create event" link: a plain anchor that opens in a new tab -- this page
+ * never talks to Google itself. Nothing upcoming is a sentence, not a blank.
+ */
+export function calendarHtml(events: CalendarEventView[], dash: string): string {
+  if (!events || !events.length) return '<div class="ms-calempty">No limit resets in the coming days.</div>';
+  var html = "";
+  var day = "";
+  events.forEach(function (e) {
+    var t = Date.parse(e.at);
+    var label = calendarDayLabel(t);
+    if (label !== day) {
+      if (day) html += "</ul>";
+      html += '<h3 class="ms-calday">' + esc(label) + '</h3><ul class="ms-cal">';
+      day = label;
+    }
+    var d = new Date(t);
+    html += '<li><span class="ms-caltime">' + pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + "</span>"
+      + '<span class="ms-calwho">' + esc(e.account) + ' <span class="ms-calprov">' + esc(providerLabel(e.provider)) + "</span></span>"
+      + '<span class="ms-calwin">' + esc((e.windows || []).join(" + ")) + " resets</span>"
+      + '<span class="ms-calpct">' + (isFinite(e.usedPercent) ? Math.round(e.usedPercent) + "% used" : esc(dash)) + "</span>"
+      + '<a class="ms-callink" href="' + esc(e.googleUrl) + '" target="_blank" rel="noopener noreferrer">+ Google Calendar</a></li>';
+  });
+  return html + "</ul>";
+}

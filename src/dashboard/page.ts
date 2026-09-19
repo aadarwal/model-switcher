@@ -72,6 +72,8 @@ import {
   visibleSessions,
   finishedToggleText,
   MAX_POLL_FAILURES,
+  calendarDayLabel,
+  calendarHtml,
 } from "./client-logic.ts";
 
 const DASH = "—"; // matches status.ts's own DASH exactly
@@ -212,6 +214,22 @@ h2 { margin: 0; font-size: 13px; font-weight: 500; letter-spacing: -0.01em; colo
 }
 .ms-ledger td.actions button:hover:not(:disabled) { color: var(--ink); }
 .ms-ledger td.actions button:disabled { opacity: 0.4; cursor: default; }
+
+/* Calendar: upcoming limit resets, one quiet row each. The only colour is the link. */
+.ms-calday { margin: 14px 0 4px; font-size: 11.5px; font-weight: 500; color: var(--muted); letter-spacing: 0.02em; }
+.ms-calday:first-child { margin-top: 0; }
+.ms-cal { list-style: none; margin: 0; padding: 0; }
+.ms-cal li { display: grid; grid-template-columns: 52px minmax(120px, 1.4fr) minmax(90px, 1fr) 84px auto; gap: 12px; align-items: baseline;
+  padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+.ms-cal li:last-child { border-bottom: 0; }
+.ms-caltime, .ms-calpct { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ms-calwho { color: var(--ink); overflow-wrap: anywhere; }
+.ms-calprov, .ms-calwin { color: var(--muted); }
+.ms-callink, .ms-calfeed { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--baseline); white-space: nowrap; }
+.ms-calfeed { margin-left: 10px; }
+.ms-callink:hover, .ms-calfeed:hover, .ms-callink:focus-visible, .ms-calfeed:focus-visible { color: var(--ink); border-bottom-color: var(--ink); }
+.ms-calempty { font-size: 12.5px; color: var(--muted); padding: 6px 0; }
+@media (max-width: 640px) { .ms-cal li { grid-template-columns: 52px 1fr; } .ms-calpct, .ms-calwin { grid-column: 2; } .ms-callink { grid-column: 2; justify-self: start; } }
 .ms-ledger td.actions button:not(:first-child)::before { content: "·"; margin-right: 8px; color: var(--baseline); }
 select {
   appearance: none; font-family: inherit; font-size: 11.5px; color: var(--ink);
@@ -310,6 +328,8 @@ const EMBEDDED = [
   isFinishedSession,
   visibleSessions,
   finishedToggleText,
+  calendarDayLabel,
+  calendarHtml,
 ];
 
 /** The names the page's own script depends on being present, verbatim, in
@@ -594,6 +614,17 @@ ${EMBEDDED_FUNCTIONS}
   // failures the interval stops outright; a later visibilitychange (finding
   // 4) gets exactly one more try via pollStateOnVisible(), not a silently
   // restored full retry budget.
+  // The calendar rides on the state poll but is its own request: a failure here
+  // leaves the last good calendar on screen and never stops the accounts poll.
+  function refreshCalendar() {
+    fetch("/api/calendar").then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (data) {
+      el("calendar").innerHTML = calendarHtml(data.events || [], DASH);
+    }).catch(function () { /* keep what is shown */ });
+  }
+
   function tick() {
     fetch("/api/state").then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -607,6 +638,7 @@ ${EMBEDDED_FUNCTIONS}
       renderSessions(currentSessions, currentAccounts);
       renderMoveAll(currentAccounts);
       updateMeta();
+      refreshCalendar();
       scheduleNext();
     }).catch(function (e) {
       pollState = nextPollState(pollState, false);
@@ -671,6 +703,14 @@ export function renderDashboardPage(): string {
       <button id="moveall-go">Go</button>
     </div>
     <div class="rowmsg" id="moveall-msg"></div>
+  </section>
+
+  <section>
+    <div class="ms-sechead">
+      <h2>Calendar</h2>
+      <a class="ms-calfeed" href="/calendar.ics" download="model-switcher-resets.ics">Download .ics</a>
+    </div>
+    <div id="calendar"><div class="ms-calempty">reading…</div></div>
   </section>
 </main>
 <script>${JS}</script>

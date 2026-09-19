@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - `ms import` brings conversations running outside tmux into it: it finds every Claude
   Code and Codex conversation on the machine (`--since 30m|2h|1d|all`, `--dir <path>`),

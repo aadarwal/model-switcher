@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.6
 
+- `npm test` scrubs `CLAUDE_CONFIG_DIR`, `MS_HOME`, `CODEX_HOME` and `MS_BIN` from its own environment, so a developer's real Claude config is never written by the suite
 - an account's e-mail, as the provider's own profile reports it, is kept in
   the registry at `ms accounts login`/`verify` and shown by `ms accounts ls`
   (EMAIL, last column), in `ms status --json` and under the name on the page;

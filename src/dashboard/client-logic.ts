@@ -94,6 +94,10 @@ export type AccountRowView = {
   state: string;
   provider?: string;
   usage?: { session?: UsageWindow; weeklyAll?: UsageWindow; weeklyFable?: UsageWindow } | null;
+  /** The login behind the name; absent from an older /api/state and until the account is next verified. */
+  email?: string | null;
+  /** Live sessions on this account (src/status.ts's sessionsByAccount). */
+  sessions?: { id: string; pane: string; state: string }[];
 };
 export type SessionRowView = {
   id: string;
@@ -308,6 +312,16 @@ export function accountLanesHtml(a: AccountRowView, dash: string): string {
  *  the name doesn't, a chip for a STATE that isn't `ok`, then the meters.
  *  LABEL and STATE are `statusJson()`'s own computed words — rendered as
  *  given, never re-derived here. */
+/** `2 sessions · %1 · %2 walled`: what runs on the account, by pane; a state is named only when it is not
+ *  plain `running`. Nothing running says nothing -- an empty line on every idle card is noise. */
+export function accountSessionsHtml(sessions: { id: string; pane: string; state: string }[] | undefined): string {
+  if (!sessions || !sessions.length) return "";
+  var parts = sessions.map(function (s) {
+    return esc(s.pane) + (s.state && s.state !== "running" ? " " + esc(s.state) : "");
+  });
+  return '<div class="ms-onacct">' + sessions.length + (sessions.length === 1 ? " session" : " sessions") + " · " + parts.join(" · ") + "</div>";
+}
+
 export function accountRowHtml(a: AccountRowView, dash: string): string {
   var lanes = accountLanesHtml(a, dash);
   var showLabel = a.label && a.label !== a.name;
@@ -318,6 +332,8 @@ export function accountRowHtml(a: AccountRowView, dash: string): string {
     (a.state && a.state !== "ok" ? '<span class="' + chipClass(a.state) + '">' + esc(a.state) + "</span>" : "") +
     (showLabel ? '<span class="ms-meta">' + esc(a.label) + "</span>" : "") +
     "</header>" +
+    (a.email ? '<div class="ms-email">' + esc(a.email) + "</div>" : "") +
+    accountSessionsHtml(a.sessions) +
     (lanes || '<div class="ms-note">no windows reported</div>') +
     "</section>"
   );

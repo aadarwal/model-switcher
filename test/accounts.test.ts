@@ -1164,7 +1164,7 @@ test("accounts ls prints the seven columns, provider among them", () => {
   assert.equal(s.ms(["login", "gmail"]).code, 0);
   const r = s.ms(["ls"]);
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stdout, /NAME\s+PROVIDER\s+LABEL\s+ORG\s+POLL\s+TOKEN\s+VERIFIED/);
+  assert.match(r.stdout, /NAME\s+PROVIDER\s+LABEL\s+ORG\s+POLL\s+TOKEN\s+VERIFIED\s+EMAIL/);
   assert.match(r.stdout, /gmail\s+claude\s+Personal\s+org-1\s+yes\s+yes\s+yes/);
 });
 

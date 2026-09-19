@@ -309,7 +309,7 @@ async function seedSessions(w: World): Promise<{ sess1: string; sess2: string; w
  *  separator is exactly two, and padding only ever adds more). */
 const cells = (line: string): string[] => line.trim().split(/\s{2,}/);
 
-test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE) and sessions table, with the unreported flag", async () => {
+test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE SESS) and sessions table, with the unreported flag", async () => {
   const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
   await seedSessions(w);
   const { localTimeCli } = await import("../src/status.ts");
@@ -320,13 +320,13 @@ test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE)
   const lines = r.stdout.split("\n");
   const accHeaderIdx = lines.findIndex((l) => l.startsWith("NAME"));
   assert.ok(accHeaderIdx >= 0, r.stdout);
-  assert.deepEqual(cells(lines[accHeaderIdx]!), ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"]);
+  assert.deepEqual(cells(lines[accHeaderIdx]!), ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE", "SESS"]);
 
   const dirkLine = lines.find((l) => l.startsWith("dirk"))!;
   assert.ok(dirkLine, r.stdout);
   assert.deepEqual(cells(dirkLine), [
-    "dirk", "claude", "Dirk", "42.5%", "10%", "33.3%", localTimeCli(Date.parse("2026-09-18T12:30:00Z")), "ok",
-  ]);
+    "dirk", "claude", "Dirk", "42.5%", "10%", "33.3%", localTimeCli(Date.parse("2026-09-18T12:30:00Z")), "ok", "1",
+  ]); // SESS 1: seedSessions() put sess-1 (walled, still live) on dirk
 
   const gmailLine = lines.find((l) => l.startsWith("gmail"))!;
   assert.ok(gmailLine, r.stdout);
@@ -336,6 +336,7 @@ test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE)
   assert.equal(gmailCells[2], "Gmail");
   assert.equal(gmailCells[3], "—"); // no poll grant → no reading
   assert.equal(gmailCells[7], "no-grant");
+  assert.equal(gmailCells[8], "1"); // sess-2 runs on gmail
 
   const sessHeaderIdx = lines.findIndex((l) => l.startsWith("SESSION"));
   assert.ok(sessHeaderIdx >= 0, r.stdout);
@@ -609,7 +610,7 @@ test("ms status --watch actually loops: MS_WATCH_ITERATIONS=2 redraws twice, not
   // newline between them), so "starts with NAME" per split("\n") line only
   // matches the SECOND redraw onward — count occurrences in the raw text
   // instead.
-  const headerCount = (r.stdout.match(/NAME\s+PROVIDER\s+LABEL\s+5H\s+WEEK\s+FABLE\s+RESETS\s+STATE/g) ?? []).length;
+  const headerCount = (r.stdout.match(/NAME\s+PROVIDER\s+LABEL\s+5H\s+WEEK\s+FABLE\s+RESETS\s+STATE\s+SESS/g) ?? []).length;
   assert.equal(headerCount, 2, r.stdout);
   const sessionHeaderCount = (r.stdout.match(/SESSION\s+PANE\s+PROVIDER\s+ACCOUNT\s+NEED\s+STATE\s+GEN\s+PENDING\s+WAKEUP\s+WALLED\?/g) ?? []).length;
   assert.equal(sessionHeaderCount, 2, r.stdout);

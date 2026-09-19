@@ -135,15 +135,32 @@ export function localTimeCli(epochMs: number): string {
  *  one place, so `accountRow()` (the text table) and `statusJson()` (Plan 4
  *  Task 2's dashboard) compute it identically rather than one of them
  *  copying the other's logic. See review round 1 (P4-T2), findings 1 & 2. */
-export type AccountComputed = { label: string; state: AccountState };
+export type AccountComputed = { label: string; state: AccountState; email: string | null };
 
-function computeAccount(a: AccountUsage, registry: Registry): AccountComputed {
-  const label = findAccount(registry, a.name, a.provider)?.label ?? a.name;
-  const hasToken = !!readLaunchToken(a.name);
-  return { label, state: accountState(a, hasToken) };
+/** One live session as an account card lists it. */
+export type AccountSession = { id: string; pane: string; state: string };
+
+/** What is running on each account: live sessions only (`gone`/`stopped` run on nothing), keyed by
+ *  `provider:name` because a name is only unique within a provider. */
+export function sessionsByAccount(sessions: { id: string; provider: string; account: string; state: string; pane: string }[]): Map<string, AccountSession[]> {
+  const map = new Map<string, AccountSession[]>();
+  for (const s of sessions) {
+    if (isFinishedState(s.state)) continue;
+    const key = `${s.provider}:${s.account}`;
+    const list = map.get(key) ?? [];
+    list.push({ id: s.id, pane: s.pane, state: s.state });
+    map.set(key, list);
+  }
+  return map;
 }
 
-function accountRow(a: AccountUsage, registry: Registry): string[] {
+function computeAccount(a: AccountUsage, registry: Registry): AccountComputed {
+  const row = findAccount(registry, a.name, a.provider);
+  const hasToken = !!readLaunchToken(a.name);
+  return { label: row?.label ?? a.name, state: accountState(a, hasToken), email: row?.email ?? null };
+}
+
+function accountRow(a: AccountUsage, registry: Registry, live: number): string[] {
   const c = computeAccount(a, registry);
   const reset = earliestWeeklyResetCli(a.usage);
   return [
@@ -155,6 +172,7 @@ function accountRow(a: AccountUsage, registry: Registry): string[] {
     fmtPercentCli(a.usage?.weeklyFable ?? null),
     reset ? localTimeCli(Date.parse(reset)) : DASH,
     c.state,
+    String(live),
   ];
 }
 
@@ -271,7 +289,7 @@ function table(headers: string[], rows: string[][]): string[] {
  *  the live `gone` override `SessionState` has no room for, so this is the
  *  same word `ms status`'s text table prints, not the store's raw column
  *  (fix-C-report.md item 1 / fix-R). */
-export type StatusAccountRow = AccountUsage & AccountComputed;
+export type StatusAccountRow = AccountUsage & AccountComputed & { sessions: AccountSession[] };
 export type StatusSessionRow = Omit<SessionRow, "state"> & { state: string; pending: string | null; walled: Walled };
 export type StatusJson = { accounts: StatusAccountRow[]; sessions: StatusSessionRow[]; takenAt: number | null };
 
@@ -290,11 +308,12 @@ export async function statusJson(): Promise<StatusJson> {
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
   const st = openState();
   try {
-    const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry) }));
     const sessions = st.listSessions().map((s) => {
       const c = computeSession(s, st);
       return { ...s, state: c.state, pending: c.pending, walled: c.walled };
     });
+    const on = sessionsByAccount(sessions);
+    const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry), sessions: on.get(`${a.provider}:${a.name}`) ?? [] }));
     return { accounts, sessions, takenAt: snapshot.takenAt };
   } finally {
     st.close();
@@ -314,6 +333,7 @@ async function render(json: boolean, all: boolean): Promise<string> {
   try {
     const sessions = st.listSessions().map((s) => ({ session: s, computed: computeSession(s, st) }));
     const visible = all ? sessions : sessions.filter((r) => !isFinishedState(r.computed.state));
+    const on = sessionsByAccount(sessions.map((r) => ({ ...r.session, state: r.computed.state })));
     const lines: string[] = [];
     // A registry the loader could not read is not silently a pool of zero
     // accounts — say so, first, before either table (which may still show
@@ -324,8 +344,10 @@ async function render(json: boolean, all: boolean): Promise<string> {
       // ACCOUNT in the sessions table below: identity in this tool is
       // (provider, name), and an account name is reused across providers
       // (a Claude `tulp` and a Codex `tulp` are two different accounts).
-      ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE"],
-      snapshot.accounts.map((a) => accountRow(a, registry)),
+      // SESS: how many live sessions run on the account -- the pool's other half, which otherwise
+      // means reading the sessions table below sideways. Last, so every older column keeps its place.
+      ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE", "SESS"],
+      snapshot.accounts.map((a) => accountRow(a, registry, (on.get(`${a.provider}:${a.name}`) ?? []).length)),
     ));
     lines.push("");
     lines.push(...table(

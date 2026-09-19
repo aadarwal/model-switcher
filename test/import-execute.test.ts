@@ -22,7 +22,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync
 import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
 import { Tmux } from "../src/tmux.ts";
-import type { Candidate } from "../src/import/scan.ts";
+import type { Candidate, ProcessRow } from "../src/import/scan.ts";
 import type { Plan } from "../src/import/plan.ts";
 import type { ExecuteDeps } from "../src/import/execute.ts";
 import type { Manifest } from "../src/import/manifest.ts";
@@ -82,9 +82,26 @@ async function liveProcess(t: TestContext, dir: string, kind: "polite" | "stubbo
 function cand(over: Partial<Candidate> & Pick<Candidate, "id" | "cwd">): Candidate {
   return {
     provider: "claude", transcriptPath: `/t/${over.id}.jsonl`, lastActivity: T0,
-    title: `title ${over.id}`, compacted: false, pid: null, argv: null, startedAt: null,
+    title: `title ${over.id}`, compacted: false, pid: null, argv: null,
+    // A live candidate always has a start time: the scanner reads it off `ps`,
+    // and it is what makes the pid re-identifiable later.
+    startedAt: over.pid !== undefined && over.pid !== null ? T0 - 60_000 : null,
     inTmux: false, managed: false, ...over,
   };
+}
+
+/** The process table as the plan recorded it — every live row still itself. */
+function tableFor(plan: Plan): ProcessRow[] {
+  const out: ProcessRow[] = [];
+  for (const s of plan.sessions) {
+    for (const w of s.windows) {
+      for (const p of w.panes) {
+        const c = p.candidate;
+        if (c.pid !== null) out.push({ pid: c.pid, startedAt: c.startedAt ?? 0, tty: "s001", argv: [c.provider] });
+      }
+    }
+  }
+  return out;
 }
 
 /** A one-session plan over the given candidates, four panes to a window. */
@@ -187,6 +204,7 @@ async function world(t: TestContext, plan: Plan, over: Partial<ExecuteDeps> = {}
       ready.calls.push([id, deadline]);
       return verdict;
     },
+    ps: () => tableFor(plan),
     log: (line) => log.push(line),
     ...over,
   };
@@ -323,6 +341,75 @@ test("a process that cannot be signalled fails its own row and stops nothing els
   assert.equal(rows[1]!.outcome, "resumed in data:main.1");
   assert.deepEqual(verbs(w.tmuxLog()), ["has-session", "new-session", "send-keys"], "only the second row reached tmux");
   assert.ok(!w.deps.alive(pid));
+});
+
+test("a pid that is no longer the process the plan recorded is not signalled", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid }), cand({ id: "s-2", cwd: "/tmp" })]);
+  const w = await world(t, plan);
+  const signals: [number, string][] = [];
+  w.deps.kill = (p, sig) => {
+    signals.push([p, sig]);
+    return true;
+  };
+  // The pid was recycled between the plan and the run: same number, a process
+  // that started four hours later.
+  w.deps.ps = () => [{ pid, startedAt: T0 + 4 * 3_600_000, tty: "s002", argv: ["npm"] }];
+  const { executeImport } = await import("../src/import/execute.ts");
+  const result = await executeImport(plan, w.file, w.deps);
+
+  assert.deepEqual(signals, [], "a stranger's pid is never signalled");
+  assert.ok(w.deps.alive(pid), "and the process it named is untouched");
+  assert.deepEqual(result, { moved: 1, stopped: 0, failed: 1 });
+  const rows = w.manifest().rows;
+  assert.equal(rows[0]!.outcome, `stop refused: pid ${pid} is not the process the plan recorded`);
+  assert.equal(rows[0]!.target!.paneId, null, "and no pane is made for a conversation still being written");
+  assert.equal(rows[1]!.outcome, "resumed in data:main.1", "the next row still runs");
+});
+
+test("a manifest that does not say when the process started cannot re-identify it, and refuses", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid, startedAt: null })]);
+  const w = await world(t, plan);
+  const signals: [number, string][] = [];
+  w.deps.kill = (p, sig) => { signals.push([p, sig]); return true; };
+  w.deps.ps = () => [{ pid, startedAt: T0 - 60_000, tty: "s001", argv: ["claude"] }];
+  const { executeImport } = await import("../src/import/execute.ts");
+  const result = await executeImport(plan, w.file, w.deps);
+  assert.deepEqual(signals, []);
+  assert.equal(result.failed, 1);
+  assert.match(w.manifest().rows[0]!.outcome, /^stop refused: pid \d+ has no recorded start time/);
+});
+
+test("the start time travels in the manifest, so `--plan` tomorrow checks it", async (t) => {
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid: 4321 })]);
+  await world(t, plan);
+  const { manifestFromPlan, planFromManifest } = await import("../src/import/manifest.ts");
+  const m = manifestFromPlan(plan, { since: "2h", dirs: [], createdAt: new Date(T0) });
+  assert.equal(m.rows[0]!.startedAt, new Date(T0 - 60_000).toISOString());
+  const back = planFromManifest(m);
+  assert.equal(back.sessions[0]!.windows[0]!.panes[0]!.candidate.startedAt, T0 - 60_000);
+});
+
+test("a CLI that survives SIGKILL is never resumed over: the row fails and tmux is not touched", async (t) => {
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid: 4321 })]);
+  const w = await world(t, plan);
+  // Every signal lands and nothing ever dies — the floor under both waits.
+  w.deps.kill = () => true;
+  w.deps.alive = () => true;
+  const { executeImport } = await import("../src/import/execute.ts");
+  const result = await executeImport(plan, w.file, w.deps);
+
+  assert.deepEqual(result, { moved: 0, stopped: 0, failed: 1 });
+  assert.equal(w.manifest().rows[0]!.outcome, "stop failed: pid 4321 is still running after SIGKILL");
+  assert.deepEqual(
+    w.tmuxLog(),
+    [],
+    "a conversation whose CLI is still writing it must never be resumed in a second pane",
+  );
+  assert.equal(w.manifest().rows[0]!.target!.paneId, null);
 });
 
 // --- Resuming --------------------------------------------------------------

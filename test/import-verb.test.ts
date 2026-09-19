@@ -46,6 +46,8 @@ type World = {
   msHome: string;
   env: Record<string, string>;
   project: string;
+  /** One more conversation in the same project directory. */
+  conversation: (id: string, text: string) => string;
   tmuxLog: () => string[];
   manifests: () => string[];
 };
@@ -68,6 +70,16 @@ function machine(t: TestContext, opts: { mtime?: number } = {}): World {
   const escaped = project.replace(/[/.]/g, "-");
   const transcripts = path.join(claudeConfig, "projects", escaped);
   mkdirSync(transcripts, { recursive: true });
+  const conversation = (id: string, text: string): string => {
+    const f = path.join(transcripts, `${id}.jsonl`);
+    writeFileSync(f, [
+      JSON.stringify({ type: "last-prompt", leafUuid: "f4bb", sessionId: id }),
+      JSON.stringify({ parentUuid: null, sessionId: id, type: "user", cwd: project, message: { role: "user", content: text } }),
+    ].join("\n") + "\n");
+    const t = (opts.mtime ?? Date.now()) / 1000;
+    utimesSync(f, t, t);
+    return f;
+  };
   const file = path.join(transcripts, "conv-1.jsonl");
   writeFileSync(file, [
     JSON.stringify({ type: "last-prompt", leafUuid: "f4bb", sessionId: "conv-1" }),
@@ -93,7 +105,7 @@ function machine(t: TestContext, opts: { mtime?: number } = {}): World {
     /* temp dirs are the OS's to clean */
   });
   return {
-    home, msHome, env, project,
+    home, msHome, env, project, conversation,
     tmuxLog: () => readFileSync(tmuxLog, "utf8").split("\n").filter((l) => l !== ""),
     manifests: () => {
       try {
@@ -133,7 +145,12 @@ test("the flags parse, and a flag that swallowed the next one is a mistake", asy
     assert.ok("error" in parseImportArgs(bad), `${bad.join(" ")} should not parse`);
   }
   assert.ok("error" in parseImportArgs(["--plan", "a.json", "--status", "b.json"]));
-  assert.ok("error" in parseImportArgs(["--plan", "a.json", "--since", "1d"]), "a manifest was already scanned; the scan's flags do not apply");
+  for (const flag of [["--since", "1d"], ["--dir", "/a"], ["--as", "work"], ["--include-tmux"], ["--continue"]]) {
+    assert.ok(
+      "error" in parseImportArgs(["--plan", "a.json", ...flag]),
+      `--plan ${flag[0]}: a manifest was already scanned and planned; a flag that would silently do nothing is a mistake`,
+    );
+  }
 });
 
 // --- The confirmation ------------------------------------------------------
@@ -314,6 +331,67 @@ test("--yes moves without asking, and `ms import` is a verb the CLI knows", asyn
 
   const help = run(["--help"], w.env);
   assert.match(help.stderr, /import/);
+});
+
+test("a store row answers for the conversation it NAMES, and for no other", async () => {
+  const { rowIsFor } = await import("../src/import.ts");
+  const claude = (cliSessionId: string | null) => ({ provider: "claude", cliSessionId, transcriptPath: null });
+  assert.equal(rowIsFor(claude("conv-1"), "conv-1"), true);
+  assert.equal(
+    rowIsFor(claude("conv-9"), "conv-1"),
+    false,
+    "a row for another conversation — same provider, same directory, same minute — is not evidence about this one",
+  );
+  assert.equal(rowIsFor(claude(null), "conv-1"), false, "a row that names nothing names nothing");
+  assert.equal(rowIsFor(claude("conv-1"), ""), false);
+
+  // Codex reports the rollout FILE; the id inside it is read with the same
+  // parser `ms adopt` uses, never as a substring.
+  const codex = (name: string) => ({ provider: "codex", cliSessionId: null, transcriptPath: `/s/2026/09/19/${name}` });
+  assert.equal(rowIsFor(codex("rollout-2026-09-19T09-15-00-roll-1.jsonl"), "roll-1"), true);
+  assert.equal(rowIsFor(codex("rollout-2026-09-19T09-15-00-xroll-1x.jsonl"), "roll-1"), false);
+  assert.equal(rowIsFor(codex("notes-roll-1.txt"), "roll-1"), false);
+});
+
+test("a conversation is only ever reported back by its own row, never a neighbour's", async (t) => {
+  const w = machine(t);
+  // A minute older, so the plan's order — newest first — is the one this test
+  // reads, whatever the filesystem's clock did between the two writes.
+  const second = w.conversation("conv-2", "second job");
+  const older = (Date.now() - 60_000) / 1000;
+  utimesSync(second, older, older);
+  assert.equal(run(["import", "--dry-run", "--dir", w.project], w.env).code, 0);
+  const file = path.join(w.msHome, "imports", w.manifests()[0]!);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).rows.length, 2);
+
+  // Only ONE of the two ever comes back: a row for conv-1, running. The other
+  // launch failed the way a real one does (no account has room), leaving the
+  // pane at a shell prompt and writing nothing.
+  const prev = { ...process.env };
+  Object.assign(process.env, w.env);
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  st.createSession({
+    id: "row-1", provider: "claude", cliSessionId: "conv-1", cwd: w.project, socket: "s", pane: "%1",
+    serverStart: "1:1", need: "any", account: "work", generation: 1, state: "running", desired: "running", flags: [],
+  });
+  st.close();
+  for (const k of Object.keys(w.env)) {
+    if (prev[k] === undefined) delete process.env[k];
+    else process.env[k] = prev[k]!;
+  }
+
+  const r = run(["import", "--plan", file], { ...w.env, MS_IMPORT_READY_MS: "400" });
+  assert.equal(r.code, 1, "one of the two never came back, and the run says so");
+  assert.match(r.stderr, /moved 1, stopped 0, failed 1/);
+  const outcomes = JSON.parse(readFileSync(file, "utf8")).rows.map((row: { id: string; outcome: string }) => [row.id, row.outcome]);
+  const byId = new Map<string, string>(outcomes);
+  assert.equal(byId.get("conv-1"), "resumed in data:data.0");
+  assert.match(
+    byId.get("conv-2")!,
+    /^resume failed: no report within/,
+    "a row in the same directory is not evidence about a different conversation; the manifest is the rollback record and must not claim one came back",
+  );
 });
 
 test("a conversation already in tmux is not imported, and --include-tmux only lists it", async (t) => {

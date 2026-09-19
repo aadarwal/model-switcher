@@ -237,14 +237,20 @@ moved even though the process cannot. That is what **`ms import`** does, in one 
 3. **Show it and ask once.** The table, then `Move N conversations, stopping M live
    processes? [y/N]`. `--dry-run` stops before the question; `--yes` answers it; a stdin
    that is not a terminal is a refusal.
-4. **Move them.** Per row: SIGTERM the original (SIGKILL after ten seconds), make the pane,
-   type the command, and wait up to a minute for the conversation to report itself through
-   the CLI's own hook. A row that fails never stops the next one.
+4. **Move them.** Per row: re-read the process table and refuse to signal a pid whose
+   start time or command is not the one the plan recorded (a manifest planned this morning
+   and run this evening names pids the kernel has since re-used); SIGTERM the original,
+   SIGKILL after ten seconds, and never make the pane at all if it will not go; then type
+   the command and wait up to a minute for the conversation to report itself through the
+   CLI's own hook — by its own conversation id, never a neighbour's. A row that fails never
+   stops the next one, and a launch that fails inside the pane (no account has room) leaves
+   a shell prompt rather than a dead pane, so it costs that full minute before the row is
+   recorded as `resume failed`.
 
 Every run writes a manifest — `MS_HOME/imports/<timestamp>.json`, 0600, rewritten after
 every step — and that file is the record to fall back on: each row names the conversation,
-its directory, where it went and what became of it (`resumed in data:main.2`,
-`stop failed: …`, `resume failed: …`). Your conversations are on disk whatever happened, so
+its directory, the process it was planned against, where it went and what became of it
+(`resumed in data:main.2`, `stop refused: …`, `stop failed: …`, `resume failed: …`). Your conversations are on disk whatever happened, so
 a row that failed can be resumed by hand from what the manifest says. `ms import --status
 <file>` prints it back; `ms import --plan <file>` runs it again.
 

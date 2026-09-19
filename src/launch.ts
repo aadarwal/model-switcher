@@ -80,12 +80,19 @@ type Parsed = { as: string | null; need: Need | null; continueAfter: boolean; ar
 /**
  * Does this command line bring an existing conversation back?
  *
+ * Two things turn on the answer, and they are the same fact asked twice.
+ *
  * It is the only question `--continue` may be asked, because the continuation
  * says "continue the unfinished work from this conversation" — handed to a
  * conversation that has none, it is an instruction to invent some, which is
  * the exact failure `CONTINUATION`'s own doc comment records from a live
  * rotation. So a `--continue` with nothing to continue is a refusal, not a
  * prompt sent into an empty session.
+ *
+ * And it is what decides whether a Claude launch may be given a
+ * `--session-id` at all (`planFor` below): that flag MAKES a conversation, so
+ * on a command line that already names one it is a second, contradictory
+ * answer to the question the human already answered.
  *
  * Read off the CLI's own resume spelling: Codex's `resume` subcommand, and
  * Claude Code's `--resume`/`-r` (or its own `--continue`/`-c`, which is the
@@ -95,6 +102,32 @@ type Parsed = { as: string | null; need: Need | null; continueAfter: boolean; ar
 function namesAResume(provider: Provider, args: string[]): boolean {
   if (provider === "codex") return args.includes("resume");
   return args.some((a) => a === "--resume" || a === "-r" || a === "--continue" || a === "-c" || a.startsWith("--resume="));
+}
+
+/**
+ * WHICH conversation a Claude command line resumes, when it says so by id.
+ *
+ * Null for `--continue`/`-c` and for a bare `--resume` (Claude Code's own
+ * picker): those are real resumes whose id is Claude's to choose, and the row
+ * learns it from the first SessionStart the hook reports — the same way a
+ * Codex row learns its own (`noteSessionStart`, src/hooks/claude-hook.ts,
+ * which replaces the row's id with the one the CLI reports). Inventing an id
+ * for them would name a conversation the CLI never opened, and a rotation
+ * would later resume THAT.
+ *
+ * A value that looks like a flag is not an id: `--resume --model opus` is a
+ * forgotten id, and reading `--model` as one would put a word on the row that
+ * names no conversation at all.
+ */
+export function claudeResumeId(args: string[]): string | null {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a.startsWith("--resume=")) return a.slice("--resume=".length) || null;
+    if (a !== "--resume" && a !== "-r") continue;
+    const next = args[i + 1];
+    return next !== undefined && !next.startsWith("-") ? next : null;
+  }
+  return null;
 }
 
 /**
@@ -353,6 +386,22 @@ function planFor(provider: Provider, parsed: Parsed, extras: LaunchExtras = {}):
       label: () => "codex",
     };
   }
+  // A Claude launch normally MAKES a conversation and names it itself, so the
+  // tool can hand the CLI the id (`--session-id`) and have a handle on the
+  // session from the first instant — before any hook has run.
+  //
+  // A launch that RESUMES one is the opposite case, and was wrong until
+  // 2026-09-19: `ms claude -- --resume <id>` built `claude --session-id <fresh
+  // uuid> --resume <id>`, two contradictory answers to which conversation this
+  // is, and a row whose `cliSessionId` named neither — a uuid Claude Code was
+  // never going to use. `ms import` resumes every Claude conversation it moves
+  // through exactly this path, so the whole verb rode on it. Now the command
+  // line the human wrote passes through untouched, the row is created on the
+  // id that command line names, and the CLI's own SessionStart (`source:
+  // resume`) confirms it — the same confirmation a rotation's `--resume`
+  // relaunch gets, where the row already carries the id and the hook's report
+  // is what proves the conversation came back (`waitForReady`, src/recover.ts).
+  const resumes = namesAResume("claude", parsed.args);
   return {
     need: parsed.need ?? autoNeed(parsed.args),
     credential: (account) =>
@@ -360,8 +409,8 @@ function planFor(provider: Provider, parsed: Parsed, extras: LaunchExtras = {}):
         ? null
         : { error: `no launch token for account '${account}' (run: ms accounts login ${account})` },
     prepare: () => null,
-    cliSessionId: () => randomUUID(),
-    command: (id, args) => ["claude", "--session-id", id!, ...args],
+    cliSessionId: () => (resumes ? claudeResumeId(parsed.args) : randomUUID()),
+    command: (id, args) => (resumes ? ["claude", ...args] : ["claude", "--session-id", id!, ...args]),
     label: (need) => need,
   };
 }

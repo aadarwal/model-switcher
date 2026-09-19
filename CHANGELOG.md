@@ -12,6 +12,11 @@
   refuses rather than assuming yes
 - flags are carried into an imported pane by whitelist, so a credential on the original
   command line reaches neither the new command line nor the manifest
+- a Claude launch that RESUMES is no longer given a `--session-id`: `ms claude --
+  --resume <id>` now runs `claude --resume <id>` and records that conversation's own id,
+  instead of running two contradictory answers to which conversation it is and recording
+  a uuid the CLI never used. This is the path `ms import` resumes every Claude
+  conversation through
 
 ## 0.2.6
 

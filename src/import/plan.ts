@@ -182,6 +182,37 @@ function skipReason(c: Candidate): string | null {
   return null;
 }
 
+/**
+ * The root a directory belongs to — the repo ITSELF, never one of its linked
+ * worktrees — or null when there is no repo here.
+ *
+ * `git rev-parse --show-toplevel` is the obvious question and the wrong one:
+ * run inside a linked worktree it answers with the WORKTREE, so
+ * `~/live/repo-feature` came back as a root of its own and became a session
+ * called `repo-feature` holding one window called `feature` — the branch cut
+ * off from the project it belongs to, which is the opposite of what one
+ * session per repo is for.
+ *
+ * `--git-common-dir` is the question that means "which repo is this": it
+ * resolves to the SHARED `.git`, identically from the main worktree, from a
+ * subdirectory of it, and from every linked worktree. Its parent is the root.
+ * `--path-format=absolute` is what makes that parent computable — without it
+ * git answers relatively (`.git`, `../.git`) and relative to WHICH directory
+ * is a second question.
+ *
+ * Anything unusual falls back to `--show-toplevel`: a bare repo, a
+ * `--separate-git-dir` layout, a submodule's `.git/modules/…`, or a git too
+ * old for `--path-format`. Those degrade to the previous behaviour rather
+ * than to a computed-and-wrong root.
+ */
+export function sharedRoot(cwd: string, git: (args: string[], cwd: string) => string | null): string | null {
+  const common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd);
+  const dir = common?.trim();
+  if (dir && path.isAbsolute(dir) && path.basename(dir) === ".git") return path.dirname(dir);
+  const top = git(["rev-parse", "--show-toplevel"], cwd)?.trim();
+  return top ? top : null;
+}
+
 /** One `git worktree list --porcelain` entry. */
 interface WorktreeEntry {
   path: string;
@@ -232,8 +263,7 @@ export function planImport(candidates: Candidate[], opts: PlanOptions): Plan {
   const rootOf = (cwd: string): string => {
     const hit = rootCache.get(cwd);
     if (hit !== undefined) return hit;
-    const out = opts.git(["rev-parse", "--show-toplevel"], cwd);
-    const root = out && out.trim() ? out.trim() : cwd; // not a repo: its own root
+    const root = sharedRoot(cwd, opts.git) ?? cwd; // not a repo: its own root
     rootCache.set(cwd, root);
     return root;
   };

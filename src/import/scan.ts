@@ -186,17 +186,49 @@ export function cleanTitle(raw: string): string {
 }
 
 /** Message content is a string in some records and an array of parts in
- *  others (both CLIs, both shapes); only the text parts are text. */
-function textOf(content: unknown): string | null {
-  if (typeof content === "string") return content;
+ *  others (both CLIs, both shapes); only the text parts are text. `drop`
+ *  rejects a part before it is joined, so a record that is preamble PLUS
+ *  prompt keeps the prompt. */
+function textOf(content: unknown, drop?: (text: string) => boolean): string | null {
+  if (typeof content === "string") return drop?.(content) ? null : content;
   if (!Array.isArray(content)) return null;
   const parts: string[] = [];
   for (const part of content) {
     if (!part || typeof part !== "object") continue;
     const o = part as Record<string, unknown>;
-    if ((o.type === "text" || o.type === "input_text") && typeof o.text === "string") parts.push(o.text);
+    if ((o.type === "text" || o.type === "input_text") && typeof o.text === "string" && !drop?.(o.text)) parts.push(o.text);
   }
   return parts.length ? parts.join(" ") : null;
+}
+
+/**
+ * The openings of the context Codex injects into a conversation as a USER
+ * message, ahead of anything the human has said.
+ *
+ * It is a user message in the rollout because that is how the model is meant
+ * to read it, which makes "the first user message" the wrong title for every
+ * Codex conversation on the machine — the first live dry-run titled all of
+ * them `# AGENTS.md instructions`. Taken from this machine's own rollouts:
+ * the AGENTS.md block leads with or without a trailing path, and
+ * `<recommended_plugins>` leads others; `<environment_context>` and
+ * `<user_instructions>` are the same class of injected block.
+ *
+ * A closed list, matched only at the START, on purpose. "Skip anything that
+ * opens with `<`" would eat a real prompt that begins with a tag, and a
+ * substring match would eat one that MENTIONS AGENTS.md. A marker this misses
+ * costs one bad title; a marker that over-matches costs a conversation its
+ * name.
+ */
+const CODEX_PREAMBLE_MARKERS = [
+  "# AGENTS.md instructions",
+  "<environment_context>",
+  "<user_instructions>",
+  "<recommended_plugins>",
+];
+
+export function isCodexPreamble(text: string): boolean {
+  const t = text.trimStart();
+  return CODEX_PREAMBLE_MARKERS.some((marker) => t.startsWith(marker));
 }
 
 function claudeUserText(rec: Record<string, unknown>): string | null {
@@ -210,8 +242,13 @@ function codexUserText(rec: Record<string, unknown>): string | null {
   const payload = rec.payload;
   if (!payload || typeof payload !== "object") return null;
   const o = payload as Record<string, unknown>;
-  if (o.type === "user_message" && typeof o.message === "string") return o.message;
-  if (o.type === "message" && o.role === "user") return textOf(o.content);
+  // The preamble is dropped here and not by the caller, so the caller's
+  // "keep reading until there is a title" loop simply moves on to the next
+  // user message — the human's own first word.
+  if (o.type === "user_message" && typeof o.message === "string") {
+    return isCodexPreamble(o.message) ? null : o.message;
+  }
+  if (o.type === "message" && o.role === "user") return textOf(o.content, isCodexPreamble);
   return null;
 }
 

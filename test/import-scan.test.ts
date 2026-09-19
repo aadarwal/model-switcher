@@ -55,7 +55,14 @@ function codexFile(
   codexHome: string,
   date: string,
   id: string,
-  opts: { cwd: string; text?: string | null; base?: string | null; mtime: number },
+  opts: {
+    cwd: string; text?: string | null; base?: string | null; mtime: number;
+    /** One entry per user record, in order; an array entry is one record made
+     *  of several content parts. Codex writes its injected context as a user
+     *  message of its own before the human's first word, so a rollout with a
+     *  preamble is two records, not one. */
+    users?: (string | string[])[];
+  },
 ): string {
   const [y, m, d] = date.split("-");
   const dir = path.join(codexHome, "sessions", y!, m!, d!);
@@ -69,12 +76,14 @@ function codexFile(
     },
   };
   const lines = [JSON.stringify(meta)];
-  if (opts.text !== null) {
+  const users = opts.users ?? (opts.text === null ? [] : [opts.text ?? "codex please"]);
+  users.forEach((user, i) => {
+    const parts = Array.isArray(user) ? user : [user];
     lines.push(JSON.stringify({
-      timestamp: `${date}T09:16:00.000Z`, ordinal: 1, type: "response_item",
-      payload: { type: "message", role: "user", content: [{ type: "input_text", text: opts.text ?? "codex please" }] },
+      timestamp: `${date}T09:16:00.000Z`, ordinal: i + 1, type: "response_item",
+      payload: { type: "message", role: "user", content: parts.map((text) => ({ type: "input_text", text })) },
     }));
-  }
+  });
   const file = path.join(dir, `rollout-${date}T09-15-00-${id}.jsonl`);
   writeFileSync(file, lines.join("\n") + "\n", { mode: 0o600 });
   utimesSync(file, opts.mtime / 1000, opts.mtime / 1000);
@@ -235,6 +244,81 @@ test("Codex rollouts are read from their session_meta, and a continuation reads 
   assert.equal(got[0]!.transcriptPath, contFile);
   assert.equal(got[0]!.cwd, cwd);
   assert.equal(got[0]!.title, "compacted rollout");
+});
+
+test("a Codex title is the human's first word, not the context Codex injected ahead of it", async () => {
+  // The live dry-run's second defect: every Codex row read `# AGENTS.md
+  // instructions`, because Codex writes its injected context as a user
+  // message of its own before the human has said anything. Markers confirmed
+  // against this machine's own rollouts — `# AGENTS.md instructions` (with
+  // and without a trailing path) leads five of the twelve most recent, and
+  // `<recommended_plugins>` leads another.
+  const { home } = tempHome();
+  const codexHome = path.join(home, ".codex");
+  const cwd = path.join(home, "src", "data");
+  mkdirSync(cwd, { recursive: true });
+  const ids = [
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222",
+    "33333333-3333-4333-8333-333333333333",
+    "44444444-4444-4444-8444-444444444444",
+    "55555555-5555-4555-8555-555555555555",
+    "66666666-6666-4666-8666-666666666666",
+  ];
+  codexFile(codexHome, "2026-09-18", ids[0]!, {
+    cwd, mtime: T0,
+    users: ["# AGENTS.md instructions\n\n<INSTRUCTIONS>\nread the guide\n</INSTRUCTIONS>", "port the parser to the new shape"],
+  });
+  codexFile(codexHome, "2026-09-18", ids[1]!, {
+    cwd, mtime: T0 - H,
+    users: ["# AGENTS.md instructions for /Users/x/src/data\n\nstuff", "why is the build slow?"],
+  });
+  codexFile(codexHome, "2026-09-18", ids[2]!, {
+    cwd, mtime: T0 - 2 * H,
+    users: ["<environment_context>\n  <cwd>/x</cwd>\n</environment_context>", "<user_instructions>\nbe terse\n</user_instructions>", "rename the flag"],
+  });
+  codexFile(codexHome, "2026-09-18", ids[3]!, {
+    cwd, mtime: T0 - 3 * H,
+    users: ["<recommended_plugins>\n  none\n</recommended_plugins>", "add the missing test"],
+  });
+  // The preamble and the prompt arriving as two PARTS of one record: the
+  // preamble part goes, the prompt part stays.
+  codexFile(codexHome, "2026-09-18", ids[4]!, {
+    cwd, mtime: T0 - 4 * H,
+    users: [["# AGENTS.md instructions\n\nread this", "and then do the thing"]],
+  });
+  // Nothing but preamble: no title at all, rather than Codex's own boilerplate.
+  codexFile(codexHome, "2026-09-18", ids[5]!, { cwd, mtime: T0 - 5 * H, users: ["<environment_context>\n</environment_context>"] });
+
+  const { scanConversations, isCodexPreamble } = await import("../src/import/scan.ts");
+  const byId = new Map(
+    scanConversations(opts({ claudeConfigDir: path.join(home, ".claude"), codexHome })).map((c) => [c.id, c]),
+  );
+  assert.equal(byId.get(ids[0]!)!.title, "port the parser to the new shape");
+  assert.equal(byId.get(ids[1]!)!.title, "why is the build slow?");
+  assert.equal(byId.get(ids[2]!)!.title, "rename the flag");
+  assert.equal(byId.get(ids[3]!)!.title, "add the missing test");
+  assert.equal(byId.get(ids[4]!)!.title, "and then do the thing");
+  assert.equal(byId.get(ids[5]!)!.title, "");
+
+  assert.equal(isCodexPreamble("# AGENTS.md instructions\n…"), true);
+  assert.equal(isCodexPreamble("  <user_instructions>"), true, "leading whitespace does not hide a marker");
+  // A marker MENTIONED is a prompt; only a marker that leads is preamble.
+  assert.equal(isCodexPreamble("make the header read # AGENTS.md instructions verbatim"), false);
+  assert.equal(isCodexPreamble("wrap it in <user_instructions> tags"), false);
+});
+
+test("a Claude title keeps the human's first message whatever it opens with", async () => {
+  // The preamble rule is Codex's alone: Claude Code's first user record IS
+  // the human's prompt, so nothing there may be skipped on a marker.
+  const { home } = tempHome();
+  const cfg = path.join(home, ".claude");
+  const cwd = path.join(home, "w");
+  mkdirSync(cwd, { recursive: true });
+  claudeFile(cfg, "-w", "aaaaaaaa-0000-4000-8000-000000000001", { cwd, text: "<user_instructions> are what I want to talk about", mtime: T0 });
+  const { scanConversations } = await import("../src/import/scan.ts");
+  const [c] = scanConversations(opts({ claudeConfigDir: cfg, codexHome: path.join(home, ".codex") }));
+  assert.equal(c!.title, "<user_instructions> are what I want to talk about");
 });
 
 // --- Live processes --------------------------------------------------------

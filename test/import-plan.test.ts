@@ -21,16 +21,43 @@ function cand(over: Partial<Candidate> & Pick<Candidate, "cwd">): Candidate {
   };
 }
 
-/** A `git` stand-in over a declared world: `roots` maps a cwd prefix to its
- *  repo root, `worktrees` maps a root to its `git worktree list --porcelain`
- *  output. Anything unclaimed is not a repo, which is what `null` means. */
-function fakeGit(world: { roots?: Record<string, string>; worktrees?: Record<string, string> } = {}) {
+/**
+ * A `git` stand-in over a declared world.
+ *
+ * `roots` maps a cwd prefix to the SHARED root — the thing
+ * `--git-common-dir` points into, which is the same for a repo and all of its
+ * linked worktrees. `toplevels` is what `--show-toplevel` answers where that
+ * DIFFERS, which is exactly the case that matters: run inside a linked
+ * worktree, real git answers with the worktree itself, and taking that as the
+ * root is what once made a worktree its own session. `worktrees` maps a root
+ * to its `git worktree list --porcelain`. Anything unclaimed is not a repo,
+ * which is what `null` means.
+ */
+function fakeGit(world: {
+  roots?: Record<string, string>;
+  /** The literal `--git-common-dir` answer, for the layouts where it is not
+   *  `<root>/.git`: a bare repo, or a git too old for `--path-format`. */
+  commonDirs?: Record<string, string>;
+  toplevels?: Record<string, string>;
+  worktrees?: Record<string, string>;
+} = {}) {
+  const longestMatch = (map: Record<string, string> | undefined, cwd: string): string | null => {
+    let best: [string, string] | null = null;
+    for (const [prefix, value] of Object.entries(map ?? {})) {
+      if (cwd !== prefix && !cwd.startsWith(prefix + "/")) continue;
+      if (!best || prefix.length > best[0].length) best = [prefix, value];
+    }
+    return best ? best[1] : null;
+  };
   return (args: string[], cwd: string): string | null => {
-    if (args[0] === "rev-parse") {
-      for (const [prefix, root] of Object.entries(world.roots ?? {})) {
-        if (cwd === prefix || cwd.startsWith(prefix + "/")) return root;
-      }
-      return null;
+    if (args.includes("--git-common-dir")) {
+      const literal = longestMatch(world.commonDirs, cwd);
+      if (literal) return `${literal}\n`;
+      const root = longestMatch(world.roots, cwd);
+      return root ? `${root}/.git\n` : null;
+    }
+    if (args.includes("--show-toplevel")) {
+      return longestMatch(world.toplevels, cwd) ?? longestMatch(world.roots, cwd);
     }
     if (args[0] === "worktree") return world.worktrees?.[cwd] ?? null;
     return null;
@@ -80,6 +107,68 @@ test("conversations group by repo root, then by worktree, newest first", async (
   assert.deepEqual(plan.sessions[0]!.windows[1]!.panes.map((p) => p.candidate.id), ["data-1", "data-2"]);
   assert.deepEqual(plan.sessions[1]!.windows[0]!.panes.map((p) => p.candidate.id), ["anu-1"]);
   assert.deepEqual(plan.skipped, []);
+});
+
+test("a linked worktree is a window in its main repo's session, not a session of its own", async () => {
+  // The live dry-run's first defect. `git rev-parse --show-toplevel` run
+  // inside a linked worktree answers with the WORKTREE, so `~/live/repo-feature`
+  // became a session called `repo-feature` holding one window called
+  // `feature` — the branch severed from the project it belongs to. The shared
+  // root is what `--git-common-dir` points into, and that is the same answer
+  // from the repo and from every worktree of it.
+  const { planImport } = await import("../src/import/plan.ts");
+  const root = "/Users/x/ms-import-live/repo";
+  const wt = "/Users/x/ms-import-live/repo-feature";
+  const plain = "/Users/x/ms-import-live/notes";
+  const plan = planImport(
+    [
+      cand({ cwd: wt, id: "w", lastActivity: T0 }),
+      cand({ cwd: root, id: "r", lastActivity: T0 - 1000 }),
+      cand({ cwd: plain, id: "p", lastActivity: T0 - 2000 }),
+    ],
+    opts({
+      git: fakeGit({
+        roots: { [root]: root, [wt]: root },
+        toplevels: { [wt]: wt }, // real git's answer, and the whole defect
+        worktrees: { [root]: porcelain([[root, "main"], [wt, "feature"]]) },
+      }),
+    }),
+  );
+
+  assert.deepEqual(plan.sessions.map((s) => s.name), ["repo", "notes"]);
+  assert.equal(plan.sessions[0]!.root, root);
+  assert.deepEqual(plan.sessions[0]!.windows.map((w) => w.name), ["feature", "main"]);
+  assert.deepEqual(plan.sessions[0]!.windows.map((w) => w.worktree), [wt, root]);
+  assert.deepEqual(
+    plan.sessions[0]!.windows.flatMap((w) => w.panes.map((p) => `${p.session}:${p.window}`)),
+    ["repo:feature", "repo:main"],
+  );
+  assert.equal(plan.sessions[1]!.name, "notes", "a plain directory is still a session of its own");
+  assert.equal(plan.sessions[1]!.root, plain);
+});
+
+test("a layout whose common dir is not a `.git` falls back to --show-toplevel", async () => {
+  // `--git-common-dir` answers `<root>/.git` for an ordinary repo and every
+  // worktree of it. It does not for a bare repo (the repo dir itself), for a
+  // `--separate-git-dir` or submodule layout, or on a git too old for
+  // `--path-format` (a relative `.git`). Each of those degrades to the
+  // previous question rather than to a computed-and-wrong root.
+  const { planImport } = await import("../src/import/plan.ts");
+  const bareWork = "/Users/x/work-from-bare";
+  const oldGit = "/Users/x/old-git-repo";
+  const plan = planImport(
+    [cand({ cwd: bareWork, id: "b", lastActivity: T0 }), cand({ cwd: `${oldGit}/src`, id: "o", lastActivity: T0 - 1000 })],
+    opts({
+      git: fakeGit({
+        commonDirs: { [bareWork]: "/Users/x/mirror.git", [oldGit]: "../.git" },
+        toplevels: { [bareWork]: bareWork, [oldGit]: oldGit },
+        worktrees: { [bareWork]: porcelain([[bareWork, "main"]]), [oldGit]: porcelain([[oldGit, "trunk"]]) },
+      }),
+    }),
+  );
+  assert.deepEqual(plan.sessions.map((s) => s.root), [bareWork, oldGit]);
+  assert.deepEqual(plan.sessions.map((s) => s.name), ["work-from-bare", "old-git-repo"]);
+  assert.deepEqual(plan.sessions.map((s) => s.windows[0]!.name), ["main", "trunk"]);
 });
 
 test("a directory that is not a repo is its own root, and the window is its basename", async () => {
@@ -372,12 +461,18 @@ test("git is asked once per directory, not once per conversation", async () => {
   const inner = fakeGit({ roots: { [root]: root }, worktrees: { [root]: porcelain([[root, "main"]]) } });
   const calls: string[] = [];
   const git = (args: string[], cwd: string): string | null => {
-    calls.push(`${args[0]} ${cwd}`);
+    calls.push(`${args.join(" ")} @${cwd}`);
     return inner(args, cwd);
   };
   planImport(
     [cand({ cwd: root, id: "a" }), cand({ cwd: root, id: "b" }), cand({ cwd: `${root}/lib`, id: "c" })],
     opts({ git }),
   );
-  assert.deepEqual(calls, [`rev-parse ${root}`, `worktree ${root}`, `rev-parse ${root}/lib`]);
+  // One question per directory, one per root — and in a repo the common-dir
+  // answer settles it, so `--show-toplevel` is never asked at all.
+  assert.deepEqual(calls, [
+    `rev-parse --path-format=absolute --git-common-dir @${root}`,
+    `worktree list --porcelain @${root}`,
+    `rev-parse --path-format=absolute --git-common-dir @${root}/lib`,
+  ]);
 });

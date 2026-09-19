@@ -231,8 +231,10 @@ moved even though the process cannot. That is what **`ms import`** does, in one 
    a transcript's header and first user line is ever read.
 2. **Plan the layout.** One tmux session per repo root, one window per worktree (named for
    its branch), four panes to a window; a fifth conversation opens `<window>-2`. Each pane
-   gets a command line — `ms claude … --resume <id>`, or `ms adopt <id>` for Codex, which
-   copies the rollout and its lineage into the shared store first. Flags are carried over
+   gets a command line — `ms claude … --resume <id>`, or `ms adopt <rollout path>` for
+   Codex, which copies the rollout and its lineage into the shared store first. Codex is
+   adopted by the file's own path rather than its id, because the pane's fresh shell
+   inherits no `CODEX_HOME` and would look for the id under `~/.codex`. Flags are carried over
    from the original process **by whitelist** (`--model`, `--dangerously-…`, `--yolo`, …),
    so a credential you typed on your own command line never reaches the new one.
 3. **Show it and ask once.** The table, then `Move N conversations, stopping M live

@@ -9,6 +9,10 @@ import type { Candidate } from "../src/import/scan.ts";
 import type { PlanOptions } from "../src/import/plan.ts";
 
 const T0 = Date.UTC(2026, 8, 19, 12, 0, 0);
+/** Where Codex keeps a rollout — the path an imported pane adopts BY, because
+ *  the id alone means nothing to a shell with no `CODEX_HOME` of ours. */
+const ROLLOUTS = "/Users/x/.codex/sessions/2026/09/19";
+const ROLLOUT = `${ROLLOUTS}/rollout-2026-09-19T09-15-00-r-1.jsonl`;
 let seq = 0;
 
 function cand(over: Partial<Candidate> & Pick<Candidate, "cwd">): Candidate {
@@ -328,16 +332,48 @@ test("a Claude pane resumes through `ms claude`, keeping only whitelisted flags"
 test("a Codex pane resumes through `ms adopt`, which copies the rollout and its lineage", async () => {
   const { planImport } = await import("../src/import/plan.ts");
   const root = "/Users/x/src/data";
+  const rollout = "/Users/x/.codex/sessions/2026/09/19/rollout-2026-09-19T09-15-00-roll-1.jsonl";
   const plan = planImport(
     [cand({
-      cwd: root, id: "roll-1", provider: "codex", pid: 99, compacted: true,
+      cwd: root, id: "roll-1", transcriptPath: rollout, provider: "codex", pid: 99, compacted: true,
       argv: ["codex", "--yolo", "--sandbox", "danger-full-access", "--api-key", "sk-secret", "resume", "roll-1"],
     })],
     opts({ git: fakeGit({ roots: { [root]: root }, worktrees: { [root]: porcelain([[root, "main"]]) } }) }),
   );
   assert.deepEqual(plan.sessions[0]!.windows[0]!.panes[0]!.command, [
-    "ms", "adopt", "roll-1", "--continue", "--", "--yolo", "--sandbox", "danger-full-access",
+    "ms", "adopt", rollout, "--continue", "--", "--yolo", "--sandbox", "danger-full-access",
   ]);
+});
+
+test("a Codex pane adopts the rollout BY PATH, so the pane's shell needs no CODEX_HOME of ours", async () => {
+  // Live, mini 1, 0.3.0: three Codex conversations were running under an
+  // `ms`-managed home (`CODEX_HOME=~/.config/model-switcher/codex/tulp`). The
+  // scanner found them, because the caller's environment named that home. The
+  // pane's command did not: `ms adopt <id>` ran in a fresh login shell with no
+  // `CODEX_HOME`, looked under `~/.codex`, found nothing, printed its refusal
+  // and handed back the prompt. The path is the same fact with no environment
+  // in it — and `ms adopt` has always taken one.
+  const { planImport, paneCommand } = await import("../src/import/plan.ts");
+  const root = "/Users/x/src/data";
+  const managed = "/Users/x/.config/model-switcher/codex/tulp/sessions/2026/09/19/rollout-2026-09-19T09-15-00-roll-9.jsonl";
+  const c = cand({ cwd: root, id: "roll-9", transcriptPath: managed, provider: "codex" });
+  assert.deepEqual(paneCommand(c, "work", false), ["ms", "adopt", managed, "--as", "work"]);
+
+  const plan = planImport([c], opts({ git: fakeGit({ roots: { [root]: root }, worktrees: { [root]: porcelain([[root, "main"]]) } }) }));
+  assert.deepEqual(plan.sessions[0]!.windows[0]!.panes[0]!.command, ["ms", "adopt", managed]);
+
+  // The ID still travels: the manifest is the rollback record, and `roll-9` is
+  // what a human hands `codex resume` — and what the readiness check matches
+  // a store row by.
+  const { manifestFromPlan } = await import("../src/import/manifest.ts");
+  const row = manifestFromPlan(plan, { since: "2h", dirs: [] }).rows[0]!;
+  assert.equal(row.id, "roll-9");
+  assert.deepEqual(row.command, ["ms", "adopt", managed]);
+
+  // A candidate with no file to name falls back to the id rather than adopting
+  // the empty string: a plan read back from a manifest has no transcript path.
+  assert.deepEqual(paneCommand(cand({ cwd: root, id: "roll-9", transcriptPath: "", provider: "codex" }), null, false),
+    ["ms", "adopt", "roll-9"]);
 });
 
 test("`--as` names the account on every pane, and an idle conversation carries no flags and no continuation", async () => {
@@ -346,7 +382,7 @@ test("`--as` names the account on every pane, and an idle conversation carries n
   const plan = planImport(
     [
       cand({ cwd: root, id: "c-1", provider: "claude", lastActivity: T0 }),
-      cand({ cwd: root, id: "r-1", provider: "codex", lastActivity: T0 - 1000 }),
+      cand({ cwd: root, id: "r-1", provider: "codex", transcriptPath: ROLLOUT, lastActivity: T0 - 1000 }),
     ],
     opts({ as: "work", git: fakeGit({ roots: { [root]: root }, worktrees: { [root]: porcelain([[root, "main"]]) } }) }),
   );
@@ -354,7 +390,7 @@ test("`--as` names the account on every pane, and an idle conversation carries n
   assert.deepEqual(claude!.command, ["ms", "claude", "--as", "work", "--", "--resume", "c-1"]);
   assert.deepEqual(
     codex!.command,
-    ["ms", "adopt", "r-1", "--as", "work"],
+    ["ms", "adopt", ROLLOUT, "--as", "work"],
     "neither was running: there is no unfinished turn for a continuation to name",
   );
 });
@@ -368,8 +404,8 @@ test("only a conversation this import stops carries the continuation", async () 
   const rows = [
     cand({ cwd: root, id: "live-c", provider: "claude", pid: 11, argv: ["claude"], lastActivity: T0 }),
     cand({ cwd: root, id: "idle-c", provider: "claude", lastActivity: T0 - 1000 }),
-    cand({ cwd: root, id: "live-x", provider: "codex", pid: 12, argv: ["codex"], lastActivity: T0 - 2000 }),
-    cand({ cwd: root, id: "idle-x", provider: "codex", lastActivity: T0 - 3000 }),
+    cand({ cwd: root, id: "live-x", provider: "codex", transcriptPath: `${ROLLOUTS}/rollout-2026-09-19T09-15-00-live-x.jsonl`, pid: 12, argv: ["codex"], lastActivity: T0 - 2000 }),
+    cand({ cwd: root, id: "idle-x", provider: "codex", transcriptPath: `${ROLLOUTS}/rollout-2026-09-19T09-16-00-idle-x.jsonl`, lastActivity: T0 - 3000 }),
   ];
   const commands = (mode?: "live" | "all" | "none"): string[][] =>
     planImport(rows, opts({ git, ...(mode ? { continueFor: mode } : {}) })).sessions[0]!.windows[0]!.panes.map((p) => p.command);
@@ -377,8 +413,8 @@ test("only a conversation this import stops carries the continuation", async () 
   assert.deepEqual(commands(), [
     ["ms", "claude", "--continue", "--", "--resume", "live-c"],
     ["ms", "claude", "--", "--resume", "idle-c"],
-    ["ms", "adopt", "live-x", "--continue"],
-    ["ms", "adopt", "idle-x"],
+    ["ms", "adopt", `${ROLLOUTS}/rollout-2026-09-19T09-15-00-live-x.jsonl`, "--continue"],
+    ["ms", "adopt", `${ROLLOUTS}/rollout-2026-09-19T09-16-00-idle-x.jsonl`],
   ], "the default carries it for a stopped process and for nothing else, both providers alike");
 
   assert.deepEqual(commands("all").map((c) => c.includes("--continue")), [true, true, true, true]);

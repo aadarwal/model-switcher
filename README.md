@@ -231,8 +231,10 @@ moved even though the process cannot. That is what **`ms import`** does, in one 
    a transcript's header and first user line is ever read.
 2. **Plan the layout.** One tmux session per repo root, one window per worktree (named for
    its branch), four panes to a window; a fifth conversation opens `<window>-2`. Each pane
-   gets a command line — `ms claude … --resume <id>`, or `ms adopt <id>` for Codex, which
-   copies the rollout and its lineage into the shared store first. Flags are carried over
+   gets a command line — `ms claude … --resume <id>`, or `ms adopt <rollout path>` for
+   Codex, which copies the rollout and its lineage into the shared store first. Codex is
+   adopted by the file's own path rather than its id, because the pane's fresh shell
+   inherits no `CODEX_HOME` and would look for the id under `~/.codex`. Flags are carried over
    from the original process **by whitelist** (`--model`, `--dangerously-…`, `--yolo`, …),
    so a credential you typed on your own command line never reaches the new one.
 3. **Show it and ask once.** The table, then `Move N conversations, stopping M live
@@ -241,12 +243,15 @@ moved even though the process cannot. That is what **`ms import`** does, in one 
 4. **Move them.** Per row: re-read the process table and refuse to signal a pid whose
    start time or command is not the one the plan recorded (a manifest planned this morning
    and run this evening names pids the kernel has since re-used); SIGTERM the original,
-   SIGKILL after ten seconds, and never make the pane at all if it will not go; then type
+   SIGKILL after ten seconds — and on that fallback its descendants too, leaves first,
+   because a CLI installed from npm is a wrapper plus the process doing the work and only
+   a SIGTERM can be forwarded; never make the pane at all if it will not go; then type
    the command and wait up to a minute for the conversation to report itself through the
    CLI's own hook — by its own conversation id, never a neighbour's. A row that fails never
-   stops the next one, and a launch that fails inside the pane (no account has room) leaves
-   a shell prompt rather than a dead pane, so it costs that full minute before the row is
-   recorded as `resume failed`.
+   stops the next one, and a launch that fails inside the pane (no account has room, a
+   rollout it cannot find) leaves a shell prompt rather than a dead pane: the wait watches
+   `#{pane_current_command}` too, so a pane back at a shell is `resume failed:` with the
+   line the command printed, seconds in rather than a minute.
 
 Every run writes a manifest — `MS_HOME/imports/<timestamp>.json`, 0600, rewritten after
 every step — and that file is the record to fall back on: each row names the conversation,

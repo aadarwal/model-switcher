@@ -384,12 +384,50 @@ test("two processes in one cwd take one conversation each, newest to newest", as
   const got = scanConversations(opts({
     claudeConfigDir: cfg, codexHome: path.join(home, ".codex"),
     ps: () => [
-      proc({ pid: 1, startedAt: T0 - 4 * H, argv: ["claude"] }),
-      proc({ pid: 2, startedAt: T0 - 3 * H, argv: ["claude"] }),
+      // Two conversations in one directory is two terminal tabs, so two
+      // ttys. Two CLIs on ONE tty is the npm wrapper and its own child (the
+      // test below), and those are one conversation, not two.
+      proc({ pid: 1, startedAt: T0 - 4 * H, tty: "s004", argv: ["claude"] }),
+      proc({ pid: 2, startedAt: T0 - 3 * H, tty: "s005", argv: ["claude"] }),
     ],
     cwdOf: () => cwd,
   }));
   assert.deepEqual(got.map((c) => [c.title, c.pid]), [["two", 2], ["one", 1]]);
+});
+
+test("two matching processes on one tty are one conversation: the npm wrapper's child makes no row of its own", async () => {
+  // Live, mini 1, 0.3.0: an npm-installed Codex is TWO processes per session —
+  // `node …/codex --yolo` and the native binary it execs, on the same tty, in
+  // the same cwd. One claimed the conversation and the other, having nothing
+  // left to claim, was printed as its own row: `skipped: live, no conversation
+  // found`. Three sessions, three noise rows. The tty is what says they are one
+  // session, and the lowest pid on it is the parent.
+  const { home } = tempHome();
+  const codexHome = path.join(home, ".codex");
+  const cwd = path.join(home, "src", "data");
+  mkdirSync(cwd, { recursive: true });
+  const id = "11111111-1111-4111-8111-111111111111";
+  codexFile(codexHome, "2026-09-19", id, { cwd, text: "the one conversation", mtime: T0 });
+
+  const { scanConversations, dedupeByTty } = await import("../src/import/scan.ts");
+  assert.deepEqual(
+    dedupeByTty([{ pid: 9, tty: "??" }, { pid: 8, tty: "??" }, { pid: 7, tty: "s004" }, { pid: 6, tty: "s004" }]).map((r) => r.pid),
+    [9, 8, 6],
+    "no controlling terminal is not a SHARED terminal: two of those are two unrelated processes, and neither is dropped",
+  );
+  const got = scanConversations(opts({
+    claudeConfigDir: path.join(home, ".claude"), codexHome,
+    ps: () => [
+      proc({ pid: 5100, startedAt: T0 - H, tty: "s004", argv: ["node", "/x/lib/node_modules/@openai/codex/bin/codex.js", "--yolo"] }),
+      proc({ pid: 5101, startedAt: T0 - H + 1000, tty: "s004", argv: ["/x/lib/node_modules/@openai/codex/bin/codex-aarch64-apple-darwin/codex", "--yolo"] }),
+    ],
+    cwdOf: () => cwd,
+  }));
+
+  assert.equal(got.length, 1, `one conversation, one row: ${JSON.stringify(got.map((c) => [c.id, c.pid]))}`);
+  assert.equal(got[0]!.id, id);
+  assert.equal(got[0]!.pid, 5100, "the parent — the lowest pid on that tty — is the process an import stops");
+  assert.deepEqual(got[0]!.argv, ["node", "/x/lib/node_modules/@openai/codex/bin/codex.js", "--yolo"]);
 });
 
 test("a process whose tty is a tmux pane's tty is in tmux; its neighbour is not", async () => {

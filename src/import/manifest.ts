@@ -86,7 +86,8 @@ export interface ManifestRow {
   /** The argv the pane runs, `ms` first. Null for a row nothing will run. */
   command: string[] | null;
   target: ManifestTarget | null;
-  /** `planned` | `stopped` | `resumed in <session>:<window>.<paneIndex>
+  /** `planned` | `stopped` | `killed pid <pid>[ and N child(ren)]` (the
+   *  SIGKILL fallback) | `resumed in <session>:<window>.<paneIndex>
    *  (<paneId>)` — tmux's own numbers, read back when the pane was made,
    *  never the planner's 0-based slot | `stop refused: …` |
    *  `stop failed: …` | `resume failed: …` | `skipped: <reason>` */
@@ -112,6 +113,14 @@ export const OUTCOME_STOPPED = "stopped";
  *  carrying both is that this string, unlike `targetName`'s, is something a
  *  human can hand to `tmux select-window -t`. */
 export const resumedOutcome = (t: ManifestTarget): string => `resumed in ${t.session}:${t.window}.${t.paneIndex} (${t.paneId})`;
+/** `killed pid 12 and 1 child` — a stop that needed the SIGKILL fallback, and
+ *  what went with it. A SIGKILL cannot be forwarded, so the tree is killed
+ *  leaves first and the count is part of the record: it is the difference
+ *  between a wrapper that left and a native child still holding the
+ *  conversation (src/import/execute.ts). A forced stop with no children says
+ *  `killed pid 12`. */
+export const killedOutcome = (pid: number, children: number): string =>
+  `killed pid ${pid}${children ? ` and ${children} child${children === 1 ? "" : "ren"}` : ""}`;
 export const stopFailed = (why: string): string => `stop failed: ${why}`;
 export const resumeFailed = (why: string): string => `resume failed: ${why}`;
 export const skipped = (why: string): string => `skipped: ${why}`;

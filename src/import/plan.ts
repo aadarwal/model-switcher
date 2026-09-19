@@ -158,6 +158,19 @@ export function shouldContinue(candidate: Candidate, mode: ContinueFor = "live")
  * needs its whole lineage copied with it or the resume dies on a missing
  * source rollout (see src/adopt.ts).
  *
+ * Codex is adopted BY PATH, and that is the fix for a whole class of failure.
+ * `ms adopt <id>` looks the rollout up under the CALLER'S own Codex home
+ * (`$CODEX_HOME`, else `~/.codex`) — and the caller here is not the shell the
+ * scan ran in, it is a brand-new pane holding a login shell that inherited
+ * none of it. On mini 1 the three conversations found were running under an
+ * `ms`-managed home; every pane searched `~/.codex`, found nothing, and the
+ * import waited out sixty seconds per row for a resume that had already
+ * refused. The absolute path of the rollout is the same fact with no
+ * environment in it: `ms adopt` has always accepted one, and resolves that
+ * file's own lineage from its own sessions tree (`lineageRootFor`,
+ * src/adopt.ts) rather than from a default home. The id still travels — in
+ * the manifest, and back out of the file's own name when adopt resumes it.
+ *
  * `command[0]` is the literal string `ms`, never a path: the plan is written
  * to a manifest and may be run later, and baking one install's binary path
  * into it would outlive that install. The executor substitutes `msBinary()`
@@ -170,7 +183,11 @@ export function paneCommand(candidate: Candidate, as: string | null, continueAft
   if (candidate.provider === "claude") {
     return ["ms", "claude", ...account, ...carry, "--", ...flags, "--resume", candidate.id];
   }
-  return ["ms", "adopt", candidate.id, ...account, ...carry, ...(flags.length ? ["--", ...flags] : [])];
+  // The id is the fallback, not the choice: a plan read back from a manifest
+  // carries no transcript path (it is a scan-time fact), and `ms adopt ""`
+  // would be a command line naming nothing.
+  const names = candidate.transcriptPath || candidate.id;
+  return ["ms", "adopt", names, ...account, ...carry, ...(flags.length ? ["--", ...flags] : [])];
 }
 
 /** Why a candidate is not moved. Checked in this order, so a row that is two

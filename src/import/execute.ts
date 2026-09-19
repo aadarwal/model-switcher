@@ -36,12 +36,13 @@
 // or waiting out a real ten seconds.
 
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { msBinary } from "../paths.ts";
 import { defaultPs, providerOfArgv, type Candidate, type ProcessRow } from "./scan.ts";
 import { shellQuote, type Tmux } from "../tmux.ts";
 import type { Plan, PaneSpec } from "./plan.ts";
 import {
-  OUTCOME_PLANNED, OUTCOME_STOPPED, candidateFields, readManifest, resumeFailed, resumedOutcome,
+  OUTCOME_PLANNED, OUTCOME_STOPPED, candidateFields, killedOutcome, readManifest, resumeFailed, resumedOutcome,
   stopFailed, stopRefused, targetName, writeManifest, type Manifest, type ManifestRow, type ManifestTarget,
 } from "./manifest.ts";
 
@@ -53,12 +54,91 @@ const KILL_MS = 2_000;
 const READY_MS = 60_000;
 /** How often either wait looks again. */
 const POLL_MS = 200;
+/** How often that wait also asks the PANE what it is running. */
+const SHELL_POLL_MS = 1_000;
+/** How long a pane that has never been anything but a shell is given before
+ *  the shell counts as evidence. Under it, the pane is simply one the command
+ *  has not started in yet. */
+const SHELL_SETTLE_MS = 5_000;
+/** Consecutive shell readings that make a verdict. One is the pane it was born
+ *  with; two is a moment between programs; three, a second apart, is a pane
+ *  that has been handed back. */
+const SHELL_STREAK = 3;
 
 const envMs = (name: string, fallback: number): number => Number(process.env[name]) || fallback;
 const termMs = (): number => envMs("MS_IMPORT_TERM_MS", TERM_MS);
 const killMs = (): number => envMs("MS_IMPORT_KILL_MS", KILL_MS);
 export const readyMs = (): number => envMs("MS_IMPORT_READY_MS", READY_MS);
 const pollMs = (): number => envMs("MS_IMPORT_POLL_MS", POLL_MS);
+export const shellPollMs = (): number => envMs("MS_IMPORT_SHELL_POLL_MS", SHELL_POLL_MS);
+const shellSettleMs = (): number => envMs("MS_IMPORT_SHELL_SETTLE_MS", SHELL_SETTLE_MS);
+
+/**
+ * The shells a pane is born holding, by the name tmux reports for them.
+ *
+ * A closed list, on purpose. This decides when a row FAILS, so the cost of
+ * over-matching is a working resume called a failure — and a program named
+ * after a shell it is not is exactly the shape that would do it. A shell this
+ * misses costs one row the full sixty seconds it already spent in 0.3.0.
+ */
+const SHELLS = new Set(["bash", "zsh", "sh", "fish"]);
+
+/** Is this `#{pane_current_command}` a shell? A login shell arrives as `-zsh`
+ *  from some sources, so the leading dash is stripped before the lookup. */
+export function isShellCommand(command: string): boolean {
+  return SHELLS.has(command.trim().replace(/^-/, ""));
+}
+
+/**
+ * Watch one pane's `#{pane_current_command}` and say when its command has
+ * returned to the shell.
+ *
+ * The failure this exists for, from the live run on mini 1: the pane's
+ * `ms adopt` printed a refusal and exited in under a second, nothing was ever
+ * written to the store, and the wait — which reads the store — had nothing to
+ * see for sixty seconds, three times over. The pane itself was saying so the
+ * whole time.
+ *
+ * Two readings are deliberately not a verdict, because a pane at a shell is
+ * the NORMAL state twice over: it is what the pane is born as, before
+ * `send-keys`, and it is what it is again for an instant between one program
+ * and the next. So the shell only speaks after the pane has been something
+ * else — or, when it never was, after `SHELL_SETTLE_MS`, which is the case of
+ * a command that had already failed before the first reading.
+ *
+ * `null` is tmux declining to answer, and is no evidence either way: it does
+ * not count towards the streak and does not clear it (src/tmux.ts).
+ *
+ * `sentAt` and every `now` are epoch ms on the caller's own clock.
+ */
+export function paneReturnWatch(sentAt: number): (command: string | null, now: number) => boolean {
+  let streak = 0;
+  let sawOther = false;
+  return (command, now) => {
+    if (command === null) return false;
+    if (!isShellCommand(command)) {
+      sawOther = true;
+      streak = 0;
+      return false;
+    }
+    streak += 1;
+    const armed = sawOther || now - sentAt >= shellSettleMs();
+    return armed && streak >= SHELL_STREAK;
+  };
+}
+
+/**
+ * The last `n` non-empty lines of a captured pane, trimmed.
+ *
+ * `n` is four because the line worth reading is not the last one: a command
+ * that refused printed its reason and then the shell printed a prompt under
+ * it, and the reason is usually three lines up (`ms adopt`'s own refusals are
+ * a line plus two of detail). The FIRST of these four is what a row records.
+ */
+export function lastScreenLines(screen: string, n = 4): string[] {
+  const lines = screen.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  return lines.slice(Math.max(0, lines.length - n));
+}
 
 export interface ExecuteDeps {
   /** The repo's tmux wrapper, already pointed at the plan's socket. */
@@ -75,9 +155,20 @@ export interface ExecuteDeps {
    * deadline on `now()`'s clock (in production that clock is `Date.now`).
    * `died` is for a pane whose command has exited — the resume that never
    * happened, answered in a second rather than in a minute.
+   *
+   * `paneId` is the pane the command was typed into, so the wait can watch it
+   * as well as the store: `returned` is that pane back at a shell prompt,
+   * which is a resume that has already refused and will never report
+   * (`paneReturnWatch`). The executor reads the refusal off the screen.
    */
-  waitReady: (candidateId: string, deadlineMs: number) => Promise<"ready" | "timeout" | "died">;
+  waitReady: (candidateId: string, deadlineMs: number, paneId: string) => Promise<"ready" | "timeout" | "died" | "returned">;
   log: (line: string) => void;
+  /**
+   * Every descendant of a pid, deepest first — read once, just before the
+   * SIGKILL fallback, and never for a SIGTERM (see `stopProcess`). Optional:
+   * the default walks `ps -axo pid=,ppid=`.
+   */
+  descendants?: (pid: number) => number[];
   /**
    * The process table, NOW — read again just before anything is signalled, so
    * a pid can be re-identified rather than taken on trust. Optional: the
@@ -122,6 +213,73 @@ export function pidAlive(pid: number): boolean {
     return (e as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
+
+/**
+ * `ps -axo pid=,ppid=` as a pid → ppid map. A line that is not two numbers is
+ * skipped rather than fatal: this decides what gets SIGKILLed, so a line we
+ * cannot read must mean "not in the tree", never a guess.
+ */
+export function parsePidParents(stdout: string): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const line of stdout.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 2) continue;
+    const pid = Number(parts[0]);
+    const ppid = Number(parts[1]);
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || ppid < 0) continue;
+    out.set(pid, ppid);
+  }
+  return out;
+}
+
+/**
+ * Everything under `pid`, deepest first, never including `pid` itself.
+ *
+ * Deepest first because a tree is killed from the leaves: signalling a parent
+ * before the child it owns is how a grandchild is reparented mid-walk and
+ * survives. `seen` bounds it — a table that claims a process is its own
+ * ancestor is malformed, and here it simply terminates.
+ */
+export function descendantsOf(pid: number, parents: Map<number, number>): number[] {
+  const children = new Map<number, number[]>();
+  for (const [child, parent] of parents) {
+    const list = children.get(parent);
+    if (list) list.push(child);
+    else children.set(parent, [child]);
+  }
+  const levels: number[][] = [];
+  const seen = new Set<number>([pid]);
+  let frontier = [pid];
+  while (frontier.length) {
+    const next: number[] = [];
+    for (const p of frontier) {
+      for (const child of children.get(p) ?? []) {
+        if (seen.has(child)) continue;
+        seen.add(child);
+        next.push(child);
+      }
+    }
+    if (next.length) levels.push(next);
+    frontier = next;
+  }
+  return levels.reverse().flat();
+}
+
+/**
+ * The default descendant lookup: one bounded `ps`, walked in process.
+ *
+ * One reading, not a `pgrep` per level: a tree read across several calls is a
+ * tree that changed between them, and the pids this returns are about to be
+ * SIGKILLed.
+ */
+export function defaultDescendants(pid: number): number[] {
+  const r = spawnSync("ps", ["-axo", "pid=,ppid="], {
+    encoding: "utf8", timeout: SUBPROCESS_TIMEOUT_MS, maxBuffer: 16 << 20,
+  });
+  return r.stdout ? descendantsOf(pid, parsePidParents(r.stdout)) : [];
+}
+
+const SUBPROCESS_TIMEOUT_MS = 10_000;
 
 /** Wait for a pid to go, on the injected clock. True when it is gone. */
 async function waitGone(pid: number, budgetMs: number, deps: ExecuteDeps): Promise<boolean> {
@@ -177,16 +335,28 @@ function sameProcess(c: Candidate, deps: ExecuteDeps): { ok: true } | { ok: fals
  * `refused` is not `ok: false` with a nicer word: nothing was signalled, and
  * the row says so, because "we would not touch this pid" and "we tried and it
  * would not go" are different things to read in a rollback record.
+ *
+ * The SIGKILL fallback takes the DESCENDANTS with it, and SIGTERM deliberately
+ * does not. A CLI installed from npm is a wrapper and the process doing the
+ * work — `node …/codex` and its native child — and a wrapper forwards a
+ * SIGTERM, which is why the polite path stays the parent's alone. SIGKILL
+ * cannot be forwarded by anything, so killing the wrapper there leaves the
+ * child orphaned onto launchd, still holding the conversation this import is
+ * about to resume in a pane. The tree is read BEFORE the first signal, because
+ * once the parent is gone its children are reparented and the link that names
+ * them is lost, and it is signalled leaves first for the same reason.
  */
-async function stopProcess(c: Candidate, deps: ExecuteDeps): Promise<{ ok: true; forced: boolean } | { ok: false; refused: boolean; why: string }> {
+async function stopProcess(c: Candidate, deps: ExecuteDeps): Promise<{ ok: true; forced: boolean; killed: number[] } | { ok: false; refused: boolean; why: string }> {
   const pid = c.pid!;
-  if (!deps.alive(pid)) return { ok: true, forced: false }; // it left while we were planning
+  if (!deps.alive(pid)) return { ok: true, forced: false, killed: [] }; // it left while we were planning
   const same = sameProcess(c, deps);
   if (!same.ok) return { ok: false, refused: true, why: same.why };
   if (!deps.kill(pid, "SIGTERM") && deps.alive(pid)) return { ok: false, refused: false, why: `could not signal pid ${pid}` };
-  if (await waitGone(pid, termMs(), deps)) return { ok: true, forced: false };
+  if (await waitGone(pid, termMs(), deps)) return { ok: true, forced: false, killed: [] };
+  const kin = (deps.descendants ?? defaultDescendants)(pid);
+  for (const child of kin) deps.kill(child, "SIGKILL");
   deps.kill(pid, "SIGKILL");
-  if (await waitGone(pid, killMs(), deps)) return { ok: true, forced: true };
+  if (await waitGone(pid, killMs(), deps)) return { ok: true, forced: true, killed: kin };
   return { ok: false, refused: false, why: `pid ${pid} is still running after SIGKILL` };
 }
 
@@ -264,9 +434,9 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
             continue; // its transcript is still being written; making a pane for it now would resume a live conversation twice
           }
           result.stopped += 1;
-          row.outcome = OUTCOME_STOPPED;
+          row.outcome = stop.forced ? killedOutcome(c.pid, stop.killed.length) : OUTCOME_STOPPED;
           save();
-          deps.log(`${short(c)}: stopped pid ${c.pid}${stop.forced ? " (SIGKILL)" : ""}`);
+          deps.log(`${short(c)}: ${stop.forced ? row.outcome : `stopped pid ${c.pid}`}`);
         }
 
         // 2. The pane, born holding a shell, in the conversation's own cwd.
@@ -295,7 +465,7 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
           deps.log(`${short(c)}: ${row.outcome}`);
           continue;
         }
-        const seen = await deps.waitReady(c.id, deps.now() + readyMs());
+        const seen = await deps.waitReady(c.id, deps.now() + readyMs(), paneId);
         // A pane whose command has exited explains a silence tmux could have
         // explained in one call; `paneDead` is null when tmux could not be
         // asked, which is never evidence of a death (src/tmux.ts).
@@ -305,11 +475,7 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
           row.outcome = resumedOutcome(row.target!);
         } else {
           result.failed += 1;
-          row.outcome = resumeFailed(
-            verdict === "died"
-              ? `the pane died (${paneId})`
-              : `no report within ${Math.round(readyMs() / 1000)}s (the pane is ${paneId})`,
-          );
+          row.outcome = resumeFailed(whyNotResumed(verdict, paneId, deps.tmux));
         }
         save();
         deps.log(`${short(c)}: ${row.outcome}`);
@@ -317,6 +483,21 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
     }
   }
   return result;
+}
+
+/**
+ * Why a row did not come back, in the words a human can act on.
+ *
+ * `returned` is the one that reads the SCREEN, and only there: the pane has
+ * handed the shell back, so whatever the command said before it exited is
+ * still on it, and that sentence is worth more than any phrasing of ours. The
+ * pane id carries the fallback, for a command that refused without a word.
+ */
+function whyNotResumed(verdict: "timeout" | "died" | "returned", paneId: string, tmux: Tmux): string {
+  if (verdict === "died") return `the pane died (${paneId})`;
+  if (verdict === "timeout") return `no report within ${Math.round(readyMs() / 1000)}s (the pane is ${paneId})`;
+  const said = lastScreenLines(tmux.capture(paneId))[0];
+  return said ?? `the command returned to a shell (the pane is ${paneId})`;
 }
 
 /** How a row is named in a log line: enough to find it, never the whole id. */

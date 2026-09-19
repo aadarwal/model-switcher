@@ -457,6 +457,40 @@ export function normalizeTty(tty: string): string {
   return /^(tty|cu\.)/.test(bare) ? bare : `tty${bare}`;
 }
 
+/**
+ * One process per tty, keeping the LOWEST pid on it.
+ *
+ * An npm-installed Codex is two processes for one conversation: `node
+ * …/codex` and the native binary it runs, sharing a tty and a cwd, and both
+ * matching `providerOfArgv`. Only one of them can claim the conversation, so
+ * the other arrived in the live run as a row of its own — `live, no
+ * conversation found`, one per session, for a conversation that does not
+ * exist.
+ *
+ * The tty is the evidence that they are one session: a terminal has one
+ * foreground process group, so two matching CLIs on one tty are one CLI seen
+ * twice. The lowest pid is the parent — the one that was started, the one
+ * that owns the tty's job, and the one a SIGTERM belongs to (it forwards it
+ * to the child it spawned).
+ *
+ * A process with NO tty is never deduped against anything: the empty spelling
+ * means "no controlling terminal" (`normalizeTty`), and two of those share
+ * nothing at all.
+ */
+export function dedupeByTty<T extends { pid: number; tty: string }>(rows: T[]): T[] {
+  const lowest = new Map<string, number>();
+  for (const r of rows) {
+    const tty = normalizeTty(r.tty);
+    if (!tty) continue;
+    const seen = lowest.get(tty);
+    if (seen === undefined || r.pid < seen) lowest.set(tty, r.pid);
+  }
+  return rows.filter((r) => {
+    const tty = normalizeTty(r.tty);
+    return !tty || lowest.get(tty) === r.pid;
+  });
+}
+
 // --- The scan ------------------------------------------------------------
 
 export function scanConversations(opts: ScanOptions): Candidate[] {
@@ -467,10 +501,15 @@ export function scanConversations(opts: ScanOptions): Candidate[] {
   const managed = opts.managedIds();
 
   // Newest process first, so when two CLIs share a directory the newer one
-  // takes the newer conversation instead of racing for the same row.
-  const processes = opts.ps()
+  // takes the newer conversation instead of racing for the same row — after
+  // the wrapper-and-child pairs have been collapsed to one process each, so
+  // that "two CLIs" means two conversations.
+  const matching = opts.ps()
     .map((row) => ({ row, provider: providerOfArgv(row.argv) }))
-    .filter((x): x is { row: ProcessRow; provider: ImportProvider } => x.provider !== null)
+    .filter((x): x is { row: ProcessRow; provider: ImportProvider } => x.provider !== null);
+  const kept = new Set(dedupeByTty(matching.map((x) => x.row)));
+  const processes = matching
+    .filter((x) => kept.has(x.row))
     .sort((a, b) => b.row.startedAt - a.row.startedAt);
 
   const liveOf = new Map<Conversation, ProcessRow>();

@@ -58,6 +58,7 @@ case "$1" in
     grep -qxF "$3" "$MS_TMUX_SESSIONS" 2>/dev/null || exit 1 ;;
   list-sessions) cat "$MS_TMUX_SESSIONS" 2>/dev/null ;;
   display-message) cat "$MS_TMUX_DEAD" 2>/dev/null || printf '0\n' ;;
+  capture-pane) cat "$MS_TMUX_SCREEN" 2>/dev/null ;;
 esac
 exit 0`;
 
@@ -146,9 +147,10 @@ type World = {
   file: string;
   log: string[];
   tmuxLog: () => string[];
-  ready: { calls: [string, number][] };
-  setReady: (v: "ready" | "timeout" | "died") => void;
+  ready: { calls: [string, number, string][] };
+  setReady: (v: "ready" | "timeout" | "died" | "returned") => void;
   setDead: (v: boolean) => void;
+  setScreen: (text: string) => void;
   manifest: () => Manifest;
   clock: () => number;
 };
@@ -162,9 +164,11 @@ async function world(t: TestContext, plan: Plan, over: Partial<ExecuteDeps> = {}
   const winIndex = path.join(dir, "win-index");
   const sessions = path.join(dir, "sessions");
   const dead = path.join(dir, "dead");
+  const screen = path.join(dir, "screen");
   writeFileSync(tmuxLog, "");
   writeFileSync(sessions, "");
   writeFileSync(dead, "0\n");
+  writeFileSync(screen, "");
 
   const prev = { ...process.env };
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
@@ -175,8 +179,9 @@ async function world(t: TestContext, plan: Plan, over: Partial<ExecuteDeps> = {}
   process.env.MS_TMUX_WIN_INDEX = winIndex;
   process.env.MS_TMUX_SESSIONS = sessions;
   process.env.MS_TMUX_DEAD = dead;
+  process.env.MS_TMUX_SCREEN = screen;
   t.after(() => {
-    for (const k of ["PATH", "HOME", "MS_HOME", "MS_TMUX_LOG", "MS_TMUX_PANES", "MS_TMUX_WIN_INDEX", "MS_TMUX_SESSIONS", "MS_TMUX_DEAD", "MS_TMUX_FAIL"]) {
+    for (const k of ["PATH", "HOME", "MS_HOME", "MS_TMUX_LOG", "MS_TMUX_PANES", "MS_TMUX_WIN_INDEX", "MS_TMUX_SESSIONS", "MS_TMUX_DEAD", "MS_TMUX_SCREEN", "MS_TMUX_FAIL"]) {
       if (prev[k] === undefined) delete process.env[k];
       else process.env[k] = prev[k]!;
     }
@@ -188,9 +193,9 @@ async function world(t: TestContext, plan: Plan, over: Partial<ExecuteDeps> = {}
   writeManifest(file, manifestFromPlan(plan, { since: "2h", dirs: [], createdAt: new Date(T0) }));
 
   let clock = T0;
-  let verdict: "ready" | "timeout" | "died" = "ready";
+  let verdict: "ready" | "timeout" | "died" | "returned" = "ready";
   const log: string[] = [];
-  const ready: { calls: [string, number][] } = { calls: [] };
+  const ready: { calls: [string, number, string][] } = { calls: [] };
   const deps: ExecuteDeps = {
     tmux: new Tmux(plan.socket),
     kill: (pid, sig) => {
@@ -216,8 +221,8 @@ async function world(t: TestContext, plan: Plan, over: Partial<ExecuteDeps> = {}
       clock += ms;
       await new Promise((r) => setTimeout(r, 5));
     },
-    waitReady: async (id, deadline) => {
-      ready.calls.push([id, deadline]);
+    waitReady: async (id, deadline, paneId) => {
+      ready.calls.push([id, deadline, paneId]);
       return verdict;
     },
     ps: () => tableFor(plan),
@@ -231,6 +236,7 @@ async function world(t: TestContext, plan: Plan, over: Partial<ExecuteDeps> = {}
     ready,
     setReady: (v) => { verdict = v; },
     setDead: (v) => writeFileSync(dead, v ? "1\n" : "0\n"),
+    setScreen: (text) => writeFileSync(screen, text),
     manifest: () => readManifest(file),
     clock: () => clock,
   };
@@ -332,7 +338,7 @@ test("a fifth conversation lands in its own window, and that window's panes spli
 
 // --- Stopping --------------------------------------------------------------
 
-test("a CLI that ignores SIGTERM is killed once the grace is spent, and still counts as stopped", async (t) => {
+test("a CLI that ignores SIGTERM is killed once the grace is spent, and takes its real children with it", async (t) => {
   const { dir } = stubDir();
   const pid = await liveProcess(t, dir, "stubborn");
   const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid })]);
@@ -343,14 +349,95 @@ test("a CLI that ignores SIGTERM is killed once the grace is spent, and still co
     signals.push([p, sig]);
       return realKill(p, sig);
   };
+  // The real process table, on a real tree: the stubborn script's own
+  // `sleep 30 &`. This is the shape an npm-installed Codex has — a wrapper
+  // and the process doing the work — and in 0.3.0 the child outlived the
+  // SIGKILL as an orphan.
+  const { defaultDescendants, executeImport } = await import("../src/import/execute.ts");
+  w.deps.descendants = defaultDescendants;
+  const kids = defaultDescendants(pid);
+  assert.deepEqual(kids.length, 1, `the script's own sleep: ${JSON.stringify(kids)}`);
+  const result = await executeImport(plan, w.file, w.deps);
+
+  assert.deepEqual(
+    signals,
+    [[pid, "SIGTERM"], [kids[0]!, "SIGKILL"], [pid, "SIGKILL"]],
+    "SIGTERM to the parent alone (a wrapper forwards it), and only then the floor under it — children first",
+  );
+  assert.ok(w.clock() - T0 >= 10_000, "SIGKILL waited out the whole ten-second grace");
+  assert.deepEqual(result, { moved: 1, stopped: 1, failed: 0 });
+  assert.ok(w.log.some((l) => l.includes(`killed pid ${pid} and 1 child`)), w.log.join("\n"));
+  assert.ok(!w.deps.alive(pid));
+  assert.ok(!w.deps.alive(kids[0]!), "and the child is not an orphan that outlived it");
+});
+
+test("the fallback kills descendants deepest-first, before the parent, and the row says how many", async (t) => {
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid: 12 })]);
+  const w = await world(t, plan);
+  const signals: [number, string][] = [];
+  const dead = new Set<number>();
+  w.deps.kill = (p, sig) => {
+    signals.push([p, sig]);
+    if (sig === "SIGKILL") dead.add(p);
+    return true;
+  };
+  w.deps.alive = (p) => !dead.has(p); // nothing leaves on SIGTERM
+  // 12 → 13 → 14: the tree is read BEFORE anything is signalled, because once
+  // the parent is gone its children are reparented and the link is lost.
+  let askedAt: [number, string][] = [];
+  w.deps.descendants = (p) => {
+    askedAt = [...signals];
+    return p === 12 ? [14, 13] : [];
+  };
+  const seen: string[][] = [];
+  const log = w.deps.log;
+  w.deps.log = (line) => { log(line); seen.push(w.manifest().rows.map((r) => r.outcome)); };
   const { executeImport } = await import("../src/import/execute.ts");
   const result = await executeImport(plan, w.file, w.deps);
 
-  assert.deepEqual(signals, [[pid, "SIGTERM"], [pid, "SIGKILL"]], "SIGTERM first, and only then the floor under it");
-  assert.ok(w.clock() - T0 >= 10_000, "SIGKILL waited out the whole ten-second grace");
+  assert.deepEqual(signals, [[12, "SIGTERM"], [14, "SIGKILL"], [13, "SIGKILL"], [12, "SIGKILL"]]);
+  assert.deepEqual(askedAt, [[12, "SIGTERM"]], "the tree is collected before the first SIGKILL, not after");
+  assert.deepEqual(seen[0], ["killed pid 12 and 2 children"], "the manifest says it at the moment it is true");
   assert.deepEqual(result, { moved: 1, stopped: 1, failed: 0 });
-  assert.ok(w.log.some((l) => l.includes("(SIGKILL)")), w.log.join("\n"));
-  assert.ok(!w.deps.alive(pid));
+});
+
+test("a CLI that leaves on SIGTERM is never asked for its descendants", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp", pid })]);
+  const w = await world(t, plan);
+  let asked = 0;
+  w.deps.descendants = (p) => { asked += 1; return [p + 1]; };
+  const seen: string[][] = [];
+  const log = w.deps.log;
+  w.deps.log = (line) => { log(line); seen.push(w.manifest().rows.map((r) => r.outcome)); };
+  const { executeImport } = await import("../src/import/execute.ts");
+  await executeImport(plan, w.file, w.deps);
+  assert.equal(asked, 0, "SIGTERM is the parent's alone: a wrapper forwards it, and a tree we did not have to walk is one we do not kill");
+  assert.deepEqual(seen[0], ["stopped"]);
+});
+
+test("a process tree is read off `ps -axo pid=,ppid=` and walked deepest-first", async () => {
+  const { parsePidParents, descendantsOf } = await import("../src/import/execute.ts");
+  const parents = parsePidParents([
+    "    1     0",
+    "   12     1",
+    "   13    12",
+    "   14    13",
+    "   15    12",
+    "   99     1",
+    "  junk line",
+  ].join("\n"));
+  assert.equal(parents.get(14), 13);
+  assert.deepEqual(descendantsOf(12, parents), [14, 13, 15], "deepest first: a grandchild is signalled before the child that owns it");
+  assert.deepEqual(descendantsOf(99, parents), [], "a leaf has none");
+  assert.deepEqual(descendantsOf(14, parents), []);
+
+  // A table that claims a process is its own ancestor terminates rather than
+  // walking for ever — and never names the pid itself, which the caller kills
+  // separately.
+  const cycle = parsePidParents(["  20   21", "  21   20"].join("\n"));
+  assert.deepEqual(descendantsOf(20, cycle), [21]);
 });
 
 test("a process that cannot be signalled fails its own row and stops nothing else", async (t) => {
@@ -474,12 +561,96 @@ test("a pane that died says so, rather than waiting out a silence tmux could exp
   assert.equal(w.manifest().rows[0]!.outcome, "resume failed: the pane died (%1)");
 });
 
-test("waitReady is asked with the conversation's id and a deadline sixty seconds out", async (t) => {
+test("waitReady is asked with the conversation's id, a deadline sixty seconds out, and the pane to watch", async (t) => {
   const plan = planOf([cand({ id: "s-1", cwd: "/tmp" })]);
   const w = await world(t, plan);
   const { executeImport } = await import("../src/import/execute.ts");
   await executeImport(plan, w.file, w.deps);
-  assert.deepEqual(w.ready.calls, [["s-1", T0 + 60_000]]);
+  assert.deepEqual(w.ready.calls, [["s-1", T0 + 60_000, "%1"]], "the pane id travels: the wait watches that pane as well as the store");
+});
+
+// --- A resume that has already refused -------------------------------------
+
+test("a pane whose command has handed the shell back fails with what it printed, not a minute later", async (t) => {
+  // Live, mini 1, 0.3.0: every Codex row's `ms adopt` refused in under a
+  // second — and the run then waited the full sixty for a report that could
+  // not come, three times over, and wrote `no report within 60s`: a row that
+  // says nothing about why. The shell prompt IS the report.
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp" })]);
+  const w = await world(t, plan);
+  w.setScreen([
+    "$ '/opt/ms' 'adopt' '0199' '--continue'",
+    "ms adopt: no rollout for '0199' under /Users/x/.codex",
+    "  the id is the one codex resume takes; the file is rollout-<date>-<id>.jsonl",
+    "  set CODEX_HOME if that codex runs out of another home, or pass the file's path instead",
+    "$ ",
+    "",
+    "",
+  ].join("\n"));
+  w.setReady("returned");
+  const { executeImport } = await import("../src/import/execute.ts");
+  const result = await executeImport(plan, w.file, w.deps);
+
+  assert.deepEqual(result, { moved: 0, stopped: 0, failed: 1 });
+  assert.equal(
+    w.manifest().rows[0]!.outcome,
+    "resume failed: ms adopt: no rollout for '0199' under /Users/x/.codex",
+    "the first of the last four non-empty lines — past the prompt the shell printed under it",
+  );
+  assert.ok(w.tmuxLog().some((l) => l.includes("capture-pane") && l.includes("%1")), w.tmuxLog().join("\n"));
+});
+
+test("a pane that returned to a shell and printed nothing still says so, by pane", async (t) => {
+  const plan = planOf([cand({ id: "s-1", cwd: "/tmp" })]);
+  const w = await world(t, plan);
+  w.setScreen("\n\n\n");
+  w.setReady("returned");
+  const { executeImport } = await import("../src/import/execute.ts");
+  await executeImport(plan, w.file, w.deps);
+  assert.equal(w.manifest().rows[0]!.outcome, "resume failed: the command returned to a shell (the pane is %1)");
+});
+
+test("the last four non-empty screen lines are the window a refusal is read from", async () => {
+  const { lastScreenLines } = await import("../src/import/execute.ts");
+  assert.deepEqual(lastScreenLines("a\nb\n\nc\n  \nd\ne\n\n"), ["b", "c", "d", "e"]);
+  assert.deepEqual(lastScreenLines("only\n\n"), ["only"]);
+  assert.deepEqual(lastScreenLines("\n   \n"), []);
+});
+
+test("a pane reads as returned only after three shell readings, and only once it has been something else (or five seconds have passed)", async () => {
+  const { paneReturnWatch } = await import("../src/import/execute.ts");
+
+  // The ordinary shape: the shell the pane was born with, then `ms`, then the
+  // shell again because the command refused.
+  const ordinary = paneReturnWatch(0);
+  assert.equal(ordinary("zsh", 1000), false, "the pane is BORN at a shell; that alone is never a verdict");
+  assert.equal(ordinary("zsh", 2000), false);
+  assert.equal(ordinary("node", 3000), false);
+  assert.equal(ordinary("zsh", 4000), false);
+  assert.equal(ordinary("zsh", 5000), false);
+  assert.equal(ordinary("zsh", 6000), true, "three in a row, after having been something else");
+
+  // A CLI that is up and running is never a verdict, however long it runs.
+  const running = paneReturnWatch(0);
+  for (const t of [1000, 2000, 3000, 4000, 10_000, 59_000]) assert.equal(running("codex", t), false);
+
+  // A command that failed before the first poll: the pane never changed, so
+  // the five seconds are what arm it.
+  const quick = paneReturnWatch(0);
+  assert.equal(quick("bash", 1000), false);
+  assert.equal(quick("bash", 2000), false);
+  assert.equal(quick("bash", 3000), false, "three shells, but nothing yet says the command ever ran");
+  assert.equal(quick("bash", 4000), false);
+  assert.equal(quick("bash", 5000), true);
+
+  // tmux that could not answer is no evidence either way — it neither counts
+  // as a shell reading nor clears the ones before it (src/tmux.ts).
+  const unanswered = paneReturnWatch(0);
+  assert.equal(unanswered("node", 500), false);
+  assert.equal(unanswered("fish", 1000), false);
+  assert.equal(unanswered(null, 2000), false, "a reading tmux did not give is not a third shell");
+  assert.equal(unanswered("sh", 3000), false);
+  assert.equal(unanswered("fish", 4000), true, "and it did not clear the two real ones either");
 });
 
 test("a tmux that refuses a pane fails that row and leaves the rest of the plan alone", async (t) => {

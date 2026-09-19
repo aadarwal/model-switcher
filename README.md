@@ -67,6 +67,17 @@ ms dashboard [--port N] [--no-open]
 - `ms dashboard` — serve the `ms status` tables on `127.0.0.1`, with rotate, switch and stop buttons. It prints its URL, opens it (unless `--no-open`), and exits about 90 s after the last request, so it is alive only while a tab polls it.
 - `--force` moves a session that is mid-turn; without it a busy session is refused. With no `<session|pane>`, `rotate`, `switch` and `stop` act on the current pane.
 
+### Calendar
+
+```
+ms calendar [--days N] [--all] [--ics | --json]
+```
+
+- `ms calendar` — every account's upcoming limit resets (5h, week, Fable), grouped by local day, soonest first. It reads the same snapshot `ms status` does and never polls on its own. Windows that reset together are one line (`week + fable`); a window with nothing used is left out unless `--all`. `--days` sets the horizon, 1 to 60 (default 8).
+- `--ics` — the same events as an iCalendar file: `ms calendar --ics > resets.ics`, then import it. Event UIDs depend only on what resets and when, so importing a newer file updates the events rather than duplicating them. Events are marked free, not busy.
+- `--json` — the events with a `googleUrl` each: Google Calendar's own "create event" link, prefilled. `ms` never talks to Google; the link is only a URL, and nothing leaves the machine until you open it.
+- `ms dashboard` shows the same list under **Calendar**, with a `+ Google Calendar` link per reset and `Download .ics`. A calendar app on the same machine can subscribe to `http://127.0.0.1:<port>/calendar.ics` while the dashboard is up. Google Calendar cannot subscribe to it — Google fetches feeds from its own servers, and the dashboard listens on `127.0.0.1` only — so for Google use the per-event links or import the file.
+
 ### Accounts
 
 ```

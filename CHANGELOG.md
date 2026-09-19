@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `ms calendar` lists every account's upcoming limit resets (5h, week, Fable)
+  by local day; `--ics` writes an iCalendar file, `--json` adds an "Add to
+  Google Calendar" link per event, `--days N` sets the horizon, `--all` keeps
+  windows with nothing used
+- the dashboard gains a Calendar section with the same events, a Google
+  Calendar link on each, and `/calendar.ics`
+
 ## 0.2.5
 
 - `ms adopt <rollout-id>` takes over a Codex conversation ms did not start: it

@@ -12,6 +12,7 @@ import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { paneDied, reconcile } from "./reconcile.ts";
 import { recoverVerb } from "./recover.ts";
 import { status } from "./status.ts";
+import { calendar } from "./calendar.ts";
 import { doctor } from "./doctor.ts";
 import { accountsVerb } from "./accounts.ts";
 import { setupVerb } from "./setup.ts";
@@ -34,6 +35,7 @@ registerVerb("attach", attachVerb);
 registerVerb("adopt", adoptVerb);
 registerVerb("_recover", recoverVerb);
 registerVerb("status", status);
+registerVerb("calendar", calendar);
 registerVerb("doctor", doctor);
 registerVerb("accounts", accountsVerb);
 registerVerb("setup", setupVerb);
@@ -43,7 +45,7 @@ registerVerb("stop", stopVerb);
 registerVerb("dashboard", dashboard);
 
 const USAGE = `usage: ms <verb> [args]
-  setup | claude | codex | adopt | status | accounts | rotate | switch | stop | doctor | attach | dashboard
+  setup | claude | codex | adopt | status | calendar | accounts | rotate | switch | stop | doctor | attach | dashboard
   (internal: _exec _hook _codex_watch _recover _pane_died _statusline)`;
 
 function version(): string {

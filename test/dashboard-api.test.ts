@@ -825,3 +825,24 @@ test("a POST verb reconciles first (a GET never does): a closed pane's row is re
     afterPost.close();
   }
 });
+
+// --- GET /api/calendar --------------------------------------------------
+
+test("GET /api/calendar: every seeded window's reset, soonest first, each with its title and Google Calendar link", async (t) => {
+  await world(t);
+  const res = await handle({ method: "GET", path: "/api/calendar" });
+  assert.equal(res.status, 200);
+  const body = res.json as { days: number; events: { account: string; windows: string[]; at: string; title: string; googleUrl: string }[] };
+  assert.equal(body.days, 8);
+  // writeSnapshot(): both accounts reset their 5h window in 1 h and their weekly one in 6 h.
+  assert.deepEqual(body.events.map((e) => `${e.account}:${e.windows.join("+")}`), ["dirk:5h", "gmail:5h", "dirk:week", "gmail:week"]);
+  assert.equal(body.events[0]!.title, "ms: dirk (claude) 5h limit resets");
+  assert.ok(body.events[0]!.googleUrl.startsWith("https://calendar.google.com/calendar/render?action=TEMPLATE&"));
+  assert.ok(!JSON.stringify(body).includes("sk-ant-"), "no token-shaped string in a calendar");
+});
+
+test("/api/calendar is read-only: a POST to it is not a route", async (t) => {
+  await world(t);
+  const res = await handle({ method: "POST", path: "/api/calendar", body: {} });
+  assert.equal(res.status, 404);
+});

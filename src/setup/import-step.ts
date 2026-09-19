@@ -10,13 +10,20 @@
 // is the whole safety story; nothing below it needs its own `--yes` guard.
 //
 // Composed the same way every other step is: `scanConversations` and
-// `planImport` already exist and are already tested (Tasks 1-2), and the
-// executor (Task 3, `executeImport`) is being built in parallel and is not
-// on this branch yet. So the three moving parts are all INJECTED —
+// `planImport` already exist and are already tested (Tasks 1-2), and so is
+// the executor (Task 3, `executeImport`, reached here through `runImportPlan`
+// in `../import.ts` — the same composition the verb itself calls, so the two
+// can never drift). All three moving parts are still INJECTED, though —
 // `scan`/`plan` default to the real ones (composed below against the real
-// environment), and `runImport` has no default at all: `steps.ts` supplies
-// a placeholder that throws until Task 3 merges, at which point wiring the
-// real `executeImport` in is a one-line change there, not here.
+// environment), and `runImport` has no default at all, because `steps.ts` is
+// the one place that decides which executor a run actually gets, and every
+// test in `test/setup-import.test.ts` proves this module's own logic against
+// a fake one.
+//
+// The manifest is written HERE, before `runImport` is ever called —
+// `executeImport`'s first act is reading that file back (`src/import/
+// execute.ts`), so a step that asked the human to confirm a plan it had not
+// yet written down would hand the executor a path that does not exist.
 //
 // This module never talks to setup.json directly beyond `ctx.state`/
 // `ctx.persist()`, same as every other step; `Ctx` is imported type-only so
@@ -25,9 +32,10 @@
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
+import { formatManifest, manifestFromPlan, manifestPath, readManifest, writeManifest } from "../import/manifest.ts";
 import { defaultScanDeps, scanConversations, type Candidate } from "../import/scan.ts";
 import { planImport, type Plan } from "../import/plan.ts";
-import { msHome } from "../paths.ts";
+import { ensureStore, msHome } from "../paths.ts";
 import { Tmux } from "../tmux.ts";
 import type { Ctx } from "./steps.ts"; // type-only: erased, no import cycle at runtime
 
@@ -41,9 +49,10 @@ export type ScanFn = (opts: { sinceMs: number | null; dirs: string[] }) => Candi
  *  is the real environment. */
 export type PlanFn = (candidates: Candidate[]) => Plan;
 
-/** Task 3's contract, verbatim (`executeImport`, not imported: it is not on
- *  this branch). Declared here rather than re-exported from anywhere, so this
- *  step compiles and tests standalone whether or not Task 3 has merged. */
+/** `executeImport`'s own contract (`src/import/execute.ts`, reached in
+ *  production through `runImportPlan` in `../import.ts`), declared here
+ *  rather than imported so this step's tests can inject a fake without
+ *  pulling in tmux, signals or the store. */
 export type RunImportFn = (plan: Plan, manifestPath: string) => Promise<{ moved: number; stopped: number; failed: number }>;
 
 export interface ImportStepDeps {
@@ -155,33 +164,6 @@ function dirMenu(candidates: Candidate[]): { dirs: string[]; lines: string[] } {
   return { dirs, lines };
 }
 
-/** A plain table — `formatManifest` does not exist on this branch (Task 3's
- *  executor and its manifest are not merged yet), so this is the wizard's own
- *  rendering: one row per pane the plan would create, in plan order. */
-function planTable(plan: Plan): string[] {
-  const header = ["PROVIDER", "DIR", "LAST", "LIVE", "TITLE", "→ SESSION:WINDOW.PANE"].join("  ");
-  const rows = [header];
-  for (const session of plan.sessions) {
-    for (const win of session.windows) {
-      for (const pane of win.panes) {
-        const c = pane.candidate;
-        rows.push(
-          [c.provider, c.cwd, new Date(c.lastActivity).toISOString(), c.pid !== null ? "live" : "-", c.title, `→ ${pane.session}:${pane.window}.${pane.index}`].join("  "),
-        );
-      }
-    }
-  }
-  return rows;
-}
-
-function skipSummary(plan: Plan): string | null {
-  if (!plan.skipped.length) return null;
-  const counts = new Map<string, number>();
-  for (const s of plan.skipped) counts.set(s.reason, (counts.get(s.reason) ?? 0) + 1);
-  const parts = [...counts.entries()].map(([reason, n]) => `${n} ${reason}`).join(", ");
-  return `Left alone: ${parts}.`;
-}
-
 // --- Asking ------------------------------------------------------------
 
 /** `1,3` or `all`. Re-asks on anything else — an index out of range, empty
@@ -218,8 +200,9 @@ async function askWindowHours(ctx: Ctx): Promise<number> {
  * Build the `import` step's runner.
  *
  * Returns a plain `(ctx: Ctx) => Promise<void>`, which is exactly the shape
- * `STEP_RUNNERS` wants — `steps.ts` calls this once, at module load, with the
- * placeholder `runImport` (or, after Task 3 merges, the real one).
+ * `STEP_RUNNERS` wants — `steps.ts` calls this once, at module load, wiring
+ * in whichever `runImport` it was given (the real `executeImport`, reached
+ * through `runImportPlan`, in production; a fake in every test here).
  */
 export function importStep(deps: ImportStepDeps): (ctx: Ctx) => Promise<void> {
   const scan = deps.scan ?? defaultScan;
@@ -262,20 +245,24 @@ export function importStep(deps: ImportStepDeps): (ctx: Ctx) => Promise<void> {
       return;
     }
 
-    for (const line of planTable(thePlan)) ctx.say(line);
-    const summary = skipSummary(thePlan);
-    if (summary) ctx.say(summary);
+    // Written NOW, before the human is even asked to proceed — the plan
+    // shown below is read back from this same file (same as `ms import`
+    // itself), and `runImport` (`executeImport`) reads this path as its
+    // first act, so it must already exist by the time that call happens.
+    const file = manifestPath();
+    ensureStore();
+    writeManifest(file, manifestFromPlan(thePlan, { since: `${hours}h`, dirs: chosenDirs }));
+    ctx.say(formatManifest(readManifest(file)));
 
     if (!(await ctx.confirm("Proceed?", false))) {
-      ctx.say("Not moving anything.");
+      ctx.say(`Not moving anything — the plan is written: ms import --plan ${file}`);
       return;
     }
 
-    const manifestPath = path.join(msHome(), "imports", `${new Date().toISOString()}.json`);
-    const result = await runImport(thePlan, manifestPath);
-    ctx.state.importManifest = manifestPath;
+    const result = await runImport(thePlan, file);
+    ctx.state.importManifest = file;
     ctx.persist();
     ctx.say(`moved ${result.moved}, stopped ${result.stopped}, failed ${result.failed}`);
-    ctx.say(`Manifest: ${manifestPath}`);
+    ctx.say(`Manifest: ${file}`);
   };
 }

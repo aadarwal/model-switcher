@@ -7,14 +7,16 @@
 // git. `ctx.persist()` still writes a real (temp) MS_HOME/setup.json, which is
 // the one piece of the real world these tests need: proving the manifest path
 // really lands in `ctx.state.importManifest`.
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import path from "node:path";
-import { tempHome } from "./helpers.ts";
+import { stubDir, tempHome } from "./helpers.ts";
 import { makeCtx, type Ctx } from "../src/setup/steps.ts";
 import { scriptedPrompter } from "../src/setup/prompt.ts";
 import { loadSetup } from "../src/setup/state.ts";
 import { importStep, type ScanFn, type PlanFn, type RunImportFn } from "../src/setup/import-step.ts";
+import { readManifest } from "../src/import/manifest.ts";
 import { planImport } from "../src/import/plan.ts";
 import type { Candidate } from "../src/import/scan.ts";
 
@@ -199,9 +201,12 @@ test("choosing one of two directories and 1h rescans narrowly and plans only tha
   // Move? yes. Dirs: "1" (dirA only). Window: "1" (1h). Proceed? yes.
   const { ctx, msHome } = makeTestCtx(["y", "1", "1", "y"]);
   const scanCalls: { sinceMs: number | null; dirs: string[] }[] = [];
-  const runImportCalls: { plan: unknown; manifestPath: string }[] = [];
+  const runImportCalls: { plan: unknown; manifestPath: string; existedAlready: boolean }[] = [];
   const runImport: RunImportFn = async (plan, manifestPath) => {
-    runImportCalls.push({ plan, manifestPath });
+    // The core of the fix: `executeImport`'s real first act is reading this
+    // file back, so it must already be on disk by the time `runImport` (in
+    // production, `executeImport` via `runImportPlan`) is ever called.
+    runImportCalls.push({ plan, manifestPath, existedAlready: existsSync(manifestPath) });
     return { moved: 1, stopped: 1, failed: 0 };
   };
   const step = importStep({ runImport, scan: fakeScan(all, scanCalls), plan: realPlan() });
@@ -224,17 +229,30 @@ test("choosing one of two directories and 1h rescans narrowly and plans only tha
   assert.deepEqual(cwds, [dirA]);
   assert.equal(plan.skipped.length, 0);
 
-  // The manifest path is MS_HOME/imports/<ISO>.json, and it is what got recorded.
-  assert.equal(path.dirname(runImportCalls[0].manifestPath), path.join(msHome, "imports"));
-  assert.match(path.basename(runImportCalls[0].manifestPath), /^.+\.json$/);
-  assert.doesNotThrow(() => new Date(path.basename(runImportCalls[0].manifestPath, ".json")).toISOString());
-  assert.equal(ctx.state.importManifest, runImportCalls[0].manifestPath);
+  // The manifest path is MS_HOME/imports/<flattened-ISO>.json — no colon (it
+  // must be copy-pasteable and valid on every filesystem) — and it is what
+  // got recorded in setup.json.
+  const manifestPath = runImportCalls[0].manifestPath;
+  assert.equal(path.dirname(manifestPath), path.join(msHome, "imports"));
+  assert.match(path.basename(manifestPath), /^[^:]+\.json$/);
+  assert.equal(ctx.state.importManifest, manifestPath);
 
-  // The plan table and the summary are both on stdout.
-  assert.ok(lines.some((l) => l.startsWith("PROVIDER")), lines.join("\n"));
+  // It was written to disk BEFORE runImport was ever called — the bug this
+  // fixes: `executeImport` reads this path as its first act.
+  assert.equal(runImportCalls[0].existedAlready, true, "the manifest did not exist yet when runImport was called");
+  const onDisk = readManifest(manifestPath);
+  assert.equal(onDisk.since, "1h");
+  assert.deepEqual(onDisk.dirs, [dirA]);
+  assert.equal(onDisk.rows.length, 1);
+  assert.equal(onDisk.rows[0]!.id, all[0]!.id);
+
+  // formatManifest's own table (head summary, header row, one row per
+  // conversation) is what actually reached stdout.
+  assert.ok(lines.some((l) => /1 conversation to move/.test(l)), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes("CLI") && l.includes("OUTCOME")), lines.join("\n"));
   assert.ok(lines.some((l) => l.includes(dirA) && l.includes("fix the thing")), lines.join("\n"));
   assert.ok(lines.some((l) => /moved 1, stopped 1, failed 0/.test(l)), lines.join("\n"));
-  assert.ok(lines.some((l) => l.includes(`Manifest: ${runImportCalls[0].manifestPath}`)), lines.join("\n"));
+  assert.ok(lines.some((l) => l.includes(`Manifest: ${manifestPath}`)), lines.join("\n"));
 });
 
 test("choosing 'all' directories keeps every one of them in the rescan", async () => {
@@ -276,4 +294,66 @@ test("a plan with nothing movable (everything skipped) says so and never calls t
   const { lines } = await captureStdoutAsync(() => step(ctx));
   assert.equal(ctx.state.importManifest, null);
   assert.ok(lines.some((l) => /Nothing left to move/.test(l)), lines.join("\n"));
+});
+
+// --- Integration: the REAL executor, wired the way steps.ts wires it -------
+//
+// Every test above injects a fake `runImport` on purpose — this is the one
+// test that does not, because the defect it regresses (the wizard's step
+// handing `executeImport` a manifest path nothing had written yet, which is
+// an immediate ENOENT) can only be caught by going through the real
+// `executeImport`, reached the same way `src/setup/steps.ts` reaches it in
+// production: `runImportPlan` from `../src/import.ts`. tmux is a bash stub on
+// PATH, driven through the repo's real `Tmux` wrapper (the way
+// test/import-verb.test.ts's own `--plan` test does), and the conversation
+// reports itself the same way: a session row in the real (temp) store,
+// already `running`, under this conversation's own id.
+
+test("through the REAL runImportPlan, an idle conversation reaches 'resumed' and the manifest says so", async (t: TestContext) => {
+  const { ctx } = makeTestCtx(["y", "all", "1", "y"]); // move? yes; dirs: all; window: 1h; proceed? yes.
+  const home = process.env.HOME!;
+
+  const { dir, stub } = stubDir();
+  const tmuxLog = path.join(dir, "tmux.log");
+  process.env.MS_TMUX_LOG = tmuxLog;
+  stub(
+    "tmux",
+    `printf '%s\\n' "$*" >> "$MS_TMUX_LOG"
+if [ "$1" = "-S" ]; then shift 2; fi
+case "$1" in
+  new-session|new-window|split-window) printf '%%1 5\\n' ;;
+  has-session) exit 1 ;;
+  display-message) printf '0\\n' ;;
+esac
+exit 0`,
+  );
+  const prevPath = process.env.PATH;
+  process.env.PATH = `${dir}:${prevPath ?? ""}`;
+  t.after(() => {
+    process.env.PATH = prevPath;
+    delete process.env.MS_TMUX_LOG;
+  });
+
+  const cwd = path.join(home, "src", "data");
+  const candidate = cand({ provider: "claude", id: "conv-1", cwd, lastActivity: Date.now(), title: "fix the tests", pid: null });
+
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  st.createSession({
+    id: "row-1", provider: "claude", cliSessionId: "conv-1", cwd, socket: "s", pane: "%1",
+    serverStart: "1:1", need: "any", account: "work", generation: 1, state: "running", desired: "running", flags: [],
+  });
+  st.close();
+
+  const { runImportPlan } = await import("../src/import.ts");
+  const runImport: RunImportFn = (plan, manifestPath) => runImportPlan(plan, manifestPath, () => {});
+  const step = importStep({ runImport, scan: () => [candidate], plan: realPlan() });
+
+  const { lines } = await captureStdoutAsync(() => step(ctx));
+
+  assert.ok(ctx.state.importManifest, "the wizard did not record a manifest path");
+  const manifest = readManifest(ctx.state.importManifest!);
+  assert.equal(manifest.rows.length, 1);
+  assert.match(manifest.rows[0]!.outcome, /^resumed in /, JSON.stringify(manifest.rows[0]));
+  assert.ok(lines.some((l) => /moved 1, stopped 0, failed 0/.test(l)), lines.join("\n"));
 });

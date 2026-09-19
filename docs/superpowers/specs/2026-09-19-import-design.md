@@ -56,7 +56,7 @@ A failure never stops the run. The summary prints `moved N, stopped M, failed K`
 
 `MS_HOME/imports/<ISO timestamp>.json` (0600):
 ```json
-{ "createdAt": "...", "server": "default|ms", "since": "2h", "dirs": ["..."],
+{ "createdAt": "...", "server": "current|ms", "since": "2h", "dirs": ["..."],
   "rows": [{ "provider": "codex", "id": "...", "cwd": "...", "root": "...", "worktree": "...",
              "lastActivity": "...", "title": "...", "pid": 1234, "argv": ["codex","--yolo"],
              "target": { "session": "data", "window": "main", "pane": 2 },

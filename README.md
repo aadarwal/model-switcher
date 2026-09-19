@@ -21,8 +21,9 @@ ms setup
 ```
 
 `ms setup` asks how many accounts of each provider you have, checks the prerequisites,
-signs each account in, installs the hooks, offers two opt-ins (both default to no), and
-ends with `ms doctor`. It marks each step as it finishes, so a run that stops resumes there.
+signs each account in, installs the hooks, offers to move conversations running outside
+tmux into it (default no), offers two more opt-ins (both default to no), and ends with
+`ms doctor`. It marks each step as it finishes, so a run that stops resumes there.
 
 Then launch a CLI from any tmux pane:
 
@@ -143,7 +144,7 @@ ms --version
 |---|---|
 | `--resume` | Continue at the first unfinished step. Already the default when there is progress. |
 | `--reset` | Forget how far setup got. Touches no account, credential or hook. |
-| `--yes` | Take every default and ask nothing. Both opt-ins default to no, so this installs neither. |
+| `--yes` | Take every default and ask nothing. This answers no to moving conversations into tmux and to both opt-ins, so it installs neither and moves nothing. |
 | `--repair` | Re-install the hooks for the accounts already registered, then re-run the check. No login, no questions. |
 | `--remove statusline` / `--remove alias` | Undo an opt-in. Both may be given in one run. Not combinable with `--repair` or `--reset`. |
 

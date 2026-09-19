@@ -22,6 +22,10 @@
   instead of running two contradictory answers to which conversation it is and recording
   a uuid the CLI never used. This is the path `ms import` resumes every Claude
   conversation through
+- `ms setup` gains a step, after the hooks and before the opt-ins, offering to move
+  conversations running outside tmux into it (default no): it scans, offers a numbered
+  choice of directories and an activity window, shows the plan, and on confirmation runs
+  the same executor `ms import` does, recording the manifest path in `setup.json`
 
 ## 0.2.6
 

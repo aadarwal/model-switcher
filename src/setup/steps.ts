@@ -679,15 +679,15 @@ export function registeredAccounts(): { claude: string[]; codex: string[] } {
 }
 
 /**
- * `ms import`'s executor (Task 3, `executeImport`) is not on this branch yet.
- * Until it merges, this is what `import` runs into the moment a human says
- * yes to it and confirms the plan — a clear refusal (a thrown Error naming
- * itself) rather than a silent no-op. `importStep` does not wrap this call in
- * `attempt`'s Retry/Skip/Abort — the real executor's own contract already
- * reports per-row trouble through its return value (`{moved,stopped,failed}`,
- * never a throw for an ordinary failed stop or resume), so a throw here is
- * meant to be the exceptional case, and this placeholder deliberately is one.
- *
+ * What the `import` step actually runs into once a human says yes to it and
+ * confirms the plan: the same `runImportPlan` (`../import.ts`) the `ms
+ * import` verb calls, so the wizard and the verb can never drift onto two
+ * different executors. `importStep` does not wrap this call in `attempt`'s
+ * Retry/Skip/Abort — the executor's own contract already reports per-row
+ * trouble through its return value (`{moved,stopped,failed}`, never a throw
+ * for an ordinary failed stop or resume), so a throw out of this is meant to
+ * be the exceptional case (a manifest the step failed to write, a tmux that
+ * refuses to start at all), not the routine one.
  */
 const realRunImport: RunImportFn = (plan, manifestPath) =>
   runImportPlan(plan, manifestPath, (line) => process.stderr.write(`ms setup: ${line}\n`));

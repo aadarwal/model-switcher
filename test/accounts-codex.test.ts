@@ -444,7 +444,7 @@ test("ls shows POLL yes / TOKEN n/a for a Codex row, beside the Claude rows", ()
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, /NAME\s+PROVIDER\s+LABEL\s+ORG\s+POLL\s+TOKEN\s+VERIFIED\s+EMAIL/);
   assert.match(r.stdout, /gmail\s+claude\s+gmail\s+-\s+no\s+no\s+no/);
-  assert.match(r.stdout, /work\s+codex\s+Work\s+acct-1\s+yes\s+n\/a\s+yes/);
+  assert.match(r.stdout, /work\s+codex\s+Work\s+acct-1\s+yes\s+n\/a\s+yes\s+someone@example\.com/);
   assert.equal(r.stdout.includes(ACCESS), false);
   assert.equal(r.stdout.includes(REFRESH), false);
 });

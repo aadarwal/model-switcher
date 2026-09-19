@@ -20,6 +20,17 @@ test("registry: an e-mail survives validation; a non-string or addressless one i
   assert.deepEqual(registry.accounts.map((a) => a.email ?? null), ["dirk@example.edu", null, null, null]);
 });
 
+test("registry: an e-mail past 254 characters, or carrying a control character, is dropped, never a problem", async () => {
+  const { validateRegistry } = await import("../src/registry.ts");
+  const long = `${"a".repeat(250)}@x.com`; // 256 characters, well past the bound
+  const { registry, problems } = validateRegistry({ version: 1, accounts: [
+    { name: "a", provider: "claude", email: long },
+    { name: "b", provider: "claude", email: "a@\x1b[31mRED" },
+  ] });
+  assert.deepEqual(problems, []);
+  assert.deepEqual(registry.accounts.map((a) => a.email ?? null), [null, null]);
+});
+
 test("sessionsByAccount: live sessions only, keyed by (provider, account) because a name is reused across providers", async () => {
   const { sessionsByAccount } = await import("../src/status.ts");
   const s = (id: string, provider: string, account: string, state: string, pane: string) => ({ id, provider, account, state, pane });

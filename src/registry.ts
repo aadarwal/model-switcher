@@ -68,7 +68,9 @@ export function validateRegistry(raw: unknown): { registry: Registry; problems: 
       orgId: typeof a.orgId === "string" ? a.orgId : null,
       shared: a.shared === true, identityVerified: a.identityVerified === true,
       ...(typeof a.identityMethod === "string" ? { identityMethod: a.identityMethod } : {}),
-      ...(typeof a.email === "string" && /^[^\s@]+@[^\s@]+$/.test(a.email) ? { email: a.email } : {}),
+      ...(typeof a.email === "string" && a.email.length <= 254 && !/[\x00-\x1f\x7f]/.test(a.email) && /^[^\s@]+@[^\s@]+$/.test(a.email)
+        ? { email: a.email }
+        : {}),
     });
   });
   return { registry: { version: 1, accounts: out }, problems };

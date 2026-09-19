@@ -308,10 +308,6 @@ export function accountLanesHtml(a: AccountRowView, dash: string): string {
   );
 }
 
-/** One account card: the name, the registry's LABEL when it says something
- *  the name doesn't, a chip for a STATE that isn't `ok`, then the meters.
- *  LABEL and STATE are `statusJson()`'s own computed words — rendered as
- *  given, never re-derived here. */
 /** `2 sessions · %1 · %2 walled`: what runs on the account, by pane; a state is named only when it is not
  *  plain `running`. Nothing running says nothing -- an empty line on every idle card is noise. */
 export function accountSessionsHtml(sessions: { id: string; pane: string; state: string }[] | undefined): string {
@@ -322,6 +318,10 @@ export function accountSessionsHtml(sessions: { id: string; pane: string; state:
   return '<div class="ms-onacct">' + sessions.length + (sessions.length === 1 ? " session" : " sessions") + " · " + parts.join(" · ") + "</div>";
 }
 
+/** One account card: the name, the registry's LABEL when it says something
+ *  the name doesn't, a chip for a STATE that isn't `ok`, then the meters.
+ *  LABEL and STATE are `statusJson()`'s own computed words — rendered as
+ *  given, never re-derived here. */
 export function accountRowHtml(a: AccountRowView, dash: string): string {
   var lanes = accountLanesHtml(a, dash);
   var showLabel = a.label && a.label !== a.name;

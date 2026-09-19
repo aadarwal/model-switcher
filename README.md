@@ -78,7 +78,7 @@ ms accounts token <name>
 ms accounts ls
 ```
 
-- `ls` — every account under one set of columns. EMAIL, the last one, is the login behind the name as the provider's own profile reported it at `login` or `verify`; it is display only (identity is still decided by the organisation), and an account signed in before 0.2.6 shows `-` until its next `ms accounts verify <name>`.
+- `ls` — every account under one set of columns. EMAIL, the last one, is the login behind the name as the provider's own profile reported it at `login` or `verify`; it is display only (identity is still decided by the organisation), and an account signed in before this shows `-` until its next `ms accounts verify <name>`.
 - `add` — register a name with no credentials yet. `--label` sets the display label; `--shared` marks an account other people also use, which loses ties in the chooser.
 - `login` — mint the credentials and record the account's identity. Claude opens two browser flows; `--device-auth` (Codex only) prints a device code instead of redirecting to localhost, which is what you want over SSH. `--relogin` forces a fresh sign-in even when a usable grant is already in place.
 - `verify` — re-check an account's credentials and the identity behind them. `remove` — delete the registry row and every credential it names.
@@ -206,7 +206,9 @@ beside them, and never touches another tool's hooks in the same file.
 `launch/`, per-account Claude config dirs under `claude/`, per-account Codex homes under
 `codex/` (each linked to the one shared rollout store `codex/sessions/`, so a resumed
 conversation can cross accounts), per-session event logs under `sessions/`, and the tool's
-own tmux socket. Directories are 0700 and files 0600.
+own tmux socket. Directories are 0700 and files 0600. `accounts.json` now also holds each
+account's e-mail, as the provider's own profile reported it at `login`/`verify` — display
+only, and stored at rest in that same 0600 file.
 
 | Variable | Meaning |
 |---|---|

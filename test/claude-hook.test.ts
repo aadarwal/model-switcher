@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { run, stubDir, tempHome } from "./helpers.ts";
 
@@ -327,4 +327,121 @@ test("a rate limit for a session that is stopping, or one the store has never se
   assert.equal(run(["_hook", "claude"], b.env, JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit", session_id: "c-42" })).code, 0);
   assert.equal(events(b.msHome).pop()!.kind, "rate_limited");
   assert.doesNotMatch(readFileSync(b.tlog, "utf8"), /run-shell/);
+});
+
+// --- The turn end: rebalance's only trigger ------------------------------
+//
+// `Stop` writes nothing to the event log on purpose (unlike Codex, whose
+// watchdog needs to know which turns are settled). Its whole job is to be the
+// moment an idle session may be moved — so every assertion below is about
+// what reached tmux, not about what reached the log.
+
+/** The same world as `setup()`, plus a tmux that admits the pane exists:
+ *  `maybeRebalance` re-reads the pane before it moves anything, and a
+ *  `list-panes` that answers nothing means a pane that is GONE — which is a
+ *  refusal, and would make every assertion below pass for the wrong reason. */
+function setupLive() {
+  const { home, msHome } = tempHome(); const { dir, stub } = stubDir();
+  const tlog = path.join(home, "tmux.log");
+  stub("tmux", `printf '%s\\n' "$*" >> "${tlog}"
+case "$*" in
+  *list-panes*) printf '%%7\\n' ;;
+  *capture-pane*) printf '> done\\n\\n> \\n' ;;
+esac
+exit 0`);
+  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7" };
+  return { home, msHome, env, tlog };
+}
+
+/** The tmux log, or "" when tmux was never run at all — which is itself the
+ *  assertion in the gate-off case. */
+const tmuxLog = (tlog: string): string => (existsSync(tlog) ? readFileSync(tlog, "utf8") : "");
+
+/** A registry and a usage snapshot the chooser can actually read, written by
+ *  hand into the temp MS_HOME. `takenAt` is now and every row is a fresh,
+ *  unstale reading, so `getSnapshot` serves the file and nothing polls:
+ *  `poll()` returns the cache untouched when it is fresh AND covers every
+ *  registered account, and `maybeRebalance` only ever asks it for the cache. */
+function fleet(msHome: string, rows: { name: string; session: number; weekly: number; resetHours: number }[]): void {
+  const now = Date.now();
+  const iso = (h: number) => new Date(now + h * 3_600_000).toISOString();
+  writeFileSync(path.join(msHome, "accounts.json"), JSON.stringify({
+    version: 1,
+    accounts: rows.map((r) => ({ name: r.name, provider: "claude", label: r.name, orgId: null, shared: false, identityVerified: true })),
+  }), { mode: 0o600 });
+  writeFileSync(path.join(msHome, "snapshot.json"), JSON.stringify({
+    takenAt: now,
+    backoff: {},
+    accounts: rows.map((r) => ({
+      name: r.name, provider: "claude", shared: false,
+      usage: {
+        session: { usedPercent: r.session, resetsAt: iso(3) },
+        weeklyAll: { usedPercent: r.weekly, resetsAt: iso(r.resetHours) },
+        // The seeded session needs fable, so the fable window has to be a
+        // real reading: an account without one is one the chooser refuses.
+        weeklyFable: { usedPercent: r.weekly, resetsAt: iso(r.resetHours) },
+      },
+      error: null, errorKind: null, observedAt: now, stale: false,
+    })),
+  }), { mode: 0o600 });
+}
+
+/** `here` is about to wall and `there` resets sooner with room to spare: the
+ *  imminent-wall condition, as the rule sees it. */
+const WALL_COMING = [
+  { name: "here", session: 93, weekly: 20, resetHours: 120 },
+  { name: "there", session: 4, weekly: 10, resetHours: 48 },
+];
+
+test("a turn end with the gate off writes nothing and dispatches nothing", async () => {
+  const { env, msHome, tlog } = setupLive();
+  await seedSession(env, { account: "here" });
+  fleet(msHome, WALL_COMING);
+  const r = run(["_hook", "claude"], { ...env, ...LOUD }, JSON.stringify({ hook_event_name: "Stop", session_id: "c-42" }));
+  assert.deepEqual([r.code, r.stdout, r.stderr], [0, "", ""], "a turn end is not a place to print");
+  assert.equal(eventsExist(msHome), false, "Stop writes no event of its own");
+  assert.equal(tmuxLog(tlog), "", "the gate is off by default, and off costs not one tmux call");
+});
+
+test("a turn end with the gate on dispatches the switch worker, once", async () => {
+  const { env, msHome, tlog } = setupLive();
+  await seedSession(env, { account: "here" });
+  fleet(msHome, WALL_COMING);
+  const r = run(["_hook", "claude"], { ...env, MS_REBALANCE: "1", ...LOUD },
+    JSON.stringify({ hook_event_name: "Stop", session_id: "c-42" }));
+  assert.deepEqual([r.code, r.stdout, r.stderr], [0, "", ""]);
+
+  const dispatched = readFileSync(tlog, "utf8").split("\n").filter((l) => l.includes("_rebalance"));
+  assert.equal(dispatched.length, 1);
+  assert.match(dispatched[0], /run-shell -b .*'_rebalance' 's1' '--to' 'there'$/);
+  assert.doesNotMatch(dispatched[0], /--continue/, "an idle pane is handed no continuation");
+
+  const ev = events(msHome).filter((e) => e.kind === "rebalance");
+  assert.equal(ev.length, 1);
+  assert.deepEqual([ev[0].from, ev[0].to, ev[0].kindDetail], ["here", "there", "imminent-wall"]);
+});
+
+test("the turn-end gate is mirrored out of the human's shell into the store", async () => {
+  const { env, msHome } = setup();
+  const openState = await seedSession(env);
+  run(["_hook", "claude"], { ...env, MS_REBALANCE: "1" }, JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "c-42" }));
+  const on = openState(); assert.equal(on.getKv("rebalance"), "1"); on.close();
+
+  // And a shell that says no travels too — a variable exported as anything
+  // other than "1" is somebody turning this off.
+  run(["_hook", "claude"], { ...env, MS_REBALANCE: "0" }, JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "c-42" }));
+  const off = openState(); assert.equal(off.getKv("rebalance"), "0"); off.close();
+  assert.ok(existsSync(path.join(msHome, "state.sqlite")));
+});
+
+test("a turn end on the account that is already best moves nothing", async () => {
+  const { env, msHome, tlog } = setupLive();
+  await seedSession(env, { account: "here" });
+  fleet(msHome, [
+    { name: "here", session: 4, weekly: 10, resetHours: 48 },
+    { name: "there", session: 4, weekly: 10, resetHours: 120 },
+  ]);
+  assert.equal(run(["_hook", "claude"], { ...env, MS_REBALANCE: "1" },
+    JSON.stringify({ hook_event_name: "Stop", session_id: "c-42" })).code, 0);
+  assert.doesNotMatch(tmuxLog(tlog), /_rebalance/);
 });

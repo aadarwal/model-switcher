@@ -92,3 +92,76 @@ export function codexAutorotateLine(on: boolean): string {
     ? "codex auto-recovery: on (export MS_CODEX_AUTOROTATE=0 to disable)"
     : "codex auto-recovery: off (export MS_CODEX_AUTOROTATE=1 to enable)";
 }
+
+// --- The rebalance gate --------------------------------------------------
+//
+// Rebalance (docs/superpowers/specs/2026-09-19-rebalance-design.md) moves an
+// IDLE session to a better account at a turn end. It is a stored setting with
+// an environment variable in front of it for exactly the reason the Codex gate
+// above is: the processes that read it include ones tmux dispatches, which
+// carry the SERVER's environment and not the shell that typed the export.
+//
+// The one difference is the default, and it is the whole point of shipping it
+// this way: absent means OFF. Automatic Codex recovery earned its default by
+// being watched against 85 real walls; this rule moves work nobody asked it to
+// move, so it ships behind a switch in 0.3.1 and flips to on in 0.3.2 once it
+// has been observed doing the right thing.
+
+/** The one key. Its value is exactly "1" or "0"; absent is off. */
+export const REBALANCE_KEY = "rebalance";
+
+/**
+ * What the environment says, or null when it says nothing.
+ *
+ * Exactly "1" is on, the same rule the Codex gate reads — so a variable
+ * somebody exported as "0", "false" or "" can never read as having turned
+ * this on, and "not set here" stays distinguishable from "set to off".
+ */
+export function rebalanceEnv(): boolean | null {
+  const v = process.env.MS_REBALANCE;
+  if (v === undefined || v === "") return null;
+  return v === "1";
+}
+
+/**
+ * The gate. The stored value wins whenever there is one, because the store is
+ * the only thing a tmux-dispatched process can see; the environment is the
+ * fallback while nothing has mirrored one yet.
+ *
+ * Only an explicit "on" turns this on — a stored "1", or, while nothing has
+ * been stored, an exported `MS_REBALANCE` that is exactly "1". Everything
+ * else, silence included, is off.
+ */
+export function rebalanceEnabled(st: AutorotateStore): boolean {
+  const stored = st.getKv(REBALANCE_KEY);
+  if (stored === "1") return true;
+  if (stored === "0") return false;
+  return rebalanceEnv() === true;
+}
+
+/**
+ * Mirror an exported `MS_REBALANCE` into the store.
+ *
+ * Called by the `ms` processes that DO run in the human's own shell: both
+ * hooks (which each CLI runs with the environment its pane was launched
+ * under) and `ms claude`/`ms codex` themselves. A process that cannot see the
+ * variable leaves the stored gate exactly as it found it — absence here is
+ * "I was not told", never "turn it off".
+ */
+export function syncRebalance(st: AutorotateStore): void {
+  const env = rebalanceEnv();
+  if (env === null) return;
+  const want = env ? "1" : "0";
+  if (st.getKv(REBALANCE_KEY) === want) return; // no write when nothing moved
+  st.setKv(REBALANCE_KEY, want);
+}
+
+/** The doctor line's text, so the gate is stated in exactly one place. The
+ *  off half names the shell the export has to happen in, because that is the
+ *  mistake this gate invites: a variable exported in some other terminal is
+ *  one no hook will ever see. */
+export function rebalanceLine(on: boolean): string {
+  return on
+    ? "rebalance: on (export MS_REBALANCE=0 to disable)"
+    : "rebalance: off (export MS_REBALANCE=1 in the shell that runs claude/codex)";
+}

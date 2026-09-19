@@ -199,7 +199,7 @@ does not look like something `ms` wrote.
 
 | What | Where | Undo |
 |---|---|---|
-| Claude hooks: `SessionStart`, `UserPromptSubmit`, `StopFailure` (`rate_limit`), `SessionEnd` | `~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` | Delete the four entries whose command ends in `_hook claude` |
+| Claude hooks: `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure` (`rate_limit`), `SessionEnd` | `~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` | Delete the entries whose command ends in `_hook claude` |
 | Codex hook tables and their computed trust hashes | `MS_HOME/codex/<account>/config.toml`, between `# ms-hooks-begin` and `# ms-hooks-end` | Delete that block |
 | Statusline wrapper (opt-in, default no) | `statusLine` in the same `settings.json` | `ms setup --remove statusline` |
 | Shell aliases for `claude` and `codex` (opt-in, default no) | `~/.zshrc`, or `~/.bash_profile` / `~/.bashrc`, between `# ms-alias-begin` and `# ms-alias-end` | `ms setup --remove alias` |

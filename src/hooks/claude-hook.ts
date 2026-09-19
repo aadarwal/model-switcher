@@ -1,3 +1,4 @@
+import { rebalanceEnv, syncRebalance } from "../autorotate.ts";
 import { appendEvent, type EventKind } from "../events.ts";
 import { msBinary } from "../paths.ts";
 // type-only: erased, so naming them here never loads node:sqlite
@@ -35,6 +36,12 @@ export async function claudeHook(): Promise<number> {
     // is 0 too, so "finite" is not enough to tell a real one from a blank.
     if (!session || !Number.isInteger(gen) || gen <= 0 || !socket || !pane) return 0;
 
+    // The rebalance gate, carried from the human's own shell into the store
+    // the dispatched processes can actually read. Only when the variable is
+    // set here — the ordinary case is unset (and off), and that must cost no
+    // store at all.
+    await mirrorRebalance();
+
     if (process.stdin.isTTY) return 0;
     let input: Record<string, unknown>;
     try { input = JSON.parse(await readStdin(STDIN_MS)) as Record<string, unknown>; } catch { return 0; }
@@ -54,6 +61,13 @@ export async function claudeHook(): Promise<number> {
       // state move below is only bookkeeping on top of it.
       appendEvent({ t, kind: "activity", session, generation: gen, cliSessionId });
       await noteActivity(session, gen);
+    } else if (name === "Stop") {
+      // The turn ENDED, successfully. Nothing is written down for it: unlike
+      // Codex, whose wall is a turn that never ends and whose watchdog needs
+      // to know which turns are settled, Claude Code announces its own wall
+      // through StopFailure below. So this event exists for exactly one
+      // reason — it is the moment an idle session may be moved.
+      await turnEnded(session);
     } else if (name === "SessionEnd") {
       const reason = typeof input.reason === "string" && input.reason ? input.reason : null;
       appendEvent({ t, kind: "ended", session, generation: gen, cliSessionId, ...(reason ? { kindDetail: reason } : {}) });
@@ -67,6 +81,41 @@ export async function claudeHook(): Promise<number> {
     // reconciliation reads the store and the screen on the next `ms` command.
     return 0;
   }
+}
+
+/**
+ * Write an exported `MS_REBALANCE` into the store, so the processes that READ
+ * the gate — `ms _rebalance` and anything tmux dispatches — see the value the
+ * human actually set rather than the tmux server's environment.
+ *
+ * A variable that is not set here says nothing and writes nothing. Everything
+ * is guarded: a hook that threw would print through the CLI's error path into
+ * the human's transcript.
+ */
+async function mirrorRebalance(): Promise<void> {
+  if (rebalanceEnv() === null) return; // the ordinary case: no store opened
+  try {
+    const { openState } = await import("../state.ts");
+    const st = openState();
+    try { syncRebalance(st); } finally { st.close(); }
+  } catch { /* a gate we could not record is the gate that was already there */ }
+}
+
+/**
+ * The turn-end trigger (spec: "Rebalance", step 1). Everything it might do —
+ * read the gate, read the cached snapshot, re-read the pane, dispatch a
+ * switch — is behind `maybeRebalance`, which costs one SQLite read when the
+ * gate is off, and the gate is off by default.
+ *
+ * `rebalance.ts` is imported HERE and not at module scope: it reaches
+ * `state.ts` and `recover.ts`, and an unmanaged pane's hook must return long
+ * before any of that is loaded.
+ */
+async function turnEnded(session: string): Promise<void> {
+  try {
+    const { maybeRebalance } = await import("../rebalance.ts");
+    await maybeRebalance(session);
+  } catch { /* a move that could not happen is never worth a line in the transcript */ }
 }
 
 /**

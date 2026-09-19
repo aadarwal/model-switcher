@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { run, stubDir, tempHome } from "./helpers.ts";
 
@@ -363,4 +363,93 @@ test("a codex launch that RESUMED is running once its hook reports (0.2.5)", asy
   } finally {
     stB.close();
   }
+});
+
+// --- The turn end: rebalance's Codex trigger -----------------------------
+
+/** `setup()`, plus a tmux that admits the pane exists: `maybeRebalance`
+ *  re-reads the pane before it moves anything, and a `list-panes` that
+ *  answers nothing means a pane that is GONE — a refusal that would make
+ *  every assertion below pass for the wrong reason. */
+function setupLive() {
+  const { home, msHome } = tempHome(); const { dir, stub } = stubDir();
+  const tlog = path.join(home, "tmux.log");
+  stub("tmux", `printf '%s\\n' "$*" >> "${tlog}"
+case "$*" in
+  *list-panes*) printf '%%7\\n' ;;
+  *capture-pane*) printf '> done\\n\\n> \\n' ;;
+esac
+exit 0`);
+  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7" };
+  return { home, msHome, env, tlog };
+}
+
+/** A registry and a fresh usage snapshot the chooser can serve without a
+ *  poll: `getSnapshot` returns the cache file untouched while it is fresh AND
+ *  covers every registered account, and `maybeRebalance` only ever asks it
+ *  for the cache. Codex Pro reports no 5 h window, so neither does this. */
+function codexFleet(msHome: string, rows: { name: string; weekly: number; resetHours: number }[]): void {
+  const now = Date.now();
+  const iso = (h: number) => new Date(now + h * 3_600_000).toISOString();
+  writeFileSync(path.join(msHome, "accounts.json"), JSON.stringify({
+    version: 1,
+    accounts: rows.map((r) => ({ name: r.name, provider: "codex", label: r.name, orgId: null, shared: false, identityVerified: true })),
+  }), { mode: 0o600 });
+  writeFileSync(path.join(msHome, "snapshot.json"), JSON.stringify({
+    takenAt: now,
+    backoff: {},
+    accounts: rows.map((r) => ({
+      name: r.name, provider: "codex", shared: false,
+      usage: { session: null, weeklyAll: { usedPercent: r.weekly, resetsAt: iso(r.resetHours) }, weeklyFable: null },
+      error: null, errorKind: null, observedAt: now, stale: false,
+    })),
+  }), { mode: 0o600 });
+}
+
+/** `dirk` is 60 % through a week that has four more days to run — well short
+ *  of a wall, so condition 1 says nothing; `spare` resets tomorrow with room,
+ *  which is the better-budget condition and nothing else. */
+const BETTER_WEEK = [
+  { name: "dirk", weekly: 60, resetHours: 120 },
+  { name: "spare", weekly: 10, resetHours: 24 },
+];
+
+test("a Codex turn end with the gate off dispatches nothing", async () => {
+  const { env, msHome, tlog } = setupLive();
+  await seedSession(env);
+  codexFleet(msHome, BETTER_WEEK);
+  const r = run(["_hook", "codex"], { ...env, ...LOUD }, JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-1" }));
+  assert.deepEqual([r.code, r.stdout, r.stderr], [0, "", ""]);
+  assert.equal(events(msHome).pop()!.kind, "stop", "the turn is still recorded");
+  assert.doesNotMatch(tmuxLog(tlog), /_rebalance/);
+});
+
+test("a Codex turn end with the gate on records the stop AND dispatches the move", async () => {
+  const { env, msHome, tlog } = setupLive();
+  await seedSession(env);
+  codexFleet(msHome, BETTER_WEEK);
+  const r = run(["_hook", "codex"], { ...env, MS_REBALANCE: "1", ...LOUD },
+    JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-1" }));
+  assert.deepEqual([r.code, r.stdout, r.stderr], [0, "", ""]);
+
+  const kinds = events(msHome).map((e) => e.kind);
+  assert.deepEqual(kinds, ["stop", "rebalance"], "the turn's ending first, then what it triggered");
+  const move = events(msHome).pop()!;
+  assert.deepEqual([move.from, move.to, move.kindDetail], ["dirk", "spare", "better-budget"]);
+
+  const dispatched = tmuxLog(tlog).split("\n").filter((l) => l.includes("_rebalance"));
+  assert.equal(dispatched.length, 1);
+  assert.match(dispatched[0], /run-shell -b .*'_rebalance' 's1' '--to' 'spare'$/);
+  assert.doesNotMatch(dispatched[0], /--continue/, "an idle pane is handed no continuation");
+});
+
+test("the Codex hook mirrors BOTH gates, and neither set costs a store", async () => {
+  const { env, msHome } = setup();
+  const openState = await seedSession(env);
+  run(["_hook", "codex"], { ...env, MS_REBALANCE: "1", MS_CODEX_AUTOROTATE: "0" },
+    JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "cx-7", turn_id: "t-1" }));
+  const st = openState();
+  assert.deepEqual([st.getKv("rebalance"), st.getKv("codexAutorotate")], ["1", "0"]);
+  st.close();
+  assert.ok(existsSync(path.join(msHome, "state.sqlite")));
 });

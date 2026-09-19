@@ -8,10 +8,14 @@ type Settings = Record<string, unknown> & { hooks?: Record<string, HookEntry[]> 
 
 /** The events the Claude hook subscribes to, with the matcher each needs.
  * `StopFailure` matches only `rate_limit` — every other failure is somebody
- * else's problem and must not wake a recovery worker. */
+ * else's problem and must not wake a recovery worker. `Stop` is its opposite
+ * number: the turn that ENDED, which is the only moment rebalance
+ * (src/rebalance.ts) is allowed to move a session, and which records no event
+ * of its own — Claude Code needs no `stop` in the log the way Codex does. */
 const EVENTS: readonly [string, string][] = [
   ["SessionStart", ""],
   ["UserPromptSubmit", ""],
+  ["Stop", ""],
   ["StopFailure", "rate_limit"],
   ["SessionEnd", ""],
 ];

@@ -45,7 +45,16 @@ async function world(opts: { rows?: Record<string, unknown>[]; events?: Record<s
   const { home, msHome } = tempHome();
   const { dir, stub } = stubDir();
   const tlog = path.join(home, "tmux.log");
-  stub("tmux", `printf '%s\\n' "$*" >> "${tlog}"; exit 0`);
+  // `list-panes`/`capture-pane` are answered because the turn-end rebalance
+  // re-reads the pane before it moves anything: a tmux that says nothing means
+  // a pane that is GONE, which is a refusal for the wrong reason. The watch
+  // itself asks tmux for neither.
+  stub("tmux", `printf '%s\\n' "$*" >> "${tlog}"
+case "$*" in
+  *list-panes*) printf '%%7\\n' ;;
+  *capture-pane*) printf '> done\\n\\n> \\n' ;;
+esac
+exit 0`);
 
   process.env.HOME = home;
   process.env.MS_HOME = msHome;
@@ -687,4 +696,59 @@ test("a turn that began DURING the pass is picked up before the watch stands dow
     st.close();
   }
   delete process.env.MS_CODEX_AUTOROTATE;
+});
+
+// --- The turn end the watch closes is a rebalance trigger ----------------
+
+/** The registry `getSnapshot` scopes its cache file against: without it the
+ *  scope is empty and every reading in the file is invisible. */
+function seedRegistry(msHome: string, names: string[]): void {
+  writeFileSync(path.join(msHome, "accounts.json"), JSON.stringify({
+    version: 1,
+    accounts: names.map((n) => ({ name: n, provider: "codex", label: n, orgId: null, shared: false, identityVerified: true })),
+  }), { mode: 0o600 });
+}
+
+/** A cache file whose weekly windows differ — `seedSnapshot` above writes only
+ *  the 5 h one, and a week is what condition 2 argues from. */
+function seedWeeks(msHome: string, rows: { name: string; weekly: number; resetHours: number }[]): void {
+  const now = Date.now();
+  writeFileSync(path.join(msHome, "snapshot.json"), JSON.stringify({
+    takenAt: now,
+    backoff: {},
+    accounts: rows.map((r) => ({
+      name: r.name, provider: "codex", shared: false, error: null, errorKind: null, observedAt: now, stale: false,
+      usage: { session: null, weeklyAll: { usedPercent: r.weekly, resetsAt: new Date(now + r.resetHours * 3_600_000).toISOString() }, weeklyFable: null },
+    })),
+  }) + "\n", { mode: 0o600 });
+}
+
+test("a turn the WATCH closes is a turn end: with the gate on, it moves the session", async () => {
+  // The hook's own `Stop` normally settles the turn first — this is the other
+  // path, the one that exists for a hook that never fired. It also proves the
+  // rebalance's own store connection is safe to open inside the watch lock.
+  const w = await world({ rollouts: { s1: [noise(1), taskComplete("t-1", null)] } });
+  seedRegistry(w.msHome, ["dirk", "spare"]);
+  seedWeeks(w.msHome, [{ name: "dirk", weekly: 60, resetHours: 120 }, { name: "spare", weekly: 10, resetHours: 24 }]);
+  const st = w.openState(); st.setKv("rebalance", "1"); st.close();
+
+  assert.equal(await watch(), 0);
+  const kinds = events(w.msHome).map((e) => e.kind);
+  assert.deepEqual(kinds.slice(-2), ["stop", "rebalance"], "the turn's ending first, then what it triggered");
+  assert.match(tmuxLog(w.tlog), /'_rebalance' 's1' '--to' 'spare'/);
+});
+
+test("a turn the watch closes as a WALL is never rebalanced — the 30 m guard is load-bearing", async () => {
+  // Both endings settle the turn, and both reach the same trigger. What keeps
+  // this one still is the guard reading the `rate_limited` this very pass
+  // wrote: a session that just walled has a rotation of its own under way.
+  const w = await world({ rollouts: { s1: [taskComplete("t-1", "usage_limit_exceeded")] } });
+  seedRegistry(w.msHome, ["dirk", "spare"]);
+  seedWeeks(w.msHome, [{ name: "dirk", weekly: 60, resetHours: 120 }, { name: "spare", weekly: 10, resetHours: 24 }]);
+  const st = w.openState(); st.setKv("rebalance", "1"); st.close();
+
+  assert.equal(await watch(), 0);
+  assert.equal(events(w.msHome).pop()!.kind, "rate_limited", "no rebalance on top of it");
+  assert.doesNotMatch(tmuxLog(w.tlog), /_rebalance/);
+  assert.match(tmuxLog(w.tlog), /'_recover' 's1'/, "the wall's own rotation is what runs");
 });

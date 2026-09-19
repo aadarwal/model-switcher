@@ -94,7 +94,7 @@ const tmuxLines = (w: World): string[] =>
 const respawns = (w: World): string[] => tmuxLines(w).filter((l) => l.includes("respawn-pane"));
 const dispatches = (w: World): string[] => tmuxLines(w).filter((l) => l.includes("_recover"));
 
-const base: Omit<SessionRow, "id" | "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset"> = {
+const base: Omit<SessionRow, "id" | "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset" | "lastMoveAt"> = {
   provider: "claude", cliSessionId: "c1", cwd: "/tmp/work", socket: SOCK, pane: "%7",
   serverStart: IDENTITY, need: "any", account: "gmail", generation: 1,
   state: "running", desired: "running", flags: [],

@@ -892,3 +892,24 @@ test("the worry set: an account with no room is amber — the page says what ms 
     accountRowHtml({ ...ACCOUNT, state: "no room" }, "—").includes('<span class="ms-chip worry">no room</span>'),
   );
 });
+
+// --- Calendar panel ----------------------------------------------------------
+
+test("calendarHtml: events grouped under local-day headings, each with its Google Calendar link; names are escaped", async () => {
+  const { calendarHtml } = await import("../src/dashboard/client-logic.ts");
+  const ev = [
+    { account: "<work>", provider: "claude", label: "", windows: ["5h"], at: "2026-09-18T15:00:00.000Z", usedPercent: 62, title: "t1", googleUrl: "https://calendar.google.com/calendar/render?action=TEMPLATE&text=a%26b" },
+    { account: "mit", provider: "codex", label: "", windows: ["week", "fable"], at: "2026-09-20T09:00:00.000Z", usedPercent: 5, title: "t2", googleUrl: "https://calendar.google.com/calendar/render?action=TEMPLATE&text=x" },
+  ];
+  const html = calendarHtml(ev, "—");
+  assert.equal(html.match(/class="ms-calday"/g)!.length, 2, "two days, two headings");
+  assert.ok(html.includes("&lt;work&gt;") && !html.includes("<work>"), "account names are escaped");
+  assert.ok(html.includes('href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=a%26b"'), "the link survives as an attribute");
+  assert.ok(html.includes('target="_blank"') && html.includes('rel="noopener noreferrer"'));
+  assert.ok(html.includes("week + fable") && html.includes("62%"));
+});
+
+test("calendarHtml: nothing upcoming reads as a sentence, never as an empty panel", async () => {
+  const { calendarHtml } = await import("../src/dashboard/client-logic.ts");
+  assert.match(calendarHtml([], "—"), /No limit resets/);
+});

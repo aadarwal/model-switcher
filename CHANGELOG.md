@@ -8,6 +8,12 @@
   accounts signed in before this show `-` until their next verify
 - the pool says what runs on each account: a SESS count closes the `ms status`
   accounts table, and each card on the page lists its live sessions by pane
+- `ms calendar` lists every account's upcoming limit resets (5h, week, Fable)
+  by local day; `--ics` writes an iCalendar file, `--json` adds an "Add to
+  Google Calendar" link per event, `--days N` sets the horizon, `--all` keeps
+  windows with nothing used
+- the dashboard gains a Calendar section with the same events, a Google
+  Calendar link on each, and `/calendar.ics`
 
 ## 0.2.5
 

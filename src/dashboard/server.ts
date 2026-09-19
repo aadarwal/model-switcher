@@ -17,6 +17,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { spawnSync } from "node:child_process";
 import { handle, type ApiRequest } from "./api.ts";
 import { renderDashboardPage } from "./page.ts";
+import { DEFAULT_CALENDAR_DAYS, toIcs, upcomingResets } from "../calendar.ts";
 
 /** Same order of magnitude as the manual verbs' own bounds (doctor.ts's
  *  REFRESH_TIMEOUT_MS, recover.ts's settle budgets) — `open` detaches its own
@@ -278,6 +279,18 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
           const html = renderDashboardPage();
           res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
           res.end(html);
+          return;
+        }
+        if (req.method === "GET" && pathName === "/calendar.ics") {
+          // The one non-JSON, non-HTML answer: a calendar file. GET and read-only,
+          // like the page itself. A calendar app on this machine can subscribe to
+          // it while the dashboard is up; Google Calendar cannot (it fetches feeds
+          // from Google's servers, and this listens on 127.0.0.1 only) -- for
+          // Google, the page's per-event links or an import of this file.
+          const now = Date.now();
+          const ics = toIcs(await upcomingResets(DEFAULT_CALENDAR_DAYS, now), now);
+          res.writeHead(200, { "content-type": "text/calendar; charset=utf-8", "content-disposition": 'attachment; filename="model-switcher-resets.ics"', "cache-control": "no-store" });
+          res.end(ics);
           return;
         }
         if (pathName.startsWith("/api/")) {

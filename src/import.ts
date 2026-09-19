@@ -203,6 +203,27 @@ export function runGit(args: string[], cwd: string): string | null {
  */
 const CODEX_SETTLE_MS = 5_000;
 
+/** Run one plan against the real world: the plan's own tmux server, real
+ *  signals, the store-backed readiness check. The verb and the wizard's
+ *  import step both go through here, so the two can never drift. */
+export async function runImportPlan(
+  plan: Plan,
+  manifestPath: string,
+  log: (line: string) => void,
+): Promise<{ moved: number; stopped: number; failed: number }> {
+  const tmux = new Tmux(plan.socket);
+  const startedAtSeconds = Math.floor(Date.now() / 1000);
+  return executeImport(plan, manifestPath, {
+    tmux,
+    kill: signalPid,
+    alive: pidAlive,
+    now: () => Date.now(),
+    sleep: sleepMs,
+    waitReady: storeWaitReady(plan, tmux, startedAtSeconds),
+    log,
+  });
+}
+
 export function storeWaitReady(plan: Plan, tmux: Tmux, startedAtSeconds: number): ExecuteDeps["waitReady"] {
   const known = new Map<string, Candidate>();
   for (const s of plan.sessions) for (const w of s.windows) for (const p of w.panes) known.set(p.candidate.id, p.candidate);
@@ -384,17 +405,7 @@ export async function runImport(argv: string[], io: ImportIo = processIo()): Pro
     }
   }
 
-  const tmux = new Tmux(plan.socket);
-  const startedAtSeconds = Math.floor(Date.now() / 1000);
-  const result = await executeImport(plan, file, {
-    tmux,
-    kill: signalPid,
-    alive: pidAlive,
-    now: () => Date.now(),
-    sleep: sleepMs,
-    waitReady: storeWaitReady(plan, tmux, startedAtSeconds),
-    log: (line) => io.err(`ms import: ${line}\n`),
-  });
+  const result = await runImportPlan(plan, file, (line) => io.err(`ms import: ${line}\n`));
 
   io.err(`ms import: moved ${result.moved}, stopped ${result.stopped}, failed ${result.failed}\n`);
   io.err(`ms import: manifest ${file}\n`);

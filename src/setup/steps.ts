@@ -47,6 +47,7 @@ import { findAccount, loadRegistry, NAME_PATTERN, type Provider } from "../regis
 import { status } from "../status.ts";
 import { installAlias, rcPathFor } from "./alias.ts";
 import { importStep, type RunImportFn } from "./import-step.ts";
+import { runImportPlan } from "../import.ts";
 import type { Prompter } from "./prompt.ts";
 import { saveSetup, type SetupState, type SetupStep } from "./state.ts";
 import { installStatusline } from "./statusline.ts";
@@ -687,25 +688,16 @@ export function registeredAccounts(): { claude: string[]; codex: string[] } {
  * never a throw for an ordinary failed stop or resume), so a throw here is
  * meant to be the exceptional case, and this placeholder deliberately is one.
  *
- * WIRING, once Task 3 merges (`src/import/execute.ts`'s `executeImport`,
- * `signalPid`, `pidAlive`; `src/import.ts`'s `storeWaitReady` — the same
- * pieces `runImport` in `src/import.ts` already composes into an
- * `ExecuteDeps` around one plan's own `new Tmux(plan.socket)`): add a small
- * `realRunImport: RunImportFn` next to this one, built the same way, then
- * change exactly the STEP_RUNNERS entry below —
- *   import: importStep({ runImport: realRunImport }),
- * — one line, here.
  */
-const placeholderRunImport: RunImportFn = async () => {
-  throw new Error("import executor not wired");
-};
+const realRunImport: RunImportFn = (plan, manifestPath) =>
+  runImportPlan(plan, manifestPath, (line) => process.stderr.write(`ms setup: ${line}\n`));
 
 export const STEP_RUNNERS: Record<SetupStep, (ctx: Ctx) => Promise<void>> = {
   prereqs,
   "claude-accounts": claudeAccounts,
   "codex-accounts": codexAccounts,
   hooks,
-  import: importStep({ runImport: placeholderRunImport }),
+  import: importStep({ runImport: realRunImport }),
   statusline,
   alias,
   finish,

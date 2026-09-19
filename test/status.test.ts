@@ -601,6 +601,46 @@ test("ms status --json: each session row also carries BETTER — additive, and t
   }
 });
 
+test("ms status: BETTER is a dash for a row the rule can NEVER move — a parked session, and a pane that is gone", async () => {
+  // %2 is left out of list-panes, so sess-2's pane is gone; sess-4 is parked
+  // on the same account. Both are on gmail, which the pool cannot read — so
+  // in the table test above, where sess-2 is running on a LIVE pane, that
+  // identical row reads BETTER dirk. Neither of these may: `decide` computes
+  // `better` ahead of every guard, and both rows are ones `ms rebalance`
+  // skips outright.
+  const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": WALL_SCREEN } });
+  await seedSessions(w);
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    st.createSession({
+      id: "sess-4", provider: "claude", cliSessionId: "cli-4", cwd: "/tmp/work4",
+      socket: TMUX_SOCKET, pane: "%1", serverStart: "srv1",
+      need: "any", account: "gmail", generation: 1, state: "parked", desired: "running", flags: [],
+    });
+  } finally {
+    st.close();
+  }
+
+  const r = run(["status", "--json", "--all"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout) as { sessions: { id: string; state: string; better: string | null }[] };
+
+  const parked = parsed.sessions.find((x) => x.id === "sess-4")!;
+  assert.equal(parked.state, "parked");
+  assert.equal(parked.better, null, "a parked row was told where it belongs");
+
+  const gone = parsed.sessions.find((x) => x.id === "sess-2")!;
+  assert.equal(gone.state, "gone");
+  assert.equal(gone.better, null, "a dead pane was told where it belongs");
+
+  // The control, in the same run: sess-1 is live and running, so the column
+  // is still doing its job — this is not a fix that blanked BETTER outright.
+  const live = parsed.sessions.find((x) => x.id === "sess-1")!;
+  assert.equal(live.state, "walled");
+  assert.equal("better" in live, true);
+});
+
 test("ms status --json: finding 2 — a Claude account with no launch token reads STATE no-token, never ok", async () => {
   const { home, msHome } = tempHome();
   writeFileSync(
@@ -675,10 +715,11 @@ test("ms status: a session whose pane no longer exists shows STATE gone, with no
   // separator — the assertion is therefore that neither wall word appears
   // on the row at all, which is what "blank" meant here in the first place.
   assert.ok(!/\breported\b|\bunreported\b/.test(s2), s2);
-  // …and BETTER still lands last: the rule's opinion for a pane that is
-  // gone is the same opinion it has for a live one (the guards change the
-  // reason, never `better`).
-  assert.equal(s2Cells[s2Cells.length - 1], "dirk");
+  // …and BETTER, which still lands last, is the DASH: a pane that is gone
+  // is a row the rule can never move, and a column naming a destination
+  // `ms rebalance` refuses to send it to would be worse than blank. (The
+  // very same row, on a live pane, reads "dirk" — see the table test above.)
+  assert.equal(s2Cells[s2Cells.length - 1], "—");
 
   // sess-1's pane is still there and unaffected.
   const s1 = lines.find((l) => l.startsWith("sess-1"))!;

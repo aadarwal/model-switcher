@@ -12,7 +12,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
 import { appendEvent } from "../src/events.ts";
@@ -353,6 +353,59 @@ test("POST /api/rebalance with dryRun omitted is a REAL run, and the calm fixtur
   // Nothing was asked of tmux beyond reading the pane.
   const acted = logLines(w).filter((l) => /send-keys|respawn-pane|run-shell/.test(l));
   assert.deepEqual(acted, [], `a run with nothing to do touched a pane:\n${logLines(w).join("\n")}`);
+});
+
+test("POST /api/rebalance runs its moves INSIDE the capture — a refused handoff's stderr never reaches the process's own", async (t) => {
+  const w = await world(t);
+  // dirk is about to wall and gmail has room in both windows, so s1's
+  // decision is a move — the only shape of run that reaches the switch
+  // transaction at all.
+  const now = Date.now();
+  const row = (name: string, session: number, weekly: number) => ({
+    name, provider: "claude" as const, shared: false,
+    usage: {
+      session: { usedPercent: session, resetsAt: new Date(now + HOUR).toISOString() },
+      weeklyAll: { usedPercent: weekly, resetsAt: new Date(now + 6 * HOUR).toISOString() },
+      weeklyFable: null,
+    },
+    error: null, errorKind: null, observedAt: now, stale: false,
+  });
+  writeFileSync(
+    path.join(w.msHome, "snapshot.json"),
+    JSON.stringify({ takenAt: now, accounts: [row("dirk", 90, 30), row("gmail", 5, 10)], backoff: {} }),
+    { mode: 0o600 },
+  );
+  // …and the destination has no launch token, so `recoverSession` refuses
+  // before it touches the pane — through `fail()`, which writes one line to
+  // `process.stderr` (src/recover.ts). That line is the canary: finding C2
+  // is exactly this, and outside `captured()` it lands in the `ms dashboard`
+  // terminal, or in whatever other request's capture happens to be in flight.
+  rmSync(path.join(w.msHome, "launch", "gmail.token"), { force: true });
+
+  const leaked: string[] = [];
+  const real = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    leaked.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+    return true;
+  }) as typeof process.stderr.write;
+  let res: Awaited<ReturnType<typeof handle>>;
+  try {
+    res = await handle({ method: "POST", path: "/api/rebalance", body: {} });
+  } finally {
+    process.stderr.write = real;
+  }
+
+  // The run really did reach the transaction, and really was refused —
+  // otherwise nothing would have been written anywhere and this proves
+  // nothing at all.
+  assert.equal(res.status, 200);
+  const rows = (res.json as { rows: { session: string; outcome: string }[] }).rows;
+  const s1 = rows.find((r) => r.session === "s1")!;
+  assert.match(s1.outcome, /^failed: .*launch token/, JSON.stringify(rows));
+  // …and its one line of stderr went into the capture, not onto the
+  // process's own. Mutation-proved: dropping `captured()` from the route
+  // puts "ms _recover: no candidate account has a launch token …" here.
+  assert.deepEqual(leaked, [], `the handoff's stderr leaked to the process: ${leaked.join("")}`);
 });
 
 // --- Unknown route → 404 -----------------------------------------------

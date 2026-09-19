@@ -230,7 +230,7 @@ async function runVerb(fn: Verb, argv: string[]): Promise<ApiResponse> {
   }
 }
 
-/** The four routes that ACT. A POST to one of them repairs the store first,
+/** The five routes that ACT. A POST to one of them repairs the store first,
  *  the way the CLI does at the start of every public verb. */
 const POST_VERB_PATHS = new Set(["/api/rotate", "/api/switch", "/api/stop", "/api/switch-all", "/api/rebalance"]);
 

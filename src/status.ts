@@ -17,7 +17,7 @@ import type { Verb } from "./cli.ts";
 import { findAccount, loadRegistry, type Registry } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import type { PickInput, Window } from "./pick.ts";
-import { decide, lastMoveAtMs, lastWallAtMs, paneReading } from "./rebalance.ts";
+import { decide, lastMoveAtMs, lastWallAtMs, movable, paneReading } from "./rebalance.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { readEvents, type Event } from "./events.ts";
@@ -244,8 +244,15 @@ export type SessionComputed = { state: string; pending: string | null; walled: W
  * The guards still run, and they still only ever change the REASON — `better`
  * is computed before the first of them — so this column says the same thing
  * for a session that is mid-turn, freshly moved or perfectly still.
+ *
+ * The one exception is `movable` below, and it is not a guard about the
+ * moment: a `parked`/`waiting`/`stopped` row and a pane that is gone are rows
+ * this rule will NEVER move, whatever the pool does next. Naming a
+ * destination for one of them would be a column telling a human where a
+ * session belongs while `ms rebalance` refuses to send it there.
  */
 function betterAccount(s: SessionRow, st: State, accounts: PickInput[], pane: ReturnType<typeof paneReading>): string | null {
+  if (!movable(s.state, pane)) return null;
   return decide({
     session: s,
     accounts,

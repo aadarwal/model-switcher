@@ -309,7 +309,15 @@ export type RebalanceRun = { refreshed: boolean; moved: boolean };
 export const newRebalanceRun = (): RebalanceRun => ({ refreshed: false, moved: false });
 
 /** The default run: this process's. Callers that want isolation (tests, and
- *  Task 3's fleet verb, which is one run by the same argument) pass their own. */
+ *  Task 3's fleet verb, which is one run by the same argument) pass their own.
+ *
+ *  Per PROCESS, and that is the whole of its scope: every production caller of
+ *  `maybeRebalance` is a one-shot process (`ms _hook claude`, `ms _hook codex`,
+ *  one `ms _codex_watch` pass), so this latch is born and dies inside one run
+ *  and never has to be reset. `ms rebalance` and `/api/rebalance` go through
+ *  `rebalanceFleet` (src/rebalance-verb.ts), which has no `RebalanceRun` at all
+ *  — an explicit human ask is not bounded to one move — so a long-lived
+ *  `ms dashboard` process can never accumulate a latched one. */
 const processRun: RebalanceRun = newRebalanceRun();
 
 export type RebalanceDeps = {
@@ -339,6 +347,25 @@ const CACHE_ONLY_MS = Number.POSITIVE_INFINITY;
  *  never drift into something else. */
 export const rebalanceArgv = (sessionId: string, to: string): string[] =>
   [msBinary(), "_rebalance", sessionId, "--to", to];
+
+/**
+ * Could this rule EVER move this session, whatever the pool looks like?
+ *
+ * The two refusals below that are about the SESSION rather than about the
+ * moment: a state this rule never touches, and a pane that is not there any
+ * more. Both outlive any snapshot — unlike `busy`, which is this minute's
+ * answer and nothing more, and unlike a cooldown, which expires.
+ *
+ * `ms status`'s BETTER column consults this BEFORE it consults `decide`:
+ * `decide` computes `better` ahead of every guard (which is right — the
+ * guards change the reason, not the opinion), so a parked row or a dead pane
+ * would otherwise be told where it "belongs" while `ms rebalance` refuses to
+ * send it there. A column naming a destination nothing will ever act on is
+ * worse than a dash.
+ */
+export function movable(state: string, pane: PaneReading): boolean {
+  return !NEVER_STATES.has(state) && pane !== "gone";
+}
 
 /**
  * One word for a pane, from a reading somebody else already took.

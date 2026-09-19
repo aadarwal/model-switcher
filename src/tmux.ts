@@ -49,6 +49,21 @@ export class Tmux {
     return v === "1" ? true : v === "0" ? false : null;
   }
   /**
+   * `#{pane_current_command}` — the program tmux sees running in one pane now.
+   *
+   * Null when there is no answer to read (no server, no such pane, a timeout,
+   * a tmux that is not on PATH), and never the empty string: the same rule
+   * `paneDead` follows, for the same reason. A caller watching a pane to see
+   * whether its command has finished must be able to tell "it is at a shell"
+   * from "I could not ask".
+   */
+  paneCurrentCommand(pane: string): string | null {
+    const r = this.run(["display-message", "-p", "-t", pane, "#{pane_current_command}"]);
+    if (r.code !== 0) return null;
+    const v = r.stdout.trim();
+    return v === "" ? null : v;
+  }
+  /**
    * `#{pane_dead_status}` — the exit status of the command whose corpse a dead
    * pane is holding. Null means "no number to read": tmux did not answer, or
    * the pane is alive and the field is empty. Only a number is evidence, and

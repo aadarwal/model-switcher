@@ -246,9 +246,10 @@ moved even though the process cannot. That is what **`ms import`** does, in one 
    SIGKILL after ten seconds, and never make the pane at all if it will not go; then type
    the command and wait up to a minute for the conversation to report itself through the
    CLI's own hook — by its own conversation id, never a neighbour's. A row that fails never
-   stops the next one, and a launch that fails inside the pane (no account has room) leaves
-   a shell prompt rather than a dead pane, so it costs that full minute before the row is
-   recorded as `resume failed`.
+   stops the next one, and a launch that fails inside the pane (no account has room, a
+   rollout it cannot find) leaves a shell prompt rather than a dead pane: the wait watches
+   `#{pane_current_command}` too, so a pane back at a shell is `resume failed:` with the
+   line the command printed, seconds in rather than a minute.
 
 Every run writes a manifest — `MS_HOME/imports/<timestamp>.json`, 0600, rewritten after
 every step — and that file is the record to fall back on: each row names the conversation,

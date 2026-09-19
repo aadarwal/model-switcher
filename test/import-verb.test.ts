@@ -342,6 +342,61 @@ test("--yes moves without asking, and `ms import` is a verb the CLI knows", asyn
   assert.match(help.stderr, /import/);
 });
 
+test("the wait watches the pane as well as the store: a command that handed the shell back is a failure now, not in a minute", async (t) => {
+  // Live, mini 1, 0.3.0. The pane's `ms adopt` refused in well under a second
+  // — and with nothing ever writing a store row, the wait had nothing to see
+  // and spent the whole sixty-second bound on each of three conversations.
+  // The pane's own `#{pane_current_command}` was saying so the entire time.
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  const seq = path.join(dir, "seq");
+  const at = path.join(dir, "at");
+  // tmux answering a SEQUENCE of `#{pane_current_command}` readings, one per
+  // call: the shell the pane is born with, `ms` itself, then the shell again
+  // because the command has returned.
+  stub("tmux", String.raw`if [ "$1" = "-S" ]; then shift 2; fi
+case "$*" in
+  *pane_current_command*)
+    i=$(cat "$MS_SEQ_AT" 2>/dev/null || echo 1)
+    printf '%s' "$((i + 1))" > "$MS_SEQ_AT"
+    awk -v n="$i" '{ last = $0; if (NR == n) { print; found = 1 } } END { if (!found) print last }' "$MS_SEQ" ;;
+  *pane_dead*) printf '0\n' ;;
+esac
+exit 0`);
+  const prev = { ...process.env };
+  Object.assign(process.env, {
+    HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH ?? ""}`,
+    MS_SEQ: seq, MS_SEQ_AT: at,
+    MS_IMPORT_SHELL_POLL_MS: "1", MS_IMPORT_SHELL_SETTLE_MS: "20",
+  });
+  t.after(() => {
+    for (const k of ["HOME", "MS_HOME", "PATH", "MS_SEQ", "MS_SEQ_AT", "MS_IMPORT_SHELL_POLL_MS", "MS_IMPORT_SHELL_SETTLE_MS"]) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k]!;
+    }
+  });
+
+  const { Tmux } = await import("../src/tmux.ts");
+  const { storeWaitReady } = await import("../src/import.ts");
+  const plan = { server: "ms" as const, socket: null, sessions: [], skipped: [] };
+  const tmux = new Tmux(null);
+
+  // Born at a shell, then `ms` runs, then the shell is back: three readings of
+  // it, after it has been something else, is the pane saying the command is
+  // over.
+  writeFileSync(seq, ["zsh", "node", "zsh", "zsh", "zsh"].join("\n") + "\n");
+  writeFileSync(at, "1");
+  const started = Date.now();
+  assert.equal(await storeWaitReady(plan, tmux)("conv-1", started + 30_000, "%1"), "returned");
+  assert.ok(Date.now() - started < 10_000, "and it said so long before the sixty-second bound");
+
+  // A CLI that is up is never a returned pane: this one times out on its own
+  // short deadline instead, exactly as it did before.
+  writeFileSync(seq, "codex\n");
+  writeFileSync(at, "1");
+  assert.equal(await storeWaitReady(plan, tmux)("conv-1", Date.now() + 400, "%1"), "timeout");
+});
+
 test("a store row answers for the conversation it NAMES, and for no other", async () => {
   const { rowIsFor } = await import("../src/import.ts");
   const claude = (cliSessionId: string | null) => ({ provider: "claude", cliSessionId, transcriptPath: null });

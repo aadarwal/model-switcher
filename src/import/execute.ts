@@ -53,12 +53,91 @@ const KILL_MS = 2_000;
 const READY_MS = 60_000;
 /** How often either wait looks again. */
 const POLL_MS = 200;
+/** How often that wait also asks the PANE what it is running. */
+const SHELL_POLL_MS = 1_000;
+/** How long a pane that has never been anything but a shell is given before
+ *  the shell counts as evidence. Under it, the pane is simply one the command
+ *  has not started in yet. */
+const SHELL_SETTLE_MS = 5_000;
+/** Consecutive shell readings that make a verdict. One is the pane it was born
+ *  with; two is a moment between programs; three, a second apart, is a pane
+ *  that has been handed back. */
+const SHELL_STREAK = 3;
 
 const envMs = (name: string, fallback: number): number => Number(process.env[name]) || fallback;
 const termMs = (): number => envMs("MS_IMPORT_TERM_MS", TERM_MS);
 const killMs = (): number => envMs("MS_IMPORT_KILL_MS", KILL_MS);
 export const readyMs = (): number => envMs("MS_IMPORT_READY_MS", READY_MS);
 const pollMs = (): number => envMs("MS_IMPORT_POLL_MS", POLL_MS);
+export const shellPollMs = (): number => envMs("MS_IMPORT_SHELL_POLL_MS", SHELL_POLL_MS);
+const shellSettleMs = (): number => envMs("MS_IMPORT_SHELL_SETTLE_MS", SHELL_SETTLE_MS);
+
+/**
+ * The shells a pane is born holding, by the name tmux reports for them.
+ *
+ * A closed list, on purpose. This decides when a row FAILS, so the cost of
+ * over-matching is a working resume called a failure — and a program named
+ * after a shell it is not is exactly the shape that would do it. A shell this
+ * misses costs one row the full sixty seconds it already spent in 0.3.0.
+ */
+const SHELLS = new Set(["bash", "zsh", "sh", "fish"]);
+
+/** Is this `#{pane_current_command}` a shell? A login shell arrives as `-zsh`
+ *  from some sources, so the leading dash is stripped before the lookup. */
+export function isShellCommand(command: string): boolean {
+  return SHELLS.has(command.trim().replace(/^-/, ""));
+}
+
+/**
+ * Watch one pane's `#{pane_current_command}` and say when its command has
+ * returned to the shell.
+ *
+ * The failure this exists for, from the live run on mini 1: the pane's
+ * `ms adopt` printed a refusal and exited in under a second, nothing was ever
+ * written to the store, and the wait — which reads the store — had nothing to
+ * see for sixty seconds, three times over. The pane itself was saying so the
+ * whole time.
+ *
+ * Two readings are deliberately not a verdict, because a pane at a shell is
+ * the NORMAL state twice over: it is what the pane is born as, before
+ * `send-keys`, and it is what it is again for an instant between one program
+ * and the next. So the shell only speaks after the pane has been something
+ * else — or, when it never was, after `SHELL_SETTLE_MS`, which is the case of
+ * a command that had already failed before the first reading.
+ *
+ * `null` is tmux declining to answer, and is no evidence either way: it does
+ * not count towards the streak and does not clear it (src/tmux.ts).
+ *
+ * `sentAt` and every `now` are epoch ms on the caller's own clock.
+ */
+export function paneReturnWatch(sentAt: number): (command: string | null, now: number) => boolean {
+  let streak = 0;
+  let sawOther = false;
+  return (command, now) => {
+    if (command === null) return false;
+    if (!isShellCommand(command)) {
+      sawOther = true;
+      streak = 0;
+      return false;
+    }
+    streak += 1;
+    const armed = sawOther || now - sentAt >= shellSettleMs();
+    return armed && streak >= SHELL_STREAK;
+  };
+}
+
+/**
+ * The last `n` non-empty lines of a captured pane, trimmed.
+ *
+ * `n` is four because the line worth reading is not the last one: a command
+ * that refused printed its reason and then the shell printed a prompt under
+ * it, and the reason is usually three lines up (`ms adopt`'s own refusals are
+ * a line plus two of detail). The FIRST of these four is what a row records.
+ */
+export function lastScreenLines(screen: string, n = 4): string[] {
+  const lines = screen.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  return lines.slice(Math.max(0, lines.length - n));
+}
 
 export interface ExecuteDeps {
   /** The repo's tmux wrapper, already pointed at the plan's socket. */
@@ -75,8 +154,13 @@ export interface ExecuteDeps {
    * deadline on `now()`'s clock (in production that clock is `Date.now`).
    * `died` is for a pane whose command has exited — the resume that never
    * happened, answered in a second rather than in a minute.
+   *
+   * `paneId` is the pane the command was typed into, so the wait can watch it
+   * as well as the store: `returned` is that pane back at a shell prompt,
+   * which is a resume that has already refused and will never report
+   * (`paneReturnWatch`). The executor reads the refusal off the screen.
    */
-  waitReady: (candidateId: string, deadlineMs: number) => Promise<"ready" | "timeout" | "died">;
+  waitReady: (candidateId: string, deadlineMs: number, paneId: string) => Promise<"ready" | "timeout" | "died" | "returned">;
   log: (line: string) => void;
   /**
    * The process table, NOW — read again just before anything is signalled, so
@@ -295,7 +379,7 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
           deps.log(`${short(c)}: ${row.outcome}`);
           continue;
         }
-        const seen = await deps.waitReady(c.id, deps.now() + readyMs());
+        const seen = await deps.waitReady(c.id, deps.now() + readyMs(), paneId);
         // A pane whose command has exited explains a silence tmux could have
         // explained in one call; `paneDead` is null when tmux could not be
         // asked, which is never evidence of a death (src/tmux.ts).
@@ -305,11 +389,7 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
           row.outcome = resumedOutcome(row.target!);
         } else {
           result.failed += 1;
-          row.outcome = resumeFailed(
-            verdict === "died"
-              ? `the pane died (${paneId})`
-              : `no report within ${Math.round(readyMs() / 1000)}s (the pane is ${paneId})`,
-          );
+          row.outcome = resumeFailed(whyNotResumed(verdict, paneId, deps.tmux));
         }
         save();
         deps.log(`${short(c)}: ${row.outcome}`);
@@ -317,6 +397,21 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
     }
   }
   return result;
+}
+
+/**
+ * Why a row did not come back, in the words a human can act on.
+ *
+ * `returned` is the one that reads the SCREEN, and only there: the pane has
+ * handed the shell back, so whatever the command said before it exited is
+ * still on it, and that sentence is worth more than any phrasing of ours. The
+ * pane id carries the fallback, for a command that refused without a word.
+ */
+function whyNotResumed(verdict: "timeout" | "died" | "returned", paneId: string, tmux: Tmux): string {
+  if (verdict === "died") return `the pane died (${paneId})`;
+  if (verdict === "timeout") return `no report within ${Math.round(readyMs() / 1000)}s (the pane is ${paneId})`;
+  const said = lastScreenLines(tmux.capture(paneId))[0];
+  return said ?? `the command returned to a shell (the pane is ${paneId})`;
 }
 
 /** How a row is named in a log line: enough to find it, never the whole id. */

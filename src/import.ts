@@ -40,7 +40,7 @@ import { rolloutIdsFromName } from "./adopt.ts";
 import { defaultScanDeps, scanConversations } from "./import/scan.ts";
 import { planImport, type ContinueFor, type Plan } from "./import/plan.ts";
 import { formatManifest, manifestFromPlan, manifestPath, planFromManifest, readManifest, writeManifest } from "./import/manifest.ts";
-import { executeImport, pidAlive, signalPid, type ExecuteDeps } from "./import/execute.ts";
+import { executeImport, paneReturnWatch, pidAlive, shellPollMs, signalPid, type ExecuteDeps } from "./import/execute.ts";
 
 const EXIT_OK = 0;
 const EXIT_FAILED = 1;
@@ -234,8 +234,16 @@ export function storeWaitReady(plan: Plan, tmux: Tmux): ExecuteDeps["waitReady"]
   // because it is the one they will not read twice.
   const claimedBy = new Map<string, string>();
 
-  return async (candidateId, deadlineMs) => {
+  return async (candidateId, deadlineMs, paneId) => {
     let firstSeen: number | null = null;
+    // The store is not the only thing that knows. A command that refused —
+    // `ms adopt` on a rollout it cannot find, a launch with no account free —
+    // writes no row at all, so the loop below has nothing to see and spends
+    // the whole sixty seconds seeing it. The pane it was typed into says so in
+    // one call: the command is over and the shell is back (`paneReturnWatch`,
+    // src/import/execute.ts). Asked once a second, inside the same bound.
+    const returned = paneReturnWatch(Date.now());
+    let lastPanePoll = 0;
     for (;;) {
       const st = openState();
       let verdict: "ready" | "died" | null = null;
@@ -263,8 +271,15 @@ export function storeWaitReady(plan: Plan, tmux: Tmux): ExecuteDeps["waitReady"]
         return verdict;
       }
       if (!present) firstSeen = null;
+      // The store first, always: a row that has reached `running` is the
+      // conversation back, whatever the pane happens to be running this
+      // instant.
+      if (paneId && Date.now() - lastPanePoll >= shellPollMs()) {
+        lastPanePoll = Date.now();
+        if (returned(tmux.paneCurrentCommand(paneId), Date.now())) return "returned";
+      }
       if (Date.now() >= deadlineMs) return "timeout";
-      await sleepMs(Math.min(500, Math.max(50, deadlineMs - Date.now())));
+      await sleepMs(Math.max(50, Math.min(500, shellPollMs(), deadlineMs - Date.now())));
     }
   };
 }

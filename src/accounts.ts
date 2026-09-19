@@ -799,7 +799,7 @@ export async function cmdLogin(name: string, opts: { relogin?: boolean } = {}): 
   }
   // The organisation is a fact about the grant now on disk: record it before
   // the mint, and never leave a stale verdict standing beside a fresh org.
-  update(name, { orgId: profile.orgId, identityVerified: false, identityMethod: undefined });
+  update(name, { orgId: profile.orgId, identityVerified: false, identityMethod: undefined, email: profile.email || undefined });
   // The browser flow that opens next (`claude setup-token`) is a SEPARATE
   // sign-in from the one that just produced the poll grant, and this tool has
   // no way to check the human used the same account for both — the probe only
@@ -852,7 +852,7 @@ export async function cmdVerify(name: string): Promise<number> {
   const token = readLaunchToken(name);
   if (!token) throw new Error(`no launch token for ${name} — run: ms accounts login ${name}`);
   const { verified, probe, mismatchOrg } = checkLaunchToken(name, token, profile);
-  update(name, { orgId: profile.orgId, identityVerified: verified, identityMethod: verified ? "both-usable" : undefined });
+  update(name, { orgId: profile.orgId, identityVerified: verified, identityMethod: verified ? "both-usable" : undefined, email: profile.email || undefined });
   if (!probe.ok) {
     throw new Error(`the launch token for ${name} did not answer the headless check (${probe.detail})`);
   }
@@ -963,9 +963,11 @@ async function cmdLs(): Promise<number> {
           verified: a.identityVerified ? "yes" : "no",
         },
   );
-  const rows = [["NAME", "PROVIDER", "LABEL", "ORG", "POLL", "TOKEN", "VERIFIED"]];
+  // EMAIL is last on purpose: it is the widest cell and the only optional one, and every column before it
+  // keeps the position scripts and eyes already know.
+  const rows = [["NAME", "PROVIDER", "LABEL", "ORG", "POLL", "TOKEN", "VERIFIED", "EMAIL"]];
   r.registry.accounts.forEach((a, i) => {
-    rows.push([a.name, a.provider, a.label, a.orgId ?? "-", cells[i].poll, cells[i].token, cells[i].verified]);
+    rows.push([a.name, a.provider, a.label, a.orgId ?? "-", cells[i].poll, cells[i].token, cells[i].verified, a.email ?? "-"]);
   });
   out(table(rows));
   return 0;

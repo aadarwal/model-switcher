@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- an account's e-mail, as the provider's own profile reports it, is kept in
+  the registry at `ms accounts login`/`verify` and shown by `ms accounts ls`
+  (EMAIL, last column), in `ms status --json` and under the name on the page;
+  accounts signed in before this show `-` until their next verify
+- the pool says what runs on each account: a SESS count closes the `ms status`
+  accounts table, and each card on the page lists its live sessions by pane
 - `ms calendar` lists every account's upcoming limit resets (5h, week, Fable)
   by local day; `--ics` writes an iCalendar file, `--json` adds an "Add to
   Google Calendar" link per event, `--days N` sets the horizon, `--all` keeps

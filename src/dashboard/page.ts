@@ -61,6 +61,7 @@ import {
   resetNote,
   laneHtml,
   accountLanesHtml,
+  accountSessionsHtml,
   accountRowHtml,
   accountGroupsHtml,
   providerSegHtml,
@@ -190,6 +191,8 @@ h2 { margin: 0; font-size: 13px; font-weight: 500; letter-spacing: -0.01em; colo
 
 /* ———— The sessions ledger ———— */
 .ms-scroll { overflow-x: auto; }
+.ms-email, .ms-onacct { font-size: 11.5px; color: var(--muted); margin: 2px 0 0; overflow-wrap: anywhere; }
+.ms-onacct { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .ms-ledger { width: 100%; border-collapse: collapse; }
 .ms-ledger th {
   text-align: left; font-weight: 400; font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase;
@@ -318,6 +321,7 @@ const EMBEDDED = [
   resetNote,
   laneHtml,
   accountLanesHtml,
+  accountSessionsHtml,
   accountRowHtml,
   accountGroupsHtml,
   providerSegHtml,

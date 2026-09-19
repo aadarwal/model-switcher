@@ -277,7 +277,7 @@ export async function loginCodex(name: string, opts: { deviceAuth?: boolean } = 
   // proved that, and nothing later can unprove it. Whether the credential still
   // WORKS is the probe's separate answer below, and its refusal exits without
   // taking the identity back.
-  update(name, { orgId: accountId, identityVerified: true, identityMethod: "codex-login" });
+  update(name, { orgId: accountId, identityVerified: true, identityMethod: "codex-login", email: email ?? undefined });
   await proveOrRefuse(name, dir);
   report(name, accountId, email);
   return 0;
@@ -287,7 +287,7 @@ export async function loginCodex(name: string, opts: { deviceAuth?: boolean } = 
 export async function verifyCodex(name: string): Promise<number> {
   const dir = p.codexHome(name);
   const { accountId, email } = identifyOrRefuse(name, dir);
-  update(name, { orgId: accountId, identityVerified: true, identityMethod: "codex-login" });
+  update(name, { orgId: accountId, identityVerified: true, identityMethod: "codex-login", email: email ?? undefined });
   await proveOrRefuse(name, dir);
   report(name, accountId, email);
   return 0;

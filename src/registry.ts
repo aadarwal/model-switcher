@@ -24,6 +24,9 @@ export type Account = {
   shared: boolean;
   identityVerified: boolean;
   identityMethod?: string;
+  /** The login behind this name, as the provider's own profile reported it at sign-in or verify. Display only:
+   *  identity is still decided by `orgId`. Absent until the next `ms accounts login`/`verify`. */
+  email?: string;
 };
 export type Registry = { version: 1; accounts: Account[] };
 export class RegistryUnreadable extends Error {}
@@ -65,6 +68,9 @@ export function validateRegistry(raw: unknown): { registry: Registry; problems: 
       orgId: typeof a.orgId === "string" ? a.orgId : null,
       shared: a.shared === true, identityVerified: a.identityVerified === true,
       ...(typeof a.identityMethod === "string" ? { identityMethod: a.identityMethod } : {}),
+      ...(typeof a.email === "string" && a.email.length <= 254 && !/[\x00-\x1f\x7f]/.test(a.email) && /^[^\s@]+@[^\s@]+$/.test(a.email)
+        ? { email: a.email }
+        : {}),
     });
   });
   return { registry: { version: 1, accounts: out }, problems };

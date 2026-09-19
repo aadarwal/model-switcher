@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.1
+
+- `ms import` adopts a Codex conversation by its rollout's own path, not by its id: the
+  pane runs a fresh shell that inherits no `CODEX_HOME`, so an id from a conversation
+  running under an `ms`-managed Codex home was looked up under `~/.codex` and not found.
+  `ms adopt` takes a path, and resolves that file's lineage from its own sessions tree
+- an imported pane whose command has returned to a shell fails now rather than at the
+  sixty-second bound, with the line the command printed: the wait watches the pane's
+  `#{pane_current_command}` as well as the store, and three shell readings after the pane
+  has been something else (or five seconds in, if it never was) is a resume that has
+  already refused
+- `ms import` lists a conversation once when its CLI is two processes: an npm-installed
+  Codex is `node …/codex` plus its native child on one tty, and the one that did not claim
+  the conversation was reported as its own `live, no conversation found` row. Matching
+  processes sharing a tty collapse to the lowest pid — the parent
+- and when stopping that parent needs the SIGKILL fallback, its descendants go with it,
+  leaves first: a wrapper forwards a SIGTERM but nothing forwards a SIGKILL, so the native
+  child used to be orphaned still holding the conversation. The row says
+  `killed pid <pid> and N children`
+
 ## 0.3.0
 
 - `ms import` brings conversations running outside tmux into it: it finds every Claude

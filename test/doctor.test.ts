@@ -360,7 +360,11 @@ test("D3: an unparsable registry is not 'not needed' — checkClaudeBinary and c
   const hooksLine = results.find((r) => r.what.startsWith("Claude hooks installed"));
   assert.doesNotMatch(hooksLine!.what, /not needed/);
   assert.equal(hooksLine?.ok, false, "no hooks are installed in this fresh settings file — the real check found that");
-  assert.match(hooksLine!.why ?? "", /not all four present/);
+  // The count is the installer's own event table's length (five since `Stop`
+  // joined it in 0.3.1), so this pins the wiring and not a literal.
+  const { CLAUDE_HOOK_ENTRIES } = await import("../src/hooks/install.ts");
+  assert.equal(CLAUDE_HOOK_ENTRIES, 5, "SessionStart, UserPromptSubmit, Stop, StopFailure, SessionEnd");
+  assert.match(hooksLine!.why ?? "", new RegExp(`not all ${CLAUDE_HOOK_ENTRIES} present`));
 });
 
 // --- store permissions ---------------------------------------------------

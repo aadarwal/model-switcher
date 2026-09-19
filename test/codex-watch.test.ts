@@ -48,11 +48,19 @@ async function world(opts: { rows?: Record<string, unknown>[]; events?: Record<s
   // `list-panes`/`capture-pane` are answered because the turn-end rebalance
   // re-reads the pane before it moves anything: a tmux that says nothing means
   // a pane that is GONE, which is a refusal for the wrong reason. The watch
-  // itself asks tmux for neither.
+  // itself asks tmux for neither — which is what makes `capture-pane` the one
+  // moment a test can be certain the turn-end work is UNDER WAY.
+  //
+  // `MS_TEST_ON_CAPTURE` runs there, synchronously, so whatever it does
+  // happens strictly inside that work with no timing race at all. (`Tmux.run`
+  // is `spawnSync`, which blocks this process's event loop — an in-process
+  // timer could never observe the same window.)
   stub("tmux", `printf '%s\\n' "$*" >> "${tlog}"
 case "$*" in
   *list-panes*) printf '%%7\\n' ;;
-  *capture-pane*) printf '> done\\n\\n> \\n' ;;
+  *capture-pane*)
+    if [ -n "$MS_TEST_ON_CAPTURE" ]; then cmd="$MS_TEST_ON_CAPTURE"; MS_TEST_ON_CAPTURE= eval "$cmd"; fi
+    printf '> done\\n\\n> \\n' ;;
 esac
 exit 0`);
 
@@ -82,6 +90,12 @@ exit 0`);
     if (existsSync(rollout(id))) st.updateSession(id, { transcriptPath: rollout(id) });
   }
   st.close();
+
+  // Every `world()` is a fresh `ms _codex_watch` PROCESS, and the one-move-per
+  // -run latch is per process — so without this, the first test in this file
+  // that moves a session silently blocks every later one.
+  const { resetRebalanceRun } = await import("../src/rebalance.ts");
+  resetRebalanceRun();
 
   const { appendEvent } = await import("../src/events.ts");
   const evs = opts.events ?? { s1: [{ t: NOW(), kind: "activity", session: "s1", generation: 2, turnId: "t-1" }] };
@@ -751,4 +765,42 @@ test("a turn the watch closes as a WALL is never rebalanced — the 30 m guard i
   assert.equal(events(w.msHome).pop()!.kind, "rate_limited", "no rebalance on top of it");
   assert.doesNotMatch(tmuxLog(w.tlog), /_rebalance/);
   assert.match(tmuxLog(w.tlog), /'_recover' 's1'/, "the wall's own rotation is what runs");
+});
+
+test("a prompt arriving DURING a turn end still arms its watch: the pass holds no lock there", async (t) => {
+  // The defect this pins. A turn end is a rebalance trigger, and a rebalance
+  // can spend a 2 s snapshot-lock wait plus a usage poll of every account.
+  // `armWatch` waits only ARM_LOCK_WAIT_MS (2 s) for the SAME lock the pass
+  // runs under, so a pass that held it across that work would make a
+  // `UserPromptSubmit` arriving mid-pass arm no timer at all — and that
+  // turn's wall would go unwatched until some later prompt happened to arm
+  // one. This is that prompt, fired from inside the turn-end work itself.
+  //
+  // One session, and its turn is settled, so the PASS arms nothing and clears
+  // the claim: every timer in the log and every claim in the store afterwards
+  // is the interrupting prompt's, or nobody's.
+  const w = await world({ rollouts: { s1: [taskComplete("t-1", null)] } });
+  seedRegistry(w.msHome, ["dirk", "spare"]);
+  seedWeeks(w.msHome, [{ name: "dirk", weekly: 60, resetHours: 120 }, { name: "spare", weekly: 10, resetHours: 24 }]);
+  const stGate = w.openState(); stGate.setKv("rebalance", "1"); stGate.close();
+
+  const prompt = path.join(w.home, "prompt.sh");
+  writeFileSync(prompt, `#!/bin/bash
+printf '%s' '{"hook_event_name":"UserPromptSubmit","session_id":"cx-s9","turn_id":"t-9"}' \\
+  | MS_SESSION=s9 MS_GENERATION=2 MS_SOCKET='${SOCKET}' MS_PANE=%9 \\
+    '${process.execPath}' --import tsx '${path.resolve("bin/ms")}' _hook codex >/dev/null 2>&1
+`, { mode: 0o755 });
+  process.env.MS_TEST_ON_CAPTURE = prompt;
+  t.after(() => { delete process.env.MS_TEST_ON_CAPTURE; });
+
+  assert.equal(await watch(), 0);
+
+  const st = w.openState();
+  try {
+    assert.ok(st.getKv("codexWatchArmedUntil"), "the interrupting prompt got the arm lock and claimed a timer");
+  } finally {
+    st.close();
+  }
+  assert.equal(rearms(w.tlog), 1, "and tmux was asked for exactly that one timer");
+  assert.match(tmuxLog(w.tlog), /'_rebalance' 's1' '--to' 'spare'/, "the move itself still happened");
 });

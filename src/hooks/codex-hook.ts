@@ -423,19 +423,31 @@ async function noteActivity(session: string, gen: number, transcript: string | n
  * rollout file for that turn's `task_complete` record. It re-arms itself while
  * any turn is still in flight and clears the claim when none is.
  *
- * The whole pass runs under one lock, which is also the lock the hook takes to
+ * The READING runs under one lock, which is also the lock the hook takes to
  * arm: two passes could otherwise read the same bytes and act on the same
  * record twice, and the offset that prevents it is only advanced at the end.
+ * The turn ENDS this pass found are handled after that lock is released — see
+ * the comment on `ended` below; nothing that can touch the network is allowed
+ * to hold a lock a hook waits two seconds for.
  */
 export async function codexWatch(): Promise<number> {
   try {
     const { withLock } = await import("../lock.ts");
+    // The turns this pass closed. Collected UNDER the lock and acted on AFTER
+    // it, because a turn end is a rebalance trigger and a rebalance can spend
+    // real time: up to a 2 s wait for the snapshot lock and, when the cached
+    // reading has aged out, a usage poll of every account on top of it. This
+    // lock is the one `armWatch` waits 2 s for (ARM_LOCK_WAIT_MS). Holding it
+    // across that work is how a `UserPromptSubmit` arriving mid-pass loses its
+    // wait, arms no timer, and leaves that turn's wall unwatched until some
+    // later prompt happens to arm one. The re-arm below is the last thing the
+    // lock is held for; everything expensive comes after it.
+    const ended: string[] = [];
     await withLock(WATCH_LOCK, async () => {
       const { openState } = await import("../state.ts");
       const st = openState();
       try {
         let inFlight: SessionRow | null = null;
-        const ended: string[] = [];
         for (const s of st.listSessions()) {
           if (s.provider !== "codex") continue;
           if (s.state !== "running" && s.state !== "continuing") continue;
@@ -445,12 +457,6 @@ export async function codexWatch(): Promise<number> {
           if (!settled) inFlight ??= s;
           else ended.push(s.id);
         }
-        // Every turn this pass closed is a turn end, and a turn end is where
-        // rebalance is allowed to move an idle session. A turn that WALLED
-        // settled here too, and is refused by the rule's own thirty-minute
-        // guard reading the `rate_limited` this pass just wrote — the guard is
-        // load-bearing, not decorative. One move covers the whole pass.
-        for (const id of ended) await turnEnded(id);
         // The claim is re-read before anything is decided. This pass began
         // when its own timer's claim expired, and a `UserPromptSubmit` that
         // won the lock in that gap has already armed a replacement: re-arming
@@ -486,6 +492,13 @@ export async function codexWatch(): Promise<number> {
         st.close();
       }
     });
+    // Outside the lock, and after the next timer is already armed. Every turn
+    // this pass closed is a turn end, and a turn end is where rebalance is
+    // allowed to move an idle session. A turn that WALLED settled here too,
+    // and is refused by the rule's own thirty-minute guard reading the
+    // `rate_limited` this pass just wrote — the guard is load-bearing, not
+    // decorative. One move covers the whole pass.
+    for (const id of ended) await turnEnded(id);
     return 0;
   } catch {
     return 0;

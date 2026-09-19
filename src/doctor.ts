@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
 import { claudeSettingsPath, msBinary, msHome, p } from "./paths.ts";
-import { claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
+import { CLAUDE_HOOK_ENTRIES, claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
 import { codexConfigPath, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
 import { loadRegistry, organisationClaimedBy, sameOrganisationAs, type Account } from "./registry.ts";
 import {
@@ -163,11 +163,13 @@ export function checkHooks(fix: boolean, hasClaudeAccounts = true): Result {
   const settingsPath = claudeSettingsPath();
   const msBin = msBinary();
   if (claudeHooksInstalled(settingsPath, msBin)) return { ok: true, what };
-  // "for `msBin`" covers both halves of what installed now means: the four
-  // entries present, AND no OTHER `_hook claude` entry left behind by an `ms`
-  // that moved. `--fix` repairs either, by re-running the installer, which
-  // replaces every ms-owned entry rather than adding beside it.
-  if (!fix) return { ok: false, what, why: `not all four present (or a stale ms entry remains) in ${settingsPath} for ${msBin}` };
+  // "for `msBin`" covers both halves of what installed now means: every one
+  // of the entries present, AND no OTHER `_hook claude` entry left behind by
+  // an `ms` that moved. `--fix` repairs either, by re-running the installer,
+  // which replaces every ms-owned entry rather than adding beside it. The
+  // count comes from the installer's own event table, so a sixth event would
+  // never leave this line saying five.
+  if (!fix) return { ok: false, what, why: `not all ${CLAUDE_HOOK_ENTRIES} present (or a stale ms entry remains) in ${settingsPath} for ${msBin}` };
   try {
     installClaudeHooks(settingsPath, msBin);
   } catch (e) {

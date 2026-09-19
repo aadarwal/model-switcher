@@ -547,7 +547,7 @@ async function verifyCodexHooks(ctx: Ctx, account: string): Promise<CheckResult>
 /**
  * Install both providers' hooks, then prove them with a real turn.
  *
- * Installing is not the same as working: a settings file can carry four
+ * Installing is not the same as working: a settings file can carry five
  * perfect hook entries that never run, and every recovery this tool performs
  * starts with a hook firing. So the step ends with one throwaway turn per
  * provider, under a probe session identity, asserting that a `started` event
@@ -557,7 +557,7 @@ async function hooks(ctx: Ctx): Promise<void> {
   const msBin = msBinary();
   const settings = claudeSettingsPath();
   // Zero Claude accounts: there is nothing for a Claude hook to fire in, so
-  // writing four entries into the human's own `settings.json` would be this
+  // writing five entries into the human's own `settings.json` would be this
   // tool editing a file it has no business in. (It used to, unconditionally.)
   if (ctx.state.claude.length === 0) {
     ctx.say(`No Claude accounts, so ${settings} is left alone.`);

@@ -82,8 +82,14 @@ test("condition 1 is a floor at exactly 85, and 84.9 is not it", () => {
       acct("there", { weeklyAll: w(20, at(48)) }),
     ],
   }));
+  // Literals on BOTH sides, so the number itself is pinned and not merely the
+  // comparison: an assertion written as `near(REBALANCE_RULES.NEAR_WALL_PERCENT)`
+  // moves wherever the constant moves and proves only that `>=` is `>=`.
+  assert.equal(near(85).move, true, "85 is the spec's floor");
+  assert.equal(near(84).move, false, "84 is not near a wall");
+  assert.equal(near(84.9).move, false, "and 84.9 is not 85 — no rounding, exactly as the chooser reads 99.6");
+  // The comparison, with the constant: the floor is inclusive.
   assert.equal(near(REBALANCE_RULES.NEAR_WALL_PERCENT).move, true);
-  assert.equal(near(84.9).move, false, "84.9 is not 85 — no rounding, exactly as the chooser reads 99.6");
 });
 
 test("condition 1 reads the WEEKLY window too, not only the 5 h one", () => {
@@ -103,8 +109,13 @@ test("condition 1 refuses a destination with less than 30 % room in a gating win
       acct("there", { weeklyAll: w(used, at(48)) }),
     ],
   }));
-  assert.equal(dest(100 - REBALANCE_RULES.DESTINATION_ROOM_PERCENT).move, true, "exactly 30 % room is enough");
-  assert.equal(dest(70.1).move, false, "29.9 % room buys a wall in an hour instead of now");
+  // `dest` takes the destination's USED percent, so 30 % room is 70 % used —
+  // both literals, because `100 - REBALANCE_RULES.DESTINATION_ROOM_PERCENT`
+  // would follow the constant anywhere it went.
+  assert.equal(dest(70).move, true, "30 % room is enough");
+  assert.equal(dest(71).move, false, "29 % room is not");
+  assert.equal(dest(70.1).move, false, "and 29.9 % room buys a wall in an hour instead of now");
+  assert.equal(dest(100 - REBALANCE_RULES.DESTINATION_ROOM_PERCENT).move, true, "the floor is inclusive");
 });
 
 test("condition 1's gating windows follow the session's need", () => {
@@ -147,8 +158,10 @@ test("condition 2 needs the current week at least half spent", () => {
       acct("there", { weeklyAll: w(10, at(24)) }),
     ],
   }));
-  assert.equal(spent(REBALANCE_RULES.WEEK_USED_PERCENT).move, true);
+  assert.equal(spent(50).move, true, "half spent is the spec's floor");
+  assert.equal(spent(49).move, false);
   assert.equal(spent(49.9).move, false, "a barely used week is not worth churning a session for");
+  assert.equal(spent(REBALANCE_RULES.WEEK_USED_PERCENT).move, true, "the floor is inclusive");
 });
 
 test("a week that resets LATER on the best account never moves anything", () => {
@@ -225,14 +238,18 @@ test("a pane that is mid-turn, or gone, is never moved", () => {
 test("no second move within six hours of the last one, by any hand", () => {
   const moving = { accounts: [acct("here", { session: w(90, at(3)) }), acct("there", { weeklyAll: w(20, at(48)) })] };
   const ago = (ms: number) => decide(input({ ...moving, lastMoveAt: NOW - ms }));
-  assert.equal(ago(REBALANCE_RULES.MOVE_COOLDOWN_MS - 1).move, false);
-  assert.equal(ago(REBALANCE_RULES.MOVE_COOLDOWN_MS).move, true, "six hours later it is free to move again");
+  assert.equal(ago(5 * HOUR + 59 * MINUTE).move, false, "five fifty-nine is still inside the six hours");
+  assert.equal(ago(6 * HOUR).move, true, "six hours later it is free to move again");
+  assert.equal(ago(REBALANCE_RULES.MOVE_COOLDOWN_MS - 1).move, false, "and the boundary itself is exclusive-then-inclusive");
+  assert.equal(ago(REBALANCE_RULES.MOVE_COOLDOWN_MS).move, true);
   assert.equal(ago(MINUTE).reason, "it moved within the last 6h");
 });
 
 test("no move within thirty minutes of a wall-driven rotation", () => {
   const moving = { accounts: [acct("here", { session: w(90, at(3)) }), acct("there", { weeklyAll: w(20, at(48)) })] };
   const ago = (ms: number) => decide(input({ ...moving, lastWallAt: NOW - ms }));
+  assert.equal(ago(29 * MINUTE).move, false, "twenty-nine minutes is still inside the thirty");
+  assert.equal(ago(30 * MINUTE).move, true);
   assert.equal(ago(REBALANCE_RULES.WALL_COOLDOWN_MS - 1).move, false);
   assert.equal(ago(REBALANCE_RULES.WALL_COOLDOWN_MS).move, true);
   assert.equal(ago(MINUTE).reason, "it rotated off a wall within the last 30m");
@@ -297,9 +314,14 @@ test("a snapshot older than fifteen minutes is refreshed; one exactly that old i
     const did = await refreshIfStale({ ...stale({ snapshotTakenAt: NOW - ms }), refresh: c.refresh });
     return { did, calls: c.calls };
   };
+  // Literals first: fifteen minutes is the spec's number, and an assertion
+  // phrased only in terms of the constant would hold just as green at five.
+  assert.deepEqual(await age(16 * MINUTE), { did: true, calls: 1 }, "sixteen minutes is older than fifteen");
+  assert.deepEqual(await age(14 * MINUTE), { did: false, calls: 0 }, "fourteen is not");
+  assert.deepEqual(await age(MINUTE), { did: false, calls: 0 });
+  // Then the comparison: "older than", so the boundary itself is not old.
   assert.deepEqual(await age(REBALANCE_RULES.SNAPSHOT_MAX_AGE_MS + 1), { did: true, calls: 1 });
   assert.deepEqual(await age(REBALANCE_RULES.SNAPSHOT_MAX_AGE_MS), { did: false, calls: 0 });
-  assert.deepEqual(await age(MINUTE), { did: false, calls: 0 });
 });
 
 test("a resetsAt that has PASSED since the snapshot was taken refreshes it", async () => {

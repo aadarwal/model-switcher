@@ -298,8 +298,14 @@ function scene(opts: Opts = {}) {
 /** The happy path's whole conversation: one Claude account, one ChatGPT
  *  account, a browser redirect rather than a device code, and both opt-ins
  *  declined. */
-const FULL = ["1", "1", "", "n", "", "n", "n"];
-const ALL_STEPS = ["prereqs", "claude-accounts", "codex-accounts", "hooks", "statusline", "alias", "finish"];
+// The `import` step's own question ("Move conversations that run outside
+// tmux into it?") sits between `hooks` and `statusline`; every scripted
+// sequence below answers it "n" — declining is a zero-side-effect return, so
+// none of these end-to-end scenes needs a scan/plan/executor of its own. See
+// test/setup-import.test.ts for the step's own behaviour when the answer is
+// "y".
+const FULL = ["1", "1", "", "n", "", "n", "n", "n"];
+const ALL_STEPS = ["prereqs", "claude-accounts", "codex-accounts", "hooks", "import", "statusline", "alias", "finish"];
 
 test("a full run with one Claude and one Codex account finishes every step, verified, with no token in the transcript", () => {
   const s = scene();
@@ -376,7 +382,7 @@ test("a run interrupted after claude-accounts resumes at codex-accounts without 
   assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts"]);
   assert.deepEqual(s.setupState().claude, ["claude-1"]);
 
-  const second = s.run(["1", "n", "", "n", "n"]);
+  const second = s.run(["1", "n", "", "n", "n", "n"]);
   assert.equal(second.code, 0, second.all);
   assert.deepEqual(s.setupState().done, ALL_STEPS);
   assert.deepEqual(s.setupState().codex, ["codex-1"]);
@@ -406,7 +412,7 @@ test("--reset forgets the progress and keeps every account", () => {
 
 test("a login that fails and is skipped leaves the row unverified and the run carries on", () => {
   const s = scene({ mintFail: true });
-  const r = s.run(["0", "1", "", "skip", "n", "n"]);
+  const r = s.run(["0", "1", "", "skip", "n", "n", "n"]);
 
   // The row exists, is not verified, and has no launch token.
   assert.equal(s.row("claude-1").identityVerified, false);
@@ -414,7 +420,7 @@ test("a login that fails and is skipped leaves the row unverified and the run ca
   assert.deepEqual(s.setupState().claude, [], "a skipped account is not recorded as done");
 
   // The run continued past the failure: later steps ran and were marked done.
-  assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts", "codex-accounts", "hooks", "statusline", "alias"]);
+  assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts", "codex-accounts", "hooks", "import", "statusline", "alias"]);
   assert.match(r.stdout, /stays registered but unverified/);
   // And it ended honestly: the doctor is not green over an unverified account.
   assert.equal(r.code, 1, r.all);
@@ -423,7 +429,7 @@ test("a login that fails and is skipped leaves the row unverified and the run ca
 
 test("zero ChatGPT accounts skips the Codex steps and tolerates a missing codex binary", () => {
   const s = scene({ noCodex: true });
-  const r = s.run(["0", "1", "", "n", "n"]);
+  const r = s.run(["0", "1", "", "n", "n", "n"]);
   assert.equal(r.code, 0, r.all);
   assert.deepEqual(s.setupState().done, ALL_STEPS);
   assert.deepEqual(s.setupState().codex, []);
@@ -458,16 +464,16 @@ test("--yes accepts every default, so it asks nothing and installs no opt-ins", 
 
 test("finish exits 1 when the doctor has a ✗, leaving finish undone so a resume retries it", () => {
   const s = scene({ noCodex: true, shadowMs: true });
-  const r = s.run(["0", "1", "", "n", "n"]);
+  const r = s.run(["0", "1", "", "n", "n", "n"]);
   assert.equal(r.code, 1, r.all);
   assert.match(r.stdout, /✗ ms on PATH is msBinary\(\)/);
-  assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts", "codex-accounts", "hooks", "statusline", "alias"]);
+  assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts", "codex-accounts", "hooks", "import", "statusline", "alias"]);
   assert.match(r.stderr, /ms doctor is not green yet/);
 });
 
 test("the opt-ins install when they are accepted", () => {
   const s = scene({ noCodex: true });
-  const r = s.run(["0", "1", "", "y", "y"]);
+  const r = s.run(["0", "1", "", "n", "y", "y"]);
   assert.equal(r.code, 0, r.all);
   assert.deepEqual(s.setupState().optIns, { statusline: true, alias: true });
   assert.equal(s.settings().statusLine.command, `'${s.msBin}' _statusline`);
@@ -493,7 +499,7 @@ test("a reserved Codex account name is re-asked, not fatal", () => {
   const s = scene();
   // `sessions` is the shared rollout store, not an account home: `add` would
   // refuse it outright, so the wizard must never let it get that far.
-  const r = s.run(["1", "1", "", "n", "sessions", "codex-1", "n", "n"]);
+  const r = s.run(["1", "1", "", "n", "sessions", "codex-1", "n", "n", "n"]);
   assert.equal(r.code, 0, r.all);
   assert.match(r.stdout, /sessions is reserved/);
   assert.deepEqual(s.setupState().codex, ["codex-1"]);
@@ -508,18 +514,18 @@ test("a registry that cannot be read fails the account with Retry/Skip/Abort rat
   // failure the human is offered the same three answers about.
   writeFileSync(path.join(s.msHome, "accounts.json"), "{ this is not json");
 
-  const r = s.run(["0", "1", "", "skip", "n", "n"]);
+  const r = s.run(["0", "1", "", "skip", "n", "n", "n"]);
   assert.match(r.stdout, /setting up claude-1 failed:/);
   assert.deepEqual(s.setupState().claude, []);
   // The run carried on through every later step rather than dying here.
-  assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts", "codex-accounts", "hooks", "statusline", "alias"]);
+  assert.deepEqual(s.setupState().done, ["prereqs", "claude-accounts", "codex-accounts", "hooks", "import", "statusline", "alias"]);
   // ...and ended honestly: the doctor will not call an unreadable registry green.
   assert.equal(r.code, 1, r.all);
 });
 
 test("a hook check the human skips says so, and does not claim nothing was ready", () => {
   const s = scene({ noCodex: true, noHook: true });
-  const r = s.run(["0", "1", "", "skip", "n", "n"]);
+  const r = s.run(["0", "1", "", "skip", "n", "n", "n"]);
   assert.equal(r.code, 0, r.all);
   assert.match(r.stdout, /hook check skipped \(claude\)/);
   assert.ok(!/No account was ready/.test(r.stdout), "a skipped check reported itself as nothing being ready");
@@ -534,7 +540,7 @@ test("a run interrupted at the statusline resumes straight into the opt-ins, re-
   const turnsAfterFirst = s.claudeCalls().filter((c) => c[0].startsWith("-p ")).length;
   assert.equal(turnsAfterFirst, 3);
 
-  const second = s.run(["y", "n"]);
+  const second = s.run(["n", "y", "n"]);
   assert.equal(second.code, 0, second.all);
   assert.deepEqual(s.setupState().done, ALL_STEPS);
   assert.deepEqual(s.setupState().optIns, { statusline: true, alias: false });
@@ -542,8 +548,12 @@ test("a run interrupted at the statusline resumes straight into the opt-ins, re-
   // The hooks step really did not run again: no fourth headless turn.
   assert.equal(s.claudeCalls().filter((c) => c[0].startsWith("-p ")).length, turnsAfterFirst);
   assert.ok(!/hooks verified/.test(second.stdout), "the resume re-ran the hook check");
-  // The opt-ins were the only thing it asked about.
-  assert.deepEqual(s.asked(), ["Show the account name in Claude Code's statusline?", "Add shell aliases so plain claude and codex go through ms?"]);
+  // The import step (declined) and the opt-ins were the only things it asked about.
+  assert.deepEqual(s.asked(), [
+    "Move conversations that run outside tmux into it?",
+    "Show the account name in Claude Code's statusline?",
+    "Add shell aliases so plain claude and codex go through ms?",
+  ]);
 });
 
 test("a Codex home the hook installer refuses is reported in the installer's own words", () => {
@@ -609,8 +619,8 @@ test("the wizard's own ANTHROPIC_API_KEY / OPENAI_API_KEY never reach a probe tu
 
 test("zero Claude accounts: a missing claude is not a fault, and settings.json is left alone", () => {
   const s = scene({ noClaude: true });
-  // codex count 1, claude count 0, codex name default, no device code, no opt-ins.
-  const r = s.run(["1", "0", "n", "", "n", "n"]);
+  // codex count 1, claude count 0, codex name default, no device code, no import, no opt-ins.
+  const r = s.run(["1", "0", "n", "", "n", "n", "n"]);
   assert.equal(r.code, 0, r.all);
   assert.deepEqual(s.setupState().done, ALL_STEPS);
   assert.ok(!/✗ claude --version/.test(r.stdout), r.stdout);
@@ -694,7 +704,7 @@ function msSetup(s: ReturnType<typeof scene>, args: string[]) {
 
 test("--remove statusline and --remove alias undo both opt-ins, naming the backup", () => {
   const s = scene({ noCodex: true });
-  assert.equal(s.run(["0", "1", "", "y", "y"]).code, 0);
+  assert.equal(s.run(["0", "1", "", "n", "y", "y"]).code, 0);
   assert.deepEqual(s.setupState().optIns, { statusline: true, alias: true });
   const rcBefore = readFileSync(s.rcFile, "utf8");
   assert.match(rcBefore, /# ms-alias-begin/);
@@ -717,7 +727,7 @@ test("--remove statusline and --remove alias undo both opt-ins, naming the backu
 
 test("--remove refuses a hand-edited alias block, exits 1, and leaves the file alone", () => {
   const s = scene({ noCodex: true });
-  assert.equal(s.run(["0", "1", "", "n", "y"]).code, 0);
+  assert.equal(s.run(["0", "1", "", "n", "n", "y"]).code, 0);
   const handEdited = readFileSync(s.rcFile, "utf8").replace("# ms-alias-end", "alias foo='bar'\n# ms-alias-end");
   writeFileSync(s.rcFile, handEdited);
 

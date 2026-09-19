@@ -8,7 +8,7 @@
 // not drop — are proved rather than observed.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tempHome } from "./helpers.ts";
 import type { ProcessRow, ScanOptions } from "../src/import/scan.ts";
@@ -379,6 +379,80 @@ test("--dir keeps only conversations under one of the given paths", async () => 
   const { scanConversations } = await import("../src/import/scan.ts");
   const got = scanConversations(opts({ claudeConfigDir: cfg, codexHome: path.join(home, ".codex"), dirs: [keep] }));
   assert.deepEqual(got.map((c) => c.title), ["at the root", "below it"]);
+});
+
+test("--dir and a recorded cwd meet as real paths, whichever of them went through a symlink", async () => {
+  // A `--dir` a human typed comes from their shell, where `~/src` may well be
+  // a symlink; a transcript's own `cwd` is whatever the CLI was started in,
+  // which may be the other spelling of the same directory. Both sides are
+  // resolved, so the two always meet — the literal strings never would.
+  const { home } = tempHome();
+  const cfg = path.join(home, ".claude");
+  const real = path.join(home, "real");
+  const realData = path.join(real, "data");
+  const link = path.join(home, "link"); // -> home/real
+  const outside = path.join(home, "elsewhere");
+  mkdirSync(realData, { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  symlinkSync(real, link);
+
+  claudeFile(cfg, "-a", "aaaaaaaa-0000-4000-8000-000000000001", { cwd: realData, text: "recorded real", mtime: T0 });
+  claudeFile(cfg, "-b", "aaaaaaaa-0000-4000-8000-000000000002", { cwd: path.join(link, "data"), text: "recorded through the link", mtime: T0 - H });
+  claudeFile(cfg, "-c", "aaaaaaaa-0000-4000-8000-000000000003", { cwd: outside, text: "somewhere else", mtime: T0 - 2 * H });
+
+  const { scanConversations } = await import("../src/import/scan.ts");
+  const base = { claudeConfigDir: cfg, codexHome: path.join(home, ".codex") };
+
+  // A `--dir` given through the symlink still finds both conversations…
+  const viaLink = scanConversations(opts({ ...base, dirs: [path.join(link, "data")] }));
+  assert.deepEqual(viaLink.map((c) => c.title), ["recorded real", "recorded through the link"]);
+  // …and so does the same `--dir` spelled as the real path.
+  const viaReal = scanConversations(opts({ ...base, dirs: [realData] }));
+  assert.deepEqual(viaReal.map((c) => c.title), ["recorded real", "recorded through the link"]);
+  // Whichever way it arrived, the cwd a candidate reports is the real one —
+  // it is what the pane will be opened in, and what `lsof` would say.
+  assert.deepEqual(new Set(viaLink.map((c) => c.cwd)), new Set([realData]));
+  assert.equal(viaLink.find((c) => c.title === "somewhere else"), undefined, "the filter still filters");
+});
+
+test("a transcript whose cwd and title sit past the header budget falls back, and does so fast", async () => {
+  // The constraint is that a transcript is read as far as its header and first
+  // user line and NO further. The guard is the FALLBACK: a reader that took
+  // the whole file (readFileSync, say) would find the buried cwd and title,
+  // so finding them is the regression. The time bound is the constraint's
+  // other half — a scan must not cost the size of the store.
+  const { home } = tempHome();
+  const cfg = path.join(home, ".claude");
+  const cwd = path.join(home, "src", "data");
+  mkdirSync(cwd, { recursive: true });
+  const dir = path.join(cfg, "projects", "-Users-x-y");
+  mkdirSync(dir, { recursive: true });
+  const id = "ffffffff-0000-4000-8000-000000000001";
+  const buried = path.join(dir, `${id}.jsonl`);
+  writeFileSync(buried, [
+    // A real transcript's own opening records: no cwd on either of them.
+    JSON.stringify({ type: "last-prompt", leafUuid: "f4bb3a18", sessionId: id }),
+    // 4 MiB on ONE line, eight times the 512 KiB budget, so the reader runs
+    // out of budget in the middle of it and never reaches what follows.
+    JSON.stringify({ type: "assistant", sessionId: id, message: { role: "assistant", content: "z".repeat(4 << 20) } }),
+    JSON.stringify({ type: "user", sessionId: id, cwd, message: { role: "user", content: "buried out of reach" } }),
+  ].join("\n") + "\n", { mode: 0o600 });
+  utimesSync(buried, T0 / 1000, T0 / 1000);
+  assert.ok(statSync(buried).size > 4 << 20, "the fixture has to be bigger than the budget to test it");
+
+  // A small transcript beside it, to show the budget is a bound and not a ban.
+  claudeFile(cfg, "-w", "aaaaaaaa-0000-4000-8000-000000000002", { cwd, text: "read in full", mtime: T0 - H });
+
+  const { scanConversations } = await import("../src/import/scan.ts");
+  const started = Date.now();
+  const got = scanConversations(opts({ claudeConfigDir: cfg, codexHome: path.join(home, ".codex") }));
+  const elapsed = Date.now() - started;
+
+  const big = got.find((c) => c.id === id)!;
+  assert.equal(big.cwd, "/Users/x/y", "past the budget there is no recorded cwd, so the directory name is unescaped");
+  assert.equal(big.title, "", "and no title, rather than one bought by reading four megabytes");
+  assert.equal(got.find((c) => c.title === "read in full")!.cwd, cwd, "its small neighbour is still read normally");
+  assert.ok(elapsed < 1000, `a bounded scan is fast; took ${elapsed}ms`);
 });
 
 test("a conversation the tool already runs is marked managed, not hidden", async () => {

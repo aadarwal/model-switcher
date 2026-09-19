@@ -46,6 +46,7 @@ import { ensureCodexTrust, removeCodexTrust } from "../providers/codex-cli.ts";
 import { findAccount, loadRegistry, NAME_PATTERN, type Provider } from "../registry.ts";
 import { status } from "../status.ts";
 import { installAlias, rcPathFor } from "./alias.ts";
+import { importStep, type RunImportFn } from "./import-step.ts";
 import type { Prompter } from "./prompt.ts";
 import { saveSetup, type SetupState, type SetupStep } from "./state.ts";
 import { installStatusline } from "./statusline.ts";
@@ -58,6 +59,7 @@ export const STEP_ORDER: readonly SetupStep[] = [
   "claude-accounts",
   "codex-accounts",
   "hooks",
+  "import",
   "statusline",
   "alias",
   "finish",
@@ -70,6 +72,7 @@ export const STEP_LABEL: Record<SetupStep, string> = {
   "claude-accounts": "the Claude accounts",
   "codex-accounts": "the ChatGPT accounts",
   hooks: "the hooks",
+  import: "moving conversations into tmux",
   statusline: "the statusline",
   alias: "the shell aliases",
   finish: "the final check",
@@ -674,11 +677,35 @@ export function registeredAccounts(): { claude: string[]; codex: string[] } {
   };
 }
 
+/**
+ * `ms import`'s executor (Task 3, `executeImport`) is not on this branch yet.
+ * Until it merges, this is what `import` runs into the moment a human says
+ * yes to it and confirms the plan — a clear refusal (a thrown Error naming
+ * itself) rather than a silent no-op. `importStep` does not wrap this call in
+ * `attempt`'s Retry/Skip/Abort — the real executor's own contract already
+ * reports per-row trouble through its return value (`{moved,stopped,failed}`,
+ * never a throw for an ordinary failed stop or resume), so a throw here is
+ * meant to be the exceptional case, and this placeholder deliberately is one.
+ *
+ * WIRING, once Task 3 merges (`src/import/execute.ts`'s `executeImport`,
+ * `signalPid`, `pidAlive`; `src/import.ts`'s `storeWaitReady` — the same
+ * pieces `runImport` in `src/import.ts` already composes into an
+ * `ExecuteDeps` around one plan's own `new Tmux(plan.socket)`): add a small
+ * `realRunImport: RunImportFn` next to this one, built the same way, then
+ * change exactly the STEP_RUNNERS entry below —
+ *   import: importStep({ runImport: realRunImport }),
+ * — one line, here.
+ */
+const placeholderRunImport: RunImportFn = async () => {
+  throw new Error("import executor not wired");
+};
+
 export const STEP_RUNNERS: Record<SetupStep, (ctx: Ctx) => Promise<void>> = {
   prereqs,
   "claude-accounts": claudeAccounts,
   "codex-accounts": codexAccounts,
   hooks,
+  import: importStep({ runImport: placeholderRunImport }),
   statusline,
   alias,
   finish,

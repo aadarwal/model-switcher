@@ -17,3 +17,11 @@ Findings:
 - The Claude native binary shows its version as `pane_current_command`; `ps` reports `claude`, which is what the scanner reads, so detection is unaffected.
 
 Verdict: PASS on the laptop. Mini 1 is checked on the released 0.3.0 (see below).
+
+## Mini 1 and the laptop again, on the released 0.3.0 / 0.3.1
+
+**Mini 1, 0.3.0, from a plain ssh shell (no tmux around it).** Three Claude stand-ins: `moved 3, stopped 3, failed 0`, onto the tool's own server (`ms attach` hinted), `running` under `tulp`. Three Codex stand-ins: the mini's default `~/.codex` had no login (the API-key dialog), so no conversation existed and the scanner correctly skipped them. Re-run under the mini's `ms`-managed Codex home (its only login): the conversations were found and planned — and the resume failed: the pane's `ms adopt <id>` ran without `CODEX_HOME` and searched `~/.codex/sessions`; every row waited the full 60 s. The npm-installed Codex also showed a second `live, no conversation found` row per session (its native child process). All three became 0.3.1.
+
+**0.3.1 checks.** Laptop: two Codex stand-ins under a managed home with room → `moved 2, stopped 2, failed 0`, both `running` under `dirk`, resumed by rollout path. Mini 1 (npm Codex): the scan now yields one row per conversation. Finding: a Codex session resumed after a limit may show Codex's own "rate limit reminder" modal (keep current model / switch); the continuation waits behind it until a key is pressed — Codex UI, not `ms`. Finding: the mini's stand-ins under the walled `tulp` home could not be moved there because `tulp` is that machine's only Codex login — an import needs a destination with room, as any rotation does.
+
+Verdict: PASS on both machines for what each could exercise; the npm-Codex dedupe and descendant kill are proven by tests, not yet by a live move.

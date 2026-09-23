@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3
+
+- the statusline wrapper no longer drops output a wrapped command wrote just
+  before it was killed for hanging; its bound is tunable (`MS_STATUSLINE_TIMEOUT_MS`)
+  and the wrapper tests no longer depend on wall-clock timing
+
 ## 0.3.2
 
 - rebalance: at the end of a turn, an idle session moves to the account the

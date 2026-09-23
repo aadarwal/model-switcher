@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2
 
 - rebalance: at the end of a turn, an idle session moves to the account the
   chooser would pick for it now — when a window it gates on is at 85 % or

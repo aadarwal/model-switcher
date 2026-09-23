@@ -6,6 +6,7 @@ import { claudeHook } from "./hooks/claude-hook.ts";
 import { codexHook, codexWatch } from "./hooks/codex-hook.ts";
 import { attachVerb, launchClaude, launchCodex } from "./launch.ts";
 import { adoptVerb } from "./adopt.ts";
+import { importVerb } from "./import.ts";
 import { dashboard } from "./dashboard.ts";
 import { statuslineVerb } from "./setup/statusline.ts";
 import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
@@ -35,6 +36,8 @@ registerVerb("codex", launchCodex);
 registerVerb("attach", attachVerb);
 // `ms adopt`: take over a Codex conversation this tool did not start.
 registerVerb("adopt", adoptVerb);
+// `ms import`: bring conversations running outside tmux into it.
+registerVerb("import", importVerb);
 registerVerb("_recover", recoverVerb);
 // The rebalance move: the human's own `ms switch` transaction, minus the
 // continuation, dispatched by tmux so it lives outside the CLI whose turn just
@@ -54,7 +57,7 @@ registerVerb("stop", stopVerb);
 registerVerb("dashboard", dashboard);
 
 const USAGE = `usage: ms <verb> [args]
-  setup | claude | codex | adopt | status | calendar | accounts | rotate | switch | rebalance | stop | doctor | attach | dashboard
+  setup | claude | codex | adopt | import | status | calendar | accounts | rotate | switch | rebalance | stop | doctor | attach | dashboard
   (internal: _exec _hook _codex_watch _recover _rebalance _pane_died _statusline)`;
 
 function version(): string {

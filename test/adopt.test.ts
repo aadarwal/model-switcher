@@ -423,6 +423,32 @@ test("ms adopt takes a path, and still finds that rollout's sources under its ow
 
 // --- What the verb refuses (review round 1) --------------------------------
 
+test("a path under an ms-managed codex home adopts with no CODEX_HOME at all, lineage and id from the file itself", async () => {
+  // The live failure `ms import` hit on mini 1, 0.3.0, from the other end.
+  // Three Codex conversations were running under an `ms`-managed home
+  // (`CODEX_HOME=MS_HOME/codex/tulp`, whose sessions dir IS the shared store's
+  // sibling). The import's pane ran `ms adopt <id>` in a fresh shell with no
+  // `CODEX_HOME`, so the lookup went to `~/.codex`, found nothing, and the row
+  // failed sixty seconds later. Given the PATH instead, with `~/.codex` empty
+  // and no `CODEX_HOME` in the environment, the whole chain still resolves —
+  // from the file's own sessions tree, not from the default home.
+  const w = await adoptWorld();
+  const managed = path.join(w.msHome, "codex", "tulp", "sessions");
+  const c = chain(managed);
+  assert.deepEqual(readdirSync(w.sessions), [], "the default home is empty: nothing here can come from it");
+
+  const r = run(["adopt", c.leaf], w.env());
+
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, new RegExp(`^ms adopt: ${LEAF} \u2192 .*\\(3 copied, 0 already there\\)$`, "m"));
+  const store = path.join(w.msHome, "codex", "sessions");
+  for (const [date, id] of [["2026-09-17", LEAF], ["2026-09-16", MID], ["2026-09-15", ROOT]] as const) {
+    assert.ok(existsSync(path.join(store, ...date.split("-"), rolloutName(date, id))), `${id} did not come with it`);
+  }
+  const { launch } = await readLaunch(w, launchIdFrom(w.log));
+  assert.deepEqual(launch!.command, ["codex", "resume", LEAF], "the id is the one the file's own name carries");
+});
+
 test("ms adopt refuses a symlink named like a rollout, rather than copying whatever it points at", async () => {
   // The reviewer's own scenario: `ms adopt ~/backup/rollout-….jsonl`, where
   // that name is a link. `statSync` follows it and cannot tell the two apart,

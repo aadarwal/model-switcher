@@ -49,6 +49,21 @@ export class Tmux {
     return v === "1" ? true : v === "0" ? false : null;
   }
   /**
+   * `#{pane_current_command}` — the program tmux sees running in one pane now.
+   *
+   * Null when there is no answer to read (no server, no such pane, a timeout,
+   * a tmux that is not on PATH), and never the empty string: the same rule
+   * `paneDead` follows, for the same reason. A caller watching a pane to see
+   * whether its command has finished must be able to tell "it is at a shell"
+   * from "I could not ask".
+   */
+  paneCurrentCommand(pane: string): string | null {
+    const r = this.run(["display-message", "-p", "-t", pane, "#{pane_current_command}"]);
+    if (r.code !== 0) return null;
+    const v = r.stdout.trim();
+    return v === "" ? null : v;
+  }
+  /**
    * `#{pane_dead_status}` — the exit status of the command whose corpse a dead
    * pane is holding. Null means "no number to read": tmux did not answer, or
    * the pane is alive and the field is empty. Only a number is evidence, and
@@ -96,12 +111,43 @@ export class Tmux {
     this.must(["set-hook", "-p", "-t", pane, "pane-died", `run-shell -b ${shellQuote([shellQuote(command)])}`]);
   }
   sendKeys(pane: string, keys: string[]): void { this.must(["send-keys", "-t", pane, ...keys]); }
-  newWindow(session: string, cwd: string, command: string[]): string {
-    return this.must(["new-window", "-P", "-F", "#{pane_id}", "-t", session, "-c", cwd, shellQuote(command)]).trim();
+  /**
+   * A new window, and the id of the pane it was born with.
+   *
+   * `target` is a tmux target-window: a bare session name works, and
+   * `"<session>:"` is the unambiguous spelling of "that session, next free
+   * index" — worth using whenever the name is one we chose rather than one
+   * tmux gave us, because a bare name is looked up as a WINDOW of the current
+   * session first. `command` may be empty, which is how a pane is born
+   * holding the human's own shell (`ms import` types into that shell).
+   */
+  newWindow(target: string, cwd: string, command: string[], name?: string): string {
+    return this.must([
+      "new-window", "-P", "-F", "#{pane_id}", "-t", target, "-c", cwd,
+      ...(name ? ["-n", name] : []), ...(command.length ? [shellQuote(command)] : []),
+    ]).trim();
   }
   hasSession(name: string): boolean { return this.run(["has-session", "-t", name]).code === 0; }
-  newSession(name: string, cwd: string, command: string[]): string {
-    return this.must(["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name, "-c", cwd, shellQuote(command)]).trim();
+  newSession(name: string, cwd: string, command: string[], windowName?: string): string {
+    return this.must([
+      "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name, "-c", cwd,
+      ...(windowName ? ["-n", windowName] : []), ...(command.length ? [shellQuote(command)] : []),
+    ]).trim();
+  }
+  /** A new pane beside `target` (a `%id`), and its own id. */
+  splitWindow(target: string, cwd: string, command: string[]): string {
+    return this.must([
+      "split-window", "-P", "-F", "#{pane_id}", "-t", target, "-c", cwd,
+      ...(command.length ? [shellQuote(command)] : []),
+    ]).trim();
+  }
+  selectLayout(target: string, layout: string): void { this.must(["select-layout", "-t", target, layout]); }
+  /** Every session name on this server; empty when there is no server at all,
+   *  which is not an error — it is a server nobody has started yet. */
+  sessionNames(): string[] {
+    const r = this.run(["list-sessions", "-F", "#{session_name}"]);
+    if (r.code !== 0) return [];
+    return r.stdout.split("\n").map((l) => l.trim()).filter((l) => l !== "");
   }
   // The one deliberately unbounded call: an interactive attach lives as long as the session.
   attach(name: string): number {

@@ -358,6 +358,65 @@ test("--session-id is ours: a user-supplied one is a usage error", async () => {
   assert.equal(st.sessions.length, 0);
 });
 
+/** The launch id tmux was told to `_exec`, off the respawn line. */
+function launchIdOf(w: World): string {
+  const respawn = logLines(w).find((l) => l.includes("respawn-pane"));
+  assert.ok(respawn, "no respawn line");
+  const m = respawn!.match(new RegExp(`'_exec' '(${UUID})'$`));
+  assert.ok(m, `respawn line not as expected: ${respawn}`);
+  return m![1]!;
+}
+
+test("a launch that RESUMES is given no --session-id, and its row carries the conversation's own id", async () => {
+  const w = await world();
+  const r = run(["claude", "--", "--resume", "abc"], w.env());
+  assert.equal(r.code, 0, r.stderr);
+
+  const st = await readState(w, launchIdOf(w));
+  const s = st.sessions[0]!;
+  assert.deepEqual(
+    st.launch!.command,
+    ["claude", "--resume", "abc"],
+    "--session-id MAKES a conversation; passed alongside --resume it is a second answer to the question the command line already answered",
+  );
+  assert.equal(s.cliSessionId, "abc", "the row names the conversation being resumed, not one ms invented");
+  assert.deepEqual(s.flags, ["--resume", "abc"]);
+});
+
+test("`--continue` has no id to carry: the row waits for the hook to report one", async () => {
+  const w = await world();
+  const r = run(["claude", "--", "--continue"], w.env());
+  assert.equal(r.code, 0, r.stderr);
+
+  const st = await readState(w, launchIdOf(w));
+  assert.deepEqual(st.launch!.command, ["claude", "--continue"]);
+  assert.equal(
+    st.sessions[0]!.cliSessionId,
+    null,
+    "claude chooses which conversation --continue means; inventing an id here would name one it never opened",
+  );
+});
+
+test("every resume spelling is one, and a launch that is not a resume still gets its own --session-id", async () => {
+  const { claudeResumeId } = await import("../src/launch.ts");
+  assert.equal(claudeResumeId(["--resume", "abc"]), "abc");
+  assert.equal(claudeResumeId(["-r", "abc"]), "abc");
+  assert.equal(claudeResumeId(["--resume=abc"]), "abc");
+  assert.equal(claudeResumeId(["--model", "opus", "--resume", "abc"]), "abc");
+  assert.equal(claudeResumeId(["--continue"]), null, "the id is claude's to choose");
+  assert.equal(claudeResumeId(["-c"]), null);
+  assert.equal(claudeResumeId(["--resume"]), null, "a bare --resume is claude's own picker");
+  assert.equal(claudeResumeId(["--resume", "--model"]), null, "a flag is not a conversation id");
+  assert.equal(claudeResumeId(["hello"]), null);
+
+  const w = await world();
+  const r = run(["claude", "--", "hello"], w.env());
+  assert.equal(r.code, 0, r.stderr);
+  const st = await readState(w, launchIdOf(w));
+  assert.match(st.sessions[0]!.cliSessionId!, new RegExp(`^${UUID}$`));
+  assert.deepEqual(st.launch!.command, ["claude", "--session-id", st.sessions[0]!.cliSessionId, "hello"]);
+});
+
 test("a bad --need, and claude args not behind --, are usage errors", async () => {
   const w = await world();
   const need = run(["claude", "--need", "sonnet"], w.env());

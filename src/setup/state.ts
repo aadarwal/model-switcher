@@ -28,6 +28,7 @@ export type SetupStep =
   | "claude-accounts"
   | "codex-accounts"
   | "hooks"
+  | "import"
   | "statusline"
   | "alias"
   | "finish";
@@ -37,6 +38,7 @@ const STEPS: readonly SetupStep[] = [
   "claude-accounts",
   "codex-accounts",
   "hooks",
+  "import",
   "statusline",
   "alias",
   "finish",
@@ -48,6 +50,12 @@ export type SetupState = {
   claude: string[];
   codex: string[];
   optIns: { statusline: boolean; alias: boolean };
+  /** The manifest the `import` step wrote (`MS_HOME/imports/<ISO>.json`), or
+   *  null when the step has not moved anything yet — declined, found nothing,
+   *  or has not run. Recorded the moment `runImport` returns, same as every
+   *  other durable fact in this file: a closed terminal after the move must
+   *  not lose where the rollback record went. */
+  importManifest: string | null;
   startedAt: string;
   updatedAt: string;
 };
@@ -58,7 +66,7 @@ function setupFile(): string {
 
 function freshState(): SetupState {
   const now = new Date().toISOString();
-  return { version: 1, done: [], claude: [], codex: [], optIns: { statusline: false, alias: false }, startedAt: now, updatedAt: now };
+  return { version: 1, done: [], claude: [], codex: [], optIns: { statusline: false, alias: false }, importManifest: null, startedAt: now, updatedAt: now };
 }
 
 function isStringArray(v: unknown): v is string[] {
@@ -79,6 +87,7 @@ function isSetupState(raw: unknown): raw is SetupState {
   if (!r.optIns || typeof r.optIns !== "object") return false;
   const oi = r.optIns as Record<string, unknown>;
   if (typeof oi.statusline !== "boolean" || typeof oi.alias !== "boolean") return false;
+  if (typeof r.importManifest !== "string" && r.importManifest !== null) return false;
   if (typeof r.startedAt !== "string" || typeof r.updatedAt !== "string") return false;
   return true;
 }

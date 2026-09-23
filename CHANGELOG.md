@@ -19,6 +19,49 @@
 - the dashboard gains a Rebalance control beside "Move every pane" (the plan
   first, then the run) and a quiet `better:` chip on each session row
 - `ms doctor` prints the rebalance gate's state, like the Codex one
+## 0.3.1
+- `ms import` adopts a Codex conversation by its rollout's own path, not by its id: the
+  pane runs a fresh shell that inherits no `CODEX_HOME`, so an id from a conversation
+  running under an `ms`-managed Codex home was looked up under `~/.codex` and not found.
+  `ms adopt` takes a path, and resolves that file's lineage from its own sessions tree
+- an imported pane whose command has returned to a shell fails now rather than at the
+  sixty-second bound, with the line the command printed: the wait watches the pane's
+  `#{pane_current_command}` as well as the store, and three shell readings after the pane
+  has been something else (or five seconds in, if it never was) is a resume that has
+  already refused
+- `ms import` lists a conversation once when its CLI is two processes: an npm-installed
+  Codex is `node …/codex` plus its native child on one tty, and the one that did not claim
+  the conversation was reported as its own `live, no conversation found` row. Matching
+  processes sharing a tty collapse to the lowest pid — the parent
+- and when stopping that parent needs the SIGKILL fallback, its descendants go with it,
+  leaves first: a wrapper forwards a SIGTERM but nothing forwards a SIGKILL, so the native
+  child used to be orphaned still holding the conversation. The row says
+  `killed pid <pid> and N children`
+## 0.3.0
+- `ms import` brings conversations running outside tmux into it: it finds every Claude
+  Code and Codex conversation on the machine (`--since 30m|2h|1d|all`, `--dir <path>`),
+  plans a tmux layout of one session per repo root and one window per worktree, stops each
+  original process, and resumes the same conversation in a pane under `ms`
+- every run writes a manifest (`MS_HOME/imports/<timestamp>.json`, 0600) that records what
+  became of each row and can be re-run (`--plan`) or printed back (`--status`);
+  `--dry-run` plans without moving anything, and without a terminal to confirm in the verb
+  refuses rather than assuming yes
+- flags are carried into an imported pane by whitelist, so a credential on the original
+  command line reaches neither the new command line nor the manifest
+- an import never signals a pid it cannot re-identify: the manifest records when each
+  process started, and `--plan` re-reads the process table and refuses (`stop refused: …`)
+  when the pid has since been re-used, so a manifest run hours later cannot kill a stranger
+- a conversation is reported resumed only on the store row that names it, so two
+  conversations in one directory can never be reported back on one row
+- a Claude launch that RESUMES is no longer given a `--session-id`: `ms claude --
+  --resume <id>` now runs `claude --resume <id>` and records that conversation's own id,
+  instead of running two contradictory answers to which conversation it is and recording
+  a uuid the CLI never used. This is the path `ms import` resumes every Claude
+  conversation through
+- `ms setup` gains a step, after the hooks and before the opt-ins, offering to move
+  conversations running outside tmux into it (default no): it scans, offers a numbered
+  choice of directories and an activity window, shows the plan, and on confirmation runs
+  the same executor `ms import` does, recording the manifest path in `setup.json`
 
 ## 0.2.6
 

@@ -341,7 +341,9 @@ test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE 
   const sessHeaderIdx = lines.findIndex((l) => l.startsWith("SESSION"));
   assert.ok(sessHeaderIdx >= 0, r.stdout);
   assert.deepEqual(cells(lines[sessHeaderIdx]!), [
-    "SESSION", "PANE", "PROVIDER", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?",
+    // BETTER goes LAST, so every older column keeps its place — the same
+    // rule SESS followed into the accounts table above.
+    "SESSION", "PANE", "PROVIDER", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?", "BETTER",
   ]);
 
   // sess-1: an open recovery, so WALLED? is "reported" even though its own
@@ -359,6 +361,10 @@ test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE 
   assert.equal(s1Cells[7], "pending");
   assert.match(s1Cells[8]!, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
   assert.equal(s1Cells[9], "reported");
+  // BETTER: gmail has no poll grant, so the chooser has exactly one account
+  // to choose from and sess-1 is already on it — there is nowhere better to
+  // name, and the column says so with the same dash every other one uses.
+  assert.equal(s1Cells[10], "—");
 
   // sess-2: no recovery, no rate_limited event for generation 1, but its
   // screen reads a wall — the provider never said so: unreported.
@@ -375,6 +381,11 @@ test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE 
   assert.equal(s2Cells[7], "—"); // no pending recovery
   assert.equal(s2Cells[8], "—"); // no wakeup scheduled
   assert.equal(s2Cells[9], "unreported");
+  // BETTER: sess-2 runs on gmail, which the pool cannot even read; dirk is
+  // the only account with a reading, and it has room in the fable window
+  // this session needs. The rule's opinion is printed whether or not
+  // anything is allowed to act on it.
+  assert.equal(s2Cells[10], "dirk");
 });
 
 test("ms status: a Codex account row renders — for FABLE and a missing 5H window and never no-token; a Codex session with the wall on screen and no rate_limited event reads unreported", async () => {
@@ -454,7 +465,8 @@ test("ms status: a Codex account row renders — for FABLE and a missing 5H wind
   const s3Cells = cells(sess3);
   assert.equal(s3Cells[2], "codex"); // PROVIDER
   assert.equal(s3Cells[3], "codexacct"); // ACCOUNT
-  assert.equal(s3Cells[s3Cells.length - 1], "unreported");
+  assert.equal(s3Cells[9], "unreported"); // WALLED?, now second-to-last
+  assert.equal(s3Cells[10], "—"); // BETTER: the only codex account IS this one
 
   // --json is a second, independent render path (JSON.stringify over the
   // snapshot/session rows, not the table) — prove it separately rather than
@@ -562,6 +574,73 @@ test("ms status --json: each session row also carries PENDING and WALLED? — nu
   assert.equal(s2.walled, "unreported");
 });
 
+// --- BETTER: the rebalance rule's own opinion, carried by both renders ----
+//
+// docs/superpowers/specs/2026-09-19-rebalance-design.md, "Visibility": the
+// same `decide()` the turn-end hook runs, with the gate forced on and no
+// side effects, so a human can see where a session belongs before anything
+// is allowed to move it. Additive: every key the row already carried is
+// untouched.
+
+test("ms status --json: each session row also carries BETTER — additive, and the same word the table prints", async () => {
+  const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
+  await seedSessions(w);
+
+  const r = run(["status", "--json"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout) as { sessions: Record<string, unknown>[] };
+
+  const s1 = parsed.sessions.find((s) => s.id === "sess-1")!;
+  assert.equal(s1.better, null, "already on the only readable account: null, which the table prints as a dash");
+  const s2 = parsed.sessions.find((s) => s.id === "sess-2")!;
+  assert.equal(s2.better, "dirk");
+
+  // Additive: `better` joined the row, it did not replace anything on it.
+  for (const key of ["id", "pane", "provider", "account", "need", "state", "generation", "pending", "walled", "wakeupAt", "lastMoveAt"]) {
+    assert.ok(key in s1, `${key} went missing from the session row: ${JSON.stringify(s1)}`);
+  }
+});
+
+test("ms status: BETTER is a dash for a row the rule can NEVER move — a parked session, and a pane that is gone", async () => {
+  // %2 is left out of list-panes, so sess-2's pane is gone; sess-4 is parked
+  // on the same account. Both are on gmail, which the pool cannot read — so
+  // in the table test above, where sess-2 is running on a LIVE pane, that
+  // identical row reads BETTER dirk. Neither of these may: `decide` computes
+  // `better` ahead of every guard, and both rows are ones `ms rebalance`
+  // skips outright.
+  const { world: w, env } = await world({ panes: ["%1"], screens: { "%1": WALL_SCREEN } });
+  await seedSessions(w);
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    st.createSession({
+      id: "sess-4", provider: "claude", cliSessionId: "cli-4", cwd: "/tmp/work4",
+      socket: TMUX_SOCKET, pane: "%1", serverStart: "srv1",
+      need: "any", account: "gmail", generation: 1, state: "parked", desired: "running", flags: [],
+    });
+  } finally {
+    st.close();
+  }
+
+  const r = run(["status", "--json", "--all"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout) as { sessions: { id: string; state: string; better: string | null }[] };
+
+  const parked = parsed.sessions.find((x) => x.id === "sess-4")!;
+  assert.equal(parked.state, "parked");
+  assert.equal(parked.better, null, "a parked row was told where it belongs");
+
+  const gone = parsed.sessions.find((x) => x.id === "sess-2")!;
+  assert.equal(gone.state, "gone");
+  assert.equal(gone.better, null, "a dead pane was told where it belongs");
+
+  // The control, in the same run: sess-1 is live and running, so the column
+  // is still doing its job — this is not a fix that blanked BETTER outright.
+  const live = parsed.sessions.find((x) => x.id === "sess-1")!;
+  assert.equal(live.state, "walled");
+  assert.equal("better" in live, true);
+});
+
 test("ms status --json: finding 2 — a Claude account with no launch token reads STATE no-token, never ok", async () => {
   const { home, msHome } = tempHome();
   writeFileSync(
@@ -631,10 +710,16 @@ test("ms status: a session whose pane no longer exists shows STATE gone, with no
   assert.ok(s2, r.stdout);
   const s2Cells = cells(s2);
   assert.equal(s2Cells[5], "gone");
-  // WALLED? is blank for a gone pane; as the last column, a blank trailing
-  // cell doesn't survive the table renderer's trailing-space trim, so the
-  // row simply has no tenth cell at all.
-  assert.equal(s2Cells[9] ?? "", "");
+  // WALLED? is blank for a gone pane. BETTER closes the row now, so that
+  // blank is an INTERIOR cell and simply collapses into the column
+  // separator — the assertion is therefore that neither wall word appears
+  // on the row at all, which is what "blank" meant here in the first place.
+  assert.ok(!/\breported\b|\bunreported\b/.test(s2), s2);
+  // …and BETTER, which still lands last, is the DASH: a pane that is gone
+  // is a row the rule can never move, and a column naming a destination
+  // `ms rebalance` refuses to send it to would be worse than blank. (The
+  // very same row, on a live pane, reads "dirk" — see the table test above.)
+  assert.equal(s2Cells[s2Cells.length - 1], "—");
 
   // sess-1's pane is still there and unaffected.
   const s1 = lines.find((l) => l.startsWith("sess-1"))!;

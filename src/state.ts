@@ -22,7 +22,17 @@ export type SessionRow = { id: string; provider: Provider; cliSessionId: string 
   /** How many bytes of `transcriptPath` the tool has already read and acted
    *  on. The watchdog is a tailer, so this is what keeps a resumed session's
    *  re-rendered history — old failures included — from being read twice. */
-  rolloutOffset: number };
+  rolloutOffset: number;
+  /** When rebalance (src/rebalance.ts) last moved this session, in unix
+   *  SECONDS like every other time in this module, or null if it never has.
+   *  It is the hysteresis record: written BEFORE the move is dispatched, so
+   *  a switch that then refuses still costs the six-hour cooldown rather
+   *  than leaving the rule free to try again on the very next turn. The
+   *  whole guard is wider than this column — a human's `ms switch` and a
+   *  wall's rotation both count as moves, and both are read out of the
+   *  `launches` table by `lastAccountChangeAt` — so nothing here needs to
+   *  be back-filled for an old store. */
+  lastMoveAt: number | null };
 export type LaunchRow = { id: string; sessionId: string; generation: number; account: string; command: string[]; env: Record<string, string>; createdAt: number };
 export type WallKind = "session" | "weekly" | "fable" | "unknown";
 export type RecoveryRow = { id: number; sessionId: string; generation: number; turnId: string | null; kind: WallKind;
@@ -34,7 +44,7 @@ type RecoveryInput = Omit<RecoveryRow, "id" | "status" | "owner" | "attempts" | 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, provider TEXT, cliSessionId TEXT, cwd TEXT, socket TEXT, pane TEXT,
   serverStart TEXT, need TEXT, account TEXT, generation INTEGER, state TEXT, desired TEXT, flags TEXT, wakeupAt INTEGER, createdAt INTEGER, updatedAt INTEGER,
-  transcriptPath TEXT, rolloutOffset INTEGER NOT NULL DEFAULT 0);
+  transcriptPath TEXT, rolloutOffset INTEGER NOT NULL DEFAULT 0, lastMoveAt INTEGER);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS launches (id TEXT PRIMARY KEY, sessionId TEXT, generation INTEGER, account TEXT, command TEXT, env TEXT, createdAt INTEGER);
 CREATE TABLE IF NOT EXISTS recoveries (id INTEGER PRIMARY KEY AUTOINCREMENT, sessionId TEXT, generation INTEGER, turnId TEXT, kind TEXT,
@@ -56,7 +66,7 @@ const now = () => Math.floor(Date.now() / 1000);
 const SESSION_COLUMNS = new Set<string>([
   "provider", "cliSessionId", "cwd", "socket", "pane", "serverStart", "need",
   "account", "generation", "state", "desired", "flags", "wakeupAt",
-  "transcriptPath", "rolloutOffset",
+  "transcriptPath", "rolloutOffset", "lastMoveAt",
 ]);
 
 /**
@@ -74,6 +84,7 @@ const SESSION_COLUMNS = new Set<string>([
 const ADDED_SESSION_COLUMNS: readonly [string, string][] = [
   ["transcriptPath", "transcriptPath TEXT"],
   ["rolloutOffset", "rolloutOffset INTEGER NOT NULL DEFAULT 0"],
+  ["lastMoveAt", "lastMoveAt INTEGER"],
 ];
 
 function isUniqueConstraintError(e: unknown): boolean {
@@ -103,8 +114,9 @@ export class State {
   /** `transcriptPath` and `rolloutOffset` are deliberately NOT creation inputs:
    * nothing knows a Codex rollout path before the CLI has reported one, and the
    * offset starts at zero by definition. Both take their column defaults and
-   * are written later through `updateSession`. */
-  createSession(s: Omit<SessionRow, "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset">): void {
+   * are written later through `updateSession`. `lastMoveAt` joins them for the
+   * same reason: a session that was only just created has never been moved. */
+  createSession(s: Omit<SessionRow, "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset" | "lastMoveAt">): void {
     const t = now();
     this.db.prepare(`INSERT INTO sessions (id,provider,cliSessionId,cwd,socket,pane,serverStart,need,account,generation,state,desired,flags,wakeupAt,createdAt,updatedAt)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(s.id, s.provider, s.cliSessionId, s.cwd, s.socket, s.pane, s.serverStart, s.need, s.account, s.generation, s.state, s.desired, JSON.stringify(s.flags), null, t, t);
@@ -134,6 +146,23 @@ export class State {
   accountChangesSince(sessionId: string, since: number): number {
     const r = this.db.prepare("SELECT COUNT(*) AS n FROM launches WHERE sessionId=? AND generation>1 AND createdAt>=?").get(sessionId, since) as { n: number } | undefined;
     return Number(r?.n ?? 0);
+  }
+  /**
+   * WHEN this session was last handed to another account, or null — the other
+   * half of `accountChangesSince` above, and the clock rebalance's six-hour
+   * hysteresis reads for moves it did not make itself.
+   *
+   * Same evidence, same rule: every respawn a handoff makes writes a launch
+   * row, and the only launch with generation 1 is the one the session was
+   * born on, so `generation > 1` is exactly "a change of account" — a
+   * human's `ms switch`, a wall's rotation and a rebalance alike. Reading it
+   * here means rebalance does not have to trust a column only rebalance
+   * writes, and a store that predates that column still answers honestly.
+   */
+  lastAccountChangeAt(sessionId: string): number | null {
+    const r = this.db.prepare("SELECT MAX(createdAt) AS t FROM launches WHERE sessionId=? AND generation>1").get(sessionId) as { t: number | null } | undefined;
+    const t = r?.t ?? null;
+    return typeof t === "number" && Number.isFinite(t) ? t : null;
   }
   getLaunch(id: string): LaunchRow | null {
     const r = this.db.prepare("SELECT * FROM launches WHERE id=?").get(id) as Record<string, unknown> | undefined;

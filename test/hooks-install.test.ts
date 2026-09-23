@@ -10,13 +10,16 @@ const MS = "/opt/homebrew/opt/model-switcher/bin/ms";
 // statusline wrapper and the alias block quote it, so a path with a space
 // stays one shell word (fix wave B-M5/B-M12).
 const CMD = `'${MS}' _hook claude`;
-const EVENTS = ["SessionStart", "UserPromptSubmit", "StopFailure", "SessionEnd"] as const;
+// `Stop` joined the set in 0.3.1: the turn that ENDED is rebalance's only
+// trigger (src/rebalance.ts), and it is the one event here that writes nothing
+// to the log.
+const EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"] as const;
 
 type Entry = { matcher?: string; hooks: { type: string; command: string }[] };
 const commands = (settings: Record<string, any>, event: string): string[] =>
   (settings.hooks?.[event] ?? []).flatMap((e: Entry) => e.hooks.map((h) => h.command));
 
-test("installing merges the four entries and preserves every other key", () => {
+test("installing merges an entry per event and preserves every other key", () => {
   const { home } = tempHome();
   const file = path.join(home, "settings.json");
   const original = {
@@ -46,7 +49,7 @@ test("installing merges the four entries and preserves every other key", () => {
   for (const ev of EVENTS) assert.deepEqual(commands(after, ev).filter((c) => c === CMD), [CMD], `${ev} carries the command exactly once`);
   const stop = after.hooks.StopFailure.find((e: Entry) => e.hooks.some((h) => h.command === CMD));
   assert.equal(stop.matcher, "rate_limit");
-  for (const ev of ["SessionStart", "UserPromptSubmit", "SessionEnd"]) {
+  for (const ev of ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]) {
     const e = after.hooks[ev].find((x: Entry) => x.hooks.some((h) => h.command === CMD));
     assert.equal(e.matcher, "");
     assert.deepEqual(e.hooks, [{ type: "command", command: CMD }]);
@@ -88,7 +91,7 @@ test("claudeHooksInstalled is false for a missing file, a partial install, or an
   const file = path.join(home, "settings.json");
   assert.equal(claudeHooksInstalled(file, MS), false);
   writeFileSync(file, JSON.stringify({ hooks: { SessionStart: [{ matcher: "", hooks: [{ type: "command", command: CMD }] }] } }));
-  assert.equal(claudeHooksInstalled(file, MS), false, "one of four is not installed");
+  assert.equal(claudeHooksInstalled(file, MS), false, "one of the set is not the whole set");
   installClaudeHooks(file, MS);
   assert.equal(claudeHooksInstalled(file, MS), true);
   assert.equal(claudeHooksInstalled(file, "/usr/local/bin/ms"), false, "a different binary is a different install");

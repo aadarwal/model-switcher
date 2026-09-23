@@ -822,6 +822,47 @@ test("ms codex leaves the stored kv row untouched when MS_CODEX_AUTOROTATE is no
   assert.equal(await codexAutorotateKv(w), null, "no export means no write, not 'off'");
 });
 
+/** The OTHER stored gate a launch mirrors (src/launch.ts, `syncRebalance`).
+ *  Same reason as the Codex one — `ms _rebalance` is dispatched by `tmux
+ *  run-shell` and sees only the tmux SERVER's environment, never the shell
+ *  that typed `export MS_REBALANCE=1` — and one difference that is the whole
+ *  point of the test below: it is mirrored for BOTH providers, because
+ *  rebalance moves Claude sessions too. */
+async function rebalanceKv(w: World): Promise<string | null> {
+  process.env.HOME = w.home; process.env.MS_HOME = w.msHome;
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    return st.getKv("rebalance");
+  } finally {
+    st.close();
+  }
+}
+
+test("ms claude mirrors an exported MS_REBALANCE into the stored kv row", async () => {
+  const on = await world();
+  assert.equal(run(["claude"], on.env({ MS_REBALANCE: "1" })).code, 0);
+  assert.equal(await rebalanceKv(on), "1");
+
+  // Exactly "1" is on, so a variable somebody exported as "0" to turn this
+  // OFF must mirror as off, never as "nothing was said".
+  const off = await world();
+  assert.equal(run(["claude"], off.env({ MS_REBALANCE: "0" })).code, 0);
+  assert.equal(await rebalanceKv(off), "0");
+});
+
+test("ms codex mirrors MS_REBALANCE too — the gate is not a Codex-only one", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  assert.equal(run(["codex"], w.env({ MS_REBALANCE: "1" })).code, 0);
+  assert.equal(await rebalanceKv(w), "1");
+});
+
+test("a launch leaves the rebalance row untouched when MS_REBALANCE is not exported", async () => {
+  const w = await world();
+  assert.equal(run(["claude"], w.env()).code, 0);
+  assert.equal(await rebalanceKv(w), null, "no export means no write, not 'off' — and never 'on'");
+});
+
 test("the cwd is trusted in the account's own home before the CLI is started", async () => {
   const w = await codexWorld([{ name: "home", weekly: 10 }]);
   const r = run(["codex"], w.env());

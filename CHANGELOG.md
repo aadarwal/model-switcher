@@ -1,7 +1,25 @@
 # Changelog
 
-## 0.3.1
+## 0.3.2
 
+- rebalance: at the end of a turn, an idle session moves to the account the
+  chooser would pick for it now — when a window it gates on is at 85 % or
+  more and the destination has 30 % room, or when the best account's week
+  resets 24 h earlier and this one's is half spent. Never mid-turn, never a
+  parked/waiting/stopped session, at most one move per hook run, and under
+  the 6 h / 30 min hysteresis guards; the move is the `ms switch`
+  transaction with no continuation. Off unless `MS_REBALANCE=1`
+- `ms status` ends its sessions table with BETTER — where that rule would
+  put each session right now, `—` when it is already there — and
+  `--json` / `/api/state` carry it as `better` (additive)
+- `ms rebalance [--dry-run] [--session <id>]` asks the same question for the
+  whole fleet and prints SESSION, ACCOUNT, BETTER, REASON, OUTCOME; without
+  `--dry-run` it makes the moves, one at a time, waiving the 6 h cooldown for
+  an explicit run but never the wall guard or the mid-turn refusal
+- the dashboard gains a Rebalance control beside "Move every pane" (the plan
+  first, then the run) and a quiet `better:` chip on each session row
+- `ms doctor` prints the rebalance gate's state, like the Codex one
+## 0.3.1
 - `ms import` adopts a Codex conversation by its rollout's own path, not by its id: the
   pane runs a fresh shell that inherits no `CODEX_HOME`, so an id from a conversation
   running under an `ms`-managed Codex home was looked up under `~/.codex` and not found.
@@ -19,9 +37,7 @@
   leaves first: a wrapper forwards a SIGTERM but nothing forwards a SIGKILL, so the native
   child used to be orphaned still holding the conversation. The row says
   `killed pid <pid> and N children`
-
 ## 0.3.0
-
 - `ms import` brings conversations running outside tmux into it: it finds every Claude
   Code and Codex conversation on the machine (`--since 30m|2h|1d|all`, `--dir <path>`),
   plans a tmux layout of one session per repo root and one window per worktree, stops each

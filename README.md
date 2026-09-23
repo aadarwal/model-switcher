@@ -89,16 +89,18 @@ ms status [--watch] [--json] [--all]
 ms rotate [<session|pane>] [--force]
 ms switch [<session|pane>] --to <account> [--continue] [--force]
 ms switch --all --to <account> [--provider claude|codex] [--continue] [--force] [--timeout <seconds>]
+ms rebalance [--dry-run] [--session <id>]
 ms stop [<session|pane>]
 ms dashboard [--port N] [--no-open]
 ```
 
-- `ms status` — two tables: the account pool as usage sees it, and every managed session. The accounts table ends in SESS, the number of live sessions on that account; `--json` lists them per account (`sessions`) and carries each account's `email`. `--watch` reprints every 5 s; `--json` prints the same rows as JSON. Sessions in state `gone` or `stopped` are hidden by default; `--all` shows them too.
+- `ms status` — two tables: the account pool as usage sees it, and every managed session. The accounts table ends in SESS, the number of live sessions on that account; `--json` lists them per account (`sessions`) and carries each account's `email`. The sessions table ends in BETTER — where [rebalance](#rebalance) would put that session right now, `—` when it is already there or the rule could never move it. `--watch` reprints every 5 s; `--json` prints the same rows as JSON. Sessions in state `gone` or `stopped` are hidden by default; `--all` shows them too.
 - `ms rotate` — move a session to the next account with room: the move a wall would have made, on demand. Always carries the unfinished work over.
 - `ms switch` — move a session to a named account. It carries the work over only when the pane reads as walled; `--continue` always carries it over.
 - `ms switch --all` — move every session of that account's provider that is not already on it, four at a time. `--timeout` bounds how long new moves are *started* (default 600 s); a move in flight is never cut off. `--provider` is needed only when the destination name is registered under both providers, same rule as `ms accounts`' own `--provider`.
+- `ms rebalance` — ask, for every live session at once, whether it is still on the best account, and move the ones that are not. It prints SESSION, ACCOUNT, BETTER, REASON, OUTCOME; `--dry-run` decides and moves nothing, `--session` asks about one. See [Rebalance](#rebalance) for what moves and when. Exit 0 when nothing failed, 1 when a move was refused.
 - `ms stop` — stop managing a session. The CLI in the pane keeps running.
-- `ms dashboard` — serve the `ms status` tables on `127.0.0.1`, with rotate, switch and stop buttons. It prints its URL, opens it (unless `--no-open`), and exits about 90 s after the last request, so it is alive only while a tab polls it.
+- `ms dashboard` — serve the `ms status` tables on `127.0.0.1`, with rotate, switch, stop and Rebalance buttons. It prints its URL, opens it (unless `--no-open`), and exits about 90 s after the last request, so it is alive only while a tab polls it.
 - `--force` moves a session that is mid-turn; without it a busy session is refused. With no `<session|pane>`, `rotate`, `switch` and `stop` act on the current pane.
 
 ### Calendar
@@ -270,6 +272,42 @@ An account is out if its reading failed, if it has no weekly window, or if any w
 needs is at 100 percent. The rest rank by earliest weekly reset, then most remaining, then
 solo before shared. No projections, no thresholds below 100.
 
+### Rebalance
+
+The chooser answers "which account is best" at launch and at a wall. In between, budgets
+move — a week resets somewhere, or the account a session is on creeps toward a wall that
+will land mid-turn. Rebalance is the rule that closes that gap, at the one moment moving a
+session is free: **the end of a turn**.
+
+**What moves.** An idle session, to the account the chooser would pick for it now, when one
+of two conditions holds:
+
+- **an imminent wall** — a window the chooser gates on is at 85 % or more on the current
+  account, and the best account has at least 30 % room in every one of its own;
+- **a clearly better budget** — the best account's week resets at least 24 h earlier than
+  the current one's, and the current week is at least 50 % spent.
+
+**The guards**, all of which must pass: the pane reads idle (never mid-turn — it is re-read
+by the decision and again inside the transaction); no move of that session by any hand in
+the last 6 h, and no wall-driven rotation of it in the last 30 min; the destination passes
+the same preflight a rotation runs; and the session is `running` or `continuing` — never
+`parked`, `waiting`, `stopped` or a pane that is gone. At most one session moves per hook
+run. The move itself is the `ms switch` transaction with **no continuation**: the turn
+ended, so there is nothing to carry over and nothing is typed into a pane its human left
+quiet. A Claude session stays Claude; there are no cross-provider moves and no projections.
+
+**The gate.** Automatic moves are off unless `MS_REBALANCE=1` (see
+[Configuration](#configuration)); `ms doctor` prints the state it will act on. Nothing
+stays resident either way: the trigger is the turn-end hook, and usage is re-read at most
+once every 15 minutes across the whole fleet.
+
+**The verb.** `ms rebalance` asks the same question on demand, for every live session, and
+prints the table. Without `--dry-run` it makes the moves — one at a time, waiving only the
+6 h cooldown (an explicit run is the human deciding), never the wall guard and never the
+mid-turn refusal. The gate does not apply to it: running the verb is the asking.
+`ms status`'s BETTER column, the dashboard's `better:` chip and this table are the same
+rule seen three ways.
+
 ### What the wizard changes on your machine
 
 Every file below is backed up first (a timestamped copy beside it, never overwriting an
@@ -279,7 +317,7 @@ does not look like something `ms` wrote.
 
 | What | Where | Undo |
 |---|---|---|
-| Claude hooks: `SessionStart`, `UserPromptSubmit`, `StopFailure` (`rate_limit`), `SessionEnd` | `~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` | Delete the four entries whose command ends in `_hook claude` |
+| Claude hooks: `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure` (`rate_limit`), `SessionEnd` | `~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` | Delete the entries whose command ends in `_hook claude` |
 | Codex hook tables and their computed trust hashes | `MS_HOME/codex/<account>/config.toml`, between `# ms-hooks-begin` and `# ms-hooks-end` | Delete that block |
 | Statusline wrapper (opt-in, default no) | `statusLine` in the same `settings.json` | `ms setup --remove statusline` |
 | Shell aliases for `claude` and `codex` (opt-in, default no) | `~/.zshrc`, or `~/.bash_profile` / `~/.bashrc`, between `# ms-alias-begin` and `# ms-alias-end` | `ms setup --remove alias` |
@@ -306,6 +344,7 @@ only, and stored at rest in that same 0600 file.
 | `MS_HOME` | Where all state lives. Default `~/.config/model-switcher`. |
 | `MS_BIN` | The absolute `ms` path written into hook commands, Codex trust hashes, the statusline wrapper and the alias block. The Homebrew shim sets it to `/opt/homebrew/opt/model-switcher/bin/ms` — the stable path, so everything the wizard wrote survives an upgrade. Set it yourself only when running `ms` from somewhere unusual. |
 | `MS_CODEX_AUTOROTATE` | Automatic recovery for Codex sessions. Unset, empty, or exactly `1` is **on**; **every other value reads as off** — `0`, but `false`, `no` and a typo too, because only `1` is read as yes. Export it in the shell that runs `codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched watchdog and worker read it too. A mirrored `off` is a stored row and outlives the variable — unsetting it later does not turn recovery back on; export `MS_CODEX_AUTOROTATE=1` (and run an `ms codex`, which mirrors) to do that. `ms doctor` prints the state it will act on. Ships on. |
+| `MS_REBALANCE` | [Rebalance](#rebalance): moving an idle session to a better account at a turn end. **Off unless the value is exactly `1`** — the reverse of `MS_CODEX_AUTOROTATE`'s default, because this rule moves sessions nothing is wrong with. Export it in the shell that runs `claude`/`codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched hooks read it too. It gates only the AUTOMATIC moves; `ms rebalance` works either way. `ms doctor` prints the state it will act on. Ships off. |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere `ms` reads or writes that settings file. |
 | `MS_VERBOSE` | `1` prints what each invocation's start-of-run repair did. |
 | `MS_ENTRY` | `src` or `dist` — which entry point `bin/ms` runs. For development; the brew shim sets `dist`. |

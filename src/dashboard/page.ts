@@ -45,6 +45,7 @@ import {
   buildSwitchBody,
   buildStopBody,
   buildSwitchAllBody,
+  buildRebalanceBody,
   nextPollState,
   pollStateOnVisible,
   isWorry,
@@ -68,6 +69,8 @@ import {
   shortSessionId,
   sessionRowHtml,
   formatSwitchAll,
+  formatRebalance,
+  rebalanceWouldMove,
   fleetCandidateIds,
   isFinishedSession,
   visibleSessions,
@@ -268,6 +271,15 @@ select option { background: var(--surface); color: var(--ink); }
 }
 #moveall-go:hover:not(:disabled) { border-color: var(--baseline); }
 #moveall-go:disabled { opacity: 0.45; cursor: default; }
+/* ———— Rebalance: the same quiet control, beside the fleet move ———— */
+#rebalance-go {
+  appearance: none; background: transparent; border: 1px solid var(--grid); border-radius: 6px;
+  color: var(--ink-2); font-family: inherit; font-size: 11.5px; padding: 4px 13px; cursor: pointer;
+}
+#rebalance-go:hover:not(:disabled) { border-color: var(--baseline); color: var(--ink); }
+#rebalance-go:disabled { opacity: 0.45; cursor: default; }
+/* One line per session, like the fleet move's answer. */
+#rebalance-msg { display: block; white-space: pre-line; line-height: 1.6; margin-top: 10px; }
 /* The fleet move's answer is one line per session plus a summary (finding
    C3), so it needs its own block and its newlines honoured — inside the
    flex control it would have been one squashed run of text. */
@@ -305,6 +317,7 @@ const EMBEDDED = [
   buildSwitchBody,
   buildStopBody,
   buildSwitchAllBody,
+  buildRebalanceBody,
   nextPollState,
   pollStateOnVisible,
   isWorry,
@@ -328,6 +341,8 @@ const EMBEDDED = [
   shortSessionId,
   sessionRowHtml,
   formatSwitchAll,
+  formatRebalance,
+  rebalanceWouldMove,
   fleetCandidateIds,
   isFinishedSession,
   visibleSessions,
@@ -373,6 +388,11 @@ ${EMBEDDED_FUNCTIONS}
   var busySessions = Object.create(null);
   var moveMsg = null;
   var moveBusy = false;
+  // The Rebalance control: one request in flight at a time, and whether the
+  // last dry run found anything worth a second click.
+  var rebalanceMsg = null;
+  var rebalanceBusy = false;
+  var rebalanceArmed = false;
   // rereview-C.md defect 3: every candidate id fleetCandidateIds() named
   // when the current fleet move started — set alongside moveBusy, cleared
   // alongside it. Without this, moveBusy only ever disabled the "Go" button
@@ -485,6 +505,17 @@ ${EMBEDDED_FUNCTIONS}
     if (moveMsg && moveMsg.expiresAt > Date.now()) {
       span.textContent = moveMsg.text;
       span.className = "rowmsg" + (moveMsg.error ? " error" : "");
+    } else {
+      span.textContent = "";
+      span.className = "rowmsg";
+    }
+  }
+
+  function renderRebalanceMsg() {
+    var span = el("rebalance-msg");
+    if (rebalanceMsg && rebalanceMsg.expiresAt > Date.now()) {
+      span.textContent = rebalanceMsg.text;
+      span.className = "rowmsg" + (rebalanceMsg.error ? " error" : "");
     } else {
       span.textContent = "";
       span.className = "rowmsg";
@@ -607,6 +638,32 @@ ${EMBEDDED_FUNCTIONS}
     });
   });
 
+  // Rebalance: the whole fleet's answer to "is this session still on the
+  // best account", and then, on a second click, the moves.
+  //
+  // The dry run comes first on purpose, and the real run that follows needs
+  // no confirm dialog: this rule never moves a pane that is mid-turn (the
+  // pane is re-read by the decision and again inside the transaction), so
+  // the worst an accidental second click does is put idle sessions on
+  // accounts with more room. What the human is agreeing to is the table the
+  // first click just printed.
+  el("rebalance-go").addEventListener("click", function () {
+    if (rebalanceBusy) return;
+    var dryRun = !rebalanceArmed;
+    rebalanceBusy = true;
+    el("rebalance-go").disabled = true;
+    post("/api/rebalance", buildRebalanceBody(dryRun)).then(function (r) {
+      rebalanceBusy = false;
+      // Armed only by a dry run that found something; a real run always
+      // disarms, so two clicks can never be two rounds of moves.
+      rebalanceArmed = dryRun && rebalanceWouldMove(r.json);
+      el("rebalance-go").textContent = rebalanceArmed ? "Rebalance now" : "Rebalance";
+      el("rebalance-go").disabled = false;
+      rebalanceMsg = { text: formatRebalance(r.status, r.json), error: resultIsError(r), expiresAt: Date.now() + MSG_MS };
+      renderRebalanceMsg();
+    });
+  });
+
   function scheduleNext() {
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = setTimeout(tick, POLL_MS);
@@ -641,6 +698,7 @@ ${EMBEDDED_FUNCTIONS}
       renderAccounts(currentAccounts);
       renderSessions(currentSessions, currentAccounts);
       renderMoveAll(currentAccounts);
+      renderRebalanceMsg();
       updateMeta();
       refreshCalendar();
       scheduleNext();
@@ -705,8 +763,10 @@ export function renderDashboardPage(): string {
       <select id="moveall-account"></select>
       <label class="ms-force"><input type="checkbox" id="force"> Force (governs "Move every…" only)</label>
       <button id="moveall-go">Go</button>
+      <button id="rebalance-go">Rebalance</button>
     </div>
     <div class="rowmsg" id="moveall-msg"></div>
+    <div class="rowmsg" id="rebalance-msg"></div>
   </section>
 
   <section>

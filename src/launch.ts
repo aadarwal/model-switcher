@@ -33,7 +33,7 @@ import { ensureStore, msBinary, msHome, p } from "./paths.ts";
 import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import { parseNeed, pickAccounts, type Need, type PickInput } from "./pick.ts";
-import { syncCodexAutorotate } from "./autorotate.ts";
+import { syncCodexAutorotate, syncRebalance } from "./autorotate.ts";
 import { openState } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
@@ -543,6 +543,11 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     if (provider === "codex") {
       try { syncCodexAutorotate(st); } catch { /* the gate is not worth failing a launch over */ }
     }
+    // The rebalance gate travels the same road, for both providers: `ms
+    // claude` and `ms codex` are the two commands that reliably run in the
+    // human's own shell, which is where `MS_REBALANCE` is exported and where
+    // `_rebalance` (dispatched by tmux) will never run.
+    try { syncRebalance(st); } catch { /* the gate is not worth failing a launch over */ }
     if (inside) {
       const pane = currentPane()!;
       const serverStart = tmux.serverIdentity();

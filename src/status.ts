@@ -15,8 +15,9 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { findAccount, loadRegistry, type Registry } from "./registry.ts";
-import { getSnapshot, type AccountUsage } from "./snapshot.ts";
-import type { Window } from "./pick.ts";
+import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
+import type { PickInput, Window } from "./pick.ts";
+import { decide, lastMoveAtMs, lastWallAtMs, movable, paneReading } from "./rebalance.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { readEvents, type Event } from "./events.ts";
@@ -221,9 +222,49 @@ export function sessionWalled(s: SessionRow, hasPendingRecovery: boolean, screen
  *  different ways. See review round 1 (P4-T2), finding 1. `pending` is
  *  `null` exactly where the table prints "—" (no open recovery); JSON has
  *  no dash of its own. */
-export type SessionComputed = { state: string; pending: string | null; walled: Walled };
+export type SessionComputed = { state: string; pending: string | null; walled: Walled; better: string | null };
 
-function computeSession(s: SessionRow, st: State): SessionComputed {
+/**
+ * BETTER: where the rebalance rule (src/rebalance.ts) would put this session
+ * right now, or null when the account it is on is already the chooser's
+ * answer — and null, too, when the rule cannot decide (nothing has room, no
+ * reading it may judge).
+ *
+ * It is the REAL `decide`, over the same snapshot and the same pane reading
+ * this render already took, with two deliberate differences from the
+ * turn-end hook's call:
+ *
+ *   * `gate: true`. The gate governs what moves WITHOUT anybody asking; what
+ *     the rule thinks is worth showing whether or not it is allowed to act,
+ *     and a column that read "—" for the whole fleet because a kv row is "0"
+ *     would be telling a human nothing at all.
+ *   * nothing is written. `decide` is pure, so this is a read of the store
+ *     and a handful of comparisons; `ms status` reports, it never repairs.
+ *
+ * The guards still run, and they still only ever change the REASON — `better`
+ * is computed before the first of them — so this column says the same thing
+ * for a session that is mid-turn, freshly moved or perfectly still.
+ *
+ * The one exception is `movable` below, and it is not a guard about the
+ * moment: a `parked`/`waiting`/`stopped` row and a pane that is gone are rows
+ * this rule will NEVER move, whatever the pool does next. Naming a
+ * destination for one of them would be a column telling a human where a
+ * session belongs while `ms rebalance` refuses to send it there.
+ */
+function betterAccount(s: SessionRow, st: State, accounts: PickInput[], pane: ReturnType<typeof paneReading>): string | null {
+  if (!movable(s.state, pane)) return null;
+  return decide({
+    session: s,
+    accounts,
+    now: Date.now(),
+    lastMoveAt: lastMoveAtMs(st, s),
+    lastWallAt: lastWallAtMs(s.id),
+    gate: true,
+    pane,
+  }).better;
+}
+
+function computeSession(s: SessionRow, st: State, accounts: PickInput[]): SessionComputed {
   const tmux = new Tmux(s.socket || null);
   const hasPane = !!s.pane;
   const exists = hasPane && tmux.paneExists(s.pane);
@@ -239,7 +280,10 @@ function computeSession(s: SessionRow, st: State): SessionComputed {
   // render's paneExists catches up and shows "gone".
   const screen = exists ? tmux.capture(s.pane) : null;
   const walled = sessionWalled(s, rec !== null, screen, exists ? readEvents(s.id) : []);
-  return { state, pending: rec ? rec.status : null, walled };
+  // The pane's own reading, from the capture just taken rather than a second
+  // round-trip per row (src/rebalance.ts's `paneReading`).
+  const better = betterAccount(s, st, accounts, paneReading(exists, screen));
+  return { state, pending: rec ? rec.status : null, walled, better };
 }
 
 function sessionRow(s: SessionRow, c: SessionComputed): string[] {
@@ -254,6 +298,9 @@ function sessionRow(s: SessionRow, c: SessionComputed): string[] {
     c.pending ?? DASH,
     s.wakeupAt != null ? localTimeCli(s.wakeupAt * 1000) : DASH,
     c.walled,
+    // BETTER, last: every older column keeps its place, the same rule SESS
+    // followed into the accounts table.
+    c.better ?? DASH,
   ];
 }
 
@@ -290,7 +337,7 @@ function table(headers: string[], rows: string[][]): string[] {
  *  same word `ms status`'s text table prints, not the store's raw column
  *  (fix-C-report.md item 1 / fix-R). */
 export type StatusAccountRow = AccountUsage & AccountComputed & { sessions: AccountSession[] };
-export type StatusSessionRow = Omit<SessionRow, "state"> & { state: string; pending: string | null; walled: Walled };
+export type StatusSessionRow = Omit<SessionRow, "state"> & { state: string; pending: string | null; walled: Walled; better: string | null };
 export type StatusJson = { accounts: StatusAccountRow[]; sessions: StatusSessionRow[]; takenAt: number | null };
 
 /**
@@ -308,9 +355,10 @@ export async function statusJson(): Promise<StatusJson> {
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
   const st = openState();
   try {
+    const accounts0 = toPickInputs(snapshot);
     const sessions = st.listSessions().map((s) => {
-      const c = computeSession(s, st);
-      return { ...s, state: c.state, pending: c.pending, walled: c.walled };
+      const c = computeSession(s, st, accounts0);
+      return { ...s, state: c.state, pending: c.pending, walled: c.walled, better: c.better };
     });
     const on = sessionsByAccount(sessions);
     const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry), sessions: on.get(`${a.provider}:${a.name}`) ?? [] }));
@@ -331,7 +379,8 @@ async function render(json: boolean, all: boolean): Promise<string> {
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
   const st = openState();
   try {
-    const sessions = st.listSessions().map((s) => ({ session: s, computed: computeSession(s, st) }));
+    const pool = toPickInputs(snapshot);
+    const sessions = st.listSessions().map((s) => ({ session: s, computed: computeSession(s, st, pool) }));
     const visible = all ? sessions : sessions.filter((r) => !isFinishedState(r.computed.state));
     const on = sessionsByAccount(sessions.map((r) => ({ ...r.session, state: r.computed.state })));
     const lines: string[] = [];
@@ -355,7 +404,9 @@ async function render(json: boolean, all: boolean): Promise<string> {
       // (provider, name), and an account name is only reused across
       // providers, never within one — so a session's own credential is
       // named by both cells together, not ACCOUNT alone.
-      ["SESSION", "PANE", "PROVIDER", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?"],
+      // BETTER closes the row: where the rebalance rule would put this
+      // session right now, "—" when it is already there (src/rebalance.ts).
+      ["SESSION", "PANE", "PROVIDER", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?", "BETTER"],
       visible.map((r) => sessionRow(r.session, r.computed)),
     ));
     return lines.join("\n") + "\n";

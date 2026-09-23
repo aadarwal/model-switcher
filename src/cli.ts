@@ -12,6 +12,8 @@ import { statuslineVerb } from "./setup/statusline.ts";
 import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { paneDied, reconcile } from "./reconcile.ts";
 import { recoverVerb } from "./recover.ts";
+import { rebalanceWorkerVerb } from "./rebalance.ts";
+import { rebalanceVerb } from "./rebalance-verb.ts";
 import { status } from "./status.ts";
 import { calendar } from "./calendar.ts";
 import { doctor } from "./doctor.ts";
@@ -37,7 +39,14 @@ registerVerb("adopt", adoptVerb);
 // `ms import`: bring conversations running outside tmux into it.
 registerVerb("import", importVerb);
 registerVerb("_recover", recoverVerb);
+// The rebalance move: the human's own `ms switch` transaction, minus the
+// continuation, dispatched by tmux so it lives outside the CLI whose turn just
+// ended (src/rebalance.ts).
+registerVerb("_rebalance", rebalanceWorkerVerb);
 registerVerb("status", status);
+// `ms rebalance`: the same decision the turn-end hook takes, for the whole
+// fleet, printed — and, without --dry-run, acted on (src/rebalance-verb.ts).
+registerVerb("rebalance", rebalanceVerb);
 registerVerb("calendar", calendar);
 registerVerb("doctor", doctor);
 registerVerb("accounts", accountsVerb);
@@ -48,8 +57,8 @@ registerVerb("stop", stopVerb);
 registerVerb("dashboard", dashboard);
 
 const USAGE = `usage: ms <verb> [args]
-  setup | claude | codex | adopt | import | status | calendar | accounts | rotate | switch | stop | doctor | attach | dashboard
-  (internal: _exec _hook _codex_watch _recover _pane_died _statusline)`;
+  setup | claude | codex | adopt | import | status | calendar | accounts | rotate | switch | rebalance | stop | doctor | attach | dashboard
+  (internal: _exec _hook _codex_watch _recover _rebalance _pane_died _statusline)`;
 
 function version(): string {
   const pkg = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
@@ -76,7 +85,7 @@ function quietExperimentalWarnings(): void {
  * ours stays resident, so each invocation is the moment we repair what a
  * crashed worker, a restarted tmux server or a closed pane left behind.
  *
- * Internal verbs (`_exec`, `_hook`, `_recover`, `_pane_died`) skip it — they
+ * Internal verbs (`_exec`, `_hook`, `_recover`, `_rebalance`, `_pane_died`) skip it — they
  * are the hot and re-entrant paths, the hook must never print or block the
  * human's turn, and a `_recover` that reconciled would be repairing itself.
  * `--version`/`--help` have already returned before this is reached.

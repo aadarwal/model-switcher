@@ -323,7 +323,7 @@ test("a full run with one Claude and one Codex account finishes every step, veri
 
   // Hooks are really in both files, pointing at the binary the wizard used.
   const events = s.settings().hooks;
-  for (const e of ["SessionStart", "UserPromptSubmit", "SessionEnd", "StopFailure"]) {
+  for (const e of ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "StopFailure"]) {
     assert.ok(
       (events[e] as { hooks: { command: string }[] }[]).some((entry) => entry.hooks.some((h) => h.command === `'${s.msBin}' _hook claude`)),
       `no ${e} hook for ${s.msBin}`,
@@ -661,7 +661,7 @@ test("--repair re-installs the hooks for the registered accounts, without a sing
 
   const live = `'${s.msBin}' _hook claude`;
   const after = s.settings();
-  for (const ev of ["SessionStart", "UserPromptSubmit", "StopFailure", "SessionEnd"]) {
+  for (const ev of ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"]) {
     const cmds = (after.hooks[ev] as { hooks: { command: string }[] }[]).flatMap((e) => e.hooks.map((h) => h.command));
     assert.deepEqual(cmds.filter((c) => / _hook claude$/.test(c)), [live], `${ev} was not repaired`);
   }

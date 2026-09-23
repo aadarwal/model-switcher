@@ -286,7 +286,7 @@ test("checkHooks: a stale ms entry from an ms that MOVED is a ✗, and --fix pru
   installClaudeHooks(settingsPath, msBinary());
   const dead = claudeHookCommand("/opt/homebrew/Cellar/model-switcher/0.1.0/bin/ms");
   const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-  for (const ev of ["SessionStart", "UserPromptSubmit", "StopFailure", "SessionEnd"]) {
+  for (const ev of ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"]) {
     settings.hooks[ev].push({ matcher: "", hooks: [{ type: "command", command: dead }] });
   }
   settings.hooks.SessionStart.push({ matcher: "", hooks: [{ type: "command", command: "anu-session-start" }] });
@@ -302,7 +302,7 @@ test("checkHooks: a stale ms entry from an ms that MOVED is a ✗, and --fix pru
 
   const after = JSON.parse(readFileSync(settingsPath, "utf8"));
   const live = claudeHookCommand(msBinary());
-  for (const ev of ["SessionStart", "UserPromptSubmit", "StopFailure", "SessionEnd"]) {
+  for (const ev of ["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"]) {
     const ms = (after.hooks[ev] as { hooks: { command: string }[] }[])
       .flatMap((e) => e.hooks.map((h) => h.command))
       .filter((c) => / _hook claude$/.test(c));
@@ -360,7 +360,11 @@ test("D3: an unparsable registry is not 'not needed' — checkClaudeBinary and c
   const hooksLine = results.find((r) => r.what.startsWith("Claude hooks installed"));
   assert.doesNotMatch(hooksLine!.what, /not needed/);
   assert.equal(hooksLine?.ok, false, "no hooks are installed in this fresh settings file — the real check found that");
-  assert.match(hooksLine!.why ?? "", /not all four present/);
+  // The count is the installer's own event table's length (five since `Stop`
+  // joined it in 0.3.1), so this pins the wiring and not a literal.
+  const { CLAUDE_HOOK_ENTRIES } = await import("../src/hooks/install.ts");
+  assert.equal(CLAUDE_HOOK_ENTRIES, 5, "SessionStart, UserPromptSubmit, Stop, StopFailure, SessionEnd");
+  assert.match(hooksLine!.why ?? "", new RegExp(`not all ${CLAUDE_HOOK_ENTRIES} present`));
 });
 
 // --- store permissions ---------------------------------------------------
@@ -669,6 +673,36 @@ test("runDoctor: the codex auto-recovery gate line reflects the stored kv value,
     assert.ok(offLine, off.lines.join("\n"));
     // Off is somebody's deliberate choice, not a fault: still a ✓.
     assert.equal(offLine!.ok, true);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("runDoctor: the rebalance gate line is printed for every fleet, and ships OFF", async () => {
+  // Deliberately a Claude-only registry: rebalance is not a Codex feature the
+  // way auto-recovery is, so its line must not hide behind a codex account.
+  const { msHome } = base();
+  stubHealthyBinaries();
+  writeHealthyAccountFiles(msHome, "gmail");
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("{}", { status: 500 })) as typeof fetch;
+  try {
+    const { openState } = await import("../src/state.ts");
+    const { rebalanceLine } = await import("../src/autorotate.ts");
+    const { runDoctor } = await import("../src/doctor.ts");
+
+    delete process.env.MS_REBALANCE;
+    const absent = await runDoctor(false);
+    const absentLine = absent.results.find((r) => r.what === rebalanceLine(false));
+    assert.ok(absentLine, absent.lines.join("\n"));
+    assert.equal(absentLine!.ok, true, "off is the 0.3.1 default, not a fault");
+    assert.match(absentLine!.what, /export MS_REBALANCE=1 in the shell that runs claude\/codex/);
+
+    const st = openState();
+    st.setKv("rebalance", "1");
+    st.close();
+    const on = await runDoctor(false);
+    assert.ok(on.results.find((r) => r.what === rebalanceLine(true)), on.lines.join("\n"));
   } finally {
     globalThis.fetch = savedFetch;
   }

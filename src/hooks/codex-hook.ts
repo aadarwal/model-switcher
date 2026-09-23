@@ -49,7 +49,7 @@
 // message over the human's pane. Both exit 0 on every path, including failure.
 
 import { closeSync, openSync, readSync, statSync } from "node:fs";
-import { codexAutorotateEnabled, codexAutorotateEnv, syncCodexAutorotate } from "../autorotate.ts";
+import { codexAutorotateEnabled, codexAutorotateEnv, rebalanceEnv, syncCodexAutorotate, syncRebalance } from "../autorotate.ts";
 import { appendEvent, readEvents, type EventKind } from "../events.ts";
 import { msBinary } from "../paths.ts";
 // type-only: erased, so naming them here never loads node:sqlite
@@ -134,10 +134,10 @@ export async function codexHook(): Promise<number> {
     // is 0 too, so "finite" is not enough to tell a real one from a blank.
     if (!session || !Number.isInteger(gen) || gen <= 0 || !socket || !pane) return 0;
 
-    // The gate, carried from the human's shell into the store the dispatched
-    // processes can actually read. Only when the variable is set here — the
-    // ordinary case is unset (and on), and that must cost no store at all.
-    await mirrorAutorotate();
+    // The two gates, carried from the human's shell into the store the
+    // dispatched processes can actually read. Only when a variable is set
+    // here — the ordinary case is neither, and that must cost no store at all.
+    await mirrorGates();
 
     if (process.stdin.isTTY) return 0;
     let input: Record<string, unknown>;
@@ -169,6 +169,13 @@ export async function codexHook(): Promise<number> {
       // immediate, and because a session whose rollout the tool cannot read
       // still gets its turns closed.
       appendEvent({ t, kind: "stop", session, generation: gen, cliSessionId, turnId });
+      // …and it is the turn end rebalance triggers on. BOTH places that record
+      // a `stop` call it, because either can be the one that gets there first:
+      // this hook closes the ordinary turn (and then the watch, finding no
+      // turn in flight, never reads the rollout at all), while the watch is
+      // what closes a turn whose hook never fired. The six-hour stamp and the
+      // one-move-per-run bound make the overlap harmless.
+      await turnEnded(session);
     } else if (name === "SessionEnd") {
       const reason = typeof input.reason === "string" && input.reason ? input.reason : null;
       appendEvent({ t, kind: "ended", session, generation: gen, cliSessionId, ...(reason ? { kindDetail: reason } : {}) });
@@ -183,21 +190,40 @@ export async function codexHook(): Promise<number> {
 }
 
 /**
- * Write an exported `MS_CODEX_AUTOROTATE` into the store, so `_codex_watch`
- * and `_recover` — which tmux dispatches with the SERVER's environment, not
- * this one — read the gate the human actually set.
+ * Write an exported `MS_CODEX_AUTOROTATE` or `MS_REBALANCE` into the store, so
+ * `_codex_watch`, `_recover` and `_rebalance` — which tmux dispatches with the
+ * SERVER's environment, not this one — read the gates the human actually set.
  *
- * A variable that is not set here says nothing and writes nothing: the stored
+ * A variable that is not set here says nothing and writes nothing: that stored
  * gate stays as it was. Everything is guarded, because a hook that threw would
  * print through the CLI's error path into the human's transcript.
  */
-async function mirrorAutorotate(): Promise<void> {
-  if (codexAutorotateEnv() === null) return; // the ordinary case: no store opened
+async function mirrorGates(): Promise<void> {
+  // The ordinary case: neither is exported, and no store is opened.
+  if (codexAutorotateEnv() === null && rebalanceEnv() === null) return;
   try {
     const { openState } = await import("../state.ts");
     const st = openState();
-    try { syncCodexAutorotate(st); } finally { st.close(); }
+    try {
+      syncCodexAutorotate(st);
+      syncRebalance(st);
+    } finally { st.close(); }
   } catch { /* a gate we could not record is the gate that was already there */ }
+}
+
+/**
+ * The turn-end trigger (spec: "Rebalance", step 1), shared by this hook's
+ * `Stop` and the watchdog's own settling of a turn.
+ *
+ * `rebalance.ts` is imported here and not at module scope: it reaches
+ * `state.ts` and `recover.ts`, and an unmanaged pane's hook must return long
+ * before any of that is loaded.
+ */
+async function turnEnded(session: string): Promise<void> {
+  try {
+    const { maybeRebalance } = await import("../rebalance.ts");
+    await maybeRebalance(session);
+  } catch { /* a move that could not happen is never worth a line in the transcript */ }
 }
 
 /**
@@ -397,13 +423,26 @@ async function noteActivity(session: string, gen: number, transcript: string | n
  * rollout file for that turn's `task_complete` record. It re-arms itself while
  * any turn is still in flight and clears the claim when none is.
  *
- * The whole pass runs under one lock, which is also the lock the hook takes to
+ * The READING runs under one lock, which is also the lock the hook takes to
  * arm: two passes could otherwise read the same bytes and act on the same
  * record twice, and the offset that prevents it is only advanced at the end.
+ * The turn ENDS this pass found are handled after that lock is released — see
+ * the comment on `ended` below; nothing that can touch the network is allowed
+ * to hold a lock a hook waits two seconds for.
  */
 export async function codexWatch(): Promise<number> {
   try {
     const { withLock } = await import("../lock.ts");
+    // The turns this pass closed. Collected UNDER the lock and acted on AFTER
+    // it, because a turn end is a rebalance trigger and a rebalance can spend
+    // real time: up to a 2 s wait for the snapshot lock and, when the cached
+    // reading has aged out, a usage poll of every account on top of it. This
+    // lock is the one `armWatch` waits 2 s for (ARM_LOCK_WAIT_MS). Holding it
+    // across that work is how a `UserPromptSubmit` arriving mid-pass loses its
+    // wait, arms no timer, and leaves that turn's wall unwatched until some
+    // later prompt happens to arm one. The re-arm below is the last thing the
+    // lock is held for; everything expensive comes after it.
+    const ended: string[] = [];
     await withLock(WATCH_LOCK, async () => {
       const { openState } = await import("../state.ts");
       const st = openState();
@@ -416,6 +455,7 @@ export async function codexWatch(): Promise<number> {
           if (!turn) continue;
           const settled = await readRollout(st, s, turn);
           if (!settled) inFlight ??= s;
+          else ended.push(s.id);
         }
         // The claim is re-read before anything is decided. This pass began
         // when its own timer's claim expired, and a `UserPromptSubmit` that
@@ -452,6 +492,13 @@ export async function codexWatch(): Promise<number> {
         st.close();
       }
     });
+    // Outside the lock, and after the next timer is already armed. Every turn
+    // this pass closed is a turn end, and a turn end is where rebalance is
+    // allowed to move an idle session. A turn that WALLED settled here too,
+    // and is refused by the rule's own thirty-minute guard reading the
+    // `rate_limited` this pass just wrote — the guard is load-bearing, not
+    // decorative. One move covers the whole pass.
+    for (const id of ended) await turnEnded(id);
     return 0;
   } catch {
     return 0;

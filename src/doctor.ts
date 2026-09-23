@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
 import { claudeSettingsPath, msBinary, msHome, p } from "./paths.ts";
-import { claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
+import { CLAUDE_HOOK_ENTRIES, claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
 import { codexConfigPath, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
 import { loadRegistry, organisationClaimedBy, sameOrganisationAs, type Account } from "./registry.ts";
 import {
@@ -34,7 +34,7 @@ import {
 } from "./providers/claude-usage.ts";
 import { fetchCodexUsage, readCodexCredentials } from "./providers/codex-usage.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
-import { codexAutorotateEnabled, codexAutorotateLine } from "./autorotate.ts";
+import { codexAutorotateEnabled, codexAutorotateLine, rebalanceEnabled, rebalanceLine } from "./autorotate.ts";
 import { openState, type SessionRow } from "./state.ts";
 import { Tmux } from "./tmux.ts";
 import { resolveOnPath } from "./exec.ts";
@@ -163,11 +163,13 @@ export function checkHooks(fix: boolean, hasClaudeAccounts = true): Result {
   const settingsPath = claudeSettingsPath();
   const msBin = msBinary();
   if (claudeHooksInstalled(settingsPath, msBin)) return { ok: true, what };
-  // "for `msBin`" covers both halves of what installed now means: the four
-  // entries present, AND no OTHER `_hook claude` entry left behind by an `ms`
-  // that moved. `--fix` repairs either, by re-running the installer, which
-  // replaces every ms-owned entry rather than adding beside it.
-  if (!fix) return { ok: false, what, why: `not all four present (or a stale ms entry remains) in ${settingsPath} for ${msBin}` };
+  // "for `msBin`" covers both halves of what installed now means: every one
+  // of the entries present, AND no OTHER `_hook claude` entry left behind by
+  // an `ms` that moved. `--fix` repairs either, by re-running the installer,
+  // which replaces every ms-owned entry rather than adding beside it. The
+  // count comes from the installer's own event table, so a sixth event would
+  // never leave this line saying five.
+  if (!fix) return { ok: false, what, why: `not all ${CLAUDE_HOOK_ENTRIES} present (or a stale ms entry remains) in ${settingsPath} for ${msBin}` };
   try {
     installClaudeHooks(settingsPath, msBin);
   } catch (e) {
@@ -801,6 +803,14 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
   if (codexAccounts.length > 0) {
     const st = openState();
     try { results.push({ ok: true, what: codexAutorotateLine(codexAutorotateEnabled(st)) }); } finally { st.close(); }
+  }
+  // The rebalance gate, stated on the same terms and for both providers: it
+  // ships OFF in 0.3.1, it is a stored setting for the same reason the Codex
+  // one is, and the off half names the SHELL the export has to happen in —
+  // the mistake this gate invites. Never a ✗; off is the default, not a fault.
+  {
+    const st = openState();
+    try { results.push({ ok: true, what: rebalanceLine(rebalanceEnabled(st)) }); } finally { st.close(); }
   }
   for (const a of codexAccounts) {
     results.push(...(await checkCodexAccount(a, fix)));

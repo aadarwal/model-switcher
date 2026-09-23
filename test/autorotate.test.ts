@@ -6,6 +6,11 @@ import {
   codexAutorotateEnv,
   codexAutorotateLine,
   syncCodexAutorotate,
+  REBALANCE_KEY,
+  rebalanceEnabled,
+  rebalanceEnv,
+  rebalanceLine,
+  syncRebalance,
   type AutorotateStore,
 } from "../src/autorotate.ts";
 
@@ -105,4 +110,74 @@ test("syncCodexAutorotate mirrors an export, and an unset variable changes nothi
 test("the doctor line names the export that would flip it, both ways round", () => {
   assert.equal(codexAutorotateLine(true), "codex auto-recovery: on (export MS_CODEX_AUTOROTATE=0 to disable)");
   assert.equal(codexAutorotateLine(false), "codex auto-recovery: off (export MS_CODEX_AUTOROTATE=1 to enable)");
+});
+
+// --- The rebalance gate --------------------------------------------------
+
+function withRebalanceEnv(v: string | undefined, fn: () => void): void {
+  const saved = process.env.MS_REBALANCE;
+  if (v === undefined) delete process.env.MS_REBALANCE;
+  else process.env.MS_REBALANCE = v;
+  try { fn(); } finally {
+    if (saved === undefined) delete process.env.MS_REBALANCE;
+    else process.env.MS_REBALANCE = saved;
+  }
+}
+
+test("the rebalance gate defaults OFF, everywhere silence is the answer", () => {
+  // The inverse of the Codex gate above, and deliberately: this rule moves
+  // work nobody asked it to move, so 0.3.1 ships it behind a switch.
+  withRebalanceEnv(undefined, () => {
+    assert.equal(rebalanceEnabled(store()), false);
+    assert.equal(rebalanceEnabled(store({ nothing: "1" })), false);
+  });
+  withRebalanceEnv("", () => assert.equal(rebalanceEnabled(store()), false, "an empty export is not somebody saying yes"));
+});
+
+test("only an exact '1' turns rebalance on, from either the store or the shell", () => {
+  withRebalanceEnv(undefined, () => {
+    assert.equal(rebalanceEnabled(store({ [REBALANCE_KEY]: "1" })), true);
+    assert.equal(rebalanceEnabled(store({ [REBALANCE_KEY]: "0" })), false);
+    assert.equal(rebalanceEnabled(store({ [REBALANCE_KEY]: "yes" })), false, "an unrecognised row falls back to the default, which is off");
+  });
+  withRebalanceEnv("1", () => assert.equal(rebalanceEnabled(store()), true));
+  for (const v of ["0", "true", "yes", "01", " 1"]) {
+    withRebalanceEnv(v, () => assert.equal(rebalanceEnabled(store()), false, v));
+  }
+});
+
+test("the stored rebalance gate WINS over the environment — the tmux-dispatched case", () => {
+  withRebalanceEnv("1", () => assert.equal(rebalanceEnabled(store({ [REBALANCE_KEY]: "0" })), false, "stored off beats env on"));
+  withRebalanceEnv("0", () => assert.equal(rebalanceEnabled(store({ [REBALANCE_KEY]: "1" })), true, "stored on beats env off"));
+});
+
+test("the rebalance environment is three-valued, exactly as the Codex one is", () => {
+  withRebalanceEnv(undefined, () => assert.equal(rebalanceEnv(), null));
+  withRebalanceEnv("", () => assert.equal(rebalanceEnv(), null));
+  withRebalanceEnv("1", () => assert.equal(rebalanceEnv(), true));
+  withRebalanceEnv("0", () => assert.equal(rebalanceEnv(), false));
+});
+
+test("syncRebalance mirrors an export, and an unset variable changes nothing", () => {
+  const s1 = store();
+  withRebalanceEnv("1", () => syncRebalance(s1));
+  assert.equal(s1.map.get(REBALANCE_KEY), "1");
+
+  const s2 = store({ [REBALANCE_KEY]: "1" });
+  withRebalanceEnv("0", () => syncRebalance(s2));
+  assert.equal(s2.map.get(REBALANCE_KEY), "0", "turning it off travels too");
+
+  const s3 = store({ [REBALANCE_KEY]: "1" });
+  withRebalanceEnv(undefined, () => syncRebalance(s3));
+  assert.equal(s3.map.get(REBALANCE_KEY), "1");
+  assert.equal(s3.writes, 0, "and nothing was written");
+
+  const s4 = store({ [REBALANCE_KEY]: "1" });
+  withRebalanceEnv("1", () => syncRebalance(s4));
+  assert.equal(s4.writes, 0, "an unchanged gate is not rewritten on every turn");
+});
+
+test("the rebalance doctor line names the shell the export has to happen in", () => {
+  assert.equal(rebalanceLine(false), "rebalance: off (export MS_REBALANCE=1 in the shell that runs claude/codex)");
+  assert.equal(rebalanceLine(true), "rebalance: on (export MS_REBALANCE=0 to disable)");
 });

@@ -231,6 +231,11 @@ test("startDashboard binds 127.0.0.1 and GET / returns HTML with both table head
   assert.ok(html.includes('id="moveall-provider"'), "move-all provider select missing");
   assert.ok(html.includes('id="moveall-account"'), "move-all account select missing");
   assert.ok(html.includes('id="moveall-go"'), "move-all Go control missing");
+  // The Rebalance control sits on that same row (the spec's Visibility
+  // section: "the dashboard gets a Rebalance control on the same row as
+  // Move every pane").
+  assert.ok(html.includes('id="rebalance-go"'), "Rebalance control missing");
+  assert.ok(html.includes('id="rebalance-msg"'), "Rebalance answer line missing");
 
   // Mutation check for the binding rule itself: never 0.0.0.0.
   const bound = new URL(dash.url);

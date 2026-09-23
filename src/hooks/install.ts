@@ -8,13 +8,23 @@ type Settings = Record<string, unknown> & { hooks?: Record<string, HookEntry[]> 
 
 /** The events the Claude hook subscribes to, with the matcher each needs.
  * `StopFailure` matches only `rate_limit` — every other failure is somebody
- * else's problem and must not wake a recovery worker. */
+ * else's problem and must not wake a recovery worker. `Stop` is its opposite
+ * number: the turn that ENDED, which is the only moment rebalance
+ * (src/rebalance.ts) is allowed to move a session, and which records no event
+ * of its own — Claude Code needs no `stop` in the log the way Codex does. */
 const EVENTS: readonly [string, string][] = [
   ["SessionStart", ""],
   ["UserPromptSubmit", ""],
+  ["Stop", ""],
   ["StopFailure", "rate_limit"],
   ["SessionEnd", ""],
 ];
+
+/** How many entries a complete install writes — five since `Stop` joined the
+ * set in 0.3.1, four before it. Derived rather than written out, because the
+ * number appeared in four comments and one line `ms doctor` prints, and every
+ * one of them was still saying "four" the day after the fifth landed. */
+export const CLAUDE_HOOK_ENTRIES = EVENTS.length;
 
 /** The exact command string an installed entry carries. `msBin` is quoted
  * the same way the statusline wrapper and the alias block quote it — Claude
@@ -57,9 +67,9 @@ export function isMsHookCommand(command: unknown): boolean {
   return typeof command === "string" && /\s_hook\s+claude\s*$/.test(command);
 }
 
-/** True when the four entries for THIS binary are present AND no OTHER ms
- * entry is left anywhere in the file. Both halves matter: four correct
- * entries beside a fifth that names a deleted checkout means Claude Code
+/** True when every one of the five entries for THIS binary is present AND no
+ * OTHER ms entry is left anywhere in the file. Both halves matter: a complete
+ * set beside one more entry that names a deleted checkout means Claude Code
  * runs a dead hook on every SessionStart (or, when the checkout is still
  * there, a second, older hook build sends duplicate `started` events). A
  * stale entry is therefore a ✗ the doctor reports and `--fix` prunes, not a
@@ -78,16 +88,16 @@ export function claudeHooksInstalled(settingsPath: string, msBin: string): boole
 }
 
 /**
- * Put the four `ms _hook claude` entries into a Claude settings file — by
+ * Put the five `ms _hook claude` entries into a Claude settings file — by
  * REPLACING whatever this tool left there before, never by appending beside
  * it.
  *
  * `ms` moves: a checkout becomes a brew keg, a keg becomes the next version's
- * keg. Every move used to add four more entries and leave the old four in
- * place, so a settings file three moves along carried twelve, most of them
- * naming a binary that no longer exists. So: strip every ms-owned command
- * first (recognised by its argv shape, whatever path it names — see
- * `isMsHookCommand`), then add this binary's four.
+ * keg. Every move used to add a whole new set of entries and leave the old
+ * set in place, so a settings file three moves along carried three of them,
+ * most naming a binary that no longer exists. So: strip every ms-owned
+ * command first (recognised by its argv shape, whatever path it names — see
+ * `isMsHookCommand`), then add this binary's set.
  *
  * Only `hooks` is touched: every other key, every hook entry that is not
  * ours, and every other tool's command sharing an entry with ours, is
@@ -136,7 +146,7 @@ export function installClaudeHooks(settingsPath: string, msBin: string): { chang
     else hooks[event] = kept;
   }
 
-  // Pass 2: add this binary's four, each in its own entry, with its matcher.
+  // Pass 2: add this binary's set, each event in its own entry, with its matcher.
   for (const [event, matcher] of EVENTS) {
     const list = hooks[event];
     if (list === undefined) { hooks[event] = [{ matcher, hooks: [ours] }]; continue; }

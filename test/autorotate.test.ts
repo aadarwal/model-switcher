@@ -124,26 +124,29 @@ function withRebalanceEnv(v: string | undefined, fn: () => void): void {
   }
 }
 
-test("the rebalance gate defaults OFF, everywhere silence is the answer", () => {
-  // The inverse of the Codex gate above, and deliberately: this rule moves
-  // work nobody asked it to move, so 0.3.1 ships it behind a switch.
+test("absent everywhere is ON: rebalance joins Codex auto-recovery in defaulting on", () => {
+  // It shipped off in 0.3.1 while nobody had watched it move work; that
+  // observation is done, so — like the Codex gate above — silence means on.
   withRebalanceEnv(undefined, () => {
-    assert.equal(rebalanceEnabled(store()), false);
-    assert.equal(rebalanceEnabled(store({ nothing: "1" })), false);
+    assert.equal(rebalanceEnabled(store()), true);
+    assert.equal(rebalanceEnabled(store({ nothing: "1" })), true);
   });
-  withRebalanceEnv("", () => assert.equal(rebalanceEnabled(store()), false, "an empty export is not somebody saying yes"));
+  withRebalanceEnv("", () => assert.equal(rebalanceEnabled(store()), true, "an empty export is not somebody saying no"));
 });
 
-test("only an exact '1' turns rebalance on, from either the store or the shell", () => {
+test("only an exact '0' turns rebalance off, from either the store or the shell", () => {
   withRebalanceEnv(undefined, () => {
     assert.equal(rebalanceEnabled(store({ [REBALANCE_KEY]: "1" })), true);
     assert.equal(rebalanceEnabled(store({ [REBALANCE_KEY]: "0" })), false);
-    assert.equal(rebalanceEnabled(store({ [REBALANCE_KEY]: "yes" })), false, "an unrecognised row falls back to the default, which is off");
+    assert.equal(rebalanceEnabled(store({ [REBALANCE_KEY]: "yes" })), true, "an unrecognised row falls back to the default, which is on");
   });
-  withRebalanceEnv("1", () => assert.equal(rebalanceEnabled(store()), true));
-  for (const v of ["0", "true", "yes", "01", " 1"]) {
+  withRebalanceEnv("0", () => assert.equal(rebalanceEnabled(store()), false));
+  // Only "1" is yes, so every other exported value — including an explicit
+  // "true" — is read as off, the same rule rebalanceEnv states.
+  for (const v of ["true", "no", "01", " 1"]) {
     withRebalanceEnv(v, () => assert.equal(rebalanceEnabled(store()), false, v));
   }
+  withRebalanceEnv("1", () => assert.equal(rebalanceEnabled(store()), true));
 });
 
 test("the stored rebalance gate WINS over the environment — the tmux-dispatched case", () => {
@@ -177,7 +180,7 @@ test("syncRebalance mirrors an export, and an unset variable changes nothing", (
   assert.equal(s4.writes, 0, "an unchanged gate is not rewritten on every turn");
 });
 
-test("the rebalance doctor line names the shell the export has to happen in", () => {
-  assert.equal(rebalanceLine(false), "rebalance: off (export MS_REBALANCE=1 in the shell that runs claude/codex)");
+test("the rebalance doctor line names the export that would flip it, both ways round", () => {
   assert.equal(rebalanceLine(true), "rebalance: on (export MS_REBALANCE=0 to disable)");
+  assert.equal(rebalanceLine(false), "rebalance: off (export MS_REBALANCE=1 to enable)");
 });

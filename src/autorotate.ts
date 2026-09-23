@@ -101,13 +101,12 @@ export function codexAutorotateLine(on: boolean): string {
 // above is: the processes that read it include ones tmux dispatches, which
 // carry the SERVER's environment and not the shell that typed the export.
 //
-// The one difference is the default, and it is the whole point of shipping it
-// this way: absent means OFF. Automatic Codex recovery earned its default by
-// being watched against 85 real walls; this rule moves work nobody asked it to
-// move, so it ships behind a switch in 0.3.1 and flips to on in 0.3.2 once it
-// has been observed doing the right thing.
+// The one difference from the Codex gate was the default, and even that gap
+// is closed now: it shipped behind a switch in 0.3.1, flipped observed
+// behavior over 0.3.2–0.3.3, and now joins Codex auto-recovery in defaulting
+// on — absent means ON, the same three-valued reasoning as above.
 
-/** The one key. Its value is exactly "1" or "0"; absent is off. */
+/** The one key. Its value is exactly "1" or "0"; absent is on. */
 export const REBALANCE_KEY = "rebalance";
 
 /**
@@ -128,15 +127,15 @@ export function rebalanceEnv(): boolean | null {
  * the only thing a tmux-dispatched process can see; the environment is the
  * fallback while nothing has mirrored one yet.
  *
- * Only an explicit "on" turns this on — a stored "1", or, while nothing has
- * been stored, an exported `MS_REBALANCE` that is exactly "1". Everything
- * else, silence included, is off.
+ * Only an explicit "off" turns this off — a stored "0", or, while nothing has
+ * been stored, an exported `MS_REBALANCE` that is not "1". Everything else,
+ * silence included, is on.
  */
 export function rebalanceEnabled(st: AutorotateStore): boolean {
   const stored = st.getKv(REBALANCE_KEY);
   if (stored === "1") return true;
   if (stored === "0") return false;
-  return rebalanceEnv() === true;
+  return rebalanceEnv() !== false;
 }
 
 /**
@@ -156,12 +155,11 @@ export function syncRebalance(st: AutorotateStore): void {
   st.setKv(REBALANCE_KEY, want);
 }
 
-/** The doctor line's text, so the gate is stated in exactly one place. The
- *  off half names the shell the export has to happen in, because that is the
- *  mistake this gate invites: a variable exported in some other terminal is
- *  one no hook will ever see. */
+/** The doctor line's text, so the gate is stated in exactly one place. Each
+ *  half names the export that would flip it, in the shell that runs
+ *  `claude`/`codex` — the same shape the Codex gate's line uses. */
 export function rebalanceLine(on: boolean): string {
   return on
     ? "rebalance: on (export MS_REBALANCE=0 to disable)"
-    : "rebalance: off (export MS_REBALANCE=1 in the shell that runs claude/codex)";
+    : "rebalance: off (export MS_REBALANCE=1 to enable)";
 }

@@ -49,11 +49,14 @@ const sess = (o: Partial<RebalanceSession> = {}): RebalanceSession => ({
 
 /** The baseline: two accounts, `here` is where the session is, `there` resets
  *  sooner so the chooser prefers it — but neither condition holds, so nothing
- *  moves until a test makes one true. */
+ *  moves until a test makes one true. The reset gap between them is
+ *  deliberately UNDER condition 2's 24 h floor (12 h here), so this baseline
+ *  does not itself satisfy "clearly better budget" now that condition 2 no
+ *  longer also requires the current week to be any particular amount spent. */
 function input(o: Partial<DecisionInput> = {}): DecisionInput {
   return {
     session: sess(),
-    accounts: [acct("here", { weeklyAll: w(20, at(120)) }), acct("there", { weeklyAll: w(20, at(48)) })],
+    accounts: [acct("here", { weeklyAll: w(20, at(60)) }), acct("there", { weeklyAll: w(20, at(48)) })],
     now: NOW,
     lastMoveAt: null,
     lastWallAt: null,
@@ -76,9 +79,12 @@ test("condition 1: a gating window at 85 on the current account moves to one wit
 });
 
 test("condition 1 is a floor at exactly 85, and 84.9 is not it", () => {
+  // The weekly reset gap is kept under condition 2's 24 h floor throughout,
+  // so a session below the wall threshold genuinely moves nothing — not
+  // "moves for the other reason instead".
   const near = (used: number) => decide(input({
     accounts: [
-      acct("here", { session: w(used, at(3)), weeklyAll: w(20, at(120)) }),
+      acct("here", { session: w(used, at(3)), weeklyAll: w(20, at(60)) }),
       acct("there", { weeklyAll: w(20, at(48)) }),
     ],
   }));
@@ -103,9 +109,11 @@ test("condition 1 reads the WEEKLY window too, not only the 5 h one", () => {
 });
 
 test("condition 1 refuses a destination with less than 30 % room in a gating window", () => {
+  // Same reset-gap discipline as above: under 24 h, so a destination this
+  // test wants refused on ROOM alone is not rescued by condition 2 instead.
   const dest = (used: number) => decide(input({
     accounts: [
-      acct("here", { session: w(90, at(3)), weeklyAll: w(20, at(120)) }),
+      acct("here", { session: w(90, at(3)), weeklyAll: w(20, at(60)) }),
       acct("there", { weeklyAll: w(used, at(48)) }),
     ],
   }));
@@ -119,8 +127,11 @@ test("condition 1 refuses a destination with less than 30 % room in a gating win
 });
 
 test("condition 1's gating windows follow the session's need", () => {
+  // `here`'s weeklyAll reset is pinned within 24 h of `there`'s so the "any"
+  // case below is refused for the reason under test, not rescued by
+  // condition 2's reset-lead test instead.
   const accounts = [
-    acct("here", { weeklyFable: w(95, at(120)) }),
+    acct("here", { weeklyAll: w(20, at(60)), weeklyFable: w(95, at(120)) }),
     acct("there", { weeklyAll: w(20, at(48)) }),
   ];
   assert.equal(decide(input({ accounts, session: sess({ need: "any" }) })).move, false,
@@ -130,7 +141,7 @@ test("condition 1's gating windows follow the session's need", () => {
 
 // --- Condition 2: a clearly better budget --------------------------------
 
-test("condition 2: a week that resets 24 h earlier, against a current week half spent", () => {
+test("condition 2: a week that resets 24 h earlier moves, whatever the current week has used", () => {
   const d = decide(input({
     accounts: [
       acct("here", { weeklyAll: w(50, at(48)) }),
@@ -151,17 +162,15 @@ test("condition 2's lead is exactly 24 h, and 23 h 59 m is not it", () => {
   assert.equal(lead(24.02).move, false, "a lead just under 24 h is not clearly better");
 });
 
-test("condition 2 needs the current week at least half spent", () => {
+test("condition 2 does not require the current account to be half used: current at 5 % still moves when the reset is 24 h earlier", () => {
   const spent = (used: number) => decide(input({
     accounts: [
       acct("here", { weeklyAll: w(used, at(48)) }),
       acct("there", { weeklyAll: w(10, at(24)) }),
     ],
   }));
-  assert.equal(spent(50).move, true, "half spent is the spec's floor");
-  assert.equal(spent(49).move, false);
-  assert.equal(spent(49.9).move, false, "a barely used week is not worth churning a session for");
-  assert.equal(spent(REBALANCE_RULES.WEEK_USED_PERCENT).move, true, "the floor is inclusive");
+  assert.equal(spent(5).move, true, "a sooner reset is reason enough, however little the current week has used");
+  assert.equal(spent(0).move, true, "even an untouched budget loses to a reset 24 h sooner");
 });
 
 test("a week that resets LATER on the best account never moves anything", () => {
@@ -414,6 +423,7 @@ function session(st: State, id: string, o: Partial<SessionRow> = {}): void {
 }
 
 const gateOn = (st: State) => st.setKv(REBALANCE_KEY, "1");
+const gateOff = (st: State) => st.setKv(REBALANCE_KEY, "0");
 
 /** `maybeRebalance` answers null only for a session the store does not have.
  *  Every call below names one it does, so the null is an assertion, not a
@@ -481,11 +491,24 @@ test("the gate off costs one store read and nothing else: no snapshot, no move",
   const w = world();
   t.after(() => w.st.close());
   session(w.st, "s1");
+  gateOff(w.st);
   const { d, calls } = deps();
   const decision = await rebalanced("s1", d);
   assert.deepEqual(decision, { move: false, better: null, reason: "the gate is off" });
   assert.equal(calls.snapshot, 0, "the gate is asked before the snapshot, so off costs no reading at all");
   assert.deepEqual(calls.dispatch, []);
+});
+
+test("the gate defaults ON: nothing stored, no env, and a condition true still moves", async (t) => {
+  const w = world();
+  t.after(() => w.st.close());
+  session(w.st, "s1");
+  // No gateOn/gateOff call: nothing has ever been stored, and `world()` has
+  // already deleted MS_REBALANCE — this is the untouched, out-of-the-box state.
+  const { d, calls } = deps();
+  const decision = await rebalanced("s1", d);
+  assert.deepEqual(decision, { move: true, to: "there", better: "there", reason: "imminent-wall" });
+  assert.deepEqual(calls.dispatch, [{ id: "s1", to: "there" }]);
 });
 
 test("the gate on and a condition true: one dispatch, one event, one stamp", async (t) => {

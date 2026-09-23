@@ -285,7 +285,8 @@ of two conditions holds:
 - **an imminent wall** — a window the chooser gates on is at 85 % or more on the current
   account, and the best account has at least 30 % room in every one of its own;
 - **a clearly better budget** — the best account's week resets at least 24 h earlier than
-  the current one's, and the current week is at least 50 % spent.
+  the current one's. That is the whole test: a sooner reset is worth more now regardless of
+  how much the current account has used.
 
 **The guards**, all of which must pass: the pane reads idle (never mid-turn — it is re-read
 by the decision and again inside the transaction); no move of that session by any hand in
@@ -296,7 +297,7 @@ run. The move itself is the `ms switch` transaction with **no continuation**: th
 ended, so there is nothing to carry over and nothing is typed into a pane its human left
 quiet. A Claude session stays Claude; there are no cross-provider moves and no projections.
 
-**The gate.** Automatic moves are off unless `MS_REBALANCE=1` (see
+**The gate.** Automatic moves are on unless `MS_REBALANCE=0` (see
 [Configuration](#configuration)); `ms doctor` prints the state it will act on. Nothing
 stays resident either way: the trigger is the turn-end hook, and usage is re-read at most
 once every 15 minutes across the whole fleet.
@@ -344,7 +345,7 @@ only, and stored at rest in that same 0600 file.
 | `MS_HOME` | Where all state lives. Default `~/.config/model-switcher`. |
 | `MS_BIN` | The absolute `ms` path written into hook commands, Codex trust hashes, the statusline wrapper and the alias block. The Homebrew shim sets it to `/opt/homebrew/opt/model-switcher/bin/ms` — the stable path, so everything the wizard wrote survives an upgrade. Set it yourself only when running `ms` from somewhere unusual. |
 | `MS_CODEX_AUTOROTATE` | Automatic recovery for Codex sessions. Unset, empty, or exactly `1` is **on**; **every other value reads as off** — `0`, but `false`, `no` and a typo too, because only `1` is read as yes. Export it in the shell that runs `codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched watchdog and worker read it too. A mirrored `off` is a stored row and outlives the variable — unsetting it later does not turn recovery back on; export `MS_CODEX_AUTOROTATE=1` (and run an `ms codex`, which mirrors) to do that. `ms doctor` prints the state it will act on. Ships on. |
-| `MS_REBALANCE` | [Rebalance](#rebalance): moving an idle session to a better account at a turn end. **Off unless the value is exactly `1`** — the reverse of `MS_CODEX_AUTOROTATE`'s default, because this rule moves sessions nothing is wrong with. Export it in the shell that runs `claude`/`codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched hooks read it too. It gates only the AUTOMATIC moves; `ms rebalance` works either way. `ms doctor` prints the state it will act on. Ships off. |
+| `MS_REBALANCE` | [Rebalance](#rebalance): moving an idle session to a better account at a turn end. Unset, empty, or exactly `1` is **on**; **every other value reads as off** — the same shape as `MS_CODEX_AUTOROTATE`, now that a sooner weekly reset alone has been observed doing the right thing. Export it in the shell that runs `claude`/`codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched hooks read it too. A mirrored `off` is a stored row and outlives the variable — unsetting it later does not turn rebalance back on; export `MS_REBALANCE=1` (and run an `ms claude`/`ms codex`, which mirrors) to do that. It gates only the AUTOMATIC moves; `ms rebalance` works either way. `ms doctor` prints the state it will act on. Ships on since 0.3.4; `MS_REBALANCE=0` disables it. |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere `ms` reads or writes that settings file. |
 | `MS_VERBOSE` | `1` prints what each invocation's start-of-run repair did. |
 | `MS_ENTRY` | `src` or `dist` — which entry point `bin/ms` runs. For development; the brew shim sets `dist`. |

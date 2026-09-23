@@ -397,10 +397,20 @@ test("a turn end with the gate off writes nothing and dispatches nothing", async
   const { env, msHome, tlog } = setupLive();
   await seedSession(env, { account: "here" });
   fleet(msHome, WALL_COMING);
-  const r = run(["_hook", "claude"], { ...env, ...LOUD }, JSON.stringify({ hook_event_name: "Stop", session_id: "c-42" }));
+  const r = run(["_hook", "claude"], { ...env, MS_REBALANCE: "0", ...LOUD }, JSON.stringify({ hook_event_name: "Stop", session_id: "c-42" }));
   assert.deepEqual([r.code, r.stdout, r.stderr], [0, "", ""], "a turn end is not a place to print");
   assert.equal(eventsExist(msHome), false, "Stop writes no event of its own");
-  assert.equal(tmuxLog(tlog), "", "the gate is off by default, and off costs not one tmux call");
+  assert.equal(tmuxLog(tlog), "", "the gate is off, and off costs not one tmux call");
+});
+
+test("a turn end with nothing set (the default since 0.3.4) dispatches too", async () => {
+  const { env, msHome, tlog } = setupLive();
+  await seedSession(env, { account: "here" });
+  fleet(msHome, WALL_COMING);
+  const r = run(["_hook", "claude"], { ...env, ...LOUD }, JSON.stringify({ hook_event_name: "Stop", session_id: "c-42" }));
+  assert.deepEqual([r.code, r.stdout, r.stderr], [0, "", ""]);
+  const dispatched = readFileSync(tlog, "utf8").split("\n").filter((l) => l.includes("_rebalance"));
+  assert.equal(dispatched.length, 1, "silence means on now, not off");
 });
 
 test("a turn end with the gate on dispatches the switch worker, once", async () => {

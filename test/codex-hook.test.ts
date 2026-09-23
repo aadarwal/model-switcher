@@ -418,10 +418,20 @@ test("a Codex turn end with the gate off dispatches nothing", async () => {
   const { env, msHome, tlog } = setupLive();
   await seedSession(env);
   codexFleet(msHome, BETTER_WEEK);
-  const r = run(["_hook", "codex"], { ...env, ...LOUD }, JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-1" }));
+  const r = run(["_hook", "codex"], { ...env, MS_REBALANCE: "0", ...LOUD }, JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-1" }));
   assert.deepEqual([r.code, r.stdout, r.stderr], [0, "", ""]);
   assert.equal(events(msHome).pop()!.kind, "stop", "the turn is still recorded");
   assert.doesNotMatch(tmuxLog(tlog), /_rebalance/);
+});
+
+test("a Codex turn end with nothing set (the default since 0.3.4) dispatches too", async () => {
+  const { env, msHome, tlog } = setupLive();
+  await seedSession(env);
+  codexFleet(msHome, BETTER_WEEK);
+  const r = run(["_hook", "codex"], { ...env, ...LOUD }, JSON.stringify({ hook_event_name: "Stop", session_id: "cx-7", turn_id: "t-1" }));
+  assert.deepEqual([r.code, r.stdout, r.stderr], [0, "", ""]);
+  const kinds = events(msHome).map((e) => e.kind);
+  assert.deepEqual(kinds, ["stop", "rebalance"], "silence means on now, not off");
 });
 
 test("a Codex turn end with the gate on records the stop AND dispatches the move", async () => {

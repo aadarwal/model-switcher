@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4
+
+- rebalance: a sooner weekly reset is reason enough to move an idle session
+  (the half-used clause is gone), and it is on by default (MS_REBALANCE=0
+  disables)
+
 ## 0.3.3
 
 - the statusline wrapper no longer drops output a wrapped command wrote just

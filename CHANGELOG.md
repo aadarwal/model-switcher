@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6
+
+- codex accounts share your own ~/.codex conversations, memories and history — only
+  auth.json and the rendered config differ per account; existing per-account stores are
+  merged in and kept as backups
+
 ## 0.3.5
 
 - codex accounts run with your own `~/.codex/config.toml` (model, reasoning

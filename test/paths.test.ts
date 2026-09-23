@@ -67,3 +67,39 @@ test("a non-existent MS_HOME resolves to the literal path, and ensureStore still
   assert.equal(existsSync(fresh), true);
   assert.equal(statSync(fresh).mode & 0o777, 0o700);
 });
+
+test("the Codex base is ~/.codex, MS_CODEX_BASE_DIR moves it, and the base config follows it unless named itself", async () => {
+  const { codexBaseDir, codexBaseConfigPath } = await import("../src/paths.ts");
+  const saved = { home: process.env.HOME, dir: process.env.MS_CODEX_BASE_DIR, cfg: process.env.MS_CODEX_BASE_CONFIG };
+  try {
+    process.env.HOME = "/Users/someone";
+    delete process.env.MS_CODEX_BASE_DIR;
+    delete process.env.MS_CODEX_BASE_CONFIG;
+    assert.equal(codexBaseDir(), "/Users/someone/.codex");
+    assert.equal(codexBaseConfigPath(), "/Users/someone/.codex/config.toml");
+    // NOT $CODEX_HOME: inside an ms pane that names the account home itself.
+    process.env.CODEX_HOME = "/Users/someone/.config/model-switcher/codex/work";
+    assert.equal(codexBaseDir(), "/Users/someone/.codex");
+    delete process.env.CODEX_HOME;
+
+    process.env.MS_CODEX_BASE_DIR = "/tmp/elsewhere/.codex";
+    assert.equal(codexBaseDir(), "/tmp/elsewhere/.codex");
+    assert.equal(codexBaseConfigPath(), "/tmp/elsewhere/.codex/config.toml");
+    process.env.MS_CODEX_BASE_CONFIG = "/tmp/pinned/config.toml";
+    assert.equal(codexBaseConfigPath(), "/tmp/pinned/config.toml");
+  } finally {
+    const put = (name: string, v: string | undefined) => (v === undefined ? delete process.env[name] : (process.env[name] = v));
+    put("HOME", saved.home);
+    put("MS_CODEX_BASE_DIR", saved.dir);
+    put("MS_CODEX_BASE_CONFIG", saved.cfg);
+  }
+});
+
+test("ensureStore no longer makes codex/sessions — since 0.3.6 that path is a link, made by the linker", async () => {
+  const { msHome } = tempHome();
+  process.env.MS_HOME = msHome;
+  const { ensureStore } = await import("../src/paths.ts");
+  ensureStore();
+  assert.equal(existsSync(path.join(msHome, "codex")), true);
+  assert.equal(existsSync(path.join(msHome, "codex", "sessions")), false);
+});

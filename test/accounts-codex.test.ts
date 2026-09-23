@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { run, stubDir, tempHome } from "./helpers.ts";
@@ -114,6 +114,8 @@ function scene(opts: Opts = {}) {
   const env: Record<string, string> = {
     HOME: home,
     MS_HOME: msHome,
+    // This scene's own ~/.codex: the base every codex home is linked into.
+    MS_CODEX_BASE_DIR: path.join(home, ".codex"),
     PATH: `${bin}:${process.env.PATH}`,
     NODE_OPTIONS: `--disable-warning=ExperimentalWarning --import=${pathToFileURL(fetchStub).href}`,
     MS_TEST_CODEX_LOG: codexLog,
@@ -131,6 +133,7 @@ function scene(opts: Opts = {}) {
   return {
     home,
     msHome,
+    base: path.join(home, ".codex"),
     sharedSessions: path.join(msHome, "codex", "sessions"),
     codexHome: (n: string) => path.join(msHome, "codex", n),
     codexCalls: (): CodexCall[] =>
@@ -171,18 +174,69 @@ function scene(opts: Opts = {}) {
 
 // --- add ---------------------------------------------------------------
 
-test("add --provider codex creates the home with a shared sessions link", () => {
+test("add --provider codex creates the home as a view of ~/.codex: its sessions is the base's", () => {
   const s = scene();
+  // A base with some of the human's own state already in it.
+  mkdirSync(path.join(s.base, "sessions"), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(s.base, "history.jsonl"), '{"text":"mine"}\n');
+  writeFileSync(path.join(s.base, "auth.json"), "{\"personal\":true}");
   const r = s.ms(["add", "work", "--provider", "codex"]);
   assert.equal(r.code, 0, r.stderr);
   const home = s.codexHome("work");
   assert.equal(statSync(home).mode & 0o777, 0o700);
-  assert.ok(lstatSync(path.join(home, "sessions")).isSymbolicLink());
-  assert.equal(readlinkSync(path.join(home, "sessions")), s.sharedSessions);
-  assert.equal(statSync(s.sharedSessions).mode & 0o777, 0o700);
+  assert.equal(readlinkSync(path.join(home, "sessions")), path.join(s.base, "sessions"));
+  assert.equal(readlinkSync(path.join(home, "history.jsonl")), path.join(s.base, "history.jsonl"));
+  // The human's own credential is the one thing that never crosses.
+  assert.equal(existsSync(path.join(home, "auth.json")), false);
+  // The store path this tool reads through is a link to the same place.
+  assert.equal(readlinkSync(s.sharedSessions), path.join(s.base, "sessions"));
+  assert.match(r.stdout, /work: linked 2 entries of .*\.codex/);
   assert.deepEqual(s.row("work"), {
     name: "work", provider: "codex", label: "work", orgId: null, shared: false, identityVerified: false,
   });
+});
+
+test("add --provider codex creates a missing ~/.codex 0700 with an empty sessions", () => {
+  const s = scene();
+  const r = s.ms(["add", "work", "--provider", "codex"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(statSync(s.base).mode & 0o777, 0o700);
+  assert.deepEqual(readdirSync(path.join(s.base, "sessions")), []);
+  assert.equal(readlinkSync(path.join(s.codexHome("work"), "sessions")), path.join(s.base, "sessions"));
+  assert.match(r.stdout, /work: created .*\.codex/);
+});
+
+test("add again on a codex account re-links its home, keeps its one row, and a third run says nothing", () => {
+  const s = scene();
+  assert.equal(s.ms(["add", "work", "--provider", "codex"]).code, 0);
+  const home = s.codexHome("work");
+  // A home as it was before 0.3.6: its sessions at the retired store, and a
+  // history codex wrote there itself.
+  rmSync(path.join(home, "sessions"));
+  rmSync(s.sharedSessions);
+  mkdirSync(path.join(s.sharedSessions, "2026", "09", "16"), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(s.sharedSessions, "2026", "09", "16", "rollout-2026-09-16T10-00-00-ms-1.jsonl"), "{}\n");
+  symlinkSync(s.sharedSessions, path.join(home, "sessions"));
+  writeFileSync(path.join(home, "history.jsonl"), '{"text":"from the account"}\n');
+
+  const again = s.ms(["add", "work", "--provider", "codex"]);
+  assert.equal(again.code, 0, again.stderr);
+  assert.equal(s.accounts().length, 1, "no second row");
+  assert.equal(readlinkSync(path.join(home, "sessions")), path.join(s.base, "sessions"));
+  assert.equal(readlinkSync(path.join(home, "history.jsonl")), path.join(s.base, "history.jsonl"));
+  assert.ok(existsSync(path.join(s.base, "sessions", "2026", "09", "16", "rollout-2026-09-16T10-00-00-ms-1.jsonl")), "the old store's rollout is in ~/.codex");
+  assert.equal(readFileSync(path.join(s.base, "history.jsonl"), "utf8"), '{"text":"from the account"}\n');
+  assert.match(again.stdout, /merged .*codex\/sessions into .*\.codex\/sessions/);
+
+  const third = s.ms(["add", "work", "--provider", "codex"]);
+  assert.equal(third.code, 0, third.stderr);
+  assert.equal(third.stdout, "", "nothing to do, nothing said");
+  assert.equal(third.stderr, "");
+
+  const labelled = s.ms(["add", "work", "--provider", "codex", "--label", "New"]);
+  assert.equal(labelled.code, 2);
+  assert.match(labelled.stderr, /only re-links its home/);
+  assert.equal(s.row("work").label, "work");
 });
 
 test("add --provider codex carries the label and the shared flag, and rejects an unknown provider", () => {
@@ -210,8 +264,11 @@ test("a Codex name may equal a Claude name (per-provider uniqueness)", () => {
   assert.equal(s.ms(["add", "gmail"]).code, 0);
   assert.equal(s.ms(["add", "gmail", "--provider", "codex"]).code, 0);
   assert.deepEqual(s.accounts().map((a) => `${a.provider}:${a.name}`), ["claude:gmail", "codex:gmail"]);
-  // ...and a second codex `gmail` is still a duplicate.
-  assert.equal(s.ms(["add", "gmail", "--provider", "codex"]).code, 2);
+  // ...and a second codex `gmail` is not a second row: `add` on an existing
+  // codex account only re-links its home (0.3.6). A second claude `gmail` is
+  // still a duplicate.
+  assert.equal(s.ms(["add", "gmail", "--provider", "codex"]).code, 0);
+  assert.equal(s.ms(["add", "gmail"]).code, 2);
   assert.equal(s.accounts().length, 2);
 });
 
@@ -497,31 +554,56 @@ test("remove deletes the home but not the shared sessions store", () => {
   assert.equal(readFileSync(rollout, "utf8"), '{"session":"kept"}\n');
 });
 
-test("remove refuses when <home>/sessions is a real directory of transcripts", () => {
-  // A-M8. `ensureCodexHome` and `ms doctor` both leave a real `sessions`
-  // directory alone on purpose — it is this account's own transcripts, from a
-  // `codex` that ran before the link existed. `rmSync` on the home tree would
-  // take it with them, and a transcript is never this tool's to throw away.
+test("remove merges a real <home>/sessions into ~/.codex first, and refuses while a differing transcript would go with the home", () => {
+  // A-M8, since 0.3.6. A real `sessions` directory is this account's own
+  // transcripts, from a `codex` that ran before the link existed. `remove`
+  // links the home first, so they land in ~/.codex rather than going with
+  // the tree — and a transcript that DIFFERS from the base's copy, which the
+  // merge keeps beside the link, stops the removal: never this tool's to
+  // throw away.
   const s = scene();
   s.ms(["add", "work", "--provider", "codex"]);
   const sessions = path.join(s.codexHome("work"), "sessions");
   rmSync(sessions);                       // the link the wizard made
   mkdirSync(sessions, { recursive: true, mode: 0o700 });
-  const kept = path.join(sessions, "rollout-2026-09-16.jsonl");
-  writeFileSync(kept, '{"session":"mine"}\n');
+  writeFileSync(path.join(sessions, "rollout-2026-09-16-a.jsonl"), '{"session":"mine"}\n');
+  writeFileSync(path.join(sessions, "rollout-2026-09-16-b.jsonl"), '{"session":"this account took it elsewhere"}\n');
+  writeFileSync(path.join(s.base, "sessions", "rollout-2026-09-16-b.jsonl"), '{"session":"the base went on its own way"}\n');
 
   const r = s.ms(["remove", "work", "--provider", "codex"]);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /real directory of transcripts/);
-  assert.ok(r.stderr.includes(sessions), "the message names the path");
-  assert.equal(readFileSync(kept, "utf8"), '{"session":"mine"}\n', "and nothing was deleted");
+  assert.match(r.stderr, /sessions\.pre-link\.\d+ holds transcripts that differ/);
+  assert.equal(readFileSync(path.join(s.base, "sessions", "rollout-2026-09-16-a.jsonl"), "utf8"), '{"session":"mine"}\n', "the transcript the base lacked is in ~/.codex");
+  const aside = readdirSync(s.codexHome("work")).find((n) => n.startsWith("sessions.pre-link."));
+  assert.ok(aside, "the differing copy is kept beside the link");
+  assert.equal(
+    readFileSync(path.join(s.codexHome("work"), aside!, "rollout-2026-09-16-b.jsonl"), "utf8"),
+    '{"session":"this account took it elsewhere"}\n',
+  );
   assert.deepEqual(s.accounts().map((a) => a.name), ["work"], "the row stays too");
 
-  // With the ordinary symlink there, remove works exactly as before.
-  rmSync(sessions, { recursive: true });
-  const s2 = scene();
-  s2.ms(["add", "other", "--provider", "codex"]);
-  assert.equal(s2.ms(["remove", "other", "--provider", "codex"]).code, 0);
+  // Once the human has dealt with it, remove works — and ~/.codex keeps all of it.
+  rmSync(path.join(s.codexHome("work"), aside!), { recursive: true });
+  assert.equal(s.ms(["remove", "work", "--provider", "codex"]).code, 0);
+  assert.equal(existsSync(s.codexHome("work")), false);
+  assert.ok(existsSync(path.join(s.base, "sessions", "rollout-2026-09-16-a.jsonl")));
+  assert.ok(existsSync(path.join(s.base, "sessions", "rollout-2026-09-16-b.jsonl")));
+});
+
+test("remove takes the home's own history into ~/.codex before it deletes the home", () => {
+  const s = scene();
+  s.ms(["add", "work", "--provider", "codex"]);
+  const home = s.codexHome("work");
+  writeFileSync(path.join(s.base, "history.jsonl"), '{"text":"base"}\n');
+  writeFileSync(path.join(home, "memories_1.sqlite"), "not really sqlite, and the base has none");
+  rmSync(path.join(home, "history.jsonl"), { force: true });
+  writeFileSync(path.join(home, "history.jsonl"), '{"text":"account"}\n');
+
+  const r = s.ms(["remove", "work", "--provider", "codex"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(existsSync(home), false);
+  assert.equal(readFileSync(path.join(s.base, "history.jsonl"), "utf8"), '{"text":"base"}\n{"text":"account"}\n');
+  assert.equal(readFileSync(path.join(s.base, "memories_1.sqlite"), "utf8"), "not really sqlite, and the base has none");
 });
 
 test("remove of a codex row leaves the claude row of the same name alone", () => {

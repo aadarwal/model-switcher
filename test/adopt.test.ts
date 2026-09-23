@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { run, stubDir, tempHome } from "./helpers.ts";
@@ -231,10 +231,17 @@ function noFetchStub(dir: string): string {
 const codexAuth = (name: string) =>
   JSON.stringify({ tokens: { id_token: "x.y.z", access_token: `cat-${name}`, refresh_token: `crt-${name}`, account_id: `acc-${name}` } });
 
-type World = { home: string; msHome: string; log: string; sessions: string; env: (o?: Record<string, string>) => Record<string, string> };
+type World = { home: string; msHome: string; base: string; log: string; sessions: string; env: (o?: Record<string, string>) => Record<string, string> };
 
-async function adoptWorld(): Promise<World> {
+/** `base` is where the store really lives (MS_CODEX_BASE_DIR). By default it
+ *  is NOT the `~/.codex` the caller's codex runs out of, so these tests keep
+ *  exercising the copy — the case of a codex run out of some other home.
+ *  `sameBase` makes it the human's own `~/.codex`, which is what it is on a
+ *  real machine since 0.3.6. */
+async function adoptWorld(opts: { sameBase?: boolean } = {}): Promise<World> {
   const { home, msHome } = tempHome();
+  const base = opts.sameBase ? path.join(home, ".codex") : path.join(home, "base", ".codex");
+  process.env.MS_CODEX_BASE_DIR = base;
   const { dir, stub } = stubDir();
   const log = path.join(dir, "tmux.log");
   stub("tmux", TMUX_STUB);
@@ -259,9 +266,9 @@ async function adoptWorld(): Promise<World> {
   mkdirSync(sessions, { recursive: true, mode: 0o700 });
 
   return {
-    home, msHome, log, sessions,
+    home, msHome, base, log, sessions,
     env: (o = {}) => ({
-      HOME: home, MS_HOME: msHome, MS_TMUX_LOG: log,
+      HOME: home, MS_HOME: msHome, MS_CODEX_BASE_DIR: base, MS_TMUX_LOG: log,
       PATH: `${dir}:${process.env.PATH}`,
       CODEX_HOME: "",
       NODE_OPTIONS: `--disable-warning=ExperimentalWarning --import ${stubUrl}`,
@@ -369,6 +376,55 @@ test("ms adopt reads CODEX_HOME when the caller's codex runs out of another home
 
   assert.equal(r.code, 0, r.stderr);
   assert.ok(existsSync(path.join(w.msHome, "codex", "sessions", "2026", "09", "17", rolloutName("2026-09-17", LEAF))));
+});
+
+// --- Since 0.3.6: the store IS ~/.codex/sessions ---------------------------
+
+test("a plain-codex conversation adopts by id with nothing to copy: the store already is ~/.codex/sessions", async () => {
+  const w = await adoptWorld({ sameBase: true });
+  chain(w.sessions);
+
+  const r = run(["adopt", LEAF, "--", "--yolo"], w.env());
+
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /^ms adopt: 11111111-1111-4111-8111-111111111111 → .*\(0 copied, 3 already there\)$/m);
+  // The store path is a link to the human's own sessions, not a copy of them.
+  assert.equal(readlinkSync(path.join(w.msHome, "codex", "sessions")), w.sessions);
+  const { launch } = await readLaunch(w, launchIdFrom(w.log));
+  assert.deepEqual(launch!.command, ["codex", "--yolo", "resume", LEAF]);
+});
+
+test("an id is found in the shared store when the caller's own CODEX_HOME does not have it", async () => {
+  // The shell this runs in names some other codex home — an import's fresh
+  // pane, a human with a CODEX_HOME of their own — and the conversation is in
+  // ~/.codex. Before 0.3.6 this was "no rollout for …"; the store is looked
+  // in too now, through its link.
+  const w = await adoptWorld({ sameBase: true });
+  chain(w.sessions);
+  const empty = path.join(w.home, "empty-codex-home");
+  mkdirSync(path.join(empty, "sessions"), { recursive: true, mode: 0o700 });
+
+  const r = run(["adopt", LEAF], w.env({ CODEX_HOME: empty }));
+
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /\(0 copied, 3 already there\)/);
+  assert.deepEqual(readdirSync(path.join(empty, "sessions")), [], "nothing was written into the caller's home");
+  const { launch } = await readLaunch(w, launchIdFrom(w.log));
+  assert.deepEqual(launch!.command, ["codex", "resume", LEAF]);
+});
+
+test("an id in neither place names both places it looked", async () => {
+  const w = await adoptWorld({ sameBase: true });
+  const empty = path.join(w.home, "empty-codex-home");
+  mkdirSync(path.join(empty, "sessions"), { recursive: true, mode: 0o700 });
+
+  const r = run(["adopt", LEAF], w.env({ CODEX_HOME: empty }));
+
+  assert.equal(r.code, 1);
+  assert.ok(
+    r.stderr.includes(`under ${path.join(empty, "sessions")} or ${path.join(w.msHome, "codex", "sessions")} or ${w.sessions}`),
+    r.stderr,
+  );
 });
 
 // --- ms codex --continue (the same continuation, for a resume you drove) ----

@@ -16,11 +16,12 @@
 // a ✗ once fixes (if requested) have been applied.
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, symlinkSync, type Stats } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readdirSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
-import { claudeSettingsPath, codexBaseConfigPath, msBinary, msHome, p } from "./paths.ts";
+import { claudeSettingsPath, codexBaseConfigPath, codexBaseDir, msBinary, msHome, p } from "./paths.ts";
+import { ensureCodexBase, isPreLinkBackup, prepareCodexStore, shareCodexHome, shareCodexState } from "./codex-share.ts";
 import { CLAUDE_HOOK_ENTRIES, claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
 import { codexConfigPath, codexHomeConfigCurrent, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
 import { loadRegistry, organisationClaimedBy, sameOrganisationAs, type Account } from "./registry.ts";
@@ -299,10 +300,13 @@ function checkClaudeTree(home: string, fix: boolean, issues: PermIssue[]): void 
  *  `config.toml.orig` or similar is never swept in by accident. */
 const CODEX_CONFIG_BACKUP_PREFIX = "config.toml.bak-ms-";
 
-/** `codex/`: the directory itself (0700), the shared rollout store
- *  `codex/sessions` (0700 — its CONTENTS are never walked or chmod'ed;
- *  Codex owns them, exactly as `claude/<name>/` is not walked above), and
- *  each `codex/<name>` account home (0700). Inside an account home, two
+/** `codex/`: the directory itself (0700), the store `codex/sessions` — a
+ *  symlink to `~/.codex/sessions` since 0.3.6, which is its expected shape
+ *  and is never reported here (the shared-state line owns it); a store that
+ *  is still a directory of its own is checked 0700, its CONTENTS never
+ *  walked or chmod'ed (Codex owns them, exactly as `claude/<name>/` is not
+ *  walked above) — and each `codex/<name>` account home (0700), skipping the
+ *  `*.pre-link.<ms>` copy a merged store leaves beside it. Inside an account home, two
  *  entries are checked BY NAME — `auth.json` and `config.toml`, both 0600 —
  *  plus, by PREFIX (`CODEX_CONFIG_BACKUP_PREFIX`, fix-A-report.md A-M4's
  *  "not done" half; fix-R), every `config.toml.bak-ms-*` backup this tool
@@ -315,11 +319,12 @@ const CODEX_CONFIG_BACKUP_PREFIX = "config.toml.bak-ms-";
  *  placed inside one (by a human, or by Codex itself) that does not match a
  *  known name or this one prefix is neither reported nor touched.
  *
- *  A home's own `sessions` entry is ALWAYS a symlink — `ensureCodexHome`
- *  (src/accounts-codex.ts) puts it there on purpose, pointing at the shared
- *  store above — and is one of the things this function deliberately never
- *  names: every OTHER symlink found under an ms-owned, walked directory is
- *  a stray to report, this one is the expected shape and must never be. */
+ *  A home's entries other than those two are symlinks into the human's own
+ *  `~/.codex` (src/codex-share.ts) — `sessions` among them — and this
+ *  function deliberately never names any of them: every OTHER symlink found
+ *  under an ms-owned, walked directory is a stray to report, these are the
+ *  expected shape and must never be. Whether they point where they should is
+ *  the shared-state line's question, not a permission. */
 function checkCodexTree(home: string, fix: boolean, issues: PermIssue[]): void {
   const codexDir = path.join(home, "codex");
   const st = checkEntry(codexDir, 0o700, issues);
@@ -332,7 +337,14 @@ function checkCodexTree(home: string, fix: boolean, issues: PermIssue[]): void {
     }
   }
 
-  checkEntry(path.join(codexDir, "sessions"), 0o700, issues);
+  const store = path.join(codexDir, "sessions");
+  let storeStat: Stats | null = null;
+  try {
+    storeStat = lstatSync(store);
+  } catch {
+    /* not there yet: the next link pass makes it */
+  }
+  if (storeStat && !storeStat.isSymbolicLink()) checkEntry(store, 0o700, issues);
 
   let entries;
   try {
@@ -341,13 +353,14 @@ function checkCodexTree(home: string, fix: boolean, issues: PermIssue[]): void {
     return;
   }
   for (const e of entries) {
-    if (e.name === "sessions") continue; // the shared store, checked above
+    if (e.name === "sessions") continue; // the store, above
+    if (isPreLinkBackup(e.name)) continue; // a merged store's leftovers: the human's, not ours to chmod
     const accountDir = path.join(codexDir, e.name);
     const ast = checkEntry(accountDir, 0o700, issues);
     if (!ast || !ast.isDirectory()) continue;
     checkEntry(path.join(accountDir, "auth.json"), 0o600, issues);
     checkEntry(path.join(accountDir, "config.toml"), 0o600, issues);
-    // accountDir/sessions is the per-home symlink — intentionally never
+    // Every other entry is a symlink into ~/.codex — intentionally never
     // checked; see the doc comment above. The one thing this DOES still read
     // the account home's own listing for: our own config.toml backups, named
     // by prefix only, so a stray file with any other name is still untouched.
@@ -546,10 +559,11 @@ export async function checkClaudeAccount(a: Account, fix: boolean, book: Account
 // its usage, so there is no launch-token/poll-grant split to check here —
 // just whether that one file is readable, whether it still answers the
 // usage endpoint, whether the account's hooks are installed and trusted,
-// and whether its home's `sessions` entry still points at the shared
-// rollout store. `--fix` never refreshes the credential (there is no
-// refresh call here at all, unlike the Claude side) and never touches an
-// existing `sessions` entry — only a missing one is ever created.
+// and whether its home is still a view of the human's own `~/.codex`
+// (src/codex-share.ts). `--fix` never refreshes the credential (there is no
+// refresh call here at all, unlike the Claude side); it re-links a home the
+// same way every launch does — merging a real entry back rather than ever
+// replacing one — and never touches a symlink that points somewhere else.
 
 /**
  * Whether this home's `config.toml` is the file `ms` renders — which is both
@@ -588,86 +602,56 @@ function checkCodexHooksLine(a: Account, home: string, fix: boolean): Result {
     : { ok: false, what, why: `${after.why} — still, after --fix` };
 }
 
-/** Whether `link` is a symlink that resolves to the same place as `target`. */
-function symlinksTo(link: string, target: string): boolean {
-  let st: Stats;
-  try {
-    st = lstatSync(link);
-  } catch {
-    return false;
-  }
-  if (!st.isSymbolicLink()) return false;
-  try {
-    return realpathSync(link) === realpathSync(target);
-  } catch {
-    return false; // dangling — points somewhere that no longer exists
-  }
+/** The `--fix` summary of a dry run: its first few findings, in its own words. */
+function pendingWhy(pending: string[], problems: string[]): string {
+  const all = [...problems, ...pending];
+  const shown = all.slice(0, 3).join("; ");
+  return `${shown}${all.length > 3 ? `; and ${all.length - 3} more` : ""}`;
 }
 
-function checkCodexSessionsLink(a: Account, fix: boolean): Result {
-  const what = `codex account ${a.name}: sessions store linked`;
-  const link = p.codexSessionsLink(a.name);
-  const target = p.codexSessions();
-
-  if (symlinksTo(link, target)) return { ok: true, what };
-
-  let st: Stats | null = null;
-  try {
-    st = lstatSync(link);
-  } catch {
-    /* missing entirely — the ordinary "recreate the link" case, below */
+/**
+ * The base every codex account is a view of (`~/.codex`), and the store path
+ * this tool reads it through (`MS_HOME/codex/sessions`, a link to its
+ * `sessions`). One line for the whole machine, ahead of the accounts, so a
+ * base problem is said once rather than once per home.
+ */
+export function checkCodexBase(fix: boolean): Result {
+  const what = `codex base ${codexBaseDir()}, shared by every codex account`;
+  const before = ensureCodexBase({ dryRun: true });
+  if (!before.pending.length && !before.problems.length) return { ok: true, what };
+  if (!fix || before.problems.length) {
+    const hint = before.problems.length ? "" : " (run ms doctor --fix)";
+    return { ok: false, what, why: `${pendingWhy(before.pending, before.problems)}${hint}` };
   }
+  const res = prepareCodexStore();
+  const after = ensureCodexBase({ dryRun: true });
+  if (!after.pending.length && !after.problems.length) return { ok: true, what, fixed: true };
+  return { ok: false, what, why: `${pendingWhy(after.pending, [...res.problems, ...after.problems])} — still, after --fix` };
+}
 
-  if (st?.isSymbolicLink()) {
-    // A symlink sits here, but `symlinksTo` above still said no. Two very
-    // different situations share that one fact, and only one of them is
-    // ours to repair: the link's own TEXT names the shared store by path
-    // and that store directory is simply the thing that's missing right
-    // now (fixable — recreate the STORE, never the link, which is already
-    // correct), or the link genuinely points somewhere else entirely (not
-    // ours to touch, `--fix` or not — it might be deliberate).
-    let rawTarget: string | null = null;
-    try {
-      rawTarget = readlinkSync(link);
-    } catch {
-      /* a readlink failing right after a successful lstat would be bizarre;
-         fall through to "points elsewhere" below either way */
-    }
-    if (rawTarget !== null && path.resolve(rawTarget) === path.resolve(target)) {
-      if (!fix) return { ok: false, what, why: `shared store missing — ${link} points at ${target}, which does not exist` };
-      try {
-        mkdirSync(target, { recursive: true, mode: 0o700 });
-        chmodSync(target, 0o700); // mkdir's mode is masked by umask; this is not
-      } catch (e) {
-        return { ok: false, what, why: `shared store missing — --fix failed: ${(e as Error).message}` };
-      }
-      return symlinksTo(link, target)
-        ? { ok: true, what, fixed: true }
-        : { ok: false, what, why: "shared store missing — still missing after --fix" };
-    }
-    return {
-      ok: false,
-      what,
-      why: `${link} is a symlink but points elsewhere (${rawTarget ?? "unreadable"}), not at ${target} — never touched automatically`,
-    };
+/**
+ * Whether this account's home is still a view of the base: every entry but
+ * `auth.json` and `config.toml` a link to the same name in `~/.codex`.
+ *
+ * Fixable, and fixed the way every launch fixes it (`shareCodexState`): a
+ * real entry is merged back into the base — never replaced — and a link that
+ * points anywhere else is reported and left alone, `--fix` or not. The dry
+ * run looks at the home alone: the base's own findings are the line above,
+ * said once rather than once per account.
+ */
+function checkCodexShared(a: Account, home: string, fix: boolean): Result {
+  const what = `codex account ${a.name}: shares ${codexBaseDir()}`;
+  if (!existsSync(home)) return { ok: false, what, why: `${home} does not exist (ms accounts add ${a.name} --provider codex)` };
+  const before = shareCodexHome(home, { dryRun: true });
+  if (!before.pending.length && !before.problems.length) return { ok: true, what };
+  if (!fix) {
+    const hint = before.pending.length ? " (run ms doctor --fix)" : "";
+    return { ok: false, what, why: `${pendingWhy(before.pending, before.problems)}${hint}` };
   }
-
-  if (st) {
-    // A real directory (moved or created before the link existed,
-    // ensureCodexHome's own doc comment on this exact case) or a plain
-    // file. Neither is ours to replace: doing so could throw away real
-    // sessions.
-    const shape = st.isDirectory() ? "a real directory" : "a file";
-    return { ok: false, what, why: `${link} exists and is ${shape}, not a symlink to ${target} — never touched automatically` };
-  }
-
-  if (!fix) return { ok: false, what, why: `${link} is missing (want a symlink to ${target})` };
-  try {
-    symlinkSync(target, link, "dir");
-  } catch (e) {
-    return { ok: false, what, why: `missing — --fix failed: ${(e as Error).message}` };
-  }
-  return symlinksTo(link, target) ? { ok: true, what, fixed: true } : { ok: false, what, why: "still not linked after --fix" };
+  const res = shareCodexState(home);
+  const after = shareCodexHome(home, { dryRun: true });
+  if (!after.pending.length && !after.problems.length) return { ok: true, what, fixed: true };
+  return { ok: false, what, why: `${pendingWhy(after.pending, [...new Set([...res.problems, ...after.problems])])}${after.pending.length ? " — still, after --fix" : ""}` };
 }
 
 export async function checkCodexAccount(a: Account, fix: boolean): Promise<Result[]> {
@@ -704,7 +688,7 @@ export async function checkCodexAccount(a: Account, fix: boolean): Promise<Resul
   }
 
   out.push(checkCodexHooksLine(a, home, fix));
-  out.push(checkCodexSessionsLink(a, fix));
+  out.push(checkCodexShared(a, home, fix));
 
   return out;
 }
@@ -834,6 +818,7 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
     const st = openState();
     try { results.push({ ok: true, what: rebalanceLine(rebalanceEnabled(st)) }); } finally { st.close(); }
   }
+  if (codexAccounts.length > 0) results.push(checkCodexBase(fix));
   for (const a of codexAccounts) {
     results.push(...(await checkCodexAccount(a, fix)));
   }

@@ -512,8 +512,10 @@ function subdirs(dir: string): string[] {
  *
  * Otherwise the shared store is searched by name. Rollouts live at
  * `<store>/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`, and every account home of this
- * tool links its own `sessions` at that ONE store — which is exactly what
- * makes a conversation started under one account resumable under another. A
+ * tool links its own `sessions` at that ONE store — since 0.3.6 the human's
+ * own `~/.codex/sessions`, read here through `p.codexSessions()`'s link
+ * (src/codex-share.ts) — which is exactly what makes a conversation started
+ * under one account, or in a plain `codex`, resumable under another. A
  * recorded path that no longer resolves falls through to the search for the
  * same reason: the path names an account's home, the store outlives it.
  */
@@ -869,7 +871,7 @@ type Refusal = { outcome: AttemptOutcome; note: string; trust?: true };
  * fine, its home is not, and a human fixes it by editing a file rather than
  * by logging in again.
  */
-function prepareCandidate(session: SessionRow, name: string): Refusal | null {
+function prepareCandidate(session: SessionRow, name: string, note: (line: string) => void = () => {}): Refusal | null {
   if (session.provider !== "codex") {
     return readLaunchToken(name) ? null : { outcome: "auth", note: "no launch token" };
   }
@@ -877,7 +879,7 @@ function prepareCandidate(session: SessionRow, name: string): Refusal | null {
   if (!readCodexAuth(home)?.accessToken) {
     return { outcome: "auth", note: `no codex credential (run: ms accounts login ${name} --provider codex)` };
   }
-  const refusal = ensureCodexReady(home, session.cwd, msBinary());
+  const refusal = ensureCodexReady(home, session.cwd, msBinary(), note);
   return refusal ? { outcome: "infra", note: refusal.problem, trust: true } : null;
 }
 
@@ -1335,7 +1337,9 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   let to: string | null = null;
   const refused: Refusal[] = [];
   for (const name of names) {
-    const no = prepareCandidate(session, name);
+    // What linking the candidate's home to ~/.codex changed (or could not)
+    // goes in this session's own log: a rotation has no terminal to say it on.
+    const no = prepareCandidate(session, name, (line) => logLine(id, g, `${name}: ${line}`));
     if (!no) {
       to = name;
       break;

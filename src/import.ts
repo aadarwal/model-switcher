@@ -33,7 +33,7 @@ import path from "node:path";
 import * as readline from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import type { Verb } from "./cli.ts";
-import { ensureStore, msHome } from "./paths.ts";
+import { ensureStore, msHome, p } from "./paths.ts";
 import { openState } from "./state.ts";
 import { Tmux } from "./tmux.ts";
 import { rolloutIdsFromName } from "./adopt.ts";
@@ -397,6 +397,10 @@ export async function runImport(argv: string[], io: ImportIo = processIo()): Pro
     const candidates = scanConversations({
       claudeConfigDir: claudeConfigDir(),
       codexHome: codexHome(),
+      // The store every ms Codex home shares, through its link — since 0.3.6
+      // the human's own ~/.codex/sessions, so this is usually the same
+      // directory as the line above and is walked once.
+      codexStore: p.codexSessions(),
       sinceMs: since.ms,
       dirs,
       ...defaultScanDeps(),

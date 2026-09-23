@@ -126,7 +126,7 @@ ms accounts ls
 ```
 
 - `ls` — every account under one set of columns. EMAIL, the last one, is the login behind the name as the provider's own profile reported it at `login` or `verify`; it is display only (identity is still decided by the organisation), and an account signed in before this shows `-` until its next `ms accounts verify <name>`.
-- `add` — register a name with no credentials yet. `--label` sets the display label; `--shared` marks an account other people also use, which loses ties in the chooser.
+- `add` — register a name with no credentials yet. `--label` sets the display label; `--shared` marks an account other people also use, which loses ties in the chooser. Run again on an existing Codex account, it re-links that account's home to `~/.codex` and changes nothing else.
 - `login` — mint the credentials and record the account's identity. Claude opens two browser flows; `--device-auth` (Codex only) prints a device code instead of redirecting to localhost, which is what you want over SSH. `--relogin` forces a fresh sign-in even when a usable grant is already in place.
 - `verify` — re-check an account's credentials and the identity behind them. `remove` — delete the registry row and every credential it names.
 - `token` — print the Claude launch token on stdout. `ls` — one row per account: provider, label, org, poll grant, launch token, verified.
@@ -171,6 +171,27 @@ That home's `config.toml` is rendered on every launch from your own
 hook block and whatever Codex itself wrote into the home; your file is only ever read
 (`MS_CODEX_BASE_CONFIG` points somewhere else), and it wins any collision.
 
+Everything else in the home is yours, not the account's: since 0.3.6 a Codex home is a
+view of your own `~/.codex`. Every top-level entry there except `auth.json` and
+`config.toml` — `sessions/`, `archived_sessions/`, `history.jsonl`, the state,
+thread-history and memories databases, skills, rules, `AGENTS.md` — is a symlink to the
+same name in `~/.codex`, so an `ms` pane's `codex resume` picker lists every conversation
+you have, `codex resume <id>` finds one started in a plain `codex`, and every account
+shares one memory and one history. The links are repaired on every launch and rotation,
+by `ms accounts add <name> --provider codex` run again, and by `ms doctor --fix`. A real
+entry where a link belongs is merged into `~/.codex` first — a directory file by file
+(only what `~/.codex` lacks moves in, and a conversation it holds a shorter copy of is
+extended), a `.jsonl` line by line, a database never — and whatever it held that differs
+is kept beside the link as `<name>.pre-link.<ms>`; an entry `~/.codex` lacks entirely is
+moved there. Nothing is overwritten or deleted, and a symlink you pointed elsewhere is
+reported, never touched. The old shared store `MS_HOME/codex/sessions` is merged into
+`~/.codex/sessions` the same way, once, and becomes a link to it. Checked against Codex
+0.156.1: it writes `config.toml` and appends to `history.jsonl` through a symlink rather
+than replacing it, and its SQLite keeps a linked database's `-wal`/`-shm` beside the real
+file, so homes share one database rather than forking it — the repair on every launch is
+the backstop for a later Codex that writes a file over its link. `MS_CODEX_BASE_DIR` puts
+the base somewhere other than `~/.codex`.
+
 ### Credentials are per device
 
 The token endpoints rotate refresh tokens, so the first refresh on either machine
@@ -209,17 +230,18 @@ back, not who asked — but the cap never refuses a person: it parks only the au
 ### Rescuing a pane you didn't start with ms
 
 A `codex` you launched yourself — plain `codex --yolo`, in your own `~/.codex` — has no
-session row, no account of ours, and no rollout in the shared store that lets a resume
-cross accounts, so `ms rotate` has nothing to move. When such a pane hits a wall, exit the
-CLI (Ctrl-C twice) and run **`ms adopt <rollout-id>`** in that same pane. It finds the
-rollout under `$CODEX_HOME`/`~/.codex` by id (or takes a path), copies it into
-`MS_HOME/codex/sessions` keeping Codex's own `YYYY/MM/DD` layout — together with every
-rollout its history points at, because a compacted conversation's file carries only a
-`history_base` pointer at the one holding the prefix, and resuming without it fails with
-`invalid paginated history lineage for <id>: missing source rollout` — and then launches
-the pane exactly as `ms codex [--as <account>] -- <your codex args> resume <id>`. Nothing
-in your own Codex home is moved, modified, or overwritten, and a rollout already in the
-store is left as it is. Add `--continue` to hand the conversation the rotation's own
+session row and no account of ours, so `ms rotate` has nothing to move. When such a pane
+hits a wall, exit the CLI (Ctrl-C twice) and run **`ms adopt <rollout-id>`** in that same
+pane. It finds the rollout by id under `$CODEX_HOME`/`~/.codex` or in the shared store (or
+takes a path), copies it into the store keeping Codex's own `YYYY/MM/DD` layout — together
+with every rollout its history points at, because a compacted conversation's file carries
+only a `history_base` pointer at the one holding the prefix, and resuming without it fails
+with `invalid paginated history lineage for <id>: missing source rollout` — and then
+launches the pane exactly as `ms codex [--as <account>] -- <your codex args> resume <id>`.
+Since 0.3.6 the store is `~/.codex/sessions` itself, so a conversation of your own
+`~/.codex` is already there and nothing is copied; the copy matters only for a codex run
+out of some other `$CODEX_HOME`. Nothing in that home is moved, modified, or overwritten,
+and a rollout already in the store is left as it is. Add `--continue` to hand the conversation the rotation's own
 continuation; a resume you type yourself sends none. The id is the one `codex resume`
 takes: `ls ~/.codex/sessions/*/*/*/` — each file is `rollout-<date>-<id>.jsonl`. Codex
 only in this release, and it refuses while a `codex` is still running in the pane, because
@@ -339,8 +361,8 @@ beside them, and never touches another tool's hooks in the same file.
 `MS_HOME` (default `~/.config/model-switcher`) holds everything: `accounts.json`,
 `state.sqlite`, `locks.sqlite`, `snapshot.json`, `last-pick.json`, launch tokens under
 `launch/`, per-account Claude config dirs under `claude/`, per-account Codex homes under
-`codex/` (each linked to the one shared rollout store `codex/sessions/`, so a resumed
-conversation can cross accounts), per-session event logs under `sessions/`, one manifest
+`codex/` (each a view of your own `~/.codex`, with `codex/sessions` a link to
+`~/.codex/sessions`, so a resumed conversation can cross accounts), per-session event logs under `sessions/`, one manifest
 per `ms import` run under `imports/`, and the tool's own tmux socket. Directories are 0700 and files 0600. `accounts.json` now also holds each
 account's e-mail, as the provider's own profile reported it at `login`/`verify` — display
 only, and stored at rest in that same 0600 file.
@@ -350,7 +372,8 @@ only, and stored at rest in that same 0600 file.
 | `MS_HOME` | Where all state lives. Default `~/.config/model-switcher`. |
 | `MS_BIN` | The absolute `ms` path written into hook commands, Codex trust hashes, the statusline wrapper and the alias block. The Homebrew shim sets it to `/opt/homebrew/opt/model-switcher/bin/ms` — the stable path, so everything the wizard wrote survives an upgrade. Set it yourself only when running `ms` from somewhere unusual. |
 | `MS_CODEX_AUTOROTATE` | Automatic recovery for Codex sessions. Unset, empty, or exactly `1` is **on**; **every other value reads as off** — `0`, but `false`, `no` and a typo too, because only `1` is read as yes. Export it in the shell that runs `codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched watchdog and worker read it too. A mirrored `off` is a stored row and outlives the variable — unsetting it later does not turn recovery back on; export `MS_CODEX_AUTOROTATE=1` (and run an `ms codex`, which mirrors) to do that. `ms doctor` prints the state it will act on. Ships on. |
-| `MS_CODEX_BASE_CONFIG` | The file every Codex account home is rendered from. Defaults to `~/.codex/config.toml`; it is read, never written. Point it elsewhere to give `ms` panes a different base, or at a path that does not exist to give them none. |
+| `MS_CODEX_BASE_DIR` | The directory every Codex account home is a view of. Defaults to `~/.codex` — never `$CODEX_HOME`, which inside an `ms` pane names the account home itself. |
+| `MS_CODEX_BASE_CONFIG` | The file every Codex account home is rendered from. Defaults to `config.toml` in `MS_CODEX_BASE_DIR`; it is read, never written. Point it elsewhere to give `ms` panes a different base, or at a path that does not exist to give them none. |
 | `MS_REBALANCE` | [Rebalance](#rebalance): moving an idle session to a better account at a turn end. Unset, empty, or exactly `1` is **on**; **every other value reads as off** — the same shape as `MS_CODEX_AUTOROTATE`, now that a sooner weekly reset alone has been observed doing the right thing. Export it in the shell that runs `claude`/`codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched hooks read it too. A mirrored `off` is a stored row and outlives the variable — unsetting it later does not turn rebalance back on; export `MS_REBALANCE=1` (and run an `ms claude`/`ms codex`, which mirrors) to do that. It gates only the AUTOMATIC moves; `ms rebalance` works either way. `ms doctor` prints the state it will act on. Ships on since 0.3.4; `MS_REBALANCE=0` disables it. |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere `ms` reads or writes that settings file. |
 | `MS_VERBOSE` | `1` prints what each invocation's start-of-run repair did. |
@@ -384,8 +407,8 @@ ms doctor --fix
 ```
 
 `--fix` repairs only what is safe: hooks that name an `ms` that moved, a Claude poll grant
-due for refresh, store paths whose mode drifted, a missing Codex `sessions` link or shared
-store, and orphaned session state. It never repairs a dead credential, a malformed
+due for refresh, store paths whose mode drifted, a Codex home whose entries are not links
+to `~/.codex` yet (merged back, never replaced), and orphaned session state. It never repairs a dead credential, a malformed
 `accounts.json`, a symlink inside the store, or an `ms` on PATH that shadows this one.
 
 ```bash

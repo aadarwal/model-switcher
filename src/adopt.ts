@@ -6,16 +6,21 @@
 // The rescue this automates happened by hand on 2026-09-17. Two `codex --yolo`
 // panes, started outside `ms` in the default `~/.codex` home, hit a real weekly
 // wall. `ms` could not move them: it manages the sessions it launched, and
-// these had no row, no account of ours and — the part that actually blocks —
-// no rollout in the store every `ms` Codex home shares (`p.codexSessions`).
-// Resuming a conversation whose rollout Codex cannot find is not a rotation
-// that fails, it is a conversation that is simply not there.
+// these had no row, no account of ours and — the part that actually blocked,
+// until 0.3.6 — no rollout in the store every `ms` Codex home read.
 //
-// So this verb is three steps, and the middle one is the whole reason it
-// exists:
+// Since 0.3.6 that store IS `~/.codex/sessions` (src/codex-share.ts): every
+// home links there, and `p.codexSessions()` is a link to it. So for a
+// conversation started in a plain `codex` the copy below is a no-op — the
+// file is already where every account looks — and what is left of this verb
+// is the part that was always its own: taking the conversation over IN THIS
+// PANE, under an account with room. The copy still matters for a codex run
+// out of some other `$CODEX_HOME`.
+//
+// So this verb is three steps:
 //
 //   1. find the rollout under the caller's OWN Codex home (`$CODEX_HOME`, else
-//      `~/.codex`), by id or by path;
+//      `~/.codex`), or failing that in the shared store, by id or by path;
 //   2. copy it AND ITS LINEAGE into the shared store, keeping Codex's own
 //      `YYYY/MM/DD` layout — because a COMPACTED conversation's rollout does
 //      not contain its own history. It carries `history_base`, a pointer at
@@ -33,13 +38,14 @@
 // of the same conversation is a no-op rather than a file swap under a running
 // CLI.
 
-import { chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
+import { prepareCodexStore } from "./codex-share.ts";
 import { launchWith } from "./launch.ts";
-import { ensureStore, p } from "./paths.ts";
+import { codexBaseDir, p } from "./paths.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
 
 const EXIT_REFUSED = 1;
@@ -118,6 +124,35 @@ export function listRollouts(root: string): string[] {
   };
   walk(root);
   return out;
+}
+
+/** The sessions roots an id is looked up under: the caller's own, then the
+ *  shared store through its link, then `~/.codex/sessions` itself — which is
+ *  what that link points at once a home has been linked (src/codex-share.ts),
+ *  and is still worth a look on a machine where nothing has made the link
+ *  yet. For anyone whose codex runs out of `~/.codex` or an `ms` home these
+ *  are one directory, and it is walked once. */
+export function lookupRoots(
+  sourceRoot: string,
+  store: string = p.codexSessions(),
+  baseSessions: string = path.join(codexBaseDir(), "sessions"),
+): string[] {
+  const real = (f: string): string => {
+    try {
+      return realpathSync(f);
+    } catch {
+      return path.resolve(f);
+    }
+  };
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  for (const root of [sourceRoot, store, baseSessions]) {
+    const key = real(root);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    roots.push(root);
+  }
+  return roots;
 }
 
 /**
@@ -408,6 +443,8 @@ export const adoptVerb: Verb = async (argv) => {
   // walk below.
   const direct = parsed.id.includes(path.sep) || parsed.id.endsWith(".jsonl");
   let leaf: string | null;
+  // Where an id was found, which is where its lineage is looked up too.
+  let foundUnder = sourceRoot;
   if (direct) {
     // `lstatSync`, never `statSync`: a path is the one input a human hands
     // this verb that we do not derive ourselves, and a SYMLINK named
@@ -438,9 +475,20 @@ export const adoptVerb: Verb = async (argv) => {
       return EXIT_REFUSED;
     }
   } else {
-    leaf = findRollout(sourceRoot, parsed.id);
+    // The caller's own home first, then the shared store: a conversation
+    // started in a plain `codex` is found by id whichever `$CODEX_HOME` this
+    // shell happens to carry.
+    const roots = lookupRoots(sourceRoot);
+    leaf = null;
+    for (const root of roots) {
+      leaf = findRollout(root, parsed.id);
+      if (leaf) {
+        foundUnder = root;
+        break;
+      }
+    }
     if (!leaf) {
-      say(`no rollout for '${parsed.id}' under ${sourceRoot}`, [
+      say(`no rollout for '${parsed.id}' under ${roots.join(" or ")}`, [
         "the id is the one codex resume takes; the file is rollout-<date>-<id>.jsonl",
         "set CODEX_HOME if that codex runs out of another home, or pass the file's path instead",
       ]);
@@ -454,9 +502,12 @@ export const adoptVerb: Verb = async (argv) => {
   const named = rolloutIdsFromName(path.basename(leaf));
   const resumeId = named ? named.threadId : parsed.id;
 
-  ensureStore();
+  // The store is `~/.codex/sessions` through its link (src/codex-share.ts);
+  // made here if this is the first thing on the machine to need it. A
+  // problem making it is said, and the copy below reports what it meets.
+  for (const problem of prepareCodexStore().problems) say(`warning: ${problem}`);
   const store = p.codexSessions();
-  const lineageRoot = direct ? (lineageRootFor(leaf) ?? sourceRoot) : sourceRoot;
+  const lineageRoot = direct ? (lineageRootFor(leaf) ?? sourceRoot) : foundUnder;
   let copy: AdoptCopy;
   try {
     copy = copyLineage(lineageRoot, store, leaf);

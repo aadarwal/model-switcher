@@ -29,3 +29,17 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 export const ABSENT_CODEX_BASE = path.join(tmpdir(), `ms-test-no-codex-base-${process.pid}`, "config.toml");
 process.env.MS_CODEX_BASE_CONFIG = ABSENT_CODEX_BASE;
+
+// Since 0.3.6 two more cannot be left to a default, because the default is
+// no longer only READ. A codex home is linked into the human's own
+// `~/.codex` on every launch (src/codex-share.ts): entries are moved into it,
+// merged into it, and the store at MS_HOME/codex/sessions is merged into it
+// once and replaced by a link. A test that reached either real directory
+// would move the developer's own conversations. So both are PINNED at temp
+// directories of this process's own — MS_HOME as the store a test that
+// forgets its own falls back to, MS_CODEX_BASE_DIR as the base — and a test
+// that cares about either (most do) still sets its own, per test.
+export const TEST_MS_HOME = path.join(tmpdir(), `ms-test-store-${process.pid}`, "model-switcher");
+process.env.MS_HOME = TEST_MS_HOME;
+export const TEST_CODEX_BASE = path.join(tmpdir(), `ms-test-codex-base-${process.pid}`, ".codex");
+process.env.MS_CODEX_BASE_DIR = TEST_CODEX_BASE;

@@ -13,9 +13,14 @@ const EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] as con
 const SNAKE: Record<string, string> = { SessionStart: "session_start", UserPromptSubmit: "user_prompt_submit", Stop: "stop", SessionEnd: "session_end" };
 const TIMEOUT: Record<string, number> = { SessionStart: 600, UserPromptSubmit: 600, Stop: 600, SessionEnd: 1 };
 
+/** An account home — `MS_HOME/codex/work`, as the tool lays one out. Not
+ *  `~/.codex`: that is the BASE every home is linked to (tempHome points
+ *  MS_CODEX_BASE_DIR there), and a home can never be its own base. MS_HOME is
+ *  this test's own, so the store link a launch makes lands nowhere shared. */
 function home(): string {
-  const { home: h } = tempHome();
-  const d = path.join(h, ".codex");
+  const { msHome } = tempHome();
+  process.env.MS_HOME = msHome;
+  const d = path.join(msHome, "codex", "work");
   mkdirSync(d, { recursive: true, mode: 0o700 });
   return d;
 }

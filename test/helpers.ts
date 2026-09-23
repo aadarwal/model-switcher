@@ -19,6 +19,12 @@ export function tempHome(): { home: string; msHome: string } {
   const home = realpathSync(mkdtempSync(path.join(tmpdir(), "ms-test-")));
   const msHome = path.join(home, ".config", "model-switcher");
   mkdirSync(msHome, { recursive: true, mode: 0o700 });
+  // This home's own `~/.codex` is the base every codex home links into
+  // (src/codex-share.ts), so a test that makes a home gets a base of its own
+  // too — not the per-process one test/setup-env.mjs pins as the floor, which
+  // every test in a file would otherwise share. `run()` spreads process.env,
+  // so a child `ms` sees the same base; a test that wants another sets it.
+  process.env.MS_CODEX_BASE_DIR = path.join(home, ".codex");
   return { home, msHome: realpathSync(msHome) };
 }
 

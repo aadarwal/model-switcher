@@ -153,10 +153,11 @@ export function shouldContinue(candidate: Candidate, mode: ContinueFor = "live")
  * The command line a pane runs, as argv for `ms`.
  *
  * Claude resumes in place (`ms claude … --resume <id>`). Codex goes through
- * `ms adopt`, which is not a detour: a rollout started outside this tool is
- * not in the shared store every `ms` Codex home reads, and a COMPACTED one
- * needs its whole lineage copied with it or the resume dies on a missing
- * source rollout (see src/adopt.ts).
+ * `ms adopt`, which is not a detour: a rollout started under some other
+ * `$CODEX_HOME` is not in the store every `ms` Codex home reads (since 0.3.6
+ * `~/.codex/sessions` itself, so for a plain `codex` the copy is a no-op), and
+ * a COMPACTED one needs its whole lineage copied with it or the resume dies
+ * on a missing source rollout (see src/adopt.ts).
  *
  * Codex is adopted BY PATH, and that is the fix for a whole class of failure.
  * `ms adopt <id>` looks the rollout up under the CALLER'S own Codex home

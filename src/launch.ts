@@ -376,7 +376,12 @@ function planFor(provider: Provider, parsed: Parsed, extras: LaunchExtras = {}):
         // call a rotation's `prepareCandidate` also makes, so a home good
         // enough to launch into and a home good enough to rotate into can
         // never drift apart. Verified on Codex 0.153.4.
-        const refusal = ensureCodexReady(p.codexHome(account), cwd, msBinary());
+        // The same call also links the home to the human's own ~/.codex
+        // (src/codex-share.ts); what that changed or could not change is
+        // said here, on the human's terminal, rather than kept from them.
+        const refusal = ensureCodexReady(p.codexHome(account), cwd, msBinary(), (line) =>
+          process.stderr.write(`ms codex: ${account}: ${line}\n`),
+        );
         return refusal ? { error: refusal.problem } : null;
       },
       // There is no `--session-id`: normally the hook reports the id Codex

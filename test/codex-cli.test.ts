@@ -51,11 +51,14 @@ test("codexExitSequence is Ctrl-C twice, and never text", () => {
 
 test("codexHome is the account's own CODEX_HOME under MS_HOME", () => {
   const ms = tempDir("ms-codex-home-");
+  // Put back the pinned store (test/setup-env.mjs), never delete it: an unset
+  // MS_HOME is the developer's real one.
+  const saved = process.env.MS_HOME;
   process.env.MS_HOME = ms;
   try {
     assert.equal(codexHome("work"), path.join(ms, "codex", "work"));
   } finally {
-    delete process.env.MS_HOME;
+    process.env.MS_HOME = saved;
   }
 });
 

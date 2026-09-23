@@ -76,6 +76,14 @@ export interface ScanOptions {
   claudeConfigDir: string;
   codexHome: string;
   /**
+   * The store this tool's own Codex homes share (`p.codexSessions()`, since
+   * 0.3.6 a link to `~/.codex/sessions`), walked too when it is not the same
+   * directory as `<codexHome>/sessions` — so a conversation is found whether
+   * the scan runs under `~/.codex`, an `ms` home, or a `$CODEX_HOME` of the
+   * human's own. Omitted, only `codexHome` is walked.
+   */
+  codexStore?: string | null;
+  /**
    * The oldest last-activity an IDLE conversation may have, as epoch ms; null
    * keeps every one of them. It is a cutoff, not a duration — the verb turns
    * `--since 2h` into `Date.now() - 7200000` — so this function needs no clock
@@ -334,57 +342,91 @@ function claudeConversations(configDir: string): Conversation[] {
 
 // --- Codex rollouts ------------------------------------------------------
 
-function codexConversations(codexHome: string): Conversation[] {
-  const root = path.join(codexHome, "sessions");
-  const out: Conversation[] = [];
-  // `listRollouts` is `src/adopt.ts`'s own walker — the same one that finds a
-  // conversation to rescue — so the two verbs can never disagree about what
-  // counts as a rollout file.
-  for (const file of listRollouts(root)) {
-    let mtime: number;
-    try {
-      mtime = statSync(file).mtimeMs;
-    } catch {
-      continue;
-    }
-    let id: string | null = null;
-    let cwd: string | null = null;
-    let compacted = false;
-    let seenMeta = false;
-    let title = "";
-    eachHeaderRecord(file, (rec) => {
-      if (!seenMeta && rec.type === "session_meta" && rec.payload && typeof rec.payload === "object") {
-        const meta = rec.payload as Record<string, unknown>;
-        seenMeta = true;
-        if (typeof meta.id === "string" && meta.id) id = meta.id;
-        else if (typeof meta.session_id === "string" && meta.session_id) id = meta.session_id;
-        if (typeof meta.cwd === "string" && meta.cwd) cwd = meta.cwd;
-        // `history_base` is the pointer at the rollout holding this
-        // conversation's prefix: its presence IS the fact that this
-        // conversation was compacted (see `lineageIds` in src/adopt.ts).
-        compacted = !!meta.history_base && typeof meta.history_base === "object";
-      }
-      if (!title) {
-        const text = codexUserText(rec);
-        if (text) title = cleanTitle(text);
-      }
-      return seenMeta && title !== "";
-    });
-    // A rollout with no readable meta still has its ids in its own filename.
-    const fromName = rolloutIdsFromName(path.basename(file));
-    const resolved = id ?? fromName?.threadId ?? null;
-    if (!resolved) continue;
-    out.push({
-      provider: "codex",
-      id: resolved,
-      cwd: realish(cwd ?? ""),
-      transcriptPath: file,
-      lastActivity: mtime,
-      title,
-      compacted,
-    });
+/** Every sessions root to walk, once each: two spellings of one directory
+ *  (an `ms` home's `sessions` link and the store's own) are one root. */
+function codexRoots(codexHome: string, store: string | null | undefined): string[] {
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  for (const root of [path.join(codexHome, "sessions"), ...(store ? [store] : [])]) {
+    const key = realish(root);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    roots.push(root);
   }
+  return roots;
+}
+
+function codexConversations(codexHome: string, store?: string | null): Conversation[] {
+  const out: Conversation[] = [];
+  // Which root each id was first found under, and where it sits in `out`.
+  const first = new Map<string, { at: number; root: number }>();
+  codexRoots(codexHome, store).forEach((root, r) => {
+    // `listRollouts` is `src/adopt.ts`'s own walker — the same one that finds a
+    // conversation to rescue — so the two verbs can never disagree about what
+    // counts as a rollout file.
+    for (const file of listRollouts(root)) {
+      const c = codexConversation(file);
+      if (!c) continue;
+      const seen = first.get(c.id);
+      if (seen && seen.root !== r) {
+        // One conversation under two roots — a copy `ms adopt` once made into
+        // the store — is one conversation: the copy written last carries its
+        // latest turn. (Two files for one id under ONE root is a reverted
+        // thread, Codex's own business, and both are kept as they always were.)
+        if (c.lastActivity > out[seen.at]!.lastActivity) out[seen.at] = c;
+        continue;
+      }
+      if (!seen) first.set(c.id, { at: out.length, root: r });
+      out.push(c);
+    }
+  });
   return out;
+}
+
+/** One rollout as a conversation, or null when it names no id at all. */
+function codexConversation(file: string): Conversation | null {
+  let mtime: number;
+  try {
+    mtime = statSync(file).mtimeMs;
+  } catch {
+    return null;
+  }
+  let id: string | null = null;
+  let cwd: string | null = null;
+  let compacted = false;
+  let seenMeta = false;
+  let title = "";
+  eachHeaderRecord(file, (rec) => {
+    if (!seenMeta && rec.type === "session_meta" && rec.payload && typeof rec.payload === "object") {
+      const meta = rec.payload as Record<string, unknown>;
+      seenMeta = true;
+      if (typeof meta.id === "string" && meta.id) id = meta.id;
+      else if (typeof meta.session_id === "string" && meta.session_id) id = meta.session_id;
+      if (typeof meta.cwd === "string" && meta.cwd) cwd = meta.cwd;
+      // `history_base` is the pointer at the rollout holding this
+      // conversation's prefix: its presence IS the fact that this
+      // conversation was compacted (see `lineageIds` in src/adopt.ts).
+      compacted = !!meta.history_base && typeof meta.history_base === "object";
+    }
+    if (!title) {
+      const text = codexUserText(rec);
+      if (text) title = cleanTitle(text);
+    }
+    return seenMeta && title !== "";
+  });
+  // A rollout with no readable meta still has its ids in its own filename.
+  const fromName = rolloutIdsFromName(path.basename(file));
+  const resolved = id ?? fromName?.threadId ?? null;
+  if (!resolved) return null;
+  return {
+    provider: "codex",
+    id: resolved,
+    cwd: realish(cwd ?? ""),
+    transcriptPath: file,
+    lastActivity: mtime,
+    title,
+    compacted,
+  };
 }
 
 // --- The process table ---------------------------------------------------
@@ -494,7 +536,7 @@ export function dedupeByTty<T extends { pid: number; tty: string }>(rows: T[]): 
 // --- The scan ------------------------------------------------------------
 
 export function scanConversations(opts: ScanOptions): Candidate[] {
-  const conversations = [...claudeConversations(opts.claudeConfigDir), ...codexConversations(opts.codexHome)]
+  const conversations = [...claudeConversations(opts.claudeConfigDir), ...codexConversations(opts.codexHome, opts.codexStore)]
     .sort((a, b) => b.lastActivity - a.lastActivity);
 
   const ttys = new Set([...opts.tmuxTtys()].map(normalizeTty).filter((t) => t !== ""));

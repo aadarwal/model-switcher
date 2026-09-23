@@ -35,7 +35,7 @@ import path from "node:path";
 import { formatManifest, manifestFromPlan, manifestPath, readManifest, writeManifest } from "../import/manifest.ts";
 import { defaultScanDeps, scanConversations, type Candidate } from "../import/scan.ts";
 import { planImport, type Plan } from "../import/plan.ts";
-import { ensureStore, msHome } from "../paths.ts";
+import { ensureStore, msHome, p } from "../paths.ts";
 import { Tmux } from "../tmux.ts";
 import type { Ctx } from "./steps.ts"; // type-only: erased, no import cycle at runtime
 
@@ -96,6 +96,7 @@ export function defaultScan(opts: { sinceMs: number | null; dirs: string[] }): C
   return scanConversations({
     claudeConfigDir: realClaudeConfigDir(),
     codexHome: realCodexHome(),
+    codexStore: p.codexSessions(),
     sinceMs: opts.sinceMs,
     dirs: opts.dirs,
     ...defaultScanDeps(),

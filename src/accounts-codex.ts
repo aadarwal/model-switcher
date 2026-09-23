@@ -8,11 +8,12 @@
 // account its own CLAUDE_CONFIG_DIR, and launching or rotating is then a
 // matter of which directory the CLI is pointed at.
 //
-// The one thing that must NOT be per-account is the rollout store. Codex
-// records a session under `$CODEX_HOME/sessions`, and a rotation resumes a
-// session that a DIFFERENT account started — so each home's `sessions` is a
-// symlink to the single shared store, `MS_HOME/codex/sessions`. That is also
-// why `remove` deletes a home as a tree but never follows that link.
+// And the credential is the ONLY thing that is per account. Since 0.3.6 a
+// home is a view of the human's own `~/.codex` (src/codex-share.ts): it keeps
+// `auth.json` and its rendered `config.toml`, and every other entry —
+// `sessions` first, because a rotation resumes a conversation some OTHER
+// account started — is a symlink into the base. That is also why `remove`
+// deletes a home as a tree but never follows a link out of it.
 //
 // Identity is the ChatGPT account id out of the login's own `id_token` — never
 // the nickname the human typed — which is why two rows resolving to one
@@ -25,11 +26,12 @@
 // line.
 
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import path from "node:path";
 import { mightCarryToken, redact } from "./accounts.ts";
+import { isPreLinkBackup, shareCodexState } from "./codex-share.ts";
 import { ensureCodexHooks } from "./hooks/codex-install.ts";
-import { ensureStore, msBinary, p } from "./paths.ts";
+import { codexBaseDir, ensureStore, msBinary, p } from "./paths.ts";
 import { type Account, findAccount, loadRegistry, saveRegistry } from "./registry.ts";
 import { probeCodexUsage, readCodexAuth } from "./providers/codex-probe.ts";
 
@@ -42,8 +44,8 @@ const LS_PROBE_TIMEOUT_MS = 10_000;
 
 /** Names no Codex account may take, because `MS_HOME/codex/<name>` would then
  *  BE something else this tool owns. Today there is exactly one: `sessions` is
- *  the shared rollout store, and an account of that name would have `remove`
- *  delete every session every Codex account of this tool has ever recorded. */
+ *  the store's own path (since 0.3.6 a link to `~/.codex/sessions`), and an
+ *  account of that name would have `remove` take the store with it. */
 export const CODEX_RESERVED_NAMES = ["sessions"];
 
 const out = (s: string) => process.stdout.write(s);
@@ -81,27 +83,34 @@ function accountClaimedBy(name: string, accountId: string): string | null {
 // --- The home ----------------------------------------------------------
 
 /**
- * This account's CODEX_HOME, created if absent (0700), with its `sessions`
- * entry pointed at the shared rollout store. Idempotent: `login` calls it too,
- * so a home someone deleted is rebuilt rather than reported.
+ * This account's CODEX_HOME, created if absent (0700), and linked to the
+ * human's own `~/.codex` — every entry but the credential and the rendered
+ * config (src/codex-share.ts). Idempotent: `login` calls it too, so a home
+ * someone deleted is rebuilt rather than reported, and a second call changes
+ * nothing and says nothing.
  *
- * An existing `sessions` entry of any kind is left alone. If a human (or a
- * `codex` that ran before the link existed) put a real directory there, moving
- * or deleting it here would throw away their sessions to satisfy a symlink.
+ * What the links changed goes to `say`, one line each; what they could not
+ * change goes to `warn`. A real entry is never thrown away to make room for a
+ * link: it is merged into the base, or moved there, or kept beside the link
+ * as `<name>.pre-link.<ms>` — the share module's rules, not this one's.
  */
-export function ensureCodexHome(name: string): string {
-  ensureStore(); // creates MS_HOME/codex and MS_HOME/codex/sessions, both 0700
+export function ensureCodexHome(
+  name: string,
+  say: (line: string) => void = () => {},
+  warnLine: (line: string) => void = () => {},
+): string {
+  ensureStore(); // creates MS_HOME/codex, 0700
   const dir = p.codexHome(name);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700); // mkdir's mode is masked by umask; the store's is not a suggestion
-  const link = p.codexSessionsLink(name);
-  try {
-    lstatSync(link);
-  } catch {
-    symlinkSync(p.codexSessions(), link, "dir");
-  }
+  const shared = shareCodexState(dir);
+  for (const line of shared.changes) say(line);
+  for (const line of shared.problems) warnLine(line);
   return dir;
 }
+
+const sayLine = (name: string) => (line: string) => out(`${name}: ${line}\n`);
+const warnFor = (name: string) => (line: string) => warn(`warning: ${name}: ${line}`);
 
 // --- The verbs ---------------------------------------------------------
 
@@ -109,12 +118,30 @@ export function ensureCodexHome(name: string): string {
  *  and found free by the dispatcher (src/accounts.ts `cmdAdd`), which owns
  *  every usage-shaped refusal. */
 export function addCodex(name: string, label: string, shared: boolean): number {
-  const dir = ensureCodexHome(name);
+  const dir = ensureCodexHome(name, sayLine(name), warnFor(name));
   const r = load();
   r.registry.accounts.push({ name, provider: "codex", label, orgId: null, shared, identityVerified: false });
   saveRegistry(r.registry, r);
   out(`added ${name} (codex), CODEX_HOME ${dir} — next: ms accounts login ${name} --provider codex\n`);
   return 0;
+}
+
+/**
+ * `ms accounts add <name> --provider codex` for an account that is already
+ * registered: re-link its home to `~/.codex`, and nothing else. The row is
+ * not rewritten — the dispatcher refuses `--label`/`--shared` here rather
+ * than drop them — so running `add` again is how a home made before 0.3.6
+ * (or one something has since replaced an entry of) is brought back to a
+ * view of the base, and on a home that already is one it changes nothing and
+ * prints nothing. Exit 1 when something could not be linked.
+ */
+export function relinkCodex(name: string): number {
+  let problems = 0;
+  ensureCodexHome(name, sayLine(name), (line) => {
+    problems++;
+    warnFor(name)(line);
+  });
+  return problems ? 1 : 0;
 }
 
 /**
@@ -256,7 +283,7 @@ function installHooks(name: string, dir: string): void {
  * carry to any browser, always can.
  */
 export async function loginCodex(name: string, opts: { deviceAuth?: boolean } = {}): Promise<number> {
-  const dir = ensureCodexHome(name);
+  const dir = ensureCodexHome(name, sayLine(name), warnFor(name));
   const argv = opts.deviceAuth || !process.stdin.isTTY ? ["login", "--device-auth"] : ["login"];
   await runCodexLogin(name, dir, argv);
   // A login that exits 0 without writing the file did not log in. Say which
@@ -296,11 +323,19 @@ export async function verifyCodex(name: string): Promise<number> {
 /**
  * Drop the row and the account's own home.
  *
- * The home goes as a TREE, and `rmSync` never follows a symlink out of one —
- * so `<home>/sessions` is unlinked as a link and the shared rollout store it
- * points at survives, along with every other account's sessions. The guard
- * below is belt and braces for the same store: `add` already refuses the name
- * that would make a home and the store the same directory.
+ * The home is linked to the base first (src/codex-share.ts), so whatever it
+ * still holds of the human's state — a `history.jsonl` a `codex` wrote before
+ * the links existed, a real `sessions` directory — is merged into `~/.codex`
+ * rather than deleted with the account. Then the home goes as a TREE, and
+ * `rmSync` never follows a symlink out of one: every link is unlinked as a
+ * link, and the base it points into survives whole.
+ *
+ * Two refusals, both about transcripts, which are never this tool's to throw
+ * away: a home the links could not be made in (its `sessions` might be the
+ * one real copy of a conversation), and a home still holding a `sessions` or
+ * `archived_sessions` directory — the part of a merged-back store that
+ * DIFFERED from the base's copy and so was kept beside the link. The guard on
+ * the store's own path is belt and braces: `add` already refuses the name.
  */
 export function removeCodex(name: string): number {
   const r = load();
@@ -310,23 +345,37 @@ export function removeCodex(name: string): number {
   if (path.resolve(dir) === path.resolve(p.codexSessions())) {
     throw new Error(`refusing to remove ${name}: its home is the shared rollout store ${dir}`);
   }
-  // `<home>/sessions` is normally a SYMLINK to the shared store, and `rmSync`
-  // unlinks a link without following it. A real directory there is this
-  // account's own transcripts — written by a `codex` that ran before the link
-  // existed, or put there by hand — and `ensureCodexHome` and `ms doctor`
-  // both deliberately leave it alone rather than replace it. Deleting the
-  // tree would take it with them, so this refuses instead and names it: a
-  // transcript is never this tool's to throw away.
-  const sessions = p.codexSessionsLink(name);
-  try {
-    if (lstatSync(sessions).isDirectory()) {
+  const real = (f: string): string => {
+    try {
+      return realpathSync(f);
+    } catch {
+      return path.resolve(f);
+    }
+  };
+  if (real(dir) === real(codexBaseDir())) {
+    throw new Error(`refusing to remove ${name}: its home is the base ${codexBaseDir()} itself`);
+  }
+  if (existsSync(dir)) {
+    const shared = shareCodexState(dir);
+    for (const line of shared.changes) out(`${name}: ${line}\n`);
+    if (shared.problems.length) {
+      throw new Error(`refusing to remove ${name}: its home could not be linked to ${codexBaseDir()} first — ${shared.problems.join("; ")}`);
+    }
+    const transcripts = readdirSync(dir).filter((n) => {
+      const bare = isPreLinkBackup(n) ? n.slice(0, n.indexOf(".pre-link.")) : n;
+      if (bare !== "sessions" && bare !== "archived_sessions") return false;
+      try {
+        return lstatSync(path.join(dir, n)).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+    if (transcripts.length) {
       throw new Error(
-        `refusing to remove ${name}: ${sessions} is a real directory of transcripts, not the shared-store link — move or delete it yourself first`,
+        `refusing to remove ${name}: ${transcripts.map((n) => path.join(dir, n)).join(", ")} ` +
+          `holds transcripts that differ from ${codexBaseDir()}'s — move or delete it yourself first`,
       );
     }
-  } catch (e) {
-    if (e instanceof Error && e.message.startsWith("refusing to remove")) throw e;
-    // No `sessions` entry at all: nothing to protect.
   }
   // The credential first: the row is what NAMES it, so dropping the row before
   // the directory could strand a live `auth.json` nothing points at.

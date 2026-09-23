@@ -62,8 +62,10 @@ export function codexLaunchCommand(flags: string[]): string[] {
  * session is then merely resumed, with no turn of ours at all.
  *
  * The id crosses accounts because every home of this tool links its
- * `sessions` at ONE rollout store (`p.codexSessions`), which is what makes a
- * rotation to another account able to resume the conversation at all.
+ * `sessions` at ONE rollout store — since 0.3.6 the human's own
+ * `~/.codex/sessions` (src/codex-share.ts) — which is what makes a rotation
+ * to another account able to resume the conversation at all, and a
+ * conversation started in a plain `codex` able to be resumed in any of them.
  */
 export function codexResumeCommand(cliSessionId: string, continuation: string | null, flags: string[]): string[] {
   return ["codex", "resume", cliSessionId, ...(continuation ? [continuation] : []), ...flags];

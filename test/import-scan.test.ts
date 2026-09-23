@@ -600,3 +600,64 @@ test("a missing store is an empty scan, not a throw", async () => {
     [],
   );
 });
+
+// --- The shared store (0.3.6) ----------------------------------------------
+
+test("the shared store is walked too — a conversation there is found whatever CODEX_HOME the scan runs under", async () => {
+  // Since 0.3.6 `p.codexSessions()` is a link to ~/.codex/sessions. A scan
+  // run under some other codex home still finds what is in the store.
+  const { home } = tempHome();
+  const cwd = path.join(home, "src", "data");
+  mkdirSync(cwd, { recursive: true });
+  const other = path.join(home, "other-codex-home");
+  const base = path.join(home, ".codex");
+  const inOther = "11111111-1111-4111-8111-111111111111";
+  const inBase = "22222222-2222-4222-8222-222222222222";
+  codexFile(other, "2026-09-17", inOther, { cwd, text: "under the other home", mtime: T0 - 2 * H });
+  codexFile(base, "2026-09-18", inBase, { cwd, text: "in ~/.codex", mtime: T0 - H });
+  const store = path.join(home, "ms", "codex", "sessions");
+  mkdirSync(path.dirname(store), { recursive: true });
+  symlinkSync(path.join(base, "sessions"), store);
+
+  const { scanConversations } = await import("../src/import/scan.ts");
+  const got = scanConversations(opts({ claudeConfigDir: path.join(home, ".claude"), codexHome: other, codexStore: store }));
+  assert.deepEqual(got.map((c) => c.id), [inBase, inOther]);
+  assert.equal(got[0]!.title, "in ~/.codex");
+});
+
+test("the store and a CODEX_HOME that are one directory are walked once — no conversation twice", async () => {
+  const { home } = tempHome();
+  const cwd = path.join(home, "src", "data");
+  mkdirSync(cwd, { recursive: true });
+  const base = path.join(home, ".codex");
+  const id = "11111111-1111-4111-8111-111111111111";
+  codexFile(base, "2026-09-17", id, { cwd, text: "once", mtime: T0 - H });
+  // An ms account home: its `sessions` links to the base's, as the store does.
+  const acct = path.join(home, "ms", "codex", "work");
+  mkdirSync(acct, { recursive: true });
+  symlinkSync(path.join(base, "sessions"), path.join(acct, "sessions"));
+  const store = path.join(home, "ms", "codex", "sessions");
+  symlinkSync(path.join(base, "sessions"), store);
+
+  const { scanConversations } = await import("../src/import/scan.ts");
+  for (const codexHome of [base, acct]) {
+    const got = scanConversations(opts({ claudeConfigDir: path.join(home, ".claude"), codexHome, codexStore: store }));
+    assert.deepEqual(got.map((c) => c.id), [id], codexHome);
+  }
+});
+
+test("one conversation under both roots — a copy ms adopt once made — is one candidate, the copy written last", async () => {
+  const { home } = tempHome();
+  const cwd = path.join(home, "src", "data");
+  mkdirSync(cwd, { recursive: true });
+  const other = path.join(home, "other-codex-home");
+  const storeHome = path.join(home, "store-home");
+  const id = "11111111-1111-4111-8111-111111111111";
+  codexFile(other, "2026-09-17", id, { cwd, text: "older copy", mtime: T0 - 3 * H });
+  const newer = codexFile(storeHome, "2026-09-17", id, { cwd, text: "newer copy", mtime: T0 - H });
+
+  const { scanConversations } = await import("../src/import/scan.ts");
+  const got = scanConversations(opts({ claudeConfigDir: path.join(home, ".claude"), codexHome: other, codexStore: path.join(storeHome, "sessions") }));
+  assert.equal(got.length, 1);
+  assert.equal(got[0]!.transcriptPath, newer);
+});

@@ -49,7 +49,7 @@ import {
   sameOrganisationAs,
   saveRegistry,
 } from "./registry.ts";
-import { addCodex, CODEX_RESERVED_NAMES, codexCells, loginCodex, removeCodex, verifyCodex } from "./accounts-codex.ts";
+import { addCodex, CODEX_RESERVED_NAMES, codexCells, loginCodex, relinkCodex, removeCodex, verifyCodex } from "./accounts-codex.ts";
 import { deleteLaunchToken, looksLikeSetupToken, readLaunchToken, saveLaunchToken } from "./launch-credentials.ts";
 import {
   AuthError,
@@ -113,7 +113,9 @@ const PROVIDERS: Provider[] = ["claude", "codex"];
 
 const USAGE = `usage: ms accounts <command>
   add <name> [--provider claude|codex] [--label L] [--shared]
-                                      register an account (no credentials yet)
+                                      register an account (no credentials yet);
+                                      again on a codex account, re-link its home
+                                      to ~/.codex
   login <name> [--provider P] [--device-auth] [--relogin]
                                       mint the credentials and record the identity
   verify <name> [--provider P]        re-check an account's credentials and identity
@@ -705,7 +707,16 @@ export function cmdAdd(args: string[]): number {
   const r = load();
   // Names are unique PER PROVIDER (src/registry.ts): a claude "work" and a
   // codex "work" are two accounts, and only a clash within one is a duplicate.
-  if (findAccount(r.registry, name, provider)) throw new UsageError(`${name} is already registered (${provider})`);
+  if (findAccount(r.registry, name, provider)) {
+    // A codex account's `add` has something to do a second time: re-link its
+    // home to ~/.codex (src/codex-share.ts). Its row is never rewritten, so a
+    // --label or --shared that would be silently dropped is refused instead.
+    if (provider !== "codex") throw new UsageError(`${name} is already registered (${provider})`);
+    if (label !== null || shared) {
+      throw new UsageError(`${name} is already registered (codex); add on an existing codex account only re-links its home, and takes no --label or --shared`);
+    }
+    return relinkCodex(name);
+  }
   if (provider === "codex") return addCodex(name, label ?? name, shared);
   r.registry.accounts.push({
     name,

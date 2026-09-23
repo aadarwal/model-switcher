@@ -1,6 +1,6 @@
 {
   "name": "model-switcher",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Run claude and codex on whichever of your accounts has room; rotate a walled session in place.",
   "type": "module",
   "bin": {

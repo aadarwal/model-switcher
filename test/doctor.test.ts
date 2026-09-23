@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync, realpathSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync, realpathSync, existsSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
@@ -957,7 +957,7 @@ test("checkCodexAccount: a fully healthy account reports four ✓ lines, in orde
       "codex account codexacct: credentials readable",
       "codex account codexacct: usage fetch ok",
       "codex account codexacct: hooks installed",
-      "codex account codexacct: sessions store linked",
+      `codex account codexacct: shares ${process.env.MS_CODEX_BASE_DIR}`,
     ]);
   } finally {
     globalThis.fetch = savedFetch;
@@ -977,7 +977,7 @@ test("checkCodexAccount: no auth.json fails credentials readable + usage fetch o
   assert.match(byWhat(/credentials readable/).why ?? "", /ms accounts login orphan-codex --provider codex/);
   assert.equal(byWhat(/usage fetch ok/).ok, false);
   assert.equal(byWhat(/hooks installed/).ok, false); // ensureCodexHome never installs hooks
-  assert.equal(byWhat(/sessions store linked/).ok, true); // ensureCodexHome already links it
+  assert.equal(byWhat(/: shares /).ok, true); // ensureCodexHome already links it
 });
 
 test("checkCodexAccount: a dead access token fails usage fetch as auth, with the codex login remedy — doctor never refreshes a Codex credential, --fix or not", async () => {
@@ -1119,146 +1119,111 @@ test("checkCodexAccount: --fix on a config.toml it cannot safely rewrite surface
   }
 });
 
-test("checkCodexAccount: the account's own sessions LINK is missing (the shared store already exists) → ✗; --fix recreates the LINK", async () => {
-  const { msHome } = base();
-  process.env.MS_HOME = msHome;
-  // The shared store itself (normally created by `loadRegistry`'s own
-  // `ensureStore`, ahead of every account check in `runDoctor`) — created
-  // here explicitly since this test calls `checkCodexAccount` directly. No
-  // ensureCodexHome for the ACCOUNT home, though — build that one by hand,
-  // deliberately without its own `sessions` entry, so the "link missing,
-  // store present" branch is what gets exercised (distinct from "link
-  // present but dangling because the STORE is missing", tested separately).
-  const { ensureStore } = await import("../src/paths.ts");
-  ensureStore();
-  const dir = path.join(msHome, "codex", "codexacct");
+/** A codex account home with a working auth.json and nothing else — built
+ *  by hand, so a test can put exactly the entries it means to in it. */
+function bareCodexHome(msHome: string, name = "codexacct"): string {
+  const dir = path.join(msHome, "codex", name);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   writeFileSync(
     path.join(dir, "auth.json"),
     JSON.stringify({
-      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
+      tokens: { id_token: "id", access_token: `at-${name}`, refresh_token: "rt", account_id: "acct" },
       last_refresh: new Date().toISOString(),
     }),
     { mode: 0o600 },
   );
+  return dir;
+}
+
+test("checkCodexAccount: a home whose entries are not links to ~/.codex yet → ✗ fixable; --fix links and merges; a second doctor is clean", async () => {
+  const { home, msHome } = base();
+  const baseDir = path.join(home, ".codex");
+  mkdirSync(path.join(baseDir, "sessions"), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(baseDir, "history.jsonl"), '{"text":"base"}\n');
+  mkdirSync(path.join(baseDir, "skills"), { recursive: true });
+  const dir = bareCodexHome(msHome);
+  writeFileSync(path.join(dir, "history.jsonl"), '{"text":"home"}\n');
 
   const savedFetch = globalThis.fetch;
   stubCodexUsageOk();
   try {
     const { checkCodexAccount } = await import("../src/doctor.ts");
-    const before = await checkCodexAccount(codexAccount(), false);
-    const linkBefore = before.find((r) => /sessions store linked/.test(r.what))!;
-    assert.equal(linkBefore.ok, false);
-    assert.match(linkBefore.why ?? "", /is missing \(want a symlink/);
-    assert.doesNotMatch(linkBefore.why ?? "", /shared store missing/);
+    const shares = (rs: { ok: boolean; what: string; why?: string; fixed?: boolean }[]) => rs.find((r) => /: shares /.test(r.what))!;
+    const before = shares(await checkCodexAccount(codexAccount(), false));
+    assert.equal(before.ok, false);
+    assert.match(before.why ?? "", /history\.jsonl is a real file, not a link/);
+    assert.match(before.why ?? "", /not linked \(sessions, skills\)/);
+    assert.match(before.why ?? "", /run ms doctor --fix/);
+    assert.equal(lstatSync(path.join(dir, "history.jsonl")).isFile(), true, "a plain check changes nothing");
 
-    const after = await checkCodexAccount(codexAccount(), true);
-    const linkAfter = after.find((r) => /sessions store linked/.test(r.what))!;
-    assert.equal(linkAfter.ok, true);
-    assert.equal(linkAfter.fixed, true);
+    const after = shares(await checkCodexAccount(codexAccount(), true));
+    assert.deepEqual([after.ok, after.fixed], [true, true], JSON.stringify(after));
+    assert.equal(realpathSync(path.join(dir, "sessions")), realpathSync(path.join(baseDir, "sessions")));
+    assert.equal(readFileSync(path.join(baseDir, "history.jsonl"), "utf8"), '{"text":"base"}\n{"text":"home"}\n');
 
-    const { p } = await import("../src/paths.ts");
-    assert.equal(lstatSync(p.codexSessionsLink("codexacct")).isSymbolicLink(), true);
-    assert.equal(realpathSync(p.codexSessionsLink("codexacct")), realpathSync(p.codexSessions()));
+    const again = shares(await checkCodexAccount(codexAccount(), false));
+    assert.deepEqual([again.ok, again.fixed], [true, undefined]);
   } finally {
     globalThis.fetch = savedFetch;
   }
 });
 
-test("checkCodexAccount: --fix never touches an existing real directory at the sessions path — only a missing entry is ever created", async () => {
-  const { msHome } = base();
-  process.env.MS_HOME = msHome;
-  const dir = path.join(msHome, "codex", "codexacct");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(
-    path.join(dir, "auth.json"),
-    JSON.stringify({
-      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
-      last_refresh: new Date().toISOString(),
-    }),
-    { mode: 0o600 },
-  );
+test("checkCodexAccount: --fix merges a real sessions directory into ~/.codex, never replaces it — a file that differs stays beside the link", async () => {
+  const { home, msHome } = base();
+  const baseSessions = path.join(home, ".codex", "sessions");
+  mkdirSync(baseSessions, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(baseSessions, "clash.jsonl"), "the base's own\n");
+  const dir = bareCodexHome(msHome);
   const realSessions = path.join(dir, "sessions");
   mkdirSync(realSessions, { recursive: true, mode: 0o700 });
-  const marker = path.join(realSessions, "keep-me.txt");
-  writeFileSync(marker, "real session data");
+  writeFileSync(path.join(realSessions, "keep-me.txt"), "real session data");
+  writeFileSync(path.join(realSessions, "clash.jsonl"), "this home's own\n");
 
   const savedFetch = globalThis.fetch;
   stubCodexUsageOk();
   try {
     const { checkCodexAccount } = await import("../src/doctor.ts");
     const rs = await checkCodexAccount(codexAccount(), true);
-    const link = rs.find((r) => /sessions store linked/.test(r.what))!;
-    assert.equal(link.ok, false);
-    assert.match(link.why ?? "", /real directory/);
-    assert.equal(lstatSync(realSessions).isDirectory(), true);
-    assert.equal(lstatSync(realSessions).isSymbolicLink(), false);
-    assert.equal(readFileSync(marker, "utf8"), "real session data");
+    const line = rs.find((r) => /: shares /.test(r.what))!;
+    assert.deepEqual([line.ok, line.fixed], [true, true], JSON.stringify(line));
+    assert.equal(lstatSync(realSessions).isSymbolicLink(), true);
+    assert.equal(readFileSync(path.join(baseSessions, "keep-me.txt"), "utf8"), "real session data");
+    assert.equal(readFileSync(path.join(baseSessions, "clash.jsonl"), "utf8"), "the base's own\n", "never overwritten");
+    const aside = readdirSync(dir).find((n) => n.startsWith("sessions.pre-link."));
+    assert.ok(aside, "the differing copy is kept");
+    assert.equal(readFileSync(path.join(dir, aside!, "clash.jsonl"), "utf8"), "this home's own\n");
   } finally {
     globalThis.fetch = savedFetch;
   }
 });
 
-test("checkCodexAccount: a symlink correctly pointing at the shared store, when the store itself is missing, reports 'shared store missing'; --fix recreates the STORE, not the link", async () => {
-  const { msHome } = base();
-  process.env.MS_HOME = msHome;
-  const dir = path.join(msHome, "codex", "codexacct");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(
-    path.join(dir, "auth.json"),
-    JSON.stringify({
-      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
-      last_refresh: new Date().toISOString(),
-    }),
-    { mode: 0o600 },
-  );
-  const { p } = await import("../src/paths.ts");
-  const target = p.codexSessions();
-  const link = path.join(dir, "sessions");
-  // The link is correct and pre-existing — pointing at the shared store by
-  // name — but nothing has ever created that store directory (never call
-  // ensureStore/ensureCodexHome in this fixture).
-  symlinkSync(target, link, "dir");
-  assert.ok(!existsSync(target), "fixture sanity: the shared store must not exist yet");
+test("checkCodexBase: a missing ~/.codex and a store that is still a directory of its own are fixable; --fix makes the base and merges the store into it", async () => {
+  const { home, msHome } = base();
+  const baseDir = path.join(home, ".codex");
+  const store = path.join(msHome, "codex", "sessions");
+  mkdirSync(path.join(store, "2026", "09", "16"), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(store, "2026", "09", "16", "rollout-2026-09-16T10-00-00-cx-1.jsonl"), "{}\n");
 
-  const savedFetch = globalThis.fetch;
-  stubCodexUsageOk();
-  try {
-    const { checkCodexAccount } = await import("../src/doctor.ts");
-    const before = await checkCodexAccount(codexAccount(), false);
-    const linkBefore = before.find((r) => /sessions store linked/.test(r.what))!;
-    assert.equal(linkBefore.ok, false);
-    assert.match(linkBefore.why ?? "", /shared store missing/);
-    assert.ok(lstatSync(link).isSymbolicLink(), "the link itself is untouched by a plain check");
+  const { checkCodexBase } = await import("../src/doctor.ts");
+  const before = checkCodexBase(false);
+  assert.equal(before.ok, false);
+  assert.match(before.why ?? "", /does not exist yet/);
+  assert.match(before.why ?? "", /run ms doctor --fix/);
+  assert.equal(existsSync(baseDir), false, "a plain check creates nothing");
 
-    const after = await checkCodexAccount(codexAccount(), true);
-    const linkAfter = after.find((r) => /sessions store linked/.test(r.what))!;
-    assert.equal(linkAfter.ok, true);
-    assert.equal(linkAfter.fixed, true);
-    assert.equal(statSync(target).isDirectory(), true);
-    assert.equal(statSync(target).mode & 0o777, 0o700);
-    // The link itself was never recreated — same inode/target as before.
-    assert.equal(realpathSync(link), realpathSync(target));
-  } finally {
-    globalThis.fetch = savedFetch;
-  }
+  const after = checkCodexBase(true);
+  assert.deepEqual([after.ok, after.fixed], [true, true], JSON.stringify(after));
+  assert.equal(statSync(baseDir).mode & 0o777, 0o700);
+  assert.equal(lstatSync(store).isSymbolicLink(), true);
+  assert.equal(realpathSync(store), realpathSync(path.join(baseDir, "sessions")));
+  assert.ok(existsSync(path.join(baseDir, "sessions", "2026", "09", "16", "rollout-2026-09-16T10-00-00-cx-1.jsonl")), "the store's rollout moved into ~/.codex");
+  assert.equal(checkCodexBase(false).ok, true);
 });
 
-test("checkCodexAccount: a symlink pointing SOMEWHERE ELSE (not the shared store) is reported and left alone — --fix never touches it, even though it is technically 'broken'", async () => {
-  const { msHome } = base();
-  process.env.MS_HOME = msHome;
-  const dir = path.join(msHome, "codex", "codexacct");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(
-    path.join(dir, "auth.json"),
-    JSON.stringify({
-      tokens: { id_token: "id", access_token: "at-codexacct", refresh_token: "rt", account_id: "acct" },
-      last_refresh: new Date().toISOString(),
-    }),
-    { mode: 0o600 },
-  );
-  const { ensureStore } = await import("../src/paths.ts"); // the shared store DOES exist here
-  ensureStore();
+test("checkCodexAccount: a symlink pointing SOMEWHERE ELSE (not ~/.codex) is reported and left alone — --fix never touches it", async () => {
+  const { home, msHome } = base();
+  mkdirSync(path.join(home, ".codex", "sessions"), { recursive: true, mode: 0o700 });
+  const dir = bareCodexHome(msHome);
   const elsewhere = path.join(msHome, "somewhere-else");
   mkdirSync(elsewhere, { recursive: true, mode: 0o700 });
   const link = path.join(dir, "sessions");
@@ -1268,16 +1233,15 @@ test("checkCodexAccount: a symlink pointing SOMEWHERE ELSE (not the shared store
   stubCodexUsageOk();
   try {
     const { checkCodexAccount } = await import("../src/doctor.ts");
-    const before = await checkCodexAccount(codexAccount(), false);
-    const linkBefore = before.find((r) => /sessions store linked/.test(r.what))!;
-    assert.equal(linkBefore.ok, false);
-    assert.match(linkBefore.why ?? "", /points elsewhere/);
-    assert.doesNotMatch(linkBefore.why ?? "", /shared store missing/);
+    const shares = (rs: { ok: boolean; what: string; why?: string }[]) => rs.find((r) => /: shares /.test(r.what))!;
+    const before = shares(await checkCodexAccount(codexAccount(), false));
+    assert.equal(before.ok, false);
+    assert.match(before.why ?? "", /never touched automatically/);
+    assert.doesNotMatch(before.why ?? "", /run ms doctor --fix/, "nothing here is --fix's to do");
 
-    const after = await checkCodexAccount(codexAccount(), true); // --fix too
-    const linkAfter = after.find((r) => /sessions store linked/.test(r.what))!;
-    assert.equal(linkAfter.ok, false);
-    assert.match(linkAfter.why ?? "", /points elsewhere/);
+    const after = shares(await checkCodexAccount(codexAccount(), true)); // --fix too
+    assert.equal(after.ok, false);
+    assert.match(after.why ?? "", /never touched automatically/);
     assert.equal(realpathSync(link), realpathSync(elsewhere), "never touched, --fix or not");
   } finally {
     globalThis.fetch = savedFetch;
@@ -1655,12 +1619,15 @@ test("runDoctor --fix: Codex hooks land as TOML tables + trusted_hash (a pre-exi
     assert.equal(codexHooksInstalled(okDir, msBinary()), true);
     assert.ok(results.some((r) => r.ok && r.fixed && r.what === "codex account codexok: hooks installed"), JSON.stringify(results));
 
-    // codexok's sessions link was missing and is now recreated, resolving
-    // to the shared store.
-    const { p } = await import("../src/paths.ts");
+    // codexok's sessions link was missing and is now made, resolving to the
+    // base's own sessions — and the store path this tool reads through is a
+    // link to the same place, made by the base line ahead of the accounts.
+    const { p, codexBaseDir } = await import("../src/paths.ts");
     assert.equal(lstatSync(p.codexSessionsLink("codexok")).isSymbolicLink(), true);
-    assert.equal(realpathSync(p.codexSessionsLink("codexok")), realpathSync(p.codexSessions()));
-    assert.ok(results.some((r) => r.ok && r.fixed && r.what === "codex account codexok: sessions store linked"), JSON.stringify(results));
+    assert.equal(realpathSync(p.codexSessionsLink("codexok")), realpathSync(path.join(codexBaseDir(), "sessions")));
+    assert.equal(realpathSync(p.codexSessions()), realpathSync(path.join(codexBaseDir(), "sessions")));
+    assert.ok(results.some((r) => r.ok && r.fixed && r.what === `codex account codexok: shares ${codexBaseDir()}`), JSON.stringify(results));
+    assert.ok(results.some((r) => r.ok && r.fixed && r.what.startsWith(`codex base ${codexBaseDir()}`)), JSON.stringify(results));
 
     // codexok's 0644 auth.json is reported (as a store-permission issue) and
     // fixed to 0600 in the same --fix run.
@@ -1677,9 +1644,9 @@ test("runDoctor --fix: Codex hooks land as TOML tables + trusted_hash (a pre-exi
     assert.match(hooksBad.why ?? "", /a 'hooks' table this tool cannot read/);
     assert.ok(lines.some((l) => l.includes("a 'hooks' table this tool cannot read")), lines.join("\n"));
 
-    // Neither account's own `sessions` symlink is ever reported as a stray
-    // symlink by the store-permission walk.
-    assert.ok(!results.some((r) => r.what.includes("codex/codexok/sessions") || r.what.includes("codex/codexbad/sessions")), JSON.stringify(results));
+    // Neither account's own `sessions` symlink — nor the store's own link —
+    // is ever reported as a stray symlink by the store-permission walk.
+    assert.ok(!results.some((r) => /store permission: codex\/(codexok\/|codexbad\/)?sessions/.test(r.what)), JSON.stringify(results));
 
     // No token text anywhere, in any result or any rendered line.
     const rendered = lines.join("\n");

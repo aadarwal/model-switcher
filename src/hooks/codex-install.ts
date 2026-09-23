@@ -56,7 +56,9 @@ import { backupThroughLink, resolveTarget, writeAtomicThroughLink } from "../fsx
 import { ensureCodexTrust, stripComment } from "../providers/codex-cli.ts";
 // The user's own `~/.codex/config.toml` — the base every home is rendered
 // from. Named in src/paths.ts beside every other path this tool resolves.
-import { codexBaseConfigPath } from "../paths.ts";
+import { codexBaseConfigPath, codexBaseDir } from "../paths.ts";
+// Everything else in a home is the base's own, linked (0.3.6).
+import { codexSessionsShared, shareCodexState } from "../codex-share.ts";
 
 /** The four lifecycle events the Codex hook subscribes to, with the snake_case
  * spelling Codex uses in a trust key and the timeout it applies by default.
@@ -630,13 +632,22 @@ export function ensureCodexHooks(homeDir: string, msBin: string): InstallResult 
 }
 
 /**
- * Make a codex home ready to receive a pane: trusted for `cwd`, and carrying
- * this binary's hooks. Trust first, because its dialog is the modal one — an
- * unattended pane that met it would sit in front of it forever with nobody to
- * answer — and the hooks second, for a subtler reason but the same shape: a
- * home with no hooks starts fine and reports NOTHING (see `ensureCodexHooks`
- * above), so the bill is deferred to the next rotation rather than refused
- * up front.
+ * Make a codex home ready to receive a pane: trusted for `cwd`, carrying this
+ * binary's hooks, and linked to the human's own Codex home. Trust first,
+ * because its dialog is the modal one — an unattended pane that met it would
+ * sit in front of it forever with nobody to answer — and the hooks second,
+ * for a subtler reason but the same shape: a home with no hooks starts fine
+ * and reports NOTHING (see `ensureCodexHooks` above), so the bill is deferred
+ * to the next rotation rather than refused up front.
+ *
+ * Third, the links (src/codex-share.ts): every entry of `~/.codex` but the
+ * credential and this config, repaired on EVERY launch and rotation, so an
+ * entry something replaced by a rename never diverges past the next one. Its
+ * changes and its problems go to `note` — a problem is never silent, and
+ * never fatal either, with one exception: a home whose `sessions` is not the
+ * base's is refused, because a rotation into it would resume nothing ("No
+ * saved session found") and replace the human's conversation with an empty
+ * one.
  *
  * The ONE call every path that is about to put a pane in this home makes —
  * `launchCodex`'s own `prepare` for a fresh launch, and a rotation's
@@ -645,7 +656,12 @@ export function ensureCodexHooks(homeDir: string, msBin: string): InstallResult 
  * neither installer will touch is a candidate refusal in both places, not
  * just one.
  */
-export function ensureCodexReady(homeDir: string, cwd: string, msBin: string): { problem: string } | null {
+export function ensureCodexReady(
+  homeDir: string,
+  cwd: string,
+  msBin: string,
+  note: (line: string) => void = () => {},
+): { problem: string } | null {
   try {
     const { problem } = ensureCodexTrust(homeDir, cwd);
     if (problem) return { problem };
@@ -657,6 +673,20 @@ export function ensureCodexReady(homeDir: string, cwd: string, msBin: string): {
     if (problem) return { problem: `${problem} — then run: ms doctor --fix` };
   } catch (e) {
     return { problem: `cannot install the codex hooks in ${homeDir}: ${(e as Error).message} (run: ms doctor --fix)` };
+  }
+  try {
+    const shared = shareCodexState(homeDir);
+    for (const line of shared.changes) note(line);
+    for (const line of shared.problems) note(`warning: ${line}`);
+  } catch (e) {
+    note(`warning: cannot link ${homeDir} to ${codexBaseDir()}: ${(e as Error).message}`);
+  }
+  if (!codexSessionsShared(homeDir)) {
+    return {
+      problem:
+        `${homeDir}/sessions is not ${codexBaseDir()}/sessions, so a conversation started anywhere else cannot be resumed there ` +
+        `— run: ms doctor --fix`,
+    };
   }
   return null;
 }

@@ -166,6 +166,11 @@ into that account's own `CODEX_HOME` (`MS_HOME/codex/<name>`), and `ms` hands th
 directory, never the credential. No secret is ever passed on a command line, put into a
 tmux command, logged or printed.
 
+That home's `config.toml` is rendered on every launch from your own
+`~/.codex/config.toml` — model, reasoning effort, MCP servers and all — plus the `ms`
+hook block and whatever Codex itself wrote into the home; your file is only ever read
+(`MS_CODEX_BASE_CONFIG` points somewhere else), and it wins any collision.
+
 ### Credentials are per device
 
 The token endpoints rotate refresh tokens, so the first refresh on either machine
@@ -319,7 +324,7 @@ does not look like something `ms` wrote.
 | What | Where | Undo |
 |---|---|---|
 | Claude hooks: `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure` (`rate_limit`), `SessionEnd` | `~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` | Delete the entries whose command ends in `_hook claude` |
-| Codex hook tables and their computed trust hashes | `MS_HOME/codex/<account>/config.toml`, between `# ms-hooks-begin` and `# ms-hooks-end` | Delete that block |
+| Codex hook tables and their computed trust hashes, and a copy of your `~/.codex/config.toml` | `MS_HOME/codex/<account>/config.toml` — the hooks between `# ms-hooks-begin` and `# ms-hooks-end` | Delete that block; remove the account |
 | Statusline wrapper (opt-in, default no) | `statusLine` in the same `settings.json` | `ms setup --remove statusline` |
 | Shell aliases for `claude` and `codex` (opt-in, default no) | `~/.zshrc`, or `~/.bash_profile` / `~/.bashrc`, between `# ms-alias-begin` and `# ms-alias-end` | `ms setup --remove alias` |
 | The wizard's own progress | `MS_HOME/setup.json` | `ms setup --reset` |
@@ -345,6 +350,7 @@ only, and stored at rest in that same 0600 file.
 | `MS_HOME` | Where all state lives. Default `~/.config/model-switcher`. |
 | `MS_BIN` | The absolute `ms` path written into hook commands, Codex trust hashes, the statusline wrapper and the alias block. The Homebrew shim sets it to `/opt/homebrew/opt/model-switcher/bin/ms` — the stable path, so everything the wizard wrote survives an upgrade. Set it yourself only when running `ms` from somewhere unusual. |
 | `MS_CODEX_AUTOROTATE` | Automatic recovery for Codex sessions. Unset, empty, or exactly `1` is **on**; **every other value reads as off** — `0`, but `false`, `no` and a typo too, because only `1` is read as yes. Export it in the shell that runs `codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched watchdog and worker read it too. A mirrored `off` is a stored row and outlives the variable — unsetting it later does not turn recovery back on; export `MS_CODEX_AUTOROTATE=1` (and run an `ms codex`, which mirrors) to do that. `ms doctor` prints the state it will act on. Ships on. |
+| `MS_CODEX_BASE_CONFIG` | The file every Codex account home is rendered from. Defaults to `~/.codex/config.toml`; it is read, never written. Point it elsewhere to give `ms` panes a different base, or at a path that does not exist to give them none. |
 | `MS_REBALANCE` | [Rebalance](#rebalance): moving an idle session to a better account at a turn end. Unset, empty, or exactly `1` is **on**; **every other value reads as off** — the same shape as `MS_CODEX_AUTOROTATE`, now that a sooner weekly reset alone has been observed doing the right thing. Export it in the shell that runs `claude`/`codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched hooks read it too. A mirrored `off` is a stored row and outlives the variable — unsetting it later does not turn rebalance back on; export `MS_REBALANCE=1` (and run an `ms claude`/`ms codex`, which mirrors) to do that. It gates only the AUTOMATIC moves; `ms rebalance` works either way. `ms doctor` prints the state it will act on. Ships on since 0.3.4; `MS_REBALANCE=0` disables it. |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere `ms` reads or writes that settings file. |
 | `MS_VERBOSE` | `1` prints what each invocation's start-of-run repair did. |

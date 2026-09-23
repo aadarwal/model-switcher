@@ -18,3 +18,14 @@
 // of these still sets it explicitly, exactly as before.
 export const SCRUBBED = ["CLAUDE_CONFIG_DIR", "MS_HOME", "CODEX_HOME", "MS_BIN", "MS_ACCOUNT", "MS_SESSION", "MS_GENERATION", "MS_SOCKET", "MS_PANE"];
 for (const name of SCRUBBED) delete process.env[name];
+
+// MS_CODEX_BASE_CONFIG is the fifth of that class and the one that cannot be
+// fixed by DELETING it: unset, `ms` renders every Codex home from the
+// developer's real `~/.codex/config.toml`, and HOME is not isolated for the
+// in-process half of the suite. So it is PINNED at a path inside a directory
+// that is never created — a base that is simply absent, which is the case
+// every test renders against unless it points this at a fixture of its own.
+import path from "node:path";
+import { tmpdir } from "node:os";
+export const ABSENT_CODEX_BASE = path.join(tmpdir(), `ms-test-no-codex-base-${process.pid}`, "config.toml");
+process.env.MS_CODEX_BASE_CONFIG = ABSENT_CODEX_BASE;

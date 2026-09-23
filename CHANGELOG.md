@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.5
+
+- codex accounts run with your own `~/.codex/config.toml` (model, reasoning
+  effort, MCP servers) plus the hooks — rendered on every launch
+
 ## 0.3.4
 
 - rebalance: a sooner weekly reset is reason enough to move an idle session

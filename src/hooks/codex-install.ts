@@ -11,13 +11,20 @@
 //
 // Two things follow from that, and they are the whole design here:
 //
-//  1. **We do not own the file.** `config.toml` also carries the human's model,
-//     approval policy, MCP servers, and — Task 7's business — the
-//     `[projects."<cwd>"] trust_level` rows a launch pre-writes. Rewriting it
-//     from a parsed model would reformat all of that (and a 0-dependency tool
-//     has no TOML serialiser to reformat it WELL). The tool therefore owns one
-//     contiguous block delimited by marker comments and copies every other byte
-//     through unchanged.
+//  1. **We do not own the file — but we do RENDER it** (0.3.5). `config.toml`
+//     also carries the model, the reasoning effort, the MCP servers, and the
+//     `[projects."<cwd>"] trust_level` rows a launch pre-writes. Until 0.3.5
+//     the first three were simply absent from an `ms` home, because a
+//     per-account `CODEX_HOME` reads none of the human's `~/.codex/config.toml`
+//     and Codex has no way to layer one over the other. So the file is now
+//     composed on every launch from the human's own config, our block, and
+//     whatever Codex wrote into the home — see "The base config a home is
+//     rendered from" below. Every part is copied as WHOLE TOP-LEVEL SECTIONS,
+//     byte for byte: nothing here parses a value or re-serialises one (a
+//     0-dependency tool has no TOML writer, and the wall drill's
+//     `openai_base_url` overrides are exactly what a re-serialiser would
+//     quietly reformat). Our own contribution is still one contiguous block
+//     delimited by marker comments, and it still stays where the markers are.
 //
 //  2. **A new hook does not run until it is trusted.** Codex records trust as
 //     `[hooks.state."<config path>:<event_snake>:<matcher idx>:<hook idx>"]`
@@ -47,6 +54,9 @@ import { backupThroughLink, resolveTarget, writeAtomicThroughLink } from "../fsx
 // one definition of "where does the TOML end and the comment begin" is the
 // only way both writers agree about what a line says.
 import { ensureCodexTrust, stripComment } from "../providers/codex-cli.ts";
+// The user's own `~/.codex/config.toml` — the base every home is rendered
+// from. Named in src/paths.ts beside every other path this tool resolves.
+import { codexBaseConfigPath } from "../paths.ts";
 
 /** The four lifecycle events the Codex hook subscribes to, with the snake_case
  * spelling Codex uses in a trust key and the timeout it applies by default.
@@ -223,6 +233,211 @@ function split(text: string): { prefix: string[]; suffix: string[] } | null {
   return { prefix: lines.slice(0, begin), suffix: lines.slice(end + 1) };
 }
 
+// --- The base config a home is rendered from ----------------------------
+//
+// A home's `config.toml` used to be whatever the human and Codex had put
+// there, plus our block. That made every `ms codex` pane run at Codex's
+// DEFAULT model and reasoning effort with none of the human's MCP servers —
+// because the home is a fresh `CODEX_HOME`, and `~/.codex/config.toml` is
+// not read from one.
+//
+// Codex 0.156.1 has no way to say otherwise. `CODEX_HOME` is the only path
+// variable it reads (checked against the shipped binary's own strings), and
+// `-p/--profile` layers `$CODEX_HOME/<name>.config.toml` over
+// `$CODEX_HOME/config.toml` — both inside the home we gave the account, so
+// neither reaches the human's file. There is no include directive. So the
+// file is RENDERED instead, on every launch, from three parts:
+//
+//   (a) the human's own `~/.codex/config.toml` (`codexBaseConfigPath`), with
+//       every `hooks` table stripped — their hook trust is keyed on THEIR
+//       config path and means nothing here, and a bare `[hooks.state]` (the
+//       real file has one) would otherwise be a header this tool refuses on;
+//   (b) our block: the four hook tables and their pre-computed trust, the
+//       same recipe and the same hashes as before;
+//   (c) everything Codex itself wrote into the home — `[projects."…"]`
+//       trust, `[tui]`, `[tui.*]`, anything else — that (a) does not already
+//       define. Base wins a collision; Codex-written state is never dropped.
+//
+// Rendering, not merging: the parts are whole top-level sections, copied
+// byte for byte, never re-serialised (a zero-dependency tool has no TOML
+// writer, and the wall-drill's `openai_base_url` overrides are exactly the
+// kind of thing a re-serialiser would quietly reformat). The file is
+// therefore idempotent by construction — a second render of what it just
+// wrote drops (a) out of (c) again and produces the same bytes.
+//
+// Nothing here ever writes to `~/.codex/config.toml`. It is opened read-only
+// and is missing-is-fine.
+
+/**
+ * A top-level table header, as the SECTION splitter sees one: a line whose
+ * FIRST character is `[` and which still ends in `]` once its comment is cut.
+ *
+ * Column zero is the whole point. `matrix = [` / `  [1, 2]` / `]` is a legal
+ * multi-line array, and its middle line trims to something that opens and
+ * closes with brackets — but it is indented, and every header Codex or this
+ * tool writes is not. (`classify` above is stricter still and answers a
+ * different question: whether a line is one of the two `hooks` shapes.)
+ */
+function isSectionHeader(raw: string): boolean {
+  if (!/^\[\[?\s*[^\s[\]]/.test(raw)) return false;
+  return stripComment(raw).trimEnd().endsWith("]");
+}
+
+/** A header whose first key segment is `hooks`, in any spelling — the tables
+ *  section (a) drops. */
+const isHooksHeader = (raw: string): boolean => HOOKS_SEGMENT.test(stripComment(raw).trim());
+
+/**
+ * A dotted TOML key as its unquoted segments, or null when this tool cannot
+ * say what key that is.
+ *
+ * Null is never a guess: it makes the caller fall back to comparing the raw
+ * text, so a header or an assignment this parser cannot read can only ever
+ * FAIL to match one from the base — never match the wrong one.
+ */
+function splitKeyPath(text: string): string[] | null {
+  const segs: string[] = [];
+  let i = 0;
+  for (;;) {
+    while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    if (i >= text.length) return null;
+    const quote = text[i]!;
+    if (quote === '"' || quote === "'") {
+      const start = i++;
+      for (;;) {
+        if (i >= text.length) return null; // unterminated
+        const c = text[i]!;
+        if (quote === '"' && c === "\\") { i += 2; continue; }
+        i++;
+        if (c === quote) break;
+      }
+      segs.push(unquoteTomlKey(text.slice(start, i)));
+    } else {
+      const start = i;
+      while (i < text.length && /[A-Za-z0-9_-]/.test(text[i]!)) i++;
+      if (i === start) return null;
+      segs.push(text.slice(start, i));
+    }
+    while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+    if (i >= text.length) return segs;
+    if (text[i] !== ".") return null;
+    i++;
+  }
+}
+
+/** The identity a base table and a home table are compared on: the key path,
+ *  NOT the bracket count. `[x]` in the base and `[[x]]` in the home are a
+ *  collision, not two tables — emitting both would be a config Codex drops
+ *  whole. */
+function headerKey(raw: string): string {
+  const line = stripComment(raw).trim();
+  const m = /^\[\[?([\s\S]*?)\]\]?$/.exec(line);
+  const segs = m ? splitKeyPath(m[1]!) : null;
+  return segs ? segs.join("\u0000") : `raw:${line}`;
+}
+
+/** The dotted key a preamble line assigns to, or null when the line does not
+ *  start an assignment: a blank, a comment, or a continuation line of a
+ *  multi-line value (`  [1, 2]`, `  { a = 1 },` — neither parses as a key,
+ *  which is what keeps a value from being split in half). */
+function rootKey(raw: string): string | null {
+  const line = stripComment(raw);
+  if (line.trim() === "") return null;
+  let eq = -1;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (c === '"') { i++; while (i < line.length && line[i] !== '"') { if (line[i] === "\\") i++; i++; } continue; }
+    if (c === "'") { i++; while (i < line.length && line[i] !== "'") i++; continue; }
+    if (c === "=") { eq = i; break; }
+  }
+  if (eq < 0) return null;
+  const segs = splitKeyPath(line.slice(0, eq));
+  return segs ? segs.join("\u0000") : null;
+}
+
+/** One top-level table with everything under it, kept as written. */
+type Section = { key: string; header: string; lines: string[] };
+/** One root-level assignment with its own continuation and leading comments. */
+type Entry = { key: string; lines: string[] };
+
+/** Pop a trailing run of blank lines, then a trailing run of comment lines,
+ *  and return the comments. A comment run at the END of a block documents
+ *  what comes NEXT, so it travels with it — otherwise a section the base
+ *  already defines would take the next section's comment away with it. An
+ *  unterminated value never ends in a comment line (its last line is the
+ *  closing bracket), so this cannot cut a value in half. */
+function detachTrailingComments(lines: string[]): string[] {
+  while (lines.length > 0 && lines[lines.length - 1]!.trim() === "") lines.pop();
+  const moved: string[] = [];
+  while (lines.length > 0 && lines[lines.length - 1]!.trimStart().startsWith("#")) moved.unshift(lines.pop()!);
+  return moved;
+}
+
+/** Split a file's lines into its header-less preamble and its top-level
+ *  sections, in order, byte for byte. */
+function splitSections(lines: string[]): { preamble: string[]; sections: Section[] } {
+  const preamble: string[] = [];
+  const sections: Section[] = [];
+  for (const raw of lines) {
+    if (isSectionHeader(raw)) sections.push({ key: headerKey(raw), header: raw, lines: [raw] });
+    else if (sections.length === 0) preamble.push(raw);
+    else sections[sections.length - 1]!.lines.push(raw);
+  }
+  for (let i = sections.length - 1; i >= 0; i--) {
+    sections[i]!.lines.unshift(...detachTrailingComments(i === 0 ? preamble : sections[i - 1]!.lines));
+  }
+  return { preamble, sections };
+}
+
+/** Split a preamble into its assignments. Lines before the first one are
+ *  comments, and travel with the assignment they document; anything left
+ *  over is dropped, because the rendered preamble is the base's and a
+ *  free-floating comment copied back in would double on every render. */
+function splitEntries(lines: string[]): Entry[] {
+  const entries: Entry[] = [];
+  const lead: string[] = [];
+  for (const raw of lines) {
+    const key = rootKey(raw);
+    if (key !== null) { entries.push({ key, lines: [raw] }); continue; }
+    if (entries.length === 0) { lead.push(raw); continue; }
+    entries[entries.length - 1]!.lines.push(raw);
+  }
+  for (let i = entries.length - 1; i >= 0; i--) {
+    entries[i]!.lines.unshift(...detachTrailingComments(i === 0 ? lead : entries[i - 1]!.lines));
+  }
+  return entries;
+}
+
+/** A block of lines with its blank edges trimmed; "" when there is nothing
+ *  in it. Every piece of the rendered file goes through this, which is what
+ *  makes the spacing between pieces exactly one blank line however the
+ *  source was spaced — and therefore what makes a second render byte-identical. */
+function textOf(lines: string[]): string {
+  const out = [...lines];
+  while (out.length > 0 && out[0]!.trim() === "") out.shift();
+  while (out.length > 0 && out[out.length - 1]!.trim() === "") out.pop();
+  return out.join("\n");
+}
+
+/** The human's own config, as the parts a home inherits. Missing, or
+ *  unreadable, is an empty base — a home renders to exactly what it rendered
+ *  to before this existed. */
+function baseDoc(): { entries: Entry[]; sections: Section[] } {
+  let text: string;
+  try { text = readFileSync(codexBaseConfigPath(), "utf8"); } catch { return { entries: [], sections: [] }; }
+  // A base that carries an ms block of its own (somebody pointed this tool at
+  // their own `~/.codex` once) contributes neither its tables nor its markers.
+  const parts = split(text);
+  const lines = parts
+    ? [...parts.prefix, ...parts.suffix]
+    : text.split("\n").filter((l) => !BEGIN_RE.test(l) && !END_RE.test(l));
+  const doc = splitSections(lines);
+  return {
+    entries: splitEntries(doc.preamble).filter((e) => e.key !== "hooks" && !e.key.startsWith("hooks\u0000")),
+    sections: doc.sections.filter((s) => !isHooksHeader(s.header)),
+  };
+}
+
 /** How many `[[hooks.<Event>]]` tables for this event the home already has
  * ahead of ours — the matcher index our trust key is built from. */
 function matcherIndexes(prefix: string[]): Record<string, number> {
@@ -292,26 +507,69 @@ function unsafe(configPath: string, msBin: string, prefix: string[], suffix: str
   return null;
 }
 
-/** The file we would write for a given current text, or the reason not to. */
+/**
+ * The file we would write for a given current text, or the reason not to.
+ *
+ * The render, end to end. `split` first, because the ONE thing this must
+ * never do is lose configuration: a begin marker with no end is a refusal,
+ * not a licence to rebuild the file from the half of it we can read.
+ *
+ * Then the three parts, in order — the base (hooks stripped), our block, and
+ * whatever the home has that the base does not define — with our block left
+ * exactly where the markers already were. That last detail is what keeps a
+ * home Codex has appended to (`[projects."<cwd>"]`, `[tui]`) rendering to
+ * byte-identical output rather than shuffling the block to the end on every
+ * launch.
+ *
+ * The safety checks run on the REBUILT prefix and suffix, not the original:
+ * the matcher index our trust key is built from is an index into the file we
+ * are about to write, and the base can no more collide with our keys than it
+ * can shift that index, because its `hooks` tables are gone by then.
+ */
 function compose(configPath: string, msBin: string, text: string): { next: string } | { problem: string } {
   const parts = split(text);
   if (!parts) {
     return { problem: `${configPath}: a '# ms-hooks-begin' marker with no '# ms-hooks-end'; repair or remove that block by hand, refusing to overwrite everything below it` };
   }
-  const { prefix, suffix } = parts;
-  const problem = unsafe(configPath, msBin, prefix, suffix);
+  const base = baseDoc();
+  const baseKeys = new Set(base.sections.map((s) => s.key));
+  const baseRoots = new Set(base.entries.map((e) => e.key));
+  const mine = (s: Section): boolean => !baseKeys.has(s.key);
+
+  const head = splitSections(parts.prefix);
+  const tail = splitSections(parts.suffix);
+
+  // (a) the base's preamble, then the home's own root keys the base does not
+  //     claim — both ahead of every table, where root keys must be.
+  const prefixPieces = [
+    base.entries.map((e) => textOf(e.lines)).filter((t) => t !== "").join("\n"),
+    splitEntries(head.preamble).filter((e) => !baseRoots.has(e.key)).map((e) => textOf(e.lines)).filter((t) => t !== "").join("\n"),
+    ...base.sections.map((s) => textOf(s.lines)),
+    ...head.sections.filter(mine).map((s) => textOf(s.lines)),
+  ].filter((t) => t !== "");
+  // Anything after our block: its own leading lines (in practice blank —
+  // `ensureCodexTrust` appends a table) kept as they stand, then the sections.
+  const suffixPieces = [
+    textOf(tail.preamble),
+    ...tail.sections.filter(mine).map((s) => textOf(s.lines)),
+  ].filter((t) => t !== "");
+
+  const headText = prefixPieces.join("\n\n");
+  const tailText = suffixPieces.join("\n\n");
+  const problem = unsafe(configPath, msBin, headText.split("\n"), tailText.split("\n"));
   if (problem) return { problem };
-  // Exactly one blank line between the human's last table and ours, and
-  // between ours and whatever followed it — so a second install produces the
+
+  // Exactly one blank line between the base's last table and ours, and
+  // between ours and whatever followed it — so a second render produces the
   // same bytes as the first and `changed` stays honest.
-  const head = prefix.join("\n").replace(/\n+$/, "");
-  const tail = suffix.join("\n").replace(/^\n+/, "").replace(/\n+$/, "");
-  const pieces = [head, block(configPath, msBin, prefix), tail].filter((x) => x !== "");
+  const pieces = [headText, block(configPath, msBin, headText.split("\n")), tailText].filter((x) => x !== "");
   return { next: pieces.join("\n\n") + "\n" };
 }
 
 /**
- * Write the four hook tables and their trust entries into `<homeDir>/config.toml`.
+ * Render `<homeDir>/config.toml`: the human's own `~/.codex/config.toml`, the
+ * four hook tables with their trust entries, and whatever Codex wrote into
+ * this home that the base does not already define.
  *
  * The file is created when it is missing (0600, parents included) and
  * otherwise backed up to `config.toml.bak-ms-<unix seconds>` before the first
@@ -353,9 +611,16 @@ export function installCodexHooks(homeDir: string, msBin: string): InstallResult
  * writes nothing and backs nothing up. `problem` is the installer's own
  * refusal, verbatim, plus the case where a write that claimed to succeed did
  * not produce an installed home — which is a refusal too, not a shrug.
+ *
+ * "Correct" is BOTH halves of what the renderer writes: the hooks installed
+ * and trusted, AND the file still the one the base would render to. A home
+ * whose hooks are fine but whose config predates a change to
+ * `~/.codex/config.toml` is stale, not healthy — leaving it alone is how a
+ * pane ends up running at default reasoning effort with no MCP servers, the
+ * exact failure this renderer exists to end.
  */
 export function ensureCodexHooks(homeDir: string, msBin: string): InstallResult {
-  if (codexHooksInstalled(homeDir, msBin)) return { changed: false, backup: null };
+  if (codexHooksInstalled(homeDir, msBin) && codexHomeConfigCurrent(homeDir, msBin)) return { changed: false, backup: null };
   const res = installCodexHooks(homeDir, msBin);
   if (res.problem) return res;
   if (!codexHooksInstalled(homeDir, msBin)) {
@@ -472,6 +737,29 @@ export function codexHooksInstalled(homeDir: string, msBin: string): boolean {
     if (!mine) return false;
     return trust.get(trustKey(file, e.snake, mine.index)) === codexTrustedHash(e.snake, cmd, e.timeout);
   });
+}
+
+/**
+ * True when `<homeDir>/config.toml` is already, byte for byte, what a render
+ * would write: the base's configuration, our hooks, and the home's own
+ * Codex-written state, in that order.
+ *
+ * This is the staleness question `codexHooksInstalled` cannot answer — it
+ * reads four tables and four hashes and is blind to the model, the reasoning
+ * effort and the MCP servers around them. A home that fails this has drifted
+ * from `~/.codex/config.toml` (the human edited it, or added an MCP server)
+ * and is one render away from correct, which is why `ms doctor` reports it as
+ * a fixable problem rather than a state anybody has to reason about.
+ *
+ * A home the renderer REFUSES reads false, the same way a blocked home reads
+ * false above: the caller goes to the installer, which states the refusal.
+ */
+export function codexHomeConfigCurrent(homeDir: string, msBin: string): boolean {
+  const file = codexConfigPath(homeDir);
+  let text: string;
+  try { text = readFileSync(file, "utf8"); } catch { return false; }
+  const composed = compose(file, msBin, text);
+  return "next" in composed && composed.next === text;
 }
 
 /** Always 0600, on every write and not only on the first. `config.toml` is

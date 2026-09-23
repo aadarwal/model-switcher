@@ -1,10 +1,10 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync, realpathSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync, chmodSync, lstatSync, symlinkSync, realpathSync, existsSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
-import { userInfo } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { stubDir, tempHome, run } from "./helpers.ts";
 import type { Account } from "../src/registry.ts";
 
@@ -1046,6 +1046,46 @@ test("checkCodexAccount: hooks not installed → ✗; --fix installs and reports
     assert.equal(codexHooksInstalled(dir, msBinary()), true);
   } finally {
     globalThis.fetch = savedFetch;
+  }
+});
+
+test("checkCodexAccount: a home that no longer matches the human's ~/.codex is STALE → ✗; --fix re-renders it", async () => {
+  // 0.3.5. The hooks are installed and trusted — `codexHooksInstalled` is
+  // blind to this — but the human has since added an MCP server to their own
+  // `~/.codex/config.toml`, so the home is a launch behind and its panes run
+  // without it. The doctor's job is to say so, and `--fix`'s is to render.
+  const { msHome } = base();
+  const savedBase = process.env.MS_CODEX_BASE_CONFIG;
+  const savedFetch = globalThis.fetch;
+  const baseFile = path.join(mkdtempSync(path.join(tmpdir(), "ms-doctor-base-")), "config.toml");
+  writeFileSync(baseFile, 'model = "gpt-6-astra"\n', { mode: 0o600 });
+  process.env.MS_CODEX_BASE_CONFIG = baseFile;
+  stubCodexUsageOk();
+  try {
+    const dir = await writeHealthyCodexAccountFiles(msHome, "codexacct");
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const { codexHooksInstalled } = await import("../src/hooks/codex-install.ts");
+    const { msBinary } = await import("../src/paths.ts");
+    const healthy = await checkCodexAccount(codexAccount(), false);
+    assert.equal(healthy.find((r) => /hooks installed/.test(r.what))!.ok, true, "rendered from this base, the home is healthy");
+
+    writeFileSync(baseFile, 'model = "gpt-6-astra"\n\n[mcp_servers.anu]\ncommand = "python3"\n', { mode: 0o600 });
+    const before = await checkCodexAccount(codexAccount(), false);
+    const stale = before.find((r) => /hooks installed/.test(r.what))!;
+    assert.equal(stale.ok, false, "a home behind its base is not healthy");
+    assert.match(stale.why ?? "", /is stale/);
+    assert.ok((stale.why ?? "").includes(baseFile), "and the line names the base it is behind");
+    assert.equal(codexHooksInstalled(dir, msBinary()), true, "though its hooks never stopped being installed");
+
+    const after = await checkCodexAccount(codexAccount(), true);
+    const fixed = after.find((r) => /hooks installed/.test(r.what))!;
+    assert.equal(fixed.ok, true);
+    assert.equal(fixed.fixed, true);
+    assert.match(readFileSync(path.join(dir, "config.toml"), "utf8"), /\[mcp_servers\.anu\]/, "--fix rendered the new server in");
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedBase === undefined) delete process.env.MS_CODEX_BASE_CONFIG;
+    else process.env.MS_CODEX_BASE_CONFIG = savedBase;
   }
 });
 

@@ -20,9 +20,9 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync,
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
-import { claudeSettingsPath, msBinary, msHome, p } from "./paths.ts";
+import { claudeSettingsPath, codexBaseConfigPath, msBinary, msHome, p } from "./paths.ts";
 import { CLAUDE_HOOK_ENTRIES, claudeHooksInstalled, installClaudeHooks } from "./hooks/install.ts";
-import { codexConfigPath, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
+import { codexConfigPath, codexHomeConfigCurrent, codexHooksInstalled, installCodexHooks } from "./hooks/codex-install.ts";
 import { loadRegistry, organisationClaimedBy, sameOrganisationAs, type Account } from "./registry.ts";
 import {
   AuthError,
@@ -551,19 +551,41 @@ export async function checkClaudeAccount(a: Account, fix: boolean, book: Account
 // refresh call here at all, unlike the Claude side) and never touches an
 // existing `sessions` entry — only a missing one is ever created.
 
+/**
+ * Whether this home's `config.toml` is the file `ms` renders — which is both
+ * halves of what that render puts there.
+ *
+ * The hooks, as before: installed AND trusted, or the account reports
+ * nothing and no wall is ever noticed. And the rest of the file, which is
+ * newer: a home is rendered from the human's own `~/.codex/config.toml`
+ * (`codexBaseConfigPath`), so a home that predates an edit to that file is
+ * STALE — it runs at Codex's default model and reasoning effort with none of
+ * the MCP servers the human added. Both are the same fix (`installCodexHooks`
+ * re-renders the file) and the same refusals, so they are one line rather
+ * than two: this file either is what `ms` would write, or it is not.
+ */
 function checkCodexHooksLine(a: Account, home: string, fix: boolean): Result {
   const what = `codex account ${a.name}: hooks installed`;
   const msBin = msBinary();
-  if (codexHooksInstalled(home, msBin)) return { ok: true, what };
-  if (!fix) return { ok: false, what, why: `not installed in ${codexConfigPath(home)}` };
+  const state = (): { ok: true } | { why: string } => {
+    if (!codexHooksInstalled(home, msBin)) return { why: `not installed in ${codexConfigPath(home)}` };
+    if (!codexHomeConfigCurrent(home, msBin)) {
+      return { why: `${codexConfigPath(home)} is stale — it is not what ${codexBaseConfigPath()} renders to` };
+    }
+    return { ok: true };
+  };
+  const before = state();
+  if ("ok" in before) return { ok: true, what };
+  if (!fix) return { ok: false, what, why: before.why };
   const res = installCodexHooks(home, msBin);
   // A refusal (a home this installer cannot safely rewrite) is never
   // "nothing to do" — it is reported verbatim, the same way `res.problem`
   // itself is worded: a reason a human can act on, not a guess papered over.
   if (res.problem) return { ok: false, what, why: res.problem };
-  return codexHooksInstalled(home, msBin)
+  const after = state();
+  return "ok" in after
     ? { ok: true, what, fixed: true }
-    : { ok: false, what, why: `still not installed in ${codexConfigPath(home)} after --fix` };
+    : { ok: false, what, why: `${after.why} — still, after --fix` };
 }
 
 /** Whether `link` is a symlink that resolves to the same place as `target`. */

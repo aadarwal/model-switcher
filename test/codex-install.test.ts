@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { tempHome } from "./helpers.ts";
-import { codexHookTables, codexHooksInstalled, codexTrustedHash, ensureCodexHooks, ensureCodexReady, installCodexHooks } from "../src/hooks/codex-install.ts";
+import { codexHomeConfigCurrent, codexHookTables, codexHooksInstalled, codexTrustedHash, ensureCodexHooks, ensureCodexReady, installCodexHooks } from "../src/hooks/codex-install.ts";
 
 const MS = "/opt/homebrew/bin/ms";
 const CMD = `${MS} _hook codex`;
@@ -478,4 +478,272 @@ test("a human's base-URL overrides survive trust, a hook install, and a repair",
   assert.equal(text.match(/^\[projects\./gm)?.length, 1);
   assert.equal(text.match(/# ms-hooks-begin/g)?.length, 1);
   assert.equal(text.match(/# ms-hooks-end/g)?.length, 1);
+});
+
+// --- Rendering a home from the human's own ~/.codex/config.toml ----------
+//
+// 0.3.5. A per-account CODEX_HOME carries none of `~/.codex/config.toml`, and
+// Codex 0.156.1 has no way to layer one over the other (`CODEX_HOME` is its
+// only path variable; `-p/--profile` layers `$CODEX_HOME/<name>.config.toml`
+// over `$CODEX_HOME/config.toml`, both inside the home we made). So every
+// `ms codex` pane ran at Codex's default model and reasoning effort with none
+// of the human's MCP servers. The file is rendered from that base instead.
+//
+// `MS_CODEX_BASE_CONFIG` names the base; the suite pins it at a path that does
+// not exist (test/setup-env.mjs), so every test above renders against an
+// absent base — which is exactly why they all still pass unchanged.
+
+/** Run `fn` with a base config of `text`, or with none at all for `null`.
+ *  Restores the suite's own pinned-absent base afterwards, always. */
+function withBase<T>(text: string | null, fn: (basePath: string) => T): T {
+  const saved = process.env.MS_CODEX_BASE_CONFIG;
+  const dir = mkdtempSync(path.join(tmpdir(), "ms-base-"));
+  const file = path.join(dir, "config.toml");
+  if (text !== null) writeFileSync(file, text, { mode: 0o600 });
+  process.env.MS_CODEX_BASE_CONFIG = file;
+  try {
+    return fn(file);
+  } finally {
+    if (saved === undefined) delete process.env.MS_CODEX_BASE_CONFIG;
+    else process.env.MS_CODEX_BASE_CONFIG = saved;
+  }
+}
+
+/** A base with the three shapes that matter: a header-less preamble (the
+ *  model and the reasoning effort — the whole reason this exists), tables the
+ *  home must inherit (`[features]`, an MCP server), and `hooks` tables that
+ *  must NOT travel. The real `~/.codex/config.toml` has all of them, bare
+ *  `[hooks.state]` included. */
+const BASE = [
+  'model = "gpt-6-astra"',
+  'model_reasoning_effort = "max"',
+  "",
+  "[features]",
+  "js_repl = false",
+  "",
+  "[mcp_servers.anu]",
+  'command = "python3"',
+  'args = ["/Users/a/.local/share/anu/mcp/server.py"]',
+  "",
+  "[hooks.state]",
+  "",
+  '[hooks.state."/Users/a/.codex/config.toml:session_start:0:0"]',
+  'trusted_hash = "sha256:theirs"',
+  "",
+  "[[hooks.SessionStart]]",
+  'hooks = [{ type = "command", command = "their-own-hook" }]',
+  "",
+  "# the status line is the human's",
+  "[tui]",
+  'status_line = ["model-with-reasoning"]',
+  "",
+].join("\n");
+
+test("a home is rendered from the human's own config: preamble, tables and all — and its hooks are left behind", () => {
+  withBase(BASE, () => {
+    const d = home();
+    assert.equal(installCodexHooks(d, MS).changed, true);
+    const text = read(d);
+
+    // The point of the whole change: the model and the reasoning effort are
+    // root keys of the home, ahead of every table, where Codex reads them.
+    const head = text.split(/^\[/m)[0]!;
+    assert.ok(head.includes('model = "gpt-6-astra"'), "the model is a root key");
+    assert.ok(head.includes('model_reasoning_effort = "max"'), "and so is the reasoning effort");
+    // The tables travel verbatim, comments included.
+    assert.ok(text.includes("[features]\njs_repl = false"), "[features]");
+    assert.ok(text.includes('[mcp_servers.anu]\ncommand = "python3"'), "the MCP server");
+    assert.ok(text.includes("# the status line is the human's\n[tui]"), "a table's own comment travels with it");
+
+    // The base's HOOKS do not travel. Their trust is keyed on THEIR config
+    // path and means nothing here; a bare `[hooks.state]` is a header this
+    // tool refuses on; and a stray `[[hooks.SessionStart]]` would push our
+    // own matcher index to 1 for a hook that is not in this file at all.
+    assert.ok(!text.includes("their-own-hook"), "the base's own hook is not installed here");
+    assert.ok(!text.includes("sha256:theirs"), "nor its trust");
+    assert.ok(!text.includes("/Users/a/.codex/config.toml:"), "nor a trust key naming another config");
+    assert.ok(text.includes(`[hooks.state."${config(d)}:session_start:0:0"]`), "ours stays at matcher index 0");
+    assert.equal(codexHooksInstalled(d, MS), true);
+  });
+});
+
+test("the render is the same four hooks and the same VERIFIED hashes — the recipe does not move", () => {
+  // A home rendered with a base and a home rendered without one must carry
+  // byte-identical hook tables and trust: the base changes what is AROUND the
+  // block, never the block, and a hash that drifted would leave every hook
+  // untrusted ("⚠ 4 hooks need review before they can run").
+  const blockOf = (text: string): string =>
+    text.slice(text.indexOf("# ms-hooks-begin"), text.indexOf("# ms-hooks-end") + "# ms-hooks-end".length);
+  const bare = home();
+  installCodexHooks(bare, MS);
+  withBase(BASE, () => {
+    const d = home();
+    installCodexHooks(d, MS);
+    // The trust key names the home's own config path, so compare the block
+    // with that one difference normalised away.
+    assert.equal(blockOf(read(d)).split(config(d)).join("<home>"), blockOf(read(bare)).split(config(bare)).join("<home>"));
+    for (const ev of EVENTS) {
+      assert.ok(read(d).includes(`trusted_hash = "${codexTrustedHash(SNAKE[ev]!, CMD, TIMEOUT[ev]!)}"`), ev);
+    }
+  });
+});
+
+test("an absent base is an empty base: the home renders to exactly what it held before", () => {
+  const before = ['[projects."/Users/a/src/app"]', 'trust_level = "trusted"', ""].join("\n");
+  // The trust key names the home's own path, so normalise that away.
+  const render = (base: string | null): string =>
+    withBase(base, () => {
+      const d = home();
+      writeFileSync(config(d), before, { mode: 0o600 });
+      installCodexHooks(d, MS);
+      return read(d).split(config(d)).join("<home>/config.toml");
+    });
+  const withAbsent = render(null);
+  // ...and a base that is an empty FILE is the same thing.
+  assert.equal(withAbsent, render(""), "an empty base file renders like no base at all");
+  assert.ok(withAbsent.startsWith(before.trimEnd()), "the home's own table still leads the file");
+  assert.ok(withAbsent.includes("# ms-hooks-begin"));
+});
+
+test("everything Codex wrote into the home survives a render — directory trust, [tui] and [tui.*]", () => {
+  withBase(BASE, () => {
+    const d = home();
+    installCodexHooks(d, MS);
+    // Exactly what Codex appends on its own: a trust row for a directory the
+    // human answered the modal for, and the TUI's state.
+    const codexWrote = [
+      "",
+      '[projects."/Users/a/src/other"]',
+      'trust_level = "trusted"',
+      "",
+      "[tui.model_availability_nux]",
+      '"gpt-6-astra" = 4',
+      "",
+    ].join("\n");
+    writeFileSync(config(d), read(d) + codexWrote, { mode: 0o600 });
+
+    assert.equal(installCodexHooks(d, MS).changed, false, "nothing to re-render");
+    const text = read(d);
+    assert.ok(text.includes('[projects."/Users/a/src/other"]'), "the trust row is kept");
+    assert.ok(text.includes('[tui.model_availability_nux]\n"gpt-6-astra" = 4'), "and so is the TUI's own state");
+    assert.ok(text.includes('status_line = ["model-with-reasoning"]'), "beside the base's [tui]");
+    assert.equal(codexHooksInstalled(d, MS), true);
+  });
+});
+
+test("the base wins a collision, and the home keeps only what the base does not name", () => {
+  withBase(BASE, () => {
+    const d = home();
+    // The home holds its OWN answer for three things the base also answers
+    // (a root key, a table, a sub-table's parent) plus one it does not.
+    writeFileSync(config(d), [
+      'model = "gpt-5-codex"',
+      'approval_policy = "never"',
+      "",
+      "[features]",
+      "js_repl = true",
+      "",
+      "[tui]",
+      "screen_reader_detection_done = true",
+      "",
+      "[tui.model_availability_nux]",
+      '"gpt-6-astra" = 1',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    installCodexHooks(d, MS);
+    const text = read(d);
+
+    assert.ok(text.includes('model = "gpt-6-astra"'), "the base's model wins");
+    assert.ok(!text.includes('model = "gpt-5-codex"'), "the home's is gone, not duplicated");
+    assert.equal(text.match(/^model = /gm)?.length, 1, "exactly one model key");
+    assert.ok(text.includes("js_repl = false"), "the base's [features] wins");
+    assert.ok(!text.includes("js_repl = true"));
+    assert.equal(text.match(/^\[features\]$/gm)?.length, 1, "never two [features] tables");
+    assert.equal(text.match(/^\[tui\]$/gm)?.length, 1, "never two [tui] tables");
+    assert.ok(!text.includes("screen_reader_detection_done"), "the home's colliding [tui] is dropped whole");
+
+    // What the base does NOT name is kept, root key and sub-table alike.
+    assert.ok(text.includes('approval_policy = "never"'), "a root key the base never mentions");
+    assert.ok(text.includes('[tui.model_availability_nux]'), "a sub-table of a colliding table is its own table");
+  });
+});
+
+test("a render is idempotent: the same bytes, no second backup, before AND after Codex appends to it", () => {
+  withBase(BASE, () => {
+    const d = home();
+    writeFileSync(config(d), 'approval_policy = "never"\n', { mode: 0o600 });
+    assert.equal(installCodexHooks(d, MS).changed, true);
+    const first = read(d);
+    const backups = () => readdirSync(d).filter((f) => f.startsWith("config.toml.bak-ms-")).length;
+    assert.equal(backups(), 1);
+
+    const second = installCodexHooks(d, MS);
+    assert.deepEqual([second.changed, second.backup], [false, null]);
+    assert.equal(read(d), first, "byte for byte");
+    assert.equal(backups(), 1, "no second backup");
+
+    // And after Codex has appended its own tables below our block.
+    writeFileSync(config(d), `${first}\n[projects."/Users/a/src/x"]\ntrust_level = "trusted"\n`, { mode: 0o600 });
+    const snapshot = read(d);
+    assert.equal(installCodexHooks(d, MS).changed, false, "an appended trust row is already what we would write");
+    assert.equal(read(d), snapshot);
+    assert.equal(backups(), 1);
+  });
+});
+
+test("a render is 0600, and the base config is only ever READ", () => {
+  withBase(BASE, (basePath) => {
+    const before = readFileSync(basePath, "utf8");
+    const beforeStat = statSync(basePath);
+    const d = home();
+    writeFileSync(config(d), 'approval_policy = "never"\n', { mode: 0o644 });
+    chmodSync(config(d), 0o644);
+    assert.equal(installCodexHooks(d, MS).changed, true);
+    assert.equal(statSync(config(d)).mode & 0o777, 0o600, "a world-readable home does not stay world-readable");
+    assert.equal(readFileSync(basePath, "utf8"), before, "the human's own config is untouched");
+    assert.equal(statSync(basePath).mtimeMs, beforeStat.mtimeMs, "not even its mtime moved");
+    assert.equal(readdirSync(path.dirname(basePath)).filter((f) => f !== "config.toml").length, 0, "and nothing was written beside it");
+  });
+});
+
+test("a home that predates an edit to the base is STALE: codexHomeConfigCurrent says so, and a render repairs it", () => {
+  const d = home();
+  withBase(BASE, () => {
+    installCodexHooks(d, MS);
+    assert.equal(codexHooksInstalled(d, MS), true);
+    assert.equal(codexHomeConfigCurrent(d, MS), true);
+  });
+  // The human adds an MCP server. The hooks are still installed and trusted —
+  // that check cannot see this at all — but the home is a launch behind.
+  withBase(`${BASE}\n[mcp_servers.proxyman]\ncommand = "mcp-server"\n`, () => {
+    assert.equal(codexHooksInstalled(d, MS), true, "the hooks never went stale");
+    assert.equal(codexHomeConfigCurrent(d, MS), false, "but the config did");
+    const res = ensureCodexHooks(d, MS);
+    assert.equal(res.problem, undefined);
+    assert.equal(res.changed, true, "ensureCodexHooks re-renders a stale home");
+    assert.ok(read(d).includes("[mcp_servers.proxyman]"), "the new server landed");
+    assert.equal(codexHomeConfigCurrent(d, MS), true);
+    assert.deepEqual([ensureCodexHooks(d, MS).changed, ensureCodexHooks(d, MS).problem], [false, undefined]);
+  });
+});
+
+test("a render still refuses everything the installer refused, and writes nothing when it does", () => {
+  // The base cannot buy its way past a refusal: a home this tool cannot
+  // rewrite safely is not rewritten, base or no base.
+  withBase(BASE, () => {
+    for (const before of [
+      "[hooks]\nSessionStart = []\n",
+      `[hooks.state."${"<HOME>"}:stop:0:0"]\ntrusted_hash = "sha256:x"\n`,
+      "# ms-hooks-begin (model-switcher — do not edit between the markers)\n[[hooks.Stop]]\n",
+    ]) {
+      const d = home();
+      const text = before.replace("<HOME>", config(d));
+      writeFileSync(config(d), text, { mode: 0o600 });
+      const r = installCodexHooks(d, MS);
+      assert.equal(r.changed, false, text);
+      assert.ok(r.problem, text);
+      assert.equal(read(d), text, `${text}: untouched — the base was never rendered over it`);
+      assert.equal(codexHomeConfigCurrent(d, MS), false, `${text}: and a refusal is never "current"`);
+    }
+  });
 });

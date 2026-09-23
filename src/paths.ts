@@ -71,6 +71,28 @@ export function msBinary(): string {
 }
 
 /**
+ * The user's OWN Codex configuration — the base every account home's
+ * `config.toml` is rendered from (`src/hooks/codex-install.ts`).
+ *
+ * Codex 0.156 has no way to layer a home's config on top of another file:
+ * `CODEX_HOME` is the only path variable, and `-p/--profile` layers
+ * `$CODEX_HOME/<name>.config.toml` over `$CODEX_HOME/config.toml` — both
+ * inside the home `ms` gives the account, so neither can reach the human's
+ * own `~/.codex/config.toml`. So the model, the reasoning effort and the MCP
+ * servers are COPIED into each home instead, and this is where that source
+ * is named. It is only ever READ; nothing in this tool writes to it.
+ *
+ * `MS_CODEX_BASE_CONFIG` overrides it. The test suite pins it at a path that
+ * does not exist (see test/setup-env.mjs), which is how the suite renders
+ * homes without ever reading the developer's real `~/.codex/config.toml`.
+ */
+export function codexBaseConfigPath(): string {
+  const override = process.env.MS_CODEX_BASE_CONFIG;
+  if (override && override.length > 0) return override;
+  return path.join(process.env.HOME || homedir(), ".codex", "config.toml");
+}
+
+/**
  * Claude Code's own settings file — where its hooks and its statusline live.
  *
  * `CLAUDE_CONFIG_DIR` is Claude Code's OWN override of where `~/.claude`

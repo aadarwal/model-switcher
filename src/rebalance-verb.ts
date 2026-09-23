@@ -4,7 +4,7 @@
 // asked on purpose instead of waited for.
 //
 // The automatic half only ever runs at a turn end, at most one session per
-// hook run, behind a gate that ships off. This is the verb a human uses to
+// hook run, behind a gate (`MS_REBALANCE=0` disables it). This is the verb a human uses to
 // see the whole fleet's answer at once and, without `--dry-run`, to act on
 // it. It is the same decision function, over the same snapshot, so the table
 // it prints is not a second opinion — `ms status`'s BETTER column, the

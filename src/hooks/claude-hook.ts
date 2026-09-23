@@ -105,7 +105,7 @@ async function mirrorRebalance(): Promise<void> {
  * The turn-end trigger (spec: "Rebalance", step 1). Everything it might do —
  * read the gate, read the cached snapshot, re-read the pane, dispatch a
  * switch — is behind `maybeRebalance`, which costs one SQLite read when the
- * gate is off, and the gate is off by default.
+ * gate is off; the gate is ON by default since 0.3.4.
  *
  * `rebalance.ts` is imported HERE and not at module scope: it reaches
  * `state.ts` and `recover.ts`, and an unmanaged pane's hook must return long

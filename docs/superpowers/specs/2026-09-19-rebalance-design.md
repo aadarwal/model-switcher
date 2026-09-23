@@ -1,6 +1,6 @@
 # Rebalance — keep every session on the best account, at idle moments
 
-Status: approved 2026-09-19 (the author, after the observation that a running session never re-asks "which account is best" between launch and a wall). Ships in 0.3.1 behind a switch, on by default one release later.
+Status: approved 2026-09-19 (the author, after the observation that a running session never re-asks "which account is best" between launch and a wall). Shipped in 0.3.1 behind a switch; on by default from 0.3.4, and condition 2's "current week half used" clause was dropped the same release — the human's ruling: a sooner reset is reason enough on its own.
 
 ## Problem
 
@@ -14,13 +14,13 @@ Unchanged: not walled, soonest weekly reset first, then most room, solo before s
 
 Only at a turn end (the session is idle), only when ONE of these holds:
 1. **Imminent wall**: a window the chooser gates on is at ≥ 85 % on the current account, and the best account has ≥ 30 % room in every gating window.
-2. **Clearly better budget**: the best account's weekly reset is ≥ 24 h earlier than the current one's, and the current account's week is ≥ 50 % used.
+2. **Clearly better budget**: the best account's weekly reset is ≥ 24 h earlier than the current one's — that is the whole test. It does not also require the current account's week to be any particular amount used: a sooner reset is worth more now whatever the current account has spent.
 
 And ALL of these guards pass:
 - the session's pane reads idle (no turn in flight; the turn-end hook is the trigger, and the pane is re-read before acting);
 - no move of this session (automatic or manual) in the last 6 h, and no wall-driven rotation of it in the last 30 min;
 - the destination passes the same preflight a rotation runs (credentials, trust for the pane's cwd, room);
-- the gate is on: kv `rebalance` = "1" (mirrored from `MS_REBALANCE`, like `codexAutorotate`); default off in 0.3.1, on in 0.3.2.
+- the gate is on: kv `rebalance` ≠ "0" (mirrored from `MS_REBALANCE`, like `codexAutorotate`); default off in 0.3.1–0.3.3, on by default from 0.3.4 (`MS_REBALANCE=0` disables it).
 
 Never mid-turn; never for a `parked`, `waiting`, `stopped` or `gone` row; at most one move per hook run.
 

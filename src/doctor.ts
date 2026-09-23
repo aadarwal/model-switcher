@@ -805,9 +805,9 @@ export async function runDoctor(fix: boolean): Promise<{ results: Result[]; line
     try { results.push({ ok: true, what: codexAutorotateLine(codexAutorotateEnabled(st)) }); } finally { st.close(); }
   }
   // The rebalance gate, stated on the same terms and for both providers: it
-  // ships OFF in 0.3.1, it is a stored setting for the same reason the Codex
-  // one is, and the off half names the SHELL the export has to happen in —
-  // the mistake this gate invites. Never a ✗; off is the default, not a fault.
+  // shipped OFF in 0.3.1 and now joins the Codex gate in shipping ON since
+  // 0.3.4, a stored setting for the same reason the Codex one is. Never a ✗;
+  // either state is somebody's deliberate choice, never a fault.
   {
     const st = openState();
     try { results.push({ ok: true, what: rebalanceLine(rebalanceEnabled(st)) }); } finally { st.close(); }

@@ -678,7 +678,7 @@ test("runDoctor: the codex auto-recovery gate line reflects the stored kv value,
   }
 });
 
-test("runDoctor: the rebalance gate line is printed for every fleet, and ships OFF", async () => {
+test("runDoctor: the rebalance gate line is printed for every fleet, and ships ON", async () => {
   // Deliberately a Claude-only registry: rebalance is not a Codex feature the
   // way auto-recovery is, so its line must not hide behind a codex account.
   const { msHome } = base();
@@ -693,16 +693,16 @@ test("runDoctor: the rebalance gate line is printed for every fleet, and ships O
 
     delete process.env.MS_REBALANCE;
     const absent = await runDoctor(false);
-    const absentLine = absent.results.find((r) => r.what === rebalanceLine(false));
+    const absentLine = absent.results.find((r) => r.what === rebalanceLine(true));
     assert.ok(absentLine, absent.lines.join("\n"));
-    assert.equal(absentLine!.ok, true, "off is the 0.3.1 default, not a fault");
-    assert.match(absentLine!.what, /export MS_REBALANCE=1 in the shell that runs claude\/codex/);
+    assert.equal(absentLine!.ok, true, "on is the default since 0.3.4");
+    assert.match(absentLine!.what, /export MS_REBALANCE=0 to disable/);
 
     const st = openState();
-    st.setKv("rebalance", "1");
+    st.setKv("rebalance", "0");
     st.close();
-    const on = await runDoctor(false);
-    assert.ok(on.results.find((r) => r.what === rebalanceLine(true)), on.lines.join("\n"));
+    const off = await runDoctor(false);
+    assert.ok(off.results.find((r) => r.what === rebalanceLine(false)), off.lines.join("\n"));
   } finally {
     globalThis.fetch = savedFetch;
   }

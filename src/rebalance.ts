@@ -52,11 +52,10 @@ export const REBALANCE_RULES = {
    *  EVERY gating window, or the move only buys the same wall an hour later. */
   DESTINATION_ROOM_PERCENT: 30,
   /** Condition 2. The best account's week must reset at least this much
-   *  earlier than the current one's. */
+   *  earlier than the current one's — the only test. A sooner reset is worth
+   *  more now whatever the current account has used, so there is no
+   *  companion "current must be this spent" clause. */
   RESET_LEAD_MS: 24 * 3_600_000,
-  /** Condition 2. …and the current week must already be at least this spent,
-   *  so an untouched budget is never churned for a theoretical one. */
-  WEEK_USED_PERCENT: 50,
   /** Hysteresis. No move of this session — by this rule, by a human, by a
    *  recovery — within this long of the last one. */
   MOVE_COOLDOWN_MS: 6 * 3_600_000,
@@ -182,8 +181,10 @@ function imminentWall(from: PickInput, to: PickInput, need: Need): boolean {
     && leastRoom(there) >= REBALANCE_RULES.DESTINATION_ROOM_PERCENT;
 }
 
-/** The destination's week resets ≥ 24 h earlier, and this one's is ≥ 50 %
- *  spent. Both readings must name a reset; an unknown one decides nothing. */
+/** The destination's week resets ≥ 24 h earlier — that is the whole test.
+ *  Both readings must name a reset; an unknown one decides nothing. How much
+ *  of the current week is spent does not matter: a sooner reset is worth more
+ *  now regardless. */
 function betterBudget(from: PickInput, to: PickInput, need: Need): boolean {
   const here = weeklyWindows(from, need);
   const there = weeklyWindows(to, need);
@@ -191,8 +192,7 @@ function betterBudget(from: PickInput, to: PickInput, need: Need): boolean {
   const hereReset = soonestReset(here);
   const thereReset = soonestReset(there);
   if (!Number.isFinite(hereReset) || !Number.isFinite(thereReset)) return false;
-  return hereReset - thereReset >= REBALANCE_RULES.RESET_LEAD_MS
-    && mostUsed(here) >= REBALANCE_RULES.WEEK_USED_PERCENT;
+  return hereReset - thereReset >= REBALANCE_RULES.RESET_LEAD_MS;
 }
 
 // --- The decision --------------------------------------------------------
@@ -455,11 +455,11 @@ export function lastWallAtMs(sessionId: string): number | null {
  * the spec's:
  *
  *   1. the gate. It is read FIRST and it is one SQLite read, because with it
- *      off — the 0.3.1 default — a turn end must cost nothing else. That is
- *      also why the refusal it returns carries no `better`: computing one
- *      would mean reading the snapshot, which is precisely the cost the gate
- *      is there to avoid. (`decide` itself always computes `better`; Task 3's
- *      status column calls it directly, with a snapshot it already has.)
+ *      off a turn end must cost nothing else. That is also why the refusal
+ *      it returns carries no `better`: computing one would mean reading the
+ *      snapshot, which is precisely the cost the gate is there to avoid.
+ *      (`decide` itself always computes `better`; Task 3's status column
+ *      calls it directly, with a snapshot it already has.)
  *   2. the cached snapshot, refreshed once per run if the rule above says it
  *      is no longer evidence;
  *   3. the pane, re-read HERE and not taken from the hook's word for it — the

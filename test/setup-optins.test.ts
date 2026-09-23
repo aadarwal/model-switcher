@@ -273,6 +273,23 @@ function configDirWith(dir: string, msOriginal?: string): void {
   writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ statusLine }, null, 2));
 }
 
+/**
+ * `ms _statusline` bounds the wrapped command to `MS_STATUSLINE_TIMEOUT_MS`
+ * (production default 3s — `src/setup/statusline.ts`'s `wrappedTimeoutMs`).
+ * Tests below that are NOT exercising that bound (they run a command that
+ * finishes on its own — a fast echo, a shell's instant "command not found")
+ * pass this generous override instead of relying on the production default:
+ * under a loaded machine, with a thousand-plus other tests each spawning
+ * their own processes, even a trivial `echo`'s fork+exec can occasionally
+ * take longer than 3s of real wall-clock time to be scheduled and complete
+ * — racing the wrapper's own internal kill and truncating output that was
+ * never slow, only delayed. The command itself still completes in
+ * milliseconds; this just removes the coincidence with an unrelated timer.
+ * Only the one test that actually means to prove the kill (`hangs`, below)
+ * sets a small bound instead.
+ */
+const GENEROUS_TIMEOUT_ENV = { MS_STATUSLINE_TIMEOUT_MS: "15000" };
+
 test("the wrapper prints the badge before the wrapped command's output and passes stdin through", () => {
   const env = stubDir();
   const execPath = stubReady(env, "echoer", `cat`);
@@ -298,7 +315,7 @@ test("reads the original command from the settings file, not from argv — the o
   // simply ignored: the output comes from the FILE's command, never argv's.
   const other = stubDir();
   const otherExec = stubReady(other, "other", `echo "from argv, should never run"`);
-  const r = run(["_statusline", "--", otherExec], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir }, "");
+  const r = run(["_statusline", "--", otherExec], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir, ...GENEROUS_TIMEOUT_ENV }, "");
   assert.equal(r.code, 0);
   assert.equal(r.stdout, "[gmail] from the file\n");
 });
@@ -320,7 +337,7 @@ test("exits 0 and still prints whatever the wrapped command wrote, even when it 
   const env = stubDir();
   const execPath = stubReady(env, "failer", `echo "partial output"\nexit 3`);
   configDirWith(env.dir, execPath);
-  const r = run(["_statusline"], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir }, "");
+  const r = run(["_statusline"], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir, ...GENEROUS_TIMEOUT_ENV }, "");
   assert.equal(r.code, 0, "a failing wrapped command never breaks the statusline's own exit code");
   assert.equal(r.stdout, "[gmail] partial output\n");
 });
@@ -329,12 +346,45 @@ test("exits 0 within a few seconds even when the wrapped command hangs", () => {
   const env = stubDir();
   const execPath = stubReady(env, "hanger", `sleep 30`);
   configDirWith(env.dir, execPath);
+  // A tight, injected bound (`MS_STATUSLINE_TIMEOUT_MS`, read by
+  // `wrappedTimeoutMs` in src/setup/statusline.ts) rather than production's
+  // 3s default: what this test proves is that the wrapper gives up at ITS
+  // OWN bound instead of waiting for the full 30s hang, not that it does so
+  // within some wall-clock number of seconds picked to comfortably clear a
+  // healthy machine's overhead. A loaded machine — 1100 other tests each
+  // spawning their own `node`+`tsx` processes — can make `node --import tsx
+  // bin/ms` itself take real, if unpredictable, wall-clock time to start and
+  // run, on top of whatever the wrapper's own bound adds; a 200ms bound
+  // keeps that internal contribution negligible, and the ceiling below
+  // leaves generous room for the startup overhead while staying an order of
+  // magnitude short of the 30s hang, so this still fails loudly if the kill
+  // itself stops working.
+  const boundMs = 200;
   const start = Date.now();
-  const r = run(["_statusline"], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir }, "");
+  const r = run(["_statusline"], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir, MS_STATUSLINE_TIMEOUT_MS: String(boundMs) }, "");
   const elapsed = Date.now() - start;
   assert.equal(r.code, 0);
-  assert.ok(elapsed < 4_000, `expected the wrapper to give up well before 30s, took ${elapsed}ms`);
+  assert.ok(elapsed < 20_000, `expected the wrapper to give up at its ${boundMs}ms bound, well short of the 30s hang, took ${elapsed}ms`);
   assert.equal(r.stdout, "[gmail] ", "the hung command produced no output before it was killed");
+});
+
+test("output already written before the bound hits is captured, not lost to the kill that follows it", () => {
+  // `MS_STATUSLINE_TIMEOUT_MS` being injectable (above) makes this provable
+  // in well under a second — previously exercising the kill path at all
+  // meant waiting out the full 3s production bound. `runWrapped` used to
+  // `destroy()` the stdout stream in the same tick it sent SIGKILL, which
+  // risks dropping bytes the child had already written but Node's event
+  // loop had not yet delivered as a `data` event; it now kills first and
+  // lets the stream drain through the ordinary `close` path (fast, once
+  // every process in the group is dead) before resolving. This asserts the
+  // resulting behaviour: legitimate prior output survives a kill for
+  // hanging, it is not wiped out along with it.
+  const env = stubDir();
+  const execPath = stubReady(env, "writer-then-hang", `printf 'wrote this before the kill'; sleep 30`);
+  configDirWith(env.dir, execPath);
+  const r = run(["_statusline"], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir, MS_STATUSLINE_TIMEOUT_MS: "150" }, "");
+  assert.equal(r.code, 0);
+  assert.equal(r.stdout, "[gmail] wrote this before the kill");
 });
 
 test("the process-group kill also reaches a grandchild the wrapped command backgrounded", () => {
@@ -360,7 +410,7 @@ test("the process-group kill also reaches a grandchild the wrapped command backg
 test("a wrapped command that does not exist still exits 0 with just the badge (the shell's own error, discarded)", () => {
   const env = stubDir();
   configDirWith(env.dir, "/no/such/binary-at-all");
-  const r = run(["_statusline"], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir }, "");
+  const r = run(["_statusline"], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir, ...GENEROUS_TIMEOUT_ENV }, "");
   assert.equal(r.code, 0);
   assert.equal(r.stdout, "[gmail] ");
 });

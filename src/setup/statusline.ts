@@ -156,8 +156,18 @@ export function installStatusline(settingsPath: string, msBin: string): Statusli
 const STDIN_MS = 3_000;
 const STDIN_MAX = 1 << 20;
 /** Total budget for the wrapped command. SIGKILL, not a courtesy signal: a
- * statusline has no time to wait for a hung child to notice SIGTERM. */
+ * statusline has no time to wait for a hung child to notice SIGTERM.
+ * Overridable via `MS_STATUSLINE_TIMEOUT_MS` — same `MS_..._MS` tunable
+ * pattern as `manual.ts`/`recover.ts`/`status.ts` — so a test can bound the
+ * wrapped command far tighter (or looser) than production's 3s without
+ * touching the constant every other caller relies on. */
 const WRAPPED_TIMEOUT_MS = 3_000;
+const wrappedTimeoutMs = (): number => Number(process.env.MS_STATUSLINE_TIMEOUT_MS) || WRAPPED_TIMEOUT_MS;
+/** Grace window after the kill, for output already in flight when the bound
+ * hits to drain through the normal `close` path rather than being ripped out
+ * from under a `destroy()` fired in the same tick as the SIGKILL. See
+ * `runWrapped`. */
+const GRACE_MS = 250;
 
 /** The original command `installStatusline` captured into
  * `statusLine.msOriginal`, or `""` for "nothing to run" — a missing file, a
@@ -199,7 +209,7 @@ export async function statuslineVerb(_args: string[]): Promise<number> {
 
     const original = readOriginalCommand();
     if (original !== "") {
-      const out = await runWrapped(["/bin/sh", "-c", original], input, WRAPPED_TIMEOUT_MS);
+      const out = await runWrapped(["/bin/sh", "-c", original], input, wrappedTimeoutMs());
       process.stdout.write(out);
     }
   } catch {
@@ -244,6 +254,7 @@ function runWrapped(cmd: string[], input: string, timeoutMs: number): Promise<st
   return new Promise((resolve) => {
     let out = "";
     let settled = false;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
 
     let child: ReturnType<typeof spawn>;
     try {
@@ -284,6 +295,7 @@ function runWrapped(cmd: string[], input: string, timeoutMs: number): Promise<st
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       // Whatever ended this — a normal exit, a failure, or the timeout below
       // — nothing the wrapped command spawned is allowed to outlive it.
       killGroup();
@@ -294,7 +306,18 @@ function runWrapped(cmd: string[], input: string, timeoutMs: number): Promise<st
       resolve(v);
     };
 
-    const timer = setTimeout(() => finish(out), timeoutMs);
+    // At the bound: kill the group so nothing can write any MORE, but don't
+    // `destroy()` the stdout stream in the same tick — bytes the child wrote
+    // a moment before the kill can still be sitting in the pipe, unread by
+    // Node's event loop, and destroying right now would drop them. Once
+    // every process in the group is dead the write end closes, so the
+    // ordinary `close` handler below fires almost immediately with whatever
+    // was already in flight fully drained; `GRACE_MS` is only the backstop
+    // for the rare case `close` doesn't come even after the kill.
+    const timer = setTimeout(() => {
+      killGroup();
+      graceTimer = setTimeout(() => finish(out), GRACE_MS);
+    }, timeoutMs);
 
     child.stdout?.on("data", (d) => {
       out += d.toString("utf8");

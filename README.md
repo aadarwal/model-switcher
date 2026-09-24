@@ -122,6 +122,7 @@ ms accounts login <name> [--provider P] [--device-auth] [--relogin]
 ms accounts verify <name> [--provider P]
 ms accounts remove <name> [--provider P]
 ms accounts token <name>
+ms accounts label <name> <text> [--provider P]
 ms accounts ls
 ```
 
@@ -134,7 +135,7 @@ ms accounts ls
 
 #### Which account is which
 
-The wizard names accounts `claude-1`, `claude-2`, …, and a name says nothing about the login behind it. So `ms status` and `ms accounts ls` both end in EMAIL: the account's e-mail, as the provider's own profile reports it. `login` and `verify` record it, and for an account that has none — one signed in before 0.2.6 — `ms` fills it in on its own the next time it talks to that provider anyway: `ms doctor`, `ms status`, the dashboard, a launch or a hook's poll. That costs one profile read per account per process (Claude: `/api/oauth/profile` under the poll grant; Codex: the identity in the account's own `auth.json`, no request at all), never one per poll, and a read that fails leaves `-` without a word. An e-mail is kept only when it belongs to the identity the row already records.
+The wizard names accounts `claude-1`, `claude-2`, …, and a name says nothing about the login behind it. So `ms status` and `ms accounts ls` both end in EMAIL: the account's e-mail, as the provider's own profile reports it. `login` and `verify` record it, and for an account that has none — one signed in before 0.2.6 — `ms` fills it in on its own the next time it talks to that provider anyway: `ms doctor`, `ms status`, the dashboard, a launch or a hook's poll. That costs one profile read per account per process (Claude: `/api/oauth/profile` under the poll grant; Codex: the identity in the account's own `auth.json`, no request at all), never one per poll, and a read that fails leaves `-` without a word. An e-mail is kept only when it belongs to the identity the row already records. To give a row a name of your own, `ms accounts label claude-1 Dirk at MIT` sets its LABEL (the words need no quoting; the name itself restores the default).
 
 ### Setup and health
 

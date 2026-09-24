@@ -121,6 +121,8 @@ const USAGE = `usage: ms accounts <command>
   verify <name> [--provider P]        re-check an account's credentials and identity
   remove <name> [--provider P]        delete the row and everything it names
   token <name>                        print the launch token (claude only)
+  label <name> <text> [--provider P]  name a row; a label equal to the name is
+                                      the default
   ls                                  list the accounts
 
 --provider is needed only when one name is held by BOTH providers; names are
@@ -701,6 +703,7 @@ export function cmdAdd(args: string[]): number {
     throw new UsageError(`'${name}' is not a usable account name (lower-case letters, digits, '-' and '_', up to 32)`);
   }
   if (label !== null && !label.trim()) throw new UsageError("--label needs a value", true);
+  if (label !== null && labelProblem(label)) throw new UsageError(`--label ${labelProblem(label)}`, true);
   if (provider === "codex" && CODEX_RESERVED_NAMES.includes(name)) {
     throw new UsageError(`'${name}' is reserved: MS_HOME/codex/${name} is the shared rollout store, not an account home`);
   }
@@ -984,6 +987,48 @@ async function cmdLs(): Promise<number> {
   return 0;
 }
 
+/** A label is printed raw into two tables: no control characters (a terminal
+ *  escape in a label would repaint the screen), and short enough to stay a
+ *  column. Null when it is fine. */
+const LABEL_MAX = 64;
+function labelProblem(text: string): string | null {
+  if (/[\x00-\x1f\x7f]/.test(text)) return "may not contain control characters";
+  if (text.length > LABEL_MAX) return `is longer than ${LABEL_MAX} characters`;
+  return null;
+}
+
+/**
+ * `ms accounts label <name> <text>`: what LABEL shows for a row in `ms status`
+ * and `ms accounts ls`. The words after the name are the label, so it needs no
+ * quoting; a label equal to the name is the default an unlabelled row carries.
+ * Re-read, patch, atomic save (temp + rename), like every other row write.
+ */
+function cmdLabel(args: string[]): number {
+  let provider: Provider | null = null;
+  const words: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--provider") provider = asProvider("label", args[++i]);
+    else if (a.startsWith("--provider=")) provider = asProvider("label", a.slice("--provider=".length));
+    else if (a.startsWith("-") && words.length < 2) throw new UsageError(`label: unknown option ${a}`, true);
+    else words.push(a);
+  }
+  const [name, ...rest] = words;
+  if (!name) throw new UsageError("label needs an account name and the label", true);
+  const text = rest.join(" ").trim();
+  if (!text) throw new UsageError(`label needs the text for ${name} (the name itself restores the default)`, true);
+  const problem = labelProblem(text);
+  if (problem) throw new UsageError(`label ${problem}`);
+  const target = resolveTarget(name, provider);
+  const r = load();
+  const row = findAccount(r.registry, target.name, target.provider);
+  if (!row) throw new UsageError(`no such ${target.provider} account: ${name}`);
+  row.label = text;
+  saveRegistry(r.registry, r);
+  out(text === row.name ? `${row.name}: label is its name again\n` : `${row.name}: label ${JSON.stringify(text)}\n`);
+  return 0;
+}
+
 /** The verbs that act on ONE existing account, and so share a target. */
 const TARGET_VERBS = ["login", "verify", "remove", "token"];
 
@@ -1041,6 +1086,7 @@ export async function accountsVerb(args: string[]): Promise<number> {
   try {
     if (sub === "add") return cmdAdd(rest);
     if (sub === "ls") return await cmdLs();
+    if (sub === "label") return cmdLabel(rest);
     if (sub && TARGET_VERBS.includes(sub)) {
       const t = parseTarget(sub, rest);
       const row = resolveTarget(t.name, t.provider);

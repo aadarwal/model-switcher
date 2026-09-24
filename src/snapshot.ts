@@ -55,6 +55,7 @@ import {
   type Usage,
 } from "./providers/claude-usage.ts";
 import { CodexAuthError, codexAccessTokenExpiryMs, fetchCodexUsage, readCodexCredentials, refreshCodexCredentials, type CodexAuth } from "./providers/codex-usage.ts";
+import { claudeEmail, codexEmail, emailWanted, recordEmails, type FoundEmail } from "./account-email.ts";
 
 export type ErrorKind = "auth" | "transient" | "other";
 
@@ -290,7 +291,9 @@ async function refreshGrant(a: Account, c: PollCredentials, signal: AbortSignal)
   );
 }
 
-async function pollClaudeUsage(a: Account, signal: AbortSignal): Promise<Usage> {
+/** The reading, and the credential it was read with — which the e-mail
+ *  backfill (src/account-email.ts) reuses rather than reading the grant twice. */
+async function pollClaudeUsage(a: Account, signal: AbortSignal): Promise<{ usage: Usage; cred: PollCredentials }> {
   let c = readPollCredentials(a.name);
   if (!c) {
     // Launchable-but-unpollable is the two-credential model's normal state
@@ -298,7 +301,7 @@ async function pollClaudeUsage(a: Account, signal: AbortSignal): Promise<Usage> 
     throw new AuthError(`no poll grant (run: ms accounts login ${a.name})`);
   }
   if (c.expiresAt < Date.now() + REFRESH_SKEW_MS) c = await refreshGrant(a, c, signal);
-  return await fetchUsage(c, signal);
+  return { usage: await fetchUsage(c, signal), cred: c };
 }
 
 // --- Polling one Codex account ------------------------------------------
@@ -428,7 +431,9 @@ async function pollCodexUsage(a: Account, signal: AbortSignal): Promise<Usage> {
   }
 }
 
-type Polled = { entry: AccountUsage; backoffUntil: number | null };
+/** `email`: what the backfill found for a row with none (src/account-email.ts),
+ *  written once the whole round is in. */
+type Polled = { entry: AccountUsage; backoffUntil: number | null; email?: FoundEmail | null };
 
 /** Never throws: every outcome is an entry, because one account's failure must
  *  not cost the caller the other accounts' numbers. */
@@ -454,10 +459,22 @@ async function pollOne(a: Account, prev: AccountUsage | null, backoffUntil: numb
 
   const signal = AbortSignal.timeout(POLL_TIMEOUT_MS);
   try {
-    const usage = a.provider === "codex" ? await pollCodexUsage(a, signal) : await pollClaudeUsage(a, signal);
+    let usage: Usage;
+    let email: FoundEmail | null = null;
+    if (a.provider === "codex") {
+      usage = await pollCodexUsage(a, signal);
+      email = codexEmail(a);
+    } else {
+      const read = await pollClaudeUsage(a, signal);
+      usage = read.usage;
+      // A row with no e-mail gets one profile read per process, under the
+      // credential the provider just accepted; its failure is nobody's error.
+      if (emailWanted(a)) email = await claudeEmail(a, read.cred, signal);
+    }
     return {
       entry: { ...who, usage, error: null, errorKind: null, observedAt: Date.now(), stale: false },
       backoffUntil: null,
+      email,
     };
   } catch (err) {
     const errorKind = classify(err);
@@ -546,6 +563,7 @@ async function poll(maxAgeMs: number, only: string[] | null): Promise<Snapshot> 
     });
     delete backoff[k];
   });
+  recordEmails(settled.map((r) => (r.status === "fulfilled" ? r.value.email ?? null : null)));
 
   // Accounts this round did not cover keep their last reading, marked stale —
   // a scoped poll must not blank the rest of the file. Rows for accounts that

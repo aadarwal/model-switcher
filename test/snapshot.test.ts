@@ -32,9 +32,12 @@ function env(rows: Row[] = [{ name: "one", provider: "claude" }, { name: "two", 
     path.join(msHome, "accounts.json"),
     JSON.stringify({
       version: 1,
+      // Each row already knows its e-mail, so these polls cost exactly the
+      // calls they count; the backfill for a row without one is
+      // test/email-backfill.test.ts's.
       accounts: rows.map((r) => ({
         name: r.name, provider: r.provider, label: r.name,
-        orgId: null, shared: r.shared === true, identityVerified: true,
+        orgId: null, shared: r.shared === true, identityVerified: true, email: `${r.name}@example.com`,
       })),
     }),
   );
@@ -487,8 +490,8 @@ test("a fresh file that does not cover a newly registered account is re-polled",
   writeFileSync(
     path.join(msHome, "accounts.json"),
     JSON.stringify({ version: 1, accounts: [
-      { name: "one", provider: "claude", label: "one", orgId: null, shared: false, identityVerified: true },
-      { name: "two", provider: "claude", label: "two", orgId: null, shared: false, identityVerified: true },
+      { name: "one", provider: "claude", label: "one", orgId: null, shared: false, identityVerified: true, email: "one@example.com" },
+      { name: "two", provider: "claude", label: "two", orgId: null, shared: false, identityVerified: true, email: "two@example.com" },
     ] }),
   );
   grant(msHome, "two");

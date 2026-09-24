@@ -11,6 +11,11 @@
 // auto-fixed — there is nothing safe to do about any of them except tell
 // the human.
 //
+// One write happens with or without `--fix`, and prints nothing: an account
+// with no e-mail in the registry gets it from the provider the check is
+// already talking to (src/account-email.ts) — display only, additive, once
+// per account per run, and silent when it cannot be read.
+//
 // Each check prints exactly one line: `✓ <what>` (plus ` → fixed` when this
 // run just repaired it) or `✗ <what> — <why>`. Exit 1 iff any check is still
 // a ✗ once fixes (if requested) have been applied.
@@ -29,10 +34,12 @@ import {
   AuthError,
   fetchProfile,
   type PollCredentials,
+  type Profile,
   TransientError,
   readPollGrant,
   refreshPollCredentials,
 } from "./providers/claude-usage.ts";
+import { claudeEmailFrom, codexEmail, emailWanted, recordEmails } from "./account-email.ts";
 import { fetchCodexUsage, readCodexCredentials } from "./providers/codex-usage.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { codexAutorotateEnabled, codexAutorotateLine, rebalanceEnabled, rebalanceLine } from "./autorotate.ts";
@@ -453,13 +460,19 @@ function checkRegistry(parseError: string | null, problems: string[]): Result[] 
  * collision. There is no `--fix` branch here, and there should not be: an
  * identity is repaired by a human at a browser tab.
  */
-async function checkClaudeIdentity(a: Account, book: Account[], cred: PollCredentials | null): Promise<Result> {
+async function checkClaudeIdentity(
+  a: Account,
+  book: Account[],
+  cred: PollCredentials | null,
+  read: (c: PollCredentials) => Promise<Profile | null>,
+): Promise<Result> {
   const tag = `claude account ${a.name}`;
   const rivals = book.filter((x) => x.provider === "claude" && x.name !== a.name && x.orgId);
   let checked = false;
   if (cred && rivals.length > 0 && cred.expiresAt - Date.now() > REFRESH_DUE_MS) {
-    try {
-      const profile = await fetchProfile(cred, AbortSignal.timeout(IDENTITY_TIMEOUT_MS));
+    // null is "could not tell" — never a collision, and never a ✓ this run did not earn
+    const profile = await read(cred);
+    if (profile) {
       checked = true;
       const other = profile.orgId ? organisationClaimedBy(rivals, a.name, profile.orgId) : null;
       if (other) {
@@ -469,8 +482,6 @@ async function checkClaudeIdentity(a: Account, book: Account[], cred: PollCreden
           why: `${sameOrganisationAs(other)}; run ms accounts login ${a.name} --relogin`,
         };
       }
-    } catch {
-      /* could not tell — never a collision, and never a ✓ this run did not earn */
     }
   }
   // A line says what was actually CHECKED. When the grant was read, "identity
@@ -496,6 +507,9 @@ export async function checkClaudeAccount(a: Account, fix: boolean, book: Account
   // refresh to attempt on it either: whatever is in it is not a refresh token,
   // so --fix would spend a call to be told `invalid_grant`.
   const grant = readPollGrant(a.name);
+  // A credential the provider takes right now: the grant when it is not due,
+  // or what --fix just refreshed it to. Never a refresh of this line's own.
+  let fresh: PollCredentials | null = null;
   if (grant.state === "unreadable") {
     out.push({
       ok: false,
@@ -512,6 +526,7 @@ export async function checkClaudeAccount(a: Account, fix: boolean, book: Account
     out.push({ ok: true, what: `${tag}: poll grant readable` });
     const due = cred.expiresAt - Date.now() <= REFRESH_DUE_MS;
     if (!due) {
+      fresh = cred;
       out.push({ ok: true, what: `${tag}: poll grant refresh not due` });
     } else if (!fix) {
       // Never refresh (and so never rotate a live credential) without
@@ -519,7 +534,7 @@ export async function checkClaudeAccount(a: Account, fix: boolean, book: Account
       out.push({ ok: false, what: `${tag}: poll grant`, why: "refresh due (run ms doctor --fix)" });
     } else {
       try {
-        await refreshPollCredentials(a.name, cred, AbortSignal.timeout(REFRESH_TIMEOUT_MS));
+        fresh = await refreshPollCredentials(a.name, cred, AbortSignal.timeout(REFRESH_TIMEOUT_MS));
         out.push({ ok: true, what: `${tag}: poll grant`, fixed: true });
       } catch (e) {
         const kind = e instanceof AuthError ? "auth" : e instanceof TransientError ? "transient" : "error";
@@ -547,7 +562,17 @@ export async function checkClaudeAccount(a: Account, fix: boolean, book: Account
         },
   );
 
-  out.push(await checkClaudeIdentity(a, book, grant.state === "ok" ? grant.cred : null));
+  // At most one profile read per account per run, shared by the identity line
+  // and the e-mail backfill: whichever asks first pays for it.
+  let profileRead: Promise<Profile | null> | null = null;
+  const read = (c: PollCredentials): Promise<Profile | null> =>
+    (profileRead ??= fetchProfile(c, AbortSignal.timeout(IDENTITY_TIMEOUT_MS)).catch(() => null));
+
+  out.push(await checkClaudeIdentity(a, book, grant.state === "ok" ? grant.cred : null, read));
+
+  // The e-mail, for a row that has none (src/account-email.ts). No line: a
+  // found e-mail shows in `ms status`/`ms accounts ls`, a missing one stays `-`.
+  if (fresh && emailWanted(a)) recordEmails([claudeEmailFrom(a, await read(fresh))]);
 
   return out;
 }
@@ -660,6 +685,9 @@ export async function checkCodexAccount(a: Account, fix: boolean): Promise<Resul
   const home = p.codexHome(a.name);
 
   const cred = readCodexCredentials(home);
+  // The e-mail from the login's own id_token, for a row that has none — local,
+  // silent, and no line of its own (src/account-email.ts).
+  if (cred) recordEmails([codexEmail(a)]);
   out.push(
     cred
       ? { ok: true, what: `${tag}: credentials readable` }

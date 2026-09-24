@@ -174,6 +174,9 @@ function accountRow(a: AccountUsage, registry: Registry, live: number): string[]
     reset ? localTimeCli(Date.parse(reset)) : DASH,
     c.state,
     String(live),
+    // EMAIL, last: the widest cell and the only optional one, printed as
+    // `ms accounts ls` prints it (`-` when unknown).
+    c.email ?? "-",
   ];
 }
 
@@ -351,8 +354,10 @@ export type StatusJson = { accounts: StatusAccountRow[]; sessions: StatusSession
  * `render`'s json branch below is still just `JSON.stringify` over this.
  */
 export async function statusJson(): Promise<StatusJson> {
-  const { registry } = loadRegistry();
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
+  // Read AFTER the poll, so an e-mail it just backfilled (src/account-email.ts)
+  // shows on this render rather than the next one.
+  const { registry } = loadRegistry();
   const st = openState();
   try {
     const accounts0 = toPickInputs(snapshot);
@@ -375,8 +380,8 @@ async function render(json: boolean, all: boolean): Promise<string> {
     return JSON.stringify({ ...data, sessions }) + "\n";
   }
 
-  const { registry, parseError } = loadRegistry();
   const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
+  const { registry, parseError } = loadRegistry(); // after the poll, as in statusJson
   const st = openState();
   try {
     const pool = toPickInputs(snapshot);
@@ -394,8 +399,9 @@ async function render(json: boolean, all: boolean): Promise<string> {
       // (provider, name), and an account name is reused across providers
       // (a Claude `tulp` and a Codex `tulp` are two different accounts).
       // SESS: how many live sessions run on the account -- the pool's other half, which otherwise
-      // means reading the sessions table below sideways. Last, so every older column keeps its place.
-      ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE", "SESS"],
+      // means reading the sessions table below sideways. EMAIL (0.3.7) closes the row: the login
+      // behind the name, so `claude-1`…`claude-5` can be told apart. Every older column keeps its place.
+      ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE", "SESS", "EMAIL"],
       snapshot.accounts.map((a) => accountRow(a, registry, (on.get(`${a.provider}:${a.name}`) ?? []).length)),
     ));
     lines.push("");

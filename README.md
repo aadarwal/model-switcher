@@ -94,7 +94,7 @@ ms stop [<session|pane>]
 ms dashboard [--port N] [--no-open]
 ```
 
-- `ms status` — two tables: the account pool as usage sees it, and every managed session. The accounts table ends in SESS, the number of live sessions on that account; `--json` lists them per account (`sessions`) and carries each account's `email`. The sessions table ends in BETTER — where [rebalance](#rebalance) would put that session right now, `—` when it is already there or the rule could never move it. `--watch` reprints every 5 s; `--json` prints the same rows as JSON. Sessions in state `gone` or `stopped` are hidden by default; `--all` shows them too.
+- `ms status` — two tables: the account pool as usage sees it, and every managed session. The accounts table ends in SESS, the number of live sessions on that account, then EMAIL, the login behind the name (`-` when unknown); `--json` lists the sessions per account (`sessions`) and carries each account's `email`. The sessions table ends in BETTER — where [rebalance](#rebalance) would put that session right now, `—` when it is already there or the rule could never move it. `--watch` reprints every 5 s; `--json` prints the same rows as JSON. Sessions in state `gone` or `stopped` are hidden by default; `--all` shows them too.
 - `ms rotate` — move a session to the next account with room: the move a wall would have made, on demand. Always carries the unfinished work over.
 - `ms switch` — move a session to a named account. It carries the work over only when the pane reads as walled; `--continue` always carries it over.
 - `ms switch --all` — move every session of that account's provider that is not already on it, four at a time. `--timeout` bounds how long new moves are *started* (default 600 s); a move in flight is never cut off. `--provider` is needed only when the destination name is registered under both providers, same rule as `ms accounts`' own `--provider`.
@@ -125,12 +125,16 @@ ms accounts token <name>
 ms accounts ls
 ```
 
-- `ls` — every account under one set of columns. EMAIL, the last one, is the login behind the name as the provider's own profile reported it at `login` or `verify`; it is display only (identity is still decided by the organisation), and an account signed in before this shows `-` until its next `ms accounts verify <name>`.
+- `ls` — every account under one set of columns. EMAIL, the last one, is the login behind the name as the provider's own profile reported it; it is display only (identity is still decided by the organisation). See [Which account is which](#which-account-is-which).
 - `add` — register a name with no credentials yet. `--label` sets the display label; `--shared` marks an account other people also use, which loses ties in the chooser. Run again on an existing Codex account, it re-links that account's home to `~/.codex` and changes nothing else.
 - `login` — mint the credentials and record the account's identity. Claude opens two browser flows; `--device-auth` (Codex only) prints a device code instead of redirecting to localhost, which is what you want over SSH. `--relogin` forces a fresh sign-in even when a usable grant is already in place.
 - `verify` — re-check an account's credentials and the identity behind them. `remove` — delete the registry row and every credential it names.
 - `token` — print the Claude launch token on stdout. `ls` — one row per account: provider, label, org, poll grant, launch token, verified.
 - `--provider` is needed only when one name is registered under both. Names are unique per provider, so a Claude `work` and a Codex `work` are two accounts.
+
+#### Which account is which
+
+The wizard names accounts `claude-1`, `claude-2`, …, and a name says nothing about the login behind it. So `ms status` and `ms accounts ls` both end in EMAIL: the account's e-mail, as the provider's own profile reports it. `login` and `verify` record it, and for an account that has none — one signed in before 0.2.6 — `ms` fills it in on its own the next time it talks to that provider anyway: `ms doctor`, `ms status`, the dashboard, a launch or a hook's poll. That costs one profile read per account per process (Claude: `/api/oauth/profile` under the poll grant; Codex: the identity in the account's own `auth.json`, no request at all), never one per poll, and a read that fails leaves `-` without a word. An e-mail is kept only when it belongs to the identity the row already records.
 
 ### Setup and health
 
@@ -364,8 +368,8 @@ beside them, and never touches another tool's hooks in the same file.
 `codex/` (each a view of your own `~/.codex`, with `codex/sessions` a link to
 `~/.codex/sessions`, so a resumed conversation can cross accounts), per-session event logs under `sessions/`, one manifest
 per `ms import` run under `imports/`, and the tool's own tmux socket. Directories are 0700 and files 0600. `accounts.json` now also holds each
-account's e-mail, as the provider's own profile reported it at `login`/`verify` — display
-only, and stored at rest in that same 0600 file.
+account's e-mail, as the provider's own profile reported it at `login`/`verify` or on the
+backfill above — display only, and stored at rest in that same 0600 file.
 
 | Variable | Meaning |
 |---|---|

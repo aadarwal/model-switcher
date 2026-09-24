@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.7
+
+- e-mails backfill on their own (doctor, status, the poll) for accounts signed in before
+  0.2.6 — one profile read per account per process, and a read that fails leaves `-`
+- `ms status` shows EMAIL, the last column of the accounts table
+
 ## 0.3.6
 
 - codex accounts share your own ~/.codex conversations, memories and history — only

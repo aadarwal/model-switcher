@@ -73,8 +73,10 @@ function writeDueCredential(msHome: string, name: string, accessToken: string, r
   );
 }
 
+// The e-mail is already recorded, so the checks below cost only the calls
+// they are about; a row without one (the backfill) is tested on its own.
 const account = (over: Partial<Account> = {}): Account => ({
-  name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true, ...over,
+  name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true, email: "gmail@example.com", ...over,
 });
 
 const codexAccount = (over: Partial<Account> = {}): Account => ({
@@ -1442,7 +1444,7 @@ test("runDoctor: hooks missing + a grant-less account among a healthy one → re
     JSON.stringify({
       version: 1,
       accounts: [
-        { name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true },
+        { name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true, email: "gmail@example.com" },
         { name: "orphan-acct", provider: "claude", label: "Orphan", orgId: null, shared: false, identityVerified: false },
       ],
     }),
@@ -1476,7 +1478,7 @@ test("runDoctor --fix: installs hooks and exits 0 on the healthy subset", async 
   saveLaunchToken("gmail", "sk-ant-oat01-AbCdEfGh12345678_-ijklmnop0123456789");
   writeFileSync(
     path.join(msHome, "accounts.json"),
-    JSON.stringify({ version: 1, accounts: [{ name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true }] }),
+    JSON.stringify({ version: 1, accounts: [{ name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true, email: "gmail@example.com" }] }),
     { mode: 0o600 },
   );
 
@@ -1514,7 +1516,7 @@ test("runDoctor: a Claude-only machine (no codex accounts, codex truly absent fr
   saveLaunchToken("gmail", "sk-ant-oat01-AbCdEfGh12345678_-ijklmnop0123456789");
   writeFileSync(
     path.join(msHome, "accounts.json"),
-    JSON.stringify({ version: 1, accounts: [{ name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true }] }),
+    JSON.stringify({ version: 1, accounts: [{ name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true, email: "gmail@example.com" }] }),
     { mode: 0o600 },
   );
 
@@ -1685,7 +1687,7 @@ test("ms doctor --fix: a due grant that fails to refresh never prints the poll g
   saveLaunchToken("gmail", LAUNCH_TOKEN);
   writeFileSync(
     path.join(msHome, "accounts.json"),
-    JSON.stringify({ version: 1, accounts: [{ name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true }] }),
+    JSON.stringify({ version: 1, accounts: [{ name: "gmail", provider: "claude", label: "Gmail", orgId: null, shared: false, identityVerified: true, email: "gmail@example.com" }] }),
     { mode: 0o600 },
   );
 

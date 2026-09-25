@@ -71,6 +71,19 @@
 // link. The picker in a linked home listed the base's conversations too,
 // which is the point. A companion file (`-wal`, `-shm`, `-journal`) is
 // therefore never linked on its own: it follows its database.
+//
+// RUNTIME STATE IS NEVER SHARED. Codex 0.157 starts one background daemon per
+// CODEX_HOME (`app-server --managed-daemon`) and finds it through
+// `app-server-control/app-server-control.sock`. A home whose
+// `app-server-control` were a link into the base would reach the BASE's
+// daemon, and every pane in it would run as whichever account that daemon
+// holds — identity mixing, the one thing a home per account exists to
+// prevent. So the daemon's entries are named in `CODEX_HOME_OWN`, and beyond
+// the names a generic rule (`isRuntimeState`): a socket, a `.lock` or `.pid`
+// file, or a directory holding a socket is one process's state — never
+// linked from the base, never moved into it. A home that already links one
+// (the pass before 0.3.9 folded them) has the LINK removed, never its target,
+// so Codex recreates its own; no process is ever signalled.
 
 import {
   appendFileSync,
@@ -90,6 +103,7 @@ import {
   symlinkSync,
   unlinkSync,
   writeSync,
+  type Dirent,
   type Stats,
 } from "node:fs";
 import path from "node:path";
@@ -111,10 +125,63 @@ import { codexBaseDir, ensureStore, p } from "./paths.ts";
  * move into the base, and the human's own `~/.codex/auth.json.bak` never
  * appears in an account's home.
  */
-export const CODEX_HOME_OWN = ["auth.json", "config.toml"] as const;
+export const CODEX_HOME_OWN = [
+  "auth.json",
+  "config.toml",
+  // Codex 0.157's per-home daemon: its control socket and startup lock, its
+  // pid/lock/socket files, and the TUI's capability handshake with it. Shared,
+  // every home would talk to ONE daemon — and run as one account.
+  "app-server-control",
+  "app-server-daemon",
+  "app-server-startup.lock",
+  "tui-thread-reference-capabilities",
+] as const;
+
+/** The daemon's entries alone — the part of `CODEX_HOME_OWN` that is runtime
+ *  state, which a home must not even LINK to the base's copy of. */
+const CODEX_RUNTIME_NAMES = CODEX_HOME_OWN.slice(2);
+
+const namedAfter = (list: readonly string[], name: string): boolean =>
+  list.some((own) => name === own || name.startsWith(`${own}.`) || name.startsWith(`.${own}.`));
 
 export function isHomeOwn(name: string): boolean {
-  return CODEX_HOME_OWN.some((own) => name === own || name.startsWith(`${own}.`) || name.startsWith(`.${own}.`));
+  return namedAfter(CODEX_HOME_OWN, name);
+}
+
+/**
+ * One process's runtime state (see the header): a daemon entry by name, a
+ * socket, a `.lock`/`.pid` file, or a directory with a socket directly in it
+ * (a link to a socket counts — Codex links its control socket to a short
+ * path). Follows a symlink at `file` itself.
+ */
+export function isRuntimeState(file: string): boolean {
+  const name = path.basename(file);
+  if (namedAfter(CODEX_RUNTIME_NAMES, name)) return true;
+  let st: Stats;
+  try {
+    st = statSync(file);
+  } catch {
+    return false;
+  }
+  if (st.isSocket()) return true;
+  if (st.isFile()) return /\.(?:lock|pid)$/.test(name);
+  if (!st.isDirectory()) return false;
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(file, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  // The entry types come with the listing: only a link costs a stat.
+  return entries.some((d) => {
+    if (d.isSocket() || d.name.endsWith(".sock")) return true;
+    if (!d.isSymbolicLink()) return false;
+    try {
+      return statSync(path.join(file, d.name)).isSocket();
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** `<name>.pre-link.<ms>[-<n>]`, and a database's companions renamed with
@@ -543,7 +610,8 @@ export function ensureCodexBase(opts: { dryRun?: boolean } = {}): ShareReport & 
 
 /** How an entry is merged back: a directory file by file, a `.jsonl` line by
  *  line, a database never, any other file whole or not at all — and anything
- *  that is neither a file nor a directory (a socket) only ever moved. */
+ *  that is neither a file nor a directory only ever moved (never a socket:
+ *  that is runtime state, `isRuntimeState`, and stays where it is). */
 type Kind = "dir" | "jsonl" | "sqlite" | "file" | "other";
 
 const kindOf = (name: string, st: Stats): Kind =>
@@ -563,6 +631,7 @@ type Action =
   | { do: "link"; name: string }
   | { do: "relink"; name: string }
   | { do: "unlink"; name: string }
+  | { do: "unshare"; name: string }
   | { do: "same"; name: string }
   | { do: "move"; name: string; kind: Kind; companions: string[] }
   | { do: "merge"; name: string; kind: Kind; companions: string[] };
@@ -577,11 +646,19 @@ function plan(home: string, base: string): { actions: Action[]; problems: string
   const homeReal = realOr(home);
 
   for (const name of homeNames) {
-    if (isHomeOwn(name) || isPreLinkBackup(name) || companionOf(name)) continue;
     const h = path.join(home, name);
     const b = path.join(base, name);
     const hs = lst(h);
     if (!hs) continue;
+    // Runtime state of the base's process, linked into this home (the pass
+    // before 0.3.9 did that): the link goes, the base's entry never does.
+    if (hs.isSymbolicLink() && (isRuntimeState(h) || isRuntimeState(b)) && pointsAt(h, b)) {
+      actions.push({ do: "unshare", name });
+      continue;
+    }
+    if (isHomeOwn(name) || isPreLinkBackup(name) || companionOf(name)) continue;
+    // This home's own runtime state: never moved, never merged.
+    if (!hs.isSymbolicLink() && isRuntimeState(h)) continue;
     const bs = lst(b);
     if (hs.isSymbolicLink()) {
       // The link every home had until 0.3.6: `sessions` at the retired store.
@@ -624,6 +701,7 @@ function plan(home: string, base: string): { actions: Action[]; problems: string
 
   for (const name of names(base)) {
     if (inHome.has(name) || isHomeOwn(name) || isPreLinkBackup(name) || companionOf(name)) continue;
+    if (isRuntimeState(path.join(base, name))) continue; // the base's own process state
     // A base entry that CONTAINS this home (an MS_HOME kept inside ~/.codex)
     // would be a link from the home to its own ancestor: a cycle for anything
     // that walks the tree.
@@ -646,6 +724,11 @@ function apply(home: string, base: string, a: Action): string | null {
       const was = linkTarget(h) ?? b;
       unlinkSync(h);
       return `removed ${h}, a link to ${was}, which no longer exists`;
+    }
+    case "unshare": {
+      const was = linkTarget(h) ?? b;
+      unlinkSync(h); // the link itself — never what it points at
+      return `removed ${h}, a link to ${was} (runtime state of another Codex process), so this account's Codex keeps its own`;
     }
     case "relink":
       unlinkSync(h);
@@ -721,6 +804,7 @@ const describe = (home: string, base: string, a: Action): string => {
   switch (a.do) {
     case "link": return a.name;
     case "unlink": return `${h} links to something that no longer exists`;
+    case "unshare": return `${h} links to ${path.join(base, a.name)}, another Codex process's runtime state — this account would share its daemon`;
     case "relink": return `${h} still points at the retired store`;
     case "same": return `${h} is a copy of ${path.join(base, a.name)}, not a link`;
     case "move": return `${h} is not in ${base} yet`;

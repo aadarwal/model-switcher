@@ -195,8 +195,12 @@ reported, never touched. The old shared store `MS_HOME/codex/sessions` is merged
 0.156.1: it writes `config.toml` and appends to `history.jsonl` through a symlink rather
 than replacing it, and its SQLite keeps a linked database's `-wal`/`-shm` beside the real
 file, so homes share one database rather than forking it — the repair on every launch is
-the backstop for a later Codex that writes a file over its link. `MS_CODEX_BASE_DIR` puts
-the base somewhere other than `~/.codex`.
+the backstop for a later Codex that writes a file over its link. Runtime state is never
+shared: Codex 0.157's per-home daemon (`app-server-control/`, `app-server-daemon/`,
+`tui-thread-reference-capabilities`), and any socket, `.lock`/`.pid` file or directory
+holding a socket, stays each account's own — shared, every account would run as whichever
+one that daemon holds — and a link to the base's copy is removed (never its target).
+`MS_CODEX_BASE_DIR` puts the base somewhere other than `~/.codex`.
 
 ### Credentials are per device
 

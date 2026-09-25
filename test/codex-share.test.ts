@@ -20,6 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import net from "node:net";
 import path from "node:path";
 import { tempHome } from "./helpers.ts";
 import {
@@ -27,6 +28,7 @@ import {
   codexSessionsShared,
   ensureCodexBase,
   isHomeOwn,
+  isRuntimeState,
   shareCodexHome,
   shareCodexState,
 } from "../src/codex-share.ts";
@@ -102,8 +104,15 @@ const backupsOf = (dir: string, name: string) => readdirSync(dir).filter((n) => 
 
 // --- The rule ------------------------------------------------------------
 
-test("the only per-home entries are auth.json and config.toml, and anything named after them", () => {
-  assert.deepEqual([...CODEX_HOME_OWN], ["auth.json", "config.toml"]);
+test("the only per-home entries are auth.json, config.toml, Codex 0.157's daemon state, and anything named after them", () => {
+  assert.deepEqual([...CODEX_HOME_OWN], [
+    "auth.json",
+    "config.toml",
+    "app-server-control",
+    "app-server-daemon",
+    "app-server-startup.lock",
+    "tui-thread-reference-capabilities",
+  ]);
   for (const own of ["auth.json", "config.toml", "config.toml.bak-ms-1789584065086", ".config.toml.tmp-123-456", "auth.json.bak", ".auth.json.tmp"]) {
     assert.equal(isHomeOwn(own), true, own);
   }
@@ -483,4 +492,120 @@ test("ensureCodexBase refuses a base that is a file, and reports a store link th
   const r2 = ensureCodexBase();
   assert.equal(r2.usable, true);
   assert.ok(r2.problems.some((l) => l.includes("never touched automatically")), r2.problems.join("\n"));
+});
+
+// --- Runtime state (Codex 0.157's per-home daemon) ----------------------
+
+/** A live unix socket at `dir/name`. Listened on by a path relative to
+ *  `dir` (macOS caps a socket path near 104 bytes; a temp home is longer),
+ *  so the socket really is inside the directory. Close it to remove it. */
+async function socketIn(dir: string, name: string): Promise<net.Server> {
+  mkdirSync(dir, { recursive: true });
+  const cwd = process.cwd();
+  process.chdir(dir);
+  try {
+    const server = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(name, () => resolve());
+    });
+    return server;
+  } finally {
+    process.chdir(cwd);
+  }
+}
+const closed = (s: net.Server) => new Promise<void>((resolve) => s.close(() => resolve()));
+
+const DAEMON = ["app-server-control", "app-server-daemon", "app-server-startup.lock", "tui-thread-reference-capabilities"];
+
+test("Codex 0.157's daemon state in a home stays real and stays put — never moved into the base", () => {
+  const w = world();
+  put(path.join(w.acct, "app-server-control", "app-server-startup.lock"), "");
+  put(path.join(w.acct, "app-server-daemon", "daemon.pid"), "123\n");
+  put(path.join(w.acct, "app-server-startup.lock"), "");
+  put(path.join(w.acct, "tui-thread-reference-capabilities"), "caps\n");
+  put(path.join(w.acct, "other.pid"), "456\n");
+  put(path.join(w.acct, "writer.lock"), "");
+
+  const r = shareCodexState(w.acct);
+
+  assert.deepEqual(r.problems, []);
+  for (const name of [...DAEMON, "other.pid", "writer.lock"]) {
+    assert.equal(lstatSync(path.join(w.acct, name)).isSymbolicLink(), false, name);
+    assert.equal(existsSync(path.join(w.base, name)), false, `${name} never moved into the base`);
+  }
+  assert.equal(readFileSync(path.join(w.acct, "app-server-daemon", "daemon.pid"), "utf8"), "123\n");
+  assert.deepEqual(shareCodexHome(w.acct, { dryRun: true }), { changes: [], pending: [], problems: [] });
+});
+
+test("the base's daemon state, locks and pid files are never linked into a home, even though the base has them", () => {
+  const w = world();
+  put(path.join(w.base, "app-server-control", "app-server-startup.lock"), "");
+  put(path.join(w.base, "app-server-daemon", "daemon.lock"), "");
+  put(path.join(w.base, "app-server-startup.lock"), "");
+  put(path.join(w.base, "tui-thread-reference-capabilities"), "caps\n");
+  put(path.join(w.base, "daemon.pid"), "1\n");
+  put(path.join(w.base, "startup.lock"), "");
+  put(path.join(w.base, "history.jsonl"), "{}\n");
+
+  const r = shareCodexState(w.acct);
+
+  assert.deepEqual(r.problems, []);
+  for (const name of [...DAEMON, "daemon.pid", "startup.lock"]) {
+    assert.equal(lstatSync(path.join(w.acct, name), { throwIfNoEntry: false }), undefined, name);
+  }
+  assert.equal(lstatSync(path.join(w.acct, "history.jsonl")).isSymbolicLink(), true, "the human's state is still shared");
+});
+
+test("a home that already links the base's daemon state has the LINK removed, never the target — and a second pass is clean", () => {
+  const w = world();
+  put(path.join(w.base, "app-server-control", "app-server-startup.lock"), "base lock");
+  put(path.join(w.base, "app-server-daemon", "daemon.pid"), "999\n");
+  put(path.join(w.base, "tui-thread-reference-capabilities"), "base caps");
+  put(path.join(w.base, "updater.pid"), "7\n");
+  for (const name of ["app-server-control", "app-server-daemon", "tui-thread-reference-capabilities", "updater.pid"]) {
+    symlinkSync(path.join(w.base, name), path.join(w.acct, name));
+  }
+
+  const dry = shareCodexHome(w.acct, { dryRun: true });
+  assert.equal(dry.pending.filter((l) => /runtime state — this account would share its daemon/.test(l)).length, 4, dry.pending.join("\n"));
+
+  const r = shareCodexState(w.acct);
+
+  assert.deepEqual(r.problems, []);
+  assert.equal(r.changes.filter((l) => /^removed .* \(runtime state of another Codex process\)/.test(l)).length, 4, r.changes.join("\n"));
+  for (const name of ["app-server-control", "app-server-daemon", "tui-thread-reference-capabilities", "updater.pid"]) {
+    assert.equal(lstatSync(path.join(w.acct, name), { throwIfNoEntry: false }), undefined, `${name} link removed`);
+  }
+  assert.equal(readFileSync(path.join(w.base, "app-server-control", "app-server-startup.lock"), "utf8"), "base lock");
+  assert.equal(readFileSync(path.join(w.base, "app-server-daemon", "daemon.pid"), "utf8"), "999\n");
+  assert.equal(readFileSync(path.join(w.base, "tui-thread-reference-capabilities"), "utf8"), "base caps");
+  assert.equal(readFileSync(path.join(w.base, "updater.pid"), "utf8"), "7\n");
+  assert.deepEqual(shareCodexState(w.acct).changes, [], "a second pass changes nothing");
+});
+
+test("generic: a directory holding a live unix socket is runtime state — not linked from the base, not moved from a home, and an old link to it is removed", async () => {
+  const w = world();
+  const baseIpc = await socketIn(path.join(w.base, "ipc"), "control");
+  const homeRt = await socketIn(path.join(w.acct, "rt"), "listener");
+  const baseRt2 = await socketIn(path.join(w.base, "rt2"), "listener");
+  try {
+    assert.equal(lstatSync(path.join(w.base, "ipc", "control")).isSocket(), true, "a real socket, not a name");
+    assert.equal(isRuntimeState(path.join(w.base, "ipc")), true);
+    assert.equal(isRuntimeState(path.join(w.base, "sessions")), false);
+    symlinkSync(path.join(w.base, "rt2"), path.join(w.acct, "rt2"));
+
+    const r = shareCodexState(w.acct);
+
+    assert.deepEqual(r.problems, []);
+    assert.equal(lstatSync(path.join(w.acct, "ipc"), { throwIfNoEntry: false }), undefined, "the base's socket dir is not linked");
+    assert.equal(lstatSync(path.join(w.acct, "rt")).isDirectory(), true, "the home's own stays a real directory");
+    assert.equal(lstatSync(path.join(w.acct, "rt", "listener")).isSocket(), true);
+    assert.equal(existsSync(path.join(w.base, "rt")), false, "never moved into the base");
+    assert.equal(lstatSync(path.join(w.acct, "rt2"), { throwIfNoEntry: false }), undefined, "the old link is removed");
+    assert.equal(lstatSync(path.join(w.base, "rt2", "listener")).isSocket(), true, "and its target is intact");
+    assert.equal(lstatSync(path.join(w.acct, "sessions")).isSymbolicLink(), true);
+  } finally {
+    await Promise.all([closed(baseIpc), closed(homeRt), closed(baseRt2)]);
+  }
 });

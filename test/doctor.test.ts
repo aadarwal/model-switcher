@@ -1170,6 +1170,35 @@ test("checkCodexAccount: a home whose entries are not links to ~/.codex yet → 
   }
 });
 
+test("checkCodexAccount: a home linking the base's Codex 0.157 daemon state → ✗ named; --fix removes the link, never the target", async () => {
+  const { home, msHome } = base();
+  const baseDir = path.join(home, ".codex");
+  mkdirSync(path.join(baseDir, "sessions"), { recursive: true, mode: 0o700 });
+  mkdirSync(path.join(baseDir, "app-server-control"), { recursive: true });
+  writeFileSync(path.join(baseDir, "app-server-control", "app-server-startup.lock"), "the base's");
+  const dir = bareCodexHome(msHome);
+  symlinkSync(path.join(baseDir, "app-server-control"), path.join(dir, "app-server-control"));
+
+  const savedFetch = globalThis.fetch;
+  stubCodexUsageOk();
+  try {
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const shares = (rs: { ok: boolean; what: string; why?: string; fixed?: boolean }[]) => rs.find((r) => /: shares /.test(r.what))!;
+    const before = shares(await checkCodexAccount(codexAccount(), false));
+    assert.equal(before.ok, false);
+    assert.match(before.why ?? "", /app-server-control links to .*runtime state — this account would share its daemon/);
+    assert.match(before.why ?? "", /run ms doctor --fix/);
+    assert.equal(lstatSync(path.join(dir, "app-server-control")).isSymbolicLink(), true, "a plain check changes nothing");
+
+    const after = shares(await checkCodexAccount(codexAccount(), true));
+    assert.deepEqual([after.ok, after.fixed], [true, true], JSON.stringify(after));
+    assert.equal(existsSync(path.join(dir, "app-server-control")), false, "the link is gone");
+    assert.equal(readFileSync(path.join(baseDir, "app-server-control", "app-server-startup.lock"), "utf8"), "the base's", "the target is intact");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
 test("checkCodexAccount: --fix merges a real sessions directory into ~/.codex, never replaces it — a file that differs stays beside the link", async () => {
   const { home, msHome } = base();
   const baseSessions = path.join(home, ".codex", "sessions");

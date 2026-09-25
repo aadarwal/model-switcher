@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.9
+
+- Codex 0.157's per-home daemon state (app-server-control, app-server-daemon, sockets, locks)
+  stays per account and is never shared — sharing it would make every account run as one
+
 ## 0.3.8
 
 - outside tmux, import and launch use the default tmux server (sessions show in `tmux ls`);

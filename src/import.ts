@@ -33,9 +33,9 @@ import path from "node:path";
 import * as readline from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import type { Verb } from "./cli.ts";
-import { ensureStore, msHome, p } from "./paths.ts";
+import { ensureStore, p } from "./paths.ts";
 import { openState } from "./state.ts";
-import { Tmux } from "./tmux.ts";
+import { Tmux, shellWord, targetServer, tmuxCommandFor, tmuxFor } from "./tmux.ts";
 import { rolloutIdsFromName } from "./adopt.ts";
 import { defaultScanDeps, scanConversations } from "./import/scan.ts";
 import { planImport, type ContinueFor, type Plan } from "./import/plan.ts";
@@ -155,12 +155,11 @@ export function codexHome(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /** The tmux server an import lands in: the one the human is standing in, else
- *  the tool's own — the same rule the planner encodes, asked here because the
- *  existing session names have to be read off that server BEFORE the plan can
- *  avoid colliding with them. */
+ *  the default server (or the `MS_TMUX_SOCKET` override) — the same rule the
+ *  planner encodes, asked here because the existing session names have to be
+ *  read off that server BEFORE the plan can avoid colliding with them. */
 export function targetSocket(env: NodeJS.ProcessEnv = process.env): string | null {
-  const t = env.TMUX;
-  return t ? t.split(",")[0]! : path.join(msHome(), "tmux.sock");
+  return targetServer(env).socket;
 }
 
 const SUBPROCESS_TIMEOUT_MS = 10_000;
@@ -212,7 +211,7 @@ export async function runImportPlan(
   manifestPath: string,
   log: (line: string) => void,
 ): Promise<{ moved: number; stopped: number; failed: number }> {
-  const tmux = new Tmux(plan.socket);
+  const tmux = tmuxFor({ server: plan.server, socket: plan.socket });
   return executeImport(plan, manifestPath, {
     tmux,
     kill: signalPid,
@@ -392,8 +391,7 @@ export async function runImport(argv: string[], io: ImportIo = processIo()): Pro
       dirs.push(realpathSync(abs));
     }
 
-    const socket = targetSocket();
-    const tmux = new Tmux(socket);
+    const tmux = tmuxFor(targetServer());
     const candidates = scanConversations({
       claudeConfigDir: claudeConfigDir(),
       codexHome: codexHome(),
@@ -416,7 +414,7 @@ export async function runImport(argv: string[], io: ImportIo = processIo()): Pro
       git: runGit,
       existingSessions: new Set(tmux.sessionNames()),
       tmuxEnv: process.env.TMUX,
-      msSocket: path.join(msHome(), "tmux.sock"),
+      socketOverride: process.env.MS_TMUX_SOCKET,
     });
 
     ensureStore();
@@ -455,7 +453,11 @@ export async function runImport(argv: string[], io: ImportIo = processIo()): Pro
 
   io.err(`ms import: moved ${result.moved}, stopped ${result.stopped}, failed ${result.failed}\n`);
   io.err(`ms import: manifest ${file}\n`);
-  if (result.moved && plan.server === "ms") io.err(`ms import: they are on the tool's own server — ms attach\n`);
+  if (result.moved && plan.server !== "current") {
+    const names = plan.sessions.map((s) => s.name);
+    const where = plan.socket ? `the tmux server on ${plan.socket}` : "the default tmux server";
+    io.err(`ms import: they are on ${where}, session${names.length === 1 ? "" : "s"} ${names.join(", ")} — ${tmuxCommandFor(plan.socket, `attach -t ${shellWord(names[0]!)}`)}\n`);
+  }
   return result.failed ? EXIT_FAILED : EXIT_OK;
 }
 

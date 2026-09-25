@@ -715,6 +715,24 @@ test("the manifest round-trips through a plan and keeps what the run was asked f
   assert.match(table, /skipped: in tmux/);
 });
 
+test("a manifest written before 0.3.8 that says server ms reads as the private socket", async (t) => {
+  await world(t, planOf([]));
+  const { readManifest, planFromManifest, serverOf } = await import("../src/import/manifest.ts");
+  const file = path.join(process.env.MS_HOME!, "imports", "old.json");
+  writeFileSync(file, JSON.stringify({ createdAt: "", server: "ms", socket: "/store/tmux.sock", since: "2h", dirs: [], rows: [] }));
+  const m = readManifest(file);
+  assert.equal(m.server, "socket:/store/tmux.sock");
+  assert.equal(m.socket, "/store/tmux.sock");
+  assert.deepEqual({ server: planFromManifest(m).server, socket: planFromManifest(m).socket }, { server: "socket:/store/tmux.sock", socket: "/store/tmux.sock" });
+
+  // No socket recorded: the one place that server ever lived.
+  const home = path.join(process.env.MS_HOME!, "tmux.sock");
+  assert.deepEqual(serverOf("ms", null), { server: `socket:${home}`, socket: home });
+  assert.deepEqual(serverOf("default", null), { server: "default", socket: null });
+  assert.deepEqual(serverOf("socket:/x/y.sock", null), { server: "socket:/x/y.sock", socket: "/x/y.sock" });
+  assert.deepEqual(serverOf("current", "/tmp/c"), { server: "current", socket: "/tmp/c" });
+});
+
 test("the manifest is 0600 — it names every directory the human is working in", async (t) => {
   const plan = planOf([cand({ id: "s-1", cwd: "/tmp" })]);
   const w = await world(t, plan);

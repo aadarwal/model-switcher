@@ -71,7 +71,7 @@ function fakeGit(world: {
 function opts(over: Partial<PlanOptions> = {}): PlanOptions {
   return {
     as: null, git: fakeGit(), existingSessions: new Set(), tmuxEnv: undefined,
-    msSocket: "/store/tmux.sock", ...over,
+    ...over,
   };
 }
 
@@ -445,18 +445,29 @@ test("the whitelist keeps a flag's value with it, and drops a secret whatever sh
 
 // --- The target server -----------------------------------------------------
 
-test("the plan targets the server the command is being run from, else the tool's own", async () => {
+test("the plan targets the server the command is being run from, else the default server", async () => {
   const { planImport } = await import("../src/import/plan.ts");
   const inside = planImport([], opts({ tmuxEnv: "/private/tmp/tmux-501/default,12345,0" }));
   assert.equal(inside.server, "current");
   assert.equal(inside.socket, "/private/tmp/tmux-501/default");
 
   const outside = planImport([], opts({ tmuxEnv: undefined }));
-  assert.equal(outside.server, "ms");
-  assert.equal(outside.socket, "/store/tmux.sock");
+  assert.equal(outside.server, "default");
+  assert.equal(outside.socket, null, "the default server is named by no socket at all");
 
   const empty = planImport([], opts({ tmuxEnv: "" }));
-  assert.equal(empty.server, "ms", "an empty TMUX is not a server");
+  assert.equal(empty.server, "default", "an empty TMUX is not a server");
+});
+
+test("MS_TMUX_SOCKET is an override outside tmux, and ignored inside it", async () => {
+  const { planImport } = await import("../src/import/plan.ts");
+  const outside = planImport([], opts({ tmuxEnv: undefined, socketOverride: "/store/tmux.sock" }));
+  assert.equal(outside.server, "socket:/store/tmux.sock");
+  assert.equal(outside.socket, "/store/tmux.sock");
+
+  const inside = planImport([], opts({ tmuxEnv: "/tmp/cur,1,0", socketOverride: "/store/tmux.sock" }));
+  assert.equal(inside.server, "current");
+  assert.equal(inside.socket, "/tmp/cur");
 });
 
 // --- Skipping --------------------------------------------------------------

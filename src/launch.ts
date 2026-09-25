@@ -19,8 +19,10 @@
 //   * inside tmux — the caller's OWN pane is respawned. tmux kills this very
 //     process to do it, so everything the human should see is already on
 //     stderr before the respawn is issued.
-//   * outside tmux — a tool-owned server (`<store>/tmux.sock`), session `ms`.
-//     The pane is born holding a placeholder and the SAME respawn puts the CLI
+//   * outside tmux — the DEFAULT tmux server (the one `tmux ls` shows; started
+//     on demand by the first `new-session -d`), session `ms`; or the private
+//     socket `MS_TMUX_SOCKET` names, when it is set (src/tmux.ts
+//     `targetServer`). The pane is born holding a placeholder and the SAME respawn puts the CLI
 //     in it, so both shapes start the CLI exactly one way: into a pane that is
 //     already recorded, already `remain-on-exit`, already hooked. Then attach.
 
@@ -29,7 +31,7 @@ import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
-import { ensureStore, msBinary, msHome, p } from "./paths.ts";
+import { ensureStore, msBinary, p } from "./paths.ts";
 import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import { parseNeed, pickAccounts, type Need, type PickInput } from "./pick.ts";
@@ -40,7 +42,7 @@ import { readCodexAuth } from "./providers/codex-probe.ts";
 import { codexLaunchCommand } from "./providers/codex-cli.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { CONTINUATION } from "./recover.ts";
-import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
+import { currentPane, outsideServer, shellWord, tmuxCommandFor, tmuxFor, tmuxFromEnv } from "./tmux.ts";
 
 /** Exit codes, fixed by spec §7 so a caller can branch on them. */
 const EXIT_OK = 0;
@@ -49,8 +51,8 @@ const EXIT_USAGE_ERROR = 2; // the command line itself is wrong
 const EXIT_NO_ROOM = 3; // nothing has room
 const EXIT_UNREACHABLE = 4; // usage is down and there is no recent pick
 
-/** The tool's own tmux server, for a launch with no tmux of its own. */
-const TOOL_SOCKET = () => path.join(msHome(), "tmux.sock");
+/** The session a launch from outside tmux lands in, on the default server (or
+ *  on the `MS_TMUX_SOCKET` override). */
 const TOOL_SESSION = "ms";
 /** What a brand-new pane holds until the CLI is respawned into it. It must be
  *  unable to exit on its own (a shell would, and would source rc files too),
@@ -289,29 +291,39 @@ export function usageUnreachable(rows: AccountUsage[], inputs: PickInput[]): boo
 // --- The verb ----------------------------------------------------------
 
 /**
- * `ms attach` (spec §4): get back to the tool-owned tmux server.
+ * `ms attach [name]` (spec §4): get back to a session a launch or an import
+ * made from outside tmux.
  *
- * A launch from OUTSIDE tmux puts the session in `<store>/tmux.sock`, session
- * `ms`, and attaches — but a detach, a closed terminal or an attach that could
- * not run (a script, no tty) leaves the CLI running there with no way back that
- * the tool itself offers. This is that way back, and the only thing it is: one
- * bounded `has-session` and then tmux's own attach, which is deliberately
- * unbounded because an interactive attach lives as long as the session does.
+ * Those land on the DEFAULT tmux server — a bare launch in session `ms`, an
+ * import in one session per repo — or on the `MS_TMUX_SOCKET` override when it
+ * is set, and attach there; a detach, a closed terminal or an attach that could
+ * not run (a script, no tty) leaves the CLI running with nothing on screen.
+ * This is the way back and the only thing it is: one bounded `has-session` and
+ * then tmux's own attach, deliberately unbounded because an interactive attach
+ * lives as long as the session does. Plain `tmux attach -t <name>` does the
+ * same thing; this verb exists so the override socket is honoured too.
  *
- * A server that is not there is a refusal, not an error to interpret: nothing
- * of ours is resident, so "no session" means no launch has happened yet.
+ * A session that is not there is a refusal, with the `tmux ls` that shows what
+ * is: nothing of ours is resident, so there is nothing else to interpret.
  */
 export const attachVerb: Verb = async (argv) => {
-  if (argv.length) {
-    process.stderr.write(`ms attach: unexpected argument ${JSON.stringify(argv[0])}\nusage: ms attach\n`);
+  if (argv.length > 1 || (argv[0] ?? "").startsWith("-")) {
+    process.stderr.write(`ms attach: unexpected argument ${JSON.stringify(argv[argv.length > 1 ? 1 : 0])}\nusage: ms attach [session]\n`);
     return EXIT_USAGE_ERROR;
   }
-  const tmux = new Tmux(TOOL_SOCKET());
-  if (!tmux.hasSession(TOOL_SESSION)) {
-    process.stderr.write("ms attach: no ms tmux server yet; run ms claude\n");
+  const name = argv[0] ?? TOOL_SESSION;
+  const target = outsideServer();
+  const where = target.socket ? `the tmux server on ${target.socket}` : "the default tmux server";
+  if (process.env.TMUX) {
+    process.stderr.write(`ms attach: already inside tmux; detach first, or: tmux switch-client -t ${shellWord(name)}\n`);
+    return EXIT_USAGE_ERROR;
+  }
+  const tmux = tmuxFor(target);
+  if (!tmux.hasSession(name)) {
+    process.stderr.write(`ms attach: no session "${name}" on ${where}; see what is there with: ${tmuxCommandFor(target.socket, "ls")}\n`);
     return EXIT_ACCOUNT;
   }
-  return tmux.attach(TOOL_SESSION);
+  return tmux.attach(name);
 };
 
 /**
@@ -534,8 +546,12 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   const command = plan.command(cliSessionId, cliArgs);
   const label = plan.label(need);
   const inside = !!process.env.TMUX && !!process.env.TMUX_PANE;
-  const tmux = inside ? tmuxFromEnv() : new Tmux(TOOL_SOCKET());
-  const socket = tmux.socket ?? "";
+  const outside = outsideServer();
+  const tmux = inside ? tmuxFromEnv() : tmuxFor(outside);
+  // Inside tmux the socket is `$TMUX`'s. Outside, it is the override's — or,
+  // on the default server, read off the server once the pane exists (below):
+  // the hooks need a socket they can name whatever environment they run in.
+  let socket = tmux.socket ?? "";
 
   const st = openState();
   try {
@@ -589,6 +605,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     const pane = tmux.hasSession(TOOL_SESSION)
       ? tmux.newWindow(TOOL_SESSION, cwd, PLACEHOLDER)
       : tmux.newSession(TOOL_SESSION, cwd, PLACEHOLDER);
+    if (!socket) socket = tmux.socketPath(pane) ?? "";
     const serverStart = tmux.serverIdentity();
     st.createSession({
       id: sessionId, provider, cliSessionId, cwd, socket, pane, serverStart,
@@ -608,7 +625,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     // caller that is a script — is not a failed launch, so it must not become
     // one of the 1/2/3/4 answers; it is a line telling the human the way back.
     if (tmux.attach(TOOL_SESSION) !== 0) {
-      process.stderr.write(`ms: launched in the ms tmux server; attach with: tmux -S ${socket} attach -t ms\n`);
+      process.stderr.write(`ms: launched in tmux session ${TOOL_SESSION}; attach with: ${tmuxCommandFor(outside.socket, `attach -t ${TOOL_SESSION}`)}\n`);
     }
     return EXIT_OK;
   } finally {

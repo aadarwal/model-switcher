@@ -9,6 +9,8 @@ const SAMPLE_TOKEN = "sk-ant-oat01-AbCdEfGh12345678_-ijklmnop0123456789";
 const MS_BIN = path.resolve("bin/ms");
 const CWD = process.cwd();
 const IDENTITY = "4242:1789000000";
+/** What the stub server says its own socket is — the default server's path. */
+const DEFAULT_SOCKET = "/private/tmp/tmux-501/default";
 const TMUX_SOCKET = "/tmp/ms-test-tmux-socket";
 const PANE = "%7";
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -65,7 +67,7 @@ globalThis.fetch = async (url, init = {}) => {
 const TMUX_STUB = `printf '%s\\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
 case "$1" in
-  display-message) echo "${IDENTITY}" ;;
+  display-message) case "$*" in *socket_path*) echo "${DEFAULT_SOCKET}" ;; *) echo "${IDENTITY}" ;; esac ;;
   new-session|new-window) echo "%42" ;;
   has-session) exit "\${MS_TMUX_HAS_SESSION:-1}" ;;
   respawn-pane)
@@ -437,13 +439,14 @@ test("a bad --need, and claude args not behind --, are usage errors", async () =
 
 // --- outside tmux ------------------------------------------------------
 
-test("outside tmux: a placeholder pane first, then the CLI respawned into it", async () => {
+test("outside tmux: the default server — a placeholder pane first, then the CLI respawned into it", async () => {
   const w = await world();
   const r = run(["claude", "--", "hi"], w.env(OUTSIDE));
   assert.equal(r.code, 0, r.stderr);
 
-  const sock = path.join(w.msHome, "tmux.sock");
   const lines = logLines(w);
+  // The default server: tmux is never told a socket, by path or by name.
+  assert.equal(lines.some((l) => l.startsWith("-S ") || l.startsWith("-L ")), false, lines.join("\n"));
   const at = (needle: string) => {
     const i = lines.findIndex((l) => l.includes(needle));
     assert.ok(i >= 0, `no ${needle} in:\n${lines.join("\n")}`);
@@ -452,9 +455,12 @@ test("outside tmux: a placeholder pane first, then the CLI respawned into it", a
 
   // The pane is made to exist FIRST, running something that cannot exit on
   // its own — never the CLI, which would start before the hook watching it.
-  assert.ok(lines.includes(`-S ${sock} has-session -t ms`), lines.join("\n"));
+  assert.ok(lines.includes(`has-session -t ms`), lines.join("\n"));
   const spawn = at("new-session");
-  assert.equal(lines[spawn], `-S ${sock} new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`);
+  assert.equal(lines[spawn], `new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`);
+  // The row's socket is read off the server the pane was born on, so the
+  // hooks (which refuse an empty MS_SOCKET) can name it from anywhere.
+  assert.ok(at("socket_path") > spawn, lines.join("\n"));
 
   const remain = at("remain-on-exit on");
   const opt = at("@ms_session");
@@ -466,11 +472,11 @@ test("outside tmux: a placeholder pane first, then the CLI respawned into it", a
   assert.ok(spawn < hook && hook < respawn, lines.join("\n"));
   assert.ok(respawn < attach, lines.join("\n"));
   assert.equal(attach, lines.length - 1);
-  assert.equal(lines[attach], `-S ${sock} attach-session -t ms`);
-  assert.equal(lines[remain], `-S ${sock} set-option -p -t %42 remain-on-exit on`);
+  assert.equal(lines[attach], `attach-session -t ms`);
+  assert.equal(lines[remain], `set-option -p -t %42 remain-on-exit on`);
 
   const m = lines[respawn]!.match(
-    new RegExp(`^-S ${esc(sock)} respawn-pane -k -c (\\S+) -t %42 '(\\S+)' '_exec' '(${UUID})'$`),
+    new RegExp(`^respawn-pane -k -c (\\S+) -t %42 '(\\S+)' '_exec' '(${UUID})'$`),
   );
   assert.ok(m, `respawn line not as expected: ${lines[respawn]}`);
   assert.equal(m![1], CWD);
@@ -482,14 +488,14 @@ test("outside tmux: a placeholder pane first, then the CLI respawned into it", a
   const early = await sessionsAtRespawn(w);
   assert.equal(early.length, 1);
   assert.equal(early[0]!.pane, "%42");
-  assert.equal(early[0]!.socket, sock);
+  assert.equal(early[0]!.socket, DEFAULT_SOCKET);
   assert.equal(early[0]!.serverStart, IDENTITY);
   assert.equal(early[0]!.state, "launching");
 
   const st = await readState(w, launchId);
   const session = st.sessions[0]!;
   assert.equal(session.id, early[0]!.id);
-  assert.equal(session.socket, sock);
+  assert.equal(session.socket, DEFAULT_SOCKET);
   assert.equal(session.pane, "%42");
   assert.equal(session.serverStart, IDENTITY);
   assert.equal(session.state, "launching");
@@ -504,21 +510,42 @@ test("outside tmux with the session already up: a new window in it", async () =>
   const w = await world();
   const r = run(["claude"], w.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(r.code, 0, r.stderr);
-  const sock = path.join(w.msHome, "tmux.sock");
   const lines = logLines(w);
   assert.equal(lines.some((l) => l.includes("new-session")), false, lines.join("\n"));
-  assert.ok(lines.includes(`-S ${sock} new-window -P -F #{pane_id} -t ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
+  assert.ok(lines.includes(`new-window -P -F #{pane_id} -t ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
   assert.ok(lines.some((l) => l.includes("respawn-pane")), lines.join("\n"));
-  assert.equal(lines.at(-1), `-S ${sock} attach-session -t ms`);
+  assert.equal(lines.at(-1), `attach-session -t ms`);
   assert.equal((await sessionsAtRespawn(w))[0]!.pane, "%42");
+});
+
+test("outside tmux with MS_TMUX_SOCKET: the private server on that socket, as before 0.3.8", async () => {
+  const w = await world();
+  const sock = path.join(w.msHome, "tmux.sock");
+  const r = run(["claude"], w.env({ ...OUTSIDE, MS_TMUX_SOCKET: sock }));
+  assert.equal(r.code, 0, r.stderr);
+  const lines = logLines(w);
+  assert.ok(lines.includes(`-S ${sock} new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
+  assert.equal(lines.some((l) => !l.startsWith(`-S ${sock} `)), false, lines.join("\n"));
+  assert.equal(lines.some((l) => l.includes("socket_path")), false, "the override already names its socket");
+  assert.equal(lines.at(-1), `-S ${sock} attach-session -t ms`);
+  assert.equal((await sessionsAtRespawn(w))[0]!.socket, sock);
+});
+
+test("inside tmux, MS_TMUX_SOCKET changes nothing: the current server", async () => {
+  const w = await world();
+  const r = run(["claude"], w.env({ MS_TMUX_SOCKET: path.join(w.msHome, "tmux.sock") }));
+  assert.equal(r.code, 0, r.stderr);
+  const lines = logLines(w);
+  assert.ok(lines.some((l) => l.startsWith(`-S ${TMUX_SOCKET} respawn-pane`)), lines.join("\n"));
+  assert.equal(lines.some((l) => l.includes("tmux.sock")), false, lines.join("\n"));
+  assert.equal((await sessionsAtRespawn(w))[0]!.socket, TMUX_SOCKET);
 });
 
 test("a launch whose attach fails is still a launch: exit 0 and how to get back", async () => {
   const w = await world();
   const r = run(["claude"], w.env({ ...OUTSIDE, MS_TMUX_ATTACH: "1" }));
-  const sock = path.join(w.msHome, "tmux.sock");
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stderr, new RegExp(`^ms: launched in the ms tmux server; attach with: tmux -S ${esc(sock)} attach -t ms$`, "m"));
+  assert.match(r.stderr, /^ms: launched in tmux session ms; attach with: tmux attach -t ms$/m);
   assert.equal(r.stderr.includes(SAMPLE_TOKEN), false);
   // and the launch really happened
   assert.ok(logLines(w).some((l) => l.includes("respawn-pane")));
@@ -527,28 +554,51 @@ test("a launch whose attach fails is still a launch: exit 0 and how to get back"
 
 // --- ms attach -----------------------------------------------------------
 
-test("attach refuses when there is no tool-owned server, and otherwise attaches to it", async () => {
-  // USAGE has advertised `ms attach` since the first cut; unregistered, it
-  // answered "unknown verb" and exit 2. It is the only way back to a session
-  // launched from outside tmux once the terminal that attached has gone.
+test("attach: the default server's ms session, or a named one; refuses with the tmux ls to run", async () => {
+  // USAGE has advertised `ms attach` since the first cut. It is the way back to
+  // a session launched or imported from outside tmux once the terminal that
+  // attached has gone.
   const w = await world();
-  const sock = path.join(w.msHome, "tmux.sock");
 
   const absent = run(["attach"], w.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "1" }));
   assert.equal(absent.code, 1);
-  assert.match(absent.stderr, /^ms attach: no ms tmux server yet; run ms claude$/m);
-  assert.equal(logLines(w).some((l) => l.includes("attach-session")), false, "nothing is attached to a server that is not there");
-  assert.ok(logLines(w).some((l) => l === `-S ${sock} has-session -t ms`), logLines(w).join("\n"));
+  assert.match(absent.stderr, /^ms attach: no session "ms" on the default tmux server; see what is there with: tmux ls$/m);
+  assert.equal(logLines(w).some((l) => l.includes("attach-session")), false, "nothing is attached to a session that is not there");
+  assert.ok(logLines(w).some((l) => l === `has-session -t ms`), logLines(w).join("\n"));
 
   const w2 = await world();
-  const sock2 = path.join(w2.msHome, "tmux.sock");
   const r = run(["attach"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(logLines(w2).at(-1), `-S ${sock2} attach-session -t ms`);
+  assert.equal(logLines(w2).at(-1), `attach-session -t ms`);
 
-  const bad = run(["attach", "ms"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
-  assert.equal(bad.code, 2, "the verb takes no arguments; a session name is a mistake, not a target");
-  assert.match(bad.stderr, /usage: ms attach/);
+  // An import's session is named for its repo.
+  const named = run(["attach", "data"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
+  assert.equal(named.code, 0, named.stderr);
+  assert.equal(logLines(w2).at(-1), `attach-session -t data`);
+
+  const bad = run(["attach", "a", "b"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
+  assert.equal(bad.code, 2);
+  assert.match(bad.stderr, /usage: ms attach \[session\]/);
+  const flag = run(["attach", "--all"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
+  assert.equal(flag.code, 2);
+});
+
+test("attach with MS_TMUX_SOCKET: that socket, and the tmux ls for it", async () => {
+  const w = await world();
+  const sock = path.join(w.msHome, "tmux.sock");
+  const absent = run(["attach"], w.env({ ...OUTSIDE, MS_TMUX_SOCKET: sock, MS_TMUX_HAS_SESSION: "1" }));
+  assert.equal(absent.code, 1);
+  assert.match(absent.stderr, new RegExp(`^ms attach: no session "ms" on the tmux server on ${esc(sock)}; see what is there with: tmux -S ${esc(sock)} ls$`, "m"));
+  const r = run(["attach"], w.env({ ...OUTSIDE, MS_TMUX_SOCKET: sock, MS_TMUX_HAS_SESSION: "0" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(logLines(w).at(-1), `-S ${sock} attach-session -t ms`);
+});
+
+test("attach from inside tmux refuses rather than nesting", async () => {
+  const w = await world();
+  const r = run(["attach"], w.env({ MS_TMUX_HAS_SESSION: "0" }));
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /already inside tmux/);
 });
 
 // --- the pick is only remembered once it has been acted on ---------------
@@ -1018,15 +1068,14 @@ test("codex's own arguments go after --, and the message says so", async () => {
   assert.equal((await readState(w)).sessions.length, 0);
 });
 
-test("outside tmux, ms codex takes the same tool-owned server path", async () => {
+test("outside tmux, ms codex takes the same default-server path", async () => {
   const w = await codexWorld([{ name: "home", weekly: 10 }]);
   const r = run(["codex"], w.env(OUTSIDE));
   assert.equal(r.code, 0, r.stderr);
-  const sock = path.join(w.msHome, "tmux.sock");
   const lines = logLines(w);
-  assert.ok(lines.includes(`-S ${sock} new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
+  assert.ok(lines.includes(`new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
   assert.ok(lines.some((l) => l.includes("respawn-pane")), lines.join("\n"));
-  assert.equal(lines.at(-1), `-S ${sock} attach-session -t ms`);
+  assert.equal(lines.at(-1), `attach-session -t ms`);
   assert.match(r.stderr, /^ms: home \(codex\) → pane %42$/m);
   const st = await readState(w);
   assert.equal(st.sessions[0]!.provider, "codex");

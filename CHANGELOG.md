@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.8
+
+- outside tmux, import and launch use the default tmux server (sessions show in `tmux ls`);
+  the private socket is now only the `MS_TMUX_SOCKET` override
+- `ms attach [session]` attaches to the default server's `ms` session or the named one
+  (an import's repo session); with no such session it prints the `tmux ls` to run
+- import manifests record `server` as `default`, `current` or `socket:<path>`, and
+  `--status` prints it; an older manifest's `ms` reads as `socket:MS_HOME/tmux.sock`
+- migration: a private-socket server started before 0.3.8 keeps running with its sessions;
+  reach it with `MS_TMUX_SOCKET=~/.config/model-switcher/tmux.sock ms attach` (or your
+  `MS_HOME`'s `tmux.sock`), or `tmux -S <that path> attach`
+
 ## 0.3.7
 
 - e-mails backfill on their own (doctor, status, the poll) for accounts signed in before

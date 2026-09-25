@@ -631,12 +631,18 @@ export function defaultCwdOf(pid: number): string | null {
   return r.stdout ? parseLsofCwd(r.stdout) : null;
 }
 
-/** Every pane tty on the default tmux server AND on the tool's own, because a
- *  conversation already in either one is already somewhere it can be rotated. */
+/** Every pane tty on the default tmux server, on the one `$TMUX` names, on the
+ *  `MS_TMUX_SOCKET` override,
+ *  and on the private server a pre-0.3.8 `ms` used (`MS_HOME/tmux.sock`, which
+ *  may still be running), because a conversation already in any of them is
+ *  already somewhere it can be rotated. */
 export function defaultTmuxTtys(): Set<string> {
   const out = new Set<string>();
-  for (const socket of [null, path.join(msHome(), "tmux.sock")]) {
-    const r = new Tmux(socket).run(["list-panes", "-a", "-F", "#{pane_tty}"]);
+  const sockets = new Set<string | null>([null, path.join(msHome(), "tmux.sock")]);
+  if (process.env.MS_TMUX_SOCKET) sockets.add(process.env.MS_TMUX_SOCKET);
+  if (process.env.TMUX) sockets.add(process.env.TMUX.split(",")[0]!);
+  for (const socket of sockets) {
+    const r = (socket ? new Tmux(socket) : Tmux.defaultServer()).run(["list-panes", "-a", "-F", "#{pane_tty}"]);
     if (r.code !== 0) continue;
     for (const line of r.stdout.split("\n")) {
       const v = line.trim();

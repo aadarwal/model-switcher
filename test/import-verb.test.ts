@@ -106,7 +106,7 @@ function machine(t: TestContext, opts: { mtime?: number } = {}): World {
     MS_TMUX_PANES: path.join(dir, "panes"),
     MS_TMUX_WIN_INDEX: path.join(dir, "win-index"),
     MS_BIN: path.resolve("bin/ms"),
-    // No TMUX: the import lands on the tool's own server, which is where a
+    // No TMUX: the import lands on the default tmux server, which is where a
     // launch from outside tmux already goes.
     TMUX: "",
   };
@@ -260,6 +260,37 @@ test("--dry-run writes the manifest, prints the table, and touches nothing", asy
   );
 });
 
+test("outside tmux the manifest records the default server, and --status prints it", async (t) => {
+  const w = machine(t);
+  assert.equal(run(["import", "--dry-run", "--dir", w.project], w.env).code, 0);
+  const file = path.join(w.msHome, "imports", w.manifests()[0]!);
+  const m = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(m.server, "default");
+  assert.equal(m.socket, null);
+  assert.ok(w.tmuxLog().includes("list-sessions -F #{session_name}"), "the session names were read off the default server:\n" + w.tmuxLog().join("\n"));
+  assert.match(run(["import", "--status", file], w.env).stdout, /server default/);
+});
+
+test("MS_TMUX_SOCKET: the manifest records socket:<path>, and tmux is told that socket", async (t) => {
+  const w = machine(t);
+  const sock = path.join(w.msHome, "tmux.sock");
+  assert.equal(run(["import", "--dry-run", "--dir", w.project], { ...w.env, MS_TMUX_SOCKET: sock }).code, 0);
+  const file = path.join(w.msHome, "imports", w.manifests()[0]!);
+  const m = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(m.server, `socket:${sock}`);
+  assert.equal(m.socket, sock);
+  assert.ok(w.tmuxLog().includes(`-S ${sock} list-sessions -F #{session_name}`), w.tmuxLog().join("\n"));
+  assert.match(run(["import", "--status", file], w.env).stdout, new RegExp(`server socket:${sock.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+});
+
+test("inside tmux the manifest records the current server", async (t) => {
+  const w = machine(t);
+  assert.equal(run(["import", "--dry-run", "--dir", w.project], { ...w.env, TMUX: "/tmp/cur-sock,1,0" }).code, 0);
+  const m = JSON.parse(readFileSync(path.join(w.msHome, "imports", w.manifests()[0]!), "utf8"));
+  assert.equal(m.server, "current");
+  assert.equal(m.socket, "/tmp/cur-sock");
+});
+
 test("--since drops a conversation older than the window, and --since all keeps it", async (t) => {
   const w = machine(t, { mtime: Date.now() - 5 * 3_600_000 });
   const tight = run(["import", "--dry-run", "--dir", w.project], w.env);
@@ -314,7 +345,9 @@ test("--plan runs a manifest written earlier, with no scan and no question", asy
   assert.match(r.stderr, /moved 1, stopped 0, failed 0/);
   const sent = w.tmuxLog().filter((l) => l.includes("send-keys"));
   assert.equal(sent.length, 1);
-  assert.match(sent[0]!, /send-keys -t %1 /);
+  assert.match(sent[0]!, /^send-keys -t %1 /, "the default server: no -S, no -L");
+  assert.equal(w.tmuxLog().some((l) => /^-[SL] .*(new-session|new-window|split-window|send-keys)/.test(l)), false, w.tmuxLog().join("\n"));
+  assert.match(r.stderr, /^ms import: they are on the default tmux server, session data — tmux attach -t data$/m);
   assert.ok(sent[0]!.includes("'claude' '--' '--resume' 'conv-1'"), sent[0]);
   assert.equal(JSON.parse(readFileSync(file, "utf8")).rows[0].outcome, "resumed in data:data.5 (%1)", "the outcome carries tmux's own pane index and id, not the planner's 0-based slot");
 });
@@ -378,7 +411,7 @@ exit 0`);
 
   const { Tmux } = await import("../src/tmux.ts");
   const { storeWaitReady } = await import("../src/import.ts");
-  const plan = { server: "ms" as const, socket: null, sessions: [], skipped: [] };
+  const plan = { server: "default" as const, socket: null, sessions: [], skipped: [] };
   const tmux = new Tmux(null);
 
   // Born at a shell, then `ms` runs, then the shell is back: three readings of

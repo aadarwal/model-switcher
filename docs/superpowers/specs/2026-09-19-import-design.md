@@ -40,7 +40,8 @@ Input: candidates (provider, id, cwd, lastActivity, title, live pid or null, arg
 - Within a root, group by worktree (`git worktree list --porcelain` of the root; a cwd under a worktree path belongs to it). Window name = the worktree's branch (`main`, `codex-rotation`), else the directory's basename.
 - Four panes per window, `tiled`. Conversations ordered by `lastActivity` descending; the fifth opens `<window>:2`, and so on.
 - Each pane's command: Claude `ms claude [--as X] -- <kept flags> --resume <id>`; Codex `ms adopt <id> [--as X] --continue -- <kept flags>` (the adopt path copies the rollout and its lineage). Kept flags are the launch whitelist already used by rotation (`--model`, `--yolo`, `--sandbox`, `--ask-for-approval`, `--full-auto`, `--dangerously-*`, `--profile`; Claude: `--model`, `--permission-mode`, `--dangerously-skip-permissions`, `--allowedTools`), taken from the live process's argv when there is one.
-- Target server: the server of the `$TMUX` the command runs in; otherwise the tool's own (`MS_HOME/tmux.sock`, printed as `ms attach`).
+- Target server: the server of the `$TMUX` the command runs in; otherwise the default tmux server — the one plain `tmux` uses, started on demand by the first `new-session -d` — so the sessions show in `tmux ls`. `MS_TMUX_SOCKET=<path>` is an explicit override that puts them on a private server on that socket instead (outside tmux only). The manifest records `server` as `current` | `default` | `socket:<path>`; a manifest that says `ms` reads as `socket:MS_HOME/tmux.sock`.
+  - *2026-09-25 (0.3.8):* this paragraph used to name the tool's own server (`MS_HOME/tmux.sock`, reached with `ms attach`) as the outside-tmux target. The human ruled that a second, private tmux world was never asked for: outside tmux, imports and launches now use the default server, and the private socket survives only as the `MS_TMUX_SOCKET` override.
 
 ## Executor
 

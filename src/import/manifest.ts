@@ -32,6 +32,7 @@ import { msHome } from "../paths.ts";
 import { keptFlags } from "./plan.ts";
 import type { Candidate, ImportProvider } from "./scan.ts";
 import type { Plan, PlanSession, PlanWindow, PaneSpec } from "./plan.ts";
+import type { ServerKind } from "../tmux.ts";
 
 /** Where a row's pane goes, in the plan's own words. `paneId` and
  *  `paneIndex` are filled in by the executor the moment tmux hands them
@@ -96,7 +97,10 @@ export interface ManifestRow {
 
 export interface Manifest {
   createdAt: string;
-  /** `current` (the tmux the command was run from) or `ms` (the tool's own). */
+  /** `current` (the tmux the command was run from), `default` (the default
+   *  tmux server) or `socket:<path>` (the `MS_TMUX_SOCKET` override). A
+   *  manifest written before 0.3.8 may say `ms` — the private server on
+   *  `MS_HOME/tmux.sock` — which reads back as `socket:<that path>`. */
   server: string;
   /** The socket that server is on — `null` means tmux's own default. */
   socket: string | null;
@@ -244,8 +248,7 @@ export function planFromManifest(m: Manifest): Plan {
     window.panes.push(pane);
   }
   return {
-    server: m.server === "ms" ? "ms" : "current",
-    socket: m.socket,
+    ...serverOf(m.server, m.socket),
     sessions,
     skipped: skippedRows,
   };
@@ -283,6 +286,27 @@ function candidateFromRow(row: ManifestRow): Candidate {
   };
 }
 
+/**
+ * A manifest's server, read back into the words this version plans in.
+ *
+ * `ms` is the pre-0.3.8 spelling of the tool's private server: it reads as
+ * `socket:<path>`, on the socket the manifest recorded (else
+ * `MS_HOME/tmux.sock`, where that server always lived). Anything this version
+ * does not know is `current`, as it always was.
+ */
+export function serverOf(server: unknown, socket: string | null): { server: ServerKind; socket: string | null } {
+  if (server === "default") return { server: "default", socket: null };
+  if (server === "ms") {
+    const s = socket ?? path.join(msHome(), "tmux.sock");
+    return { server: `socket:${s}`, socket: s };
+  }
+  if (typeof server === "string" && server.startsWith("socket:") && server.length > "socket:".length) {
+    const s = server.slice("socket:".length);
+    return { server: `socket:${s}`, socket: s };
+  }
+  return { server: "current", socket };
+}
+
 // --- The file -----------------------------------------------------------
 
 /** Write it, atomically, 0600, creating `MS_HOME/imports` if this is the
@@ -309,8 +333,7 @@ export function readManifest(file: string): Manifest {
   if (!Array.isArray(m.rows)) throw new Error(`${file} is not an import manifest (no rows)`);
   return {
     createdAt: typeof m.createdAt === "string" ? m.createdAt : "",
-    server: m.server === "ms" ? "ms" : "current",
-    socket: typeof m.socket === "string" ? m.socket : null,
+    ...serverOf(m.server, typeof m.socket === "string" ? m.socket : null),
     since: typeof m.since === "string" ? m.since : "",
     dirs: Array.isArray(m.dirs) ? m.dirs.filter((d): d is string => typeof d === "string") : [],
     rows: m.rows as ManifestRow[],

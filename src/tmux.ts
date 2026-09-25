@@ -4,17 +4,78 @@ export function shellQuote(args: string[]): string {
   return args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
 }
 
+/**
+ * Which tmux server a launch or an import from this shell lands on — one rule,
+ * asked by `ms claude`/`ms codex`, `ms import` and `ms attach` alike:
+ *
+ *   * inside tmux (`$TMUX`) — the server the human is standing in (`current`);
+ *   * outside tmux — the DEFAULT server, the one plain `tmux`, `tmux ls` and
+ *     `tmux attach` talk to. It need not be running: the first
+ *     `new-session -d` starts it, as tmux always does;
+ *   * `MS_TMUX_SOCKET=<path>`, outside tmux only — an explicit private server
+ *     on that socket (`socket:<path>`). This was the default before 0.3.8
+ *     (`MS_HOME/tmux.sock`); it is now only ever an override.
+ */
+export type ServerKind = "default" | "current" | `socket:${string}`;
+export type ServerTarget = { server: ServerKind; socket: string | null };
+
+export function targetServer(env: NodeJS.ProcessEnv = process.env): ServerTarget {
+  const t = env.TMUX;
+  if (t) return { server: "current", socket: t.split(",")[0]! };
+  return outsideServer(env);
+}
+
+/** The server for a shell that is NOT in tmux (or a verb that ignores `$TMUX`,
+ *  like `ms attach`): the override socket if one is set, else the default. */
+export function outsideServer(env: NodeJS.ProcessEnv = process.env): ServerTarget {
+  const o = env.MS_TMUX_SOCKET;
+  return o ? { server: `socket:${o}`, socket: o } : { server: "default", socket: null };
+}
+
+/** A tmux client for one server target. The default server gets a client that
+ *  never inherits `$TMUX`: tmux resolves a bare command through `$TMUX` first,
+ *  so without that a `--plan` replayed from inside some other tmux would land
+ *  on the wrong server. */
+export function tmuxFor(t: ServerTarget): Tmux {
+  return t.server === "default" ? Tmux.defaultServer() : new Tmux(t.socket);
+}
+
+/** One word a human can paste into a shell: bare when it is safe, else quoted. */
+export function shellWord(w: string): string {
+  return /^[\w.,:@%+=/-]+$/.test(w) ? w : shellQuote([w]);
+}
+
+/** `tmux ls` as the human should type it for one server. */
+export function tmuxCommandFor(socket: string | null, rest: string): string {
+  return socket ? `tmux -S ${shellWord(socket)} ${rest}` : `tmux ${rest}`;
+}
+
 export class Tmux {
-  constructor(public socket: string | null) {}
+  constructor(public socket: string | null, private readonly ignoreTmuxEnv = false) {}
+  /** The default server — no `-S`, no `-L`, and no `$TMUX` inherited. */
+  static defaultServer(): Tmux { return new Tmux(null, true); }
   private base(): string[] { return this.socket ? ["-S", this.socket] : []; }
+  private env(): NodeJS.ProcessEnv | undefined {
+    if (!this.ignoreTmuxEnv || this.socket || !process.env.TMUX) return undefined;
+    const { TMUX: _drop, ...rest } = process.env;
+    return rest;
+  }
   run(args: string[], input = ""): { code: number; stdout: string; stderr: string } {
-    const r = spawnSync("tmux", [...this.base(), ...args], { encoding: "utf8", input, timeout: 10_000 });
+    const r = spawnSync("tmux", [...this.base(), ...args], { encoding: "utf8", input, timeout: 10_000, env: this.env() });
     return { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
   }
   private must(args: string[]): string {
     const r = this.run(args);
     if (r.code !== 0) throw new Error(`tmux ${args[0]} failed: ${r.stderr.trim() || r.code}`);
     return r.stdout;
+  }
+  /** The server's own socket path, read off the server itself — how a pane on
+   *  the default server gets a socket recorded that stays right whatever
+   *  `$TMUX`/`TMUX_TMPDIR` a later hook runs under. Null when tmux did not say. */
+  socketPath(target: string): string | null {
+    const r = this.run(["display-message", "-p", "-t", target, "#{socket_path}"]);
+    const v = r.stdout.trim();
+    return r.code === 0 && v ? v : null;
   }
   serverIdentity(): string { return this.must(["display-message", "-p", "#{pid}:#{start_time}"]).trim(); }
   paneExists(pane: string): boolean { return this.run(["list-panes", "-a", "-F", "#{pane_id}"]).stdout.split("\n").includes(pane); }
@@ -151,7 +212,7 @@ export class Tmux {
   }
   // The one deliberately unbounded call: an interactive attach lives as long as the session.
   attach(name: string): number {
-    const r = spawnSync("tmux", [...this.base(), "attach-session", "-t", name], { stdio: "inherit" });
+    const r = spawnSync("tmux", [...this.base(), "attach-session", "-t", name], { stdio: "inherit", env: this.env() });
     return r.status ?? 1;
   }
 }

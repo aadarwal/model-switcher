@@ -40,7 +40,7 @@ ms codex
 ms claude [--as <account>] [--need any|fable] [--continue] [-- <claude args>]
 ms codex  [--as <account>] [--need any|fable] [--continue] [-- <codex args>]
 ms adopt  <rollout-id|path> [--as <account>] [--continue] [-- <codex args>]
-ms attach
+ms attach [session]
 ```
 
 - `ms claude` / `ms codex` — pick an account with room and start that CLI in the current tmux pane under the account's credential. Everything after `--` goes to the CLI unchanged.
@@ -48,7 +48,8 @@ ms attach
 - `--continue` — for a resume you drove yourself (`ms codex --continue -- resume <id>`, `ms claude --continue -- --resume <id>`): hand the resumed conversation the same continuation a rotation sends, as the command line's own prompt. Refused when there is nothing to continue.
 - **A launch that resumes is given no `--session-id`.** `--session-id` makes a conversation, so on a command line that already names one (`--resume <id>`, `-r <id>`, `--resume=<id>`, `--continue`/`-c`) `ms` passes your command line through untouched and records the id it names — Claude Code's own SessionStart confirms it, exactly as it does after a rotation's `--resume` relaunch. `ms claude --continue -- --resume <id>` is the path **`ms import`** resumes every Claude conversation through. Still to be checked against a live Claude Code; if that pairing misbehaves, `ms rotate` / `ms switch --continue` remain the verified way to move a Claude session `ms` already manages.
 - `ms adopt` — take over a **Codex** conversation `ms` did not start, so it can be rotated like any other. See [rescuing a pane you didn't start with ms](#rescuing-a-pane-you-didnt-start-with-ms).
-- `ms attach` — re-attach to the tool's own tmux server (`MS_HOME/tmux.sock`, session `ms`), where a launch from outside tmux puts the pane.
+- **Where it lands.** Inside tmux, the launch replaces the pane you typed it in. Outside tmux, it goes to the **default tmux server** — the one plain `tmux` talks to, started if it is not running — in session `ms`, and attaches; the session shows in `tmux ls` like any other.
+- `ms attach [session]` — attach to a session on the default tmux server: `ms` (what a bare launch makes) when no name is given, or an import's repo-named session. Plain `tmux attach -t <session>` does the same. With no such session it says so and names the `tmux ls` to run; inside tmux it refuses rather than nest.
 
 ### Import
 
@@ -294,6 +295,13 @@ its directory, the process it was planned against, where it went and what became
 a row that failed can be resumed by hand from what the manifest says. `ms import --status
 <file>` prints it back; `ms import --plan <file>` runs it again.
 
+**Where it lands.** Run from inside tmux, the sessions are made on the server you are in.
+Run from a plain terminal, they go to the **default tmux server** — the one `tmux ls` and
+`tmux attach` use, started if it is not running — so they are there alongside every other
+session you have; the run ends with the `tmux attach -t <session>` to type, and
+`ms attach <session>` does the same. The manifest records which (`server default`,
+`current` or `socket:<path>`, printed by `--status`).
+
 Two things it deliberately does not do: it does not touch a conversation already in a tmux
 pane (that one can already be rotated — `--include-tmux` only lists them), and it does not
 carry your original prompt over, only the whitelisted flags.
@@ -368,7 +376,7 @@ beside them, and never touches another tool's hooks in the same file.
 `launch/`, per-account Claude config dirs under `claude/`, per-account Codex homes under
 `codex/` (each a view of your own `~/.codex`, with `codex/sessions` a link to
 `~/.codex/sessions`, so a resumed conversation can cross accounts), per-session event logs under `sessions/`, one manifest
-per `ms import` run under `imports/`, and the tool's own tmux socket. Directories are 0700 and files 0600. `accounts.json` now also holds each
+per `ms import` run under `imports/`. Directories are 0700 and files 0600. `accounts.json` now also holds each
 account's e-mail, as the provider's own profile reported it at `login`/`verify` or on the
 backfill above — display only, and stored at rest in that same 0600 file.
 
@@ -381,6 +389,7 @@ backfill above — display only, and stored at rest in that same 0600 file.
 | `MS_CODEX_BASE_CONFIG` | The file every Codex account home is rendered from. Defaults to `config.toml` in `MS_CODEX_BASE_DIR`; it is read, never written. Point it elsewhere to give `ms` panes a different base, or at a path that does not exist to give them none. |
 | `MS_REBALANCE` | [Rebalance](#rebalance): moving an idle session to a better account at a turn end. Unset, empty, or exactly `1` is **on**; **every other value reads as off** — the same shape as `MS_CODEX_AUTOROTATE`, now that a sooner weekly reset alone has been observed doing the right thing. Export it in the shell that runs `claude`/`codex`: an `ms` that sees it mirrors the answer into the store, so the tmux-dispatched hooks read it too. A mirrored `off` is a stored row and outlives the variable — unsetting it later does not turn rebalance back on; export `MS_REBALANCE=1` (and run an `ms claude`/`ms codex`, which mirrors) to do that. It gates only the AUTOMATIC moves; `ms rebalance` works either way. `ms doctor` prints the state it will act on. Ships on since 0.3.4; `MS_REBALANCE=0` disables it. |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere `ms` reads or writes that settings file. |
+| `MS_TMUX_SOCKET` | An override, not a default: outside tmux, put launches, imports and `ms attach` on a private tmux server on this socket path (`tmux -S <path>`) instead of the default server. Ignored inside tmux, where the current server always wins. Before 0.3.8 this was the default, at `MS_HOME/tmux.sock`; set it to that path to reach a server started then. |
 | `MS_VERBOSE` | `1` prints what each invocation's start-of-run repair did. |
 | `MS_ENTRY` | `src` or `dist` — which entry point `bin/ms` runs. For development; the brew shim sets `dist`. |
 

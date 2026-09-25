@@ -25,6 +25,7 @@
 // fails open, and the failure is a secret in a tmux command string.
 
 import path from "node:path";
+import { targetServer, type ServerKind } from "../tmux.ts";
 import type { Candidate, ImportProvider } from "./scan.ts";
 
 export interface PaneSpec {
@@ -49,9 +50,10 @@ export interface PlanSession {
 }
 
 export interface Plan {
-  /** `current` = the tmux server the command is being run from; `ms` = the
-   *  tool's own server, which the human reaches with `ms attach`. */
-  server: "current" | "ms";
+  /** `current` = the tmux server the command is being run from; `default` =
+   *  the default tmux server (the one `tmux ls` shows), for an import run
+   *  outside tmux; `socket:<path>` = the `MS_TMUX_SOCKET` override. */
+  server: ServerKind;
   socket: string | null;
   sessions: PlanSession[];
   skipped: { candidate: Candidate; reason: string }[];
@@ -72,7 +74,9 @@ export interface PlanOptions {
   existingSessions: Set<string>;
   /** `process.env.TMUX`, verbatim. */
   tmuxEnv: string | undefined;
-  msSocket: string;
+  /** `process.env.MS_TMUX_SOCKET` — the private-server override, honoured
+   *  only outside tmux. */
+  socketOverride?: string | undefined;
 }
 
 /** How many panes a window may hold before the next one opens `name-2`. */
@@ -362,12 +366,12 @@ export function planImport(candidates: Candidate[], opts: PlanOptions): Plan {
   }
 
   // The server is the one the human is in, when they are in one: an import run
-  // from a tmux pane belongs in that tmux. Outside it, the tool's own server,
-  // which is where every `ms` launch already goes.
-  const inTmux = !!opts.tmuxEnv;
+  // from a tmux pane belongs in that tmux. Outside it, the default server —
+  // the same rule every `ms` launch follows (src/tmux.ts `targetServer`).
+  const target = targetServer({ TMUX: opts.tmuxEnv, MS_TMUX_SOCKET: opts.socketOverride });
   return {
-    server: inTmux ? "current" : "ms",
-    socket: inTmux ? opts.tmuxEnv!.split(",")[0]! : opts.msSocket,
+    server: target.server,
+    socket: target.socket,
     sessions,
     skipped,
   };

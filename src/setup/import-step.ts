@@ -35,8 +35,8 @@ import path from "node:path";
 import { formatManifest, manifestFromPlan, manifestPath, readManifest, writeManifest } from "../import/manifest.ts";
 import { defaultScanDeps, scanConversations, type Candidate } from "../import/scan.ts";
 import { planImport, type Plan } from "../import/plan.ts";
-import { ensureStore, msHome, p } from "../paths.ts";
-import { Tmux } from "../tmux.ts";
+import { ensureStore, p } from "../paths.ts";
+import { targetServer, tmuxFor, type ServerTarget } from "../tmux.ts";
 import type { Ctx } from "./steps.ts"; // type-only: erased, no import cycle at runtime
 
 /** What the step asks the scanner for on each pass: a cutoff (null = every
@@ -103,18 +103,10 @@ export function defaultScan(opts: { sinceMs: number | null; dirs: string[] }): C
   });
 }
 
-/** The tool's own tmux server for a plan run with no `$TMUX` of its own —
- *  same path `src/launch.ts`'s `TOOL_SOCKET` derives, spelled out again here
- *  because that constant is not exported (this step's only dependency on
- *  launch.ts would be for one path join). */
-function toolSocket(): string {
-  return path.join(msHome(), "tmux.sock");
-}
-
 /** Every session name on ONE tmux server, or an empty set when the server is
  *  not even up yet — which is not a failure, it just means no name is taken. */
-function existingSessionNames(socket: string): Set<string> {
-  const r = new Tmux(socket).run(["list-sessions", "-F", "#{session_name}"]);
+function existingSessionNames(target: ServerTarget): Set<string> {
+  const r = tmuxFor(target).run(["list-sessions", "-F", "#{session_name}"]);
   if (r.code !== 0) return new Set();
   return new Set(r.stdout.split("\n").filter(Boolean));
 }
@@ -126,17 +118,15 @@ function realGit(args: string[], cwd: string): string | null {
 
 /** The plan the wizard runs when nothing is injected: real `git`, the real
  *  session-name collision set of whichever server the plan will land on
- *  (`plan.ts`'s own rule — `$TMUX`'s socket when there is one, else this
- *  tool's), no `--as` override. */
+ *  (`plan.ts`'s own rule — `$TMUX`'s socket when there is one, else the
+ *  default server, or the `MS_TMUX_SOCKET` override), no `--as` override. */
 export function defaultPlan(candidates: Candidate[]): Plan {
-  const tmuxEnv = process.env.TMUX;
-  const socket = tmuxEnv && tmuxEnv.length > 0 ? tmuxEnv.split(",")[0]! : toolSocket();
   return planImport(candidates, {
     as: null,
     git: realGit,
-    existingSessions: existingSessionNames(socket),
-    tmuxEnv,
-    msSocket: toolSocket(),
+    existingSessions: existingSessionNames(targetServer()),
+    tmuxEnv: process.env.TMUX,
+    socketOverride: process.env.MS_TMUX_SOCKET,
   });
 }
 

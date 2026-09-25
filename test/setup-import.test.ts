@@ -68,7 +68,6 @@ function realPlan(): PlanFn {
       git: () => null, // nothing here is a repo: each cwd is its own root
       existingSessions: new Set(),
       tmuxEnv: undefined,
-      msSocket: "/store/tmux.sock",
     });
 }
 
@@ -171,7 +170,7 @@ test("the directory menu numbers each distinct cwd with its total and live count
   ];
   const { ctx } = makeTestCtx(["y", "all", "2"]);
   const calls: { sinceMs: number | null; dirs: string[] }[] = [];
-  const step = importStep({ runImport: refusingRunImport, scan: fakeScan(all, calls), plan: () => ({ server: "ms", socket: null, sessions: [], skipped: [] }) });
+  const step = importStep({ runImport: refusingRunImport, scan: fakeScan(all, calls), plan: () => ({ server: "default", socket: null, sessions: [], skipped: [] }) });
   const { lines } = await captureStdoutAsync(() => step(ctx));
   assert.ok(lines.includes(`1) ${dirA} — 2 (1 live)`), lines.join("\n"));
   assert.ok(lines.includes(`2) ${dirB} — 1 (0 live)`), lines.join("\n"));
@@ -183,7 +182,7 @@ test("an out-of-range directory choice is rejected and re-asked", async () => {
   // "5" is out of range (only one directory) — must be re-asked before "1" is accepted.
   const { ctx } = makeTestCtx(["y", "5", "1", "1"]);
   const calls: { sinceMs: number | null; dirs: string[] }[] = [];
-  const step = importStep({ runImport: refusingRunImport, scan: fakeScan(all, calls), plan: () => ({ server: "ms", socket: null, sessions: [], skipped: [] }) });
+  const step = importStep({ runImport: refusingRunImport, scan: fakeScan(all, calls), plan: () => ({ server: "default", socket: null, sessions: [], skipped: [] }) });
   const { lines } = await captureStdoutAsync(() => step(ctx));
   assert.ok(lines.some((l) => /not a selection I can use/.test(l)), lines.join("\n"));
   assert.deepEqual(calls[1], { sinceMs: calls[1].sinceMs, dirs: [dirA] });
@@ -261,7 +260,7 @@ test("choosing 'all' directories keeps every one of them in the rescan", async (
   const all = [cand({ cwd: dirA, lastActivity: T0 }), cand({ cwd: dirB, lastActivity: T0 })];
   const { ctx } = makeTestCtx(["y", "all", ""]); // "" -> default window (2h)
   const scanCalls: { sinceMs: number | null; dirs: string[] }[] = [];
-  const step = importStep({ runImport: refusingRunImport, scan: fakeScan(all, scanCalls), plan: () => ({ server: "ms", socket: null, sessions: [], skipped: [] }) });
+  const step = importStep({ runImport: refusingRunImport, scan: fakeScan(all, scanCalls), plan: () => ({ server: "default", socket: null, sessions: [], skipped: [] }) });
   await captureStdoutAsync(() => step(ctx));
   assert.deepEqual(new Set(scanCalls[1].dirs), new Set([dirA, dirB]));
 });
@@ -289,7 +288,7 @@ test("a plan with nothing movable (everything skipped) says so and never calls t
   const step = importStep({
     runImport: refusingRunImport,
     scan: fakeScan(all, []),
-    plan: (candidates) => ({ server: "ms", socket: null, sessions: [], skipped: candidates.map((c) => ({ candidate: c, reason: "in tmux" })) }),
+    plan: (candidates) => ({ server: "default", socket: null, sessions: [], skipped: candidates.map((c) => ({ candidate: c, reason: "in tmux" })) }),
   });
   const { lines } = await captureStdoutAsync(() => step(ctx));
   assert.equal(ctx.state.importManifest, null);

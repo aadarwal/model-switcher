@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `ms claude --continue` with a bare `--resume`/`-r` (the picker, no id) is refused with a usage
+  error: the appended continuation became `--resume`'s value, i.e. the picker's search text,
+  leaving the pane in the picker with no conversation and the row with no cliSessionId
+
 ## 0.3.9
 
 - Codex 0.157's per-home daemon state (app-server-control, app-server-daemon, sockets, locks)

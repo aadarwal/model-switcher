@@ -47,12 +47,5 @@ jobs:
           tmux -V
       - run: npm ci
       - run: npm run typecheck
-      # `npm test`, one test file at a time. A hosted runner is a few slow
-      # cores, and the lock tests (test/lock.test.ts, test/reconcile.test.ts)
-      # hold SQLite's write lock in a child for a fixed few hundred ms: with
-      # other files' children competing for the CPU, the parent misses that
-      # window. Flags must precede the file list (npm's `-- <args>` would land
-      # after it, where node ignores them), hence the command spelled out.
-      - name: npm test (serial)
-        run: MS_ENTRY=src node --disable-warning=ExperimentalWarning --import ./test/setup-env.mjs --import tsx --test --test-concurrency=1 test/*.test.ts
+      - run: npm test
       - run: npm run build

@@ -49,7 +49,7 @@ import { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand } 
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
 import { ownerDead } from "./reconcile.ts";
-import { NAME_PATTERN, findAccount, loadRegistry } from "./registry.ts";
+import { NAME_PATTERN, findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs } from "./snapshot.ts";
 import { openState, type AttemptOutcome, type RecoveryRow, type SessionRow, type State } from "./state.ts";
 import { Tmux } from "./tmux.ts";
@@ -262,9 +262,132 @@ function isModal(screen: string): boolean {
   return lastTurn(screen).some((l) => OPTION.test(l) || CANCEL.test(l));
 }
 
-/** The CLI is mid-turn: its own spinner says how to interrupt it. Exported so
- * Task 16's manual verbs refuse on exactly the reading this transaction uses. */
-export const isBusy = (screen: string): boolean => tail(screen, 6).some((l) => INTERRUPT.test(l));
+// Claude Code 2.1.288+ (verified on 2.1.289, 2026-10-04) no longer prints
+// "esc to interrupt" while it works, and its title glyph no longer animates.
+// What it does draw is laid out around the COMPOSER — the bottom-most line
+// that starts with `❯` (or `›`) — and the two readings below are taken on
+// either side of it:
+//
+//   ✻ Sprouting… (1m 14s · ↓ 2.8k tokens)          ← the spinner: mid-turn
+//     ⎿  Tip: Use /btw to ask a quick side question …
+//   ────────────────────────────────────────────
+//   ❯                                              ← the composer
+//   ────────────────────────────────────────────
+//     [Fable 5.1 xhigh @account] | repo:main*
+//     ⏵⏵ bypass permissions on · 1 shell, 1 monitor · ← 1 agent
+//     ◯ fix-codex-launch-v2  ▱▱▱▱▱▱▱▱  0/3 · 43s · ↓ 164.3k tokens
+//                                                  ↑ background work
+//
+// Codex draws none of this, and its own "esc to interrupt" still says when it
+// is working; neither reading below is ever applied to a Codex pane.
+
+const COMPOSER = /^\s*[❯›]/;
+const RULE = /^\s*─+\s*$/;
+/** A live spinner: one of the CLI's spinner frames, a verb ending in "…", and
+ *  a running clock. A finished turn's "✻ Worked for 44m 6s · done 3:08 PM" has
+ *  neither the "…" nor the parenthesised clock. */
+const SPINNER = /^(·|✢|✳|✶|✻|✽|\*)\s+\S+…\s+\(\d+[hms]/;
+
+/** The index of the composer line, or -1 when there is none on screen. */
+function composerAt(lines: string[]): number {
+  for (let i = lines.length - 1; i >= 0; i--) if (COMPOSER.test(lines[i]!)) return i;
+  return -1;
+}
+
+/**
+ * Claude Code 2.1.288+ is mid-turn: the last UNINDENTED line above the
+ * composer is a live spinner.
+ *
+ * Blank rows are skipped (the fullscreen layout leaves thirty of them between
+ * the spinner and the composer), and so are the composer's own `───` border
+ * and every indented line — a tip ("  ⎿  Tip: …") or a todo list drawn under
+ * the spinner. Indentation is also what keeps spinner text QUOTED in a tool
+ * result ("  ⎿  ✻ Ruminating… (1m 22s · …)") from counting: it is somebody
+ * else's spinner, captured in this pane's transcript.
+ */
+function claudeSpinning(screen: string): boolean {
+  const lines = screen.split("\n");
+  const composer = composerAt(lines);
+  for (let i = composer - 1; i >= 0; i--) {
+    const l = lines[i]!;
+    if (!l.trim() || RULE.test(l) || /^\s/.test(l)) continue;
+    return SPINNER.test(l);
+  }
+  return false;
+}
+
+/** The CLI is mid-turn: its own spinner says how to interrupt it (Codex, and
+ * Claude Code before 2.1.288), or — Claude Code 2.1.288+ — a live spinner line
+ * sits just above its composer. Exported so Task 16's manual verbs refuse on
+ * exactly the reading this transaction uses. */
+export const isBusy = (screen: string, provider: Provider): boolean =>
+  tail(screen, 6).some((l) => INTERRUPT.test(l)) || (provider !== "codex" && claudeSpinning(screen));
+
+/** A workflow's progress: a `▱▰` bar and a "done/total · elapsed" count. */
+const WORKFLOW_BAR = /[▱▰]{3}/;
+const WORKFLOW_COUNT = /\d+\/\d+ · \d+[hms]/;
+const WORKFLOW_ENDED = /done|finished|complete|failed|stopped|cancel/i;
+/** Counts in the mode line ("· 1 shell, 1 monitor ·"), as one run. A count
+ *  must open the line or follow a `·`/`,`, which is what keeps the "← 1 agent"
+ *  keyboard hint every pane draws (background work or not) from counting. */
+const COUNTED = "\\d+ (?:shells?|monitors?|agents?|subagents?|tasks?)";
+const COUNTS = new RegExp(`(?:^|[·,])\\s*(${COUNTED}(?:\\s*,\\s*${COUNTED})*)\\s*(?=[,·]|$)`);
+
+/**
+ * What a Claude pane is running BEHIND its prompt, as the line that says so,
+ * or null.
+ *
+ * A pane whose own turn is over (so `isBusy` is false) can still be running a
+ * workflow, a subagent, background shells or monitors — and every one of them
+ * is a child of the CLI process that a relaunch ends. Claude Code lists them
+ * below the composer, and only there (the same line in the transcript above
+ * is history):
+ *
+ *   * a running task on a `◯` line — a workflow
+ *     ("◯ fix-codex-launch-v2  ▱▱▱▱  0/3 · 43s · …") or a subagent
+ *     ("◯ general-purpose      Footer probe: slow agent");
+ *   * a workflow's bar and count whatever glyph leads it, unless it says it
+ *     has ended;
+ *   * a paused workflow ("⏸ oct04-backlog-sweep  paused · usage limit …"),
+ *     which resumes on its own in this very process;
+ *   * counts in the mode line ("⏵⏵ bypass permissions on · 1 shell,
+ *     1 monitor · ← 1 agent").
+ *
+ * Not background work: the "← 1 agent" hint (drawn on every pane), a status
+ * line's usage bar ("ctx (378k/1.0M) | ▓░░░░░░░░░ 10%"), and the
+ * "/tasks to see subagents" hint.
+ */
+export function backgroundWork(screen: string, provider: Provider): string | null {
+  if (provider === "codex") return null;
+  const lines = screen.split("\n");
+  const composer = composerAt(lines);
+  if (composer < 0) return null;
+  for (const raw of lines.slice(composer + 1)) {
+    const l = raw.trim();
+    if (/^◯\s/.test(l)) return l;
+    if (/^⏸\s/.test(l) && /paused/.test(l)) return l;
+    if (WORKFLOW_BAR.test(l) && WORKFLOW_COUNT.test(l) && !WORKFLOW_ENDED.test(l)) return l;
+    const counts = l.match(COUNTS);
+    if (counts) return counts[1]!;
+  }
+  return null;
+}
+
+/**
+ * Why this pane may not be relaunched under work it is running behind an idle
+ * prompt, or null — the screen's `backgroundWork`, plus the one case where
+ * the screen cannot be trusted at all: a pane in copy-mode, whose human is
+ * scrolled back through it. Unknown is never "free to relaunch".
+ *
+ * Claude only, like `backgroundWork` itself. The caller decides what a wall
+ * means: a walled pane's background work is walled too, so rotating off the
+ * wall is never refused for it.
+ */
+export function backgroundReason(tmux: Tmux, pane: string, screen: string, provider: Provider): string | null {
+  if (provider === "codex") return null;
+  if (tmux.paneInMode(pane) === true) return "the pane is in copy-mode, so what it is running cannot be read";
+  return backgroundWork(screen, provider);
+}
 
 // --- Locks -------------------------------------------------------------
 
@@ -1159,7 +1282,13 @@ function claimManual(st: State, session: SessionRow, tmux: Tmux, opts: RecoverOp
   }
   const screen = safeCapture(tmux, session.pane);
   const wall = wallKindFromText(screen);
-  if (!wall && isBusy(screen) && !opts.force) return { why: "the pane is busy and shows no wall (use --force)" };
+  if (!wall && isBusy(screen, session.provider) && !opts.force) return { why: "the pane is busy and shows no wall (use --force)" };
+  // An idle prompt is not an idle process: a workflow, a subagent or a shell
+  // still running behind it dies with the relaunch. Re-read here, under the
+  // session lock, because the rebalance worker reaches this transaction from
+  // a reading taken before it was dispatched.
+  const behind = wall || opts.force ? null : backgroundReason(tmux, session.pane, screen, session.provider);
+  if (behind) return { why: `the pane is running background work (${behind}); a relaunch would kill it (use --force)` };
 
   let open = st.pendingRecovery(session.id);
   // A row still `owned` by a worker that no longer exists is not somebody

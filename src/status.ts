@@ -285,7 +285,7 @@ function computeSession(s: SessionRow, st: State, accounts: PickInput[]): Sessio
   const walled = sessionWalled(s, rec !== null, screen, exists ? readEvents(s.id) : []);
   // The pane's own reading, from the capture just taken rather than a second
   // round-trip per row (src/rebalance.ts's `paneReading`).
-  const better = betterAccount(s, st, accounts, paneReading(exists, screen));
+  const better = betterAccount(s, st, accounts, paneReading(exists, screen, s.provider));
   return { state, pending: rec ? rec.status : null, walled, better };
 }
 

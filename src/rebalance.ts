@@ -30,7 +30,8 @@ import { rebalanceEnabled } from "./autorotate.ts";
 import { appendEvent, lastEvent } from "./events.ts";
 import { msBinary } from "./paths.ts";
 import { pickAccounts, type Need, type PickInput } from "./pick.ts";
-import { isBusy, safeCapture } from "./recover.ts";
+import { backgroundWork, isBusy, safeCapture } from "./recover.ts";
+import type { Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type Snapshot, type SnapshotOptions } from "./snapshot.ts";
 import { Tmux } from "./tmux.ts";
 import type { Verb } from "./cli.ts";
@@ -79,9 +80,16 @@ const NEVER_STATES: ReadonlySet<string> = new Set(["parked", "waiting", "stopped
  * `busy` and `gone` are kept apart on purpose. Both refuse the move, but they
  * refuse it for opposite reasons — one pane has too much life in it and the
  * other has none — and a reason a human reads in `ms rebalance` must not
- * flatten the two.
+ * flatten the two. `background` is a third refusal of the same kind as
+ * `busy`: the turn is over, but a Claude pane is still running a workflow, a
+ * subagent or a shell behind its prompt (src/recover.ts's `backgroundWork`).
  */
-export type PaneReading = "idle" | "busy" | "gone";
+export type PaneReading = "idle" | "busy" | "background" | "gone";
+
+/** Why a pane whose turn is over still may not move: a workflow, subagent or
+ *  background shell runs as a child of the CLI the move relaunches (or the
+ *  pane is in copy-mode, and what it runs cannot be read). */
+const BACKGROUND_WORK = "background-work: the pane is running a workflow, subagent or shell a relaunch would kill";
 
 /** The part of a session row this decision reads. Structural, so a test can
  *  build one in a line and a caller can pass a whole `SessionRow`. */
@@ -222,6 +230,7 @@ export function decide(input: DecisionInput): Decision {
   if (NEVER_STATES.has(session.state)) return no(`the session is ${session.state}`);
   if (input.pane === "gone") return no("the pane is gone");
   if (input.pane === "busy") return no("the pane is mid-turn");
+  if (input.pane === "background") return no(BACKGROUND_WORK);
   if (input.lastMoveAt !== null && now - input.lastMoveAt < REBALANCE_RULES.MOVE_COOLDOWN_MS) {
     return no("it moved within the last 6h");
   }
@@ -327,7 +336,7 @@ export type RebalanceDeps = {
    *  thing that ever asks it to poll. */
   snapshot?: (opts: SnapshotOptions) => Promise<Snapshot>;
   /** The pane, in one word. */
-  pane?: (socket: string, pane: string) => PaneReading;
+  pane?: (socket: string, pane: string, provider: Provider) => PaneReading;
   /** Hand the move to a process outside this one's tree. */
   dispatch?: (row: SessionRow, to: string) => void;
   run?: RebalanceRun;
@@ -376,19 +385,21 @@ export function movable(state: string, pane: PaneReading): boolean {
  * is already holding. `screen === null` is what that caller passes for a
  * pane it could not capture, which is the same thing as a pane that is gone.
  */
-export function paneReading(exists: boolean, screen: string | null): PaneReading {
+export function paneReading(exists: boolean, screen: string | null, provider: Provider, inMode = false): PaneReading {
   if (!exists || screen === null) return "gone";
-  return isBusy(screen) ? "busy" : "idle";
+  if (isBusy(screen, provider)) return "busy";
+  if (provider !== "codex" && (inMode || backgroundWork(screen, provider))) return "background";
+  return "idle";
 }
 
 /** One word for a pane, read the way the recovery transaction reads it —
  *  `src/recover.ts`'s own `safeCapture`/`isBusy`, so this rule refuses
  *  exactly the panes that transaction would refuse. */
-export function readPane(socket: string, pane: string): PaneReading {
+export function readPane(socket: string, pane: string, provider: Provider): PaneReading {
   if (!pane) return "gone";
   const tmux = new Tmux(socket || null);
   if (!tmux.paneExists(pane)) return "gone";
-  return paneReading(true, safeCapture(tmux, pane));
+  return paneReading(true, safeCapture(tmux, pane), provider, tmux.paneInMode(pane) === true);
 }
 
 /**
@@ -501,7 +512,7 @@ export async function maybeRebalance(sessionId: string, deps: RebalanceDeps = {}
       lastMoveAt: lastMoveAtMs(st, row),
       lastWallAt: lastWallAtMs(row.id),
       gate: true,
-      pane: (deps.pane ?? readPane)(row.socket, row.pane),
+      pane: (deps.pane ?? readPane)(row.socket, row.pane, row.provider),
     });
     if (!decision.move) return decision;
     // One move per run. A watchdog pass that settles four turns at once would

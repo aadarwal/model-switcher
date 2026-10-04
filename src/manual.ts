@@ -41,7 +41,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { handBackShell, releasePane } from "./handback.ts";
 import { Locked, withLock } from "./lock.ts";
-import { HANDOFF_SLOTS, isBusy, logLine, recoverSession, safeCapture, sessionLockName, stopPane, takeFailReason } from "./recover.ts";
+import { HANDOFF_SLOTS, backgroundReason, isBusy, logLine, recoverSession, safeCapture, sessionLockName, stopPane, takeFailReason } from "./recover.ts";
 import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
@@ -234,14 +234,22 @@ const wallOnScreen = (screen: string): string | null => wallKindFromText(screen)
 /**
  * Why this pane must not be moved out from under its own work, or null.
  *
+ * Two kinds of work: the turn in progress, and — on a Claude pane whose turn
+ * is over — a workflow, subagent or background shell still running behind
+ * the prompt, which is a child of the very process the move relaunches.
+ *
  * A wall on screen means the turn ENDED at the wall, so a spinner still drawn
- * above it is not work in progress — exactly the reading `claimManual` applies
- * under the lock. Both come from recover.ts's own helpers so the two can never
- * drift into refusing different panes.
+ * above it is not work in progress, and the work behind it is walled too —
+ * exactly the reading `claimManual` applies under the lock. Both come from
+ * recover.ts's own helpers so the two can never drift into refusing different
+ * panes.
  */
-function midTurn(session: SessionRow, screen: string, force: boolean): string | null {
-  if (force || wallOnScreen(screen) || !isBusy(screen)) return null;
-  return `${session.id} is mid-turn; moving it now would kill that turn (use --force)`;
+function midTurn(tmux: Tmux, session: SessionRow, screen: string, force: boolean): string | null {
+  if (force || wallOnScreen(screen)) return null;
+  if (isBusy(screen, session.provider)) return `${session.id} is mid-turn; moving it now would kill that turn (use --force)`;
+  const behind = backgroundReason(tmux, session.pane, screen, session.provider);
+  if (behind) return `${session.id} is running background work (${behind}); a relaunch would kill it (use --force)`;
+  return null;
 }
 
 // --- ms rotate ----------------------------------------------------------
@@ -256,7 +264,7 @@ export const rotateVerb: Verb = async (argv) => {
   const tmux = new Tmux(session.socket || null);
   const stale = staleServer(tmux, session);
   if (stale) return refuse("rotate", stale);
-  const busy = midTurn(session, safeCapture(tmux, session.pane), parsed.force);
+  const busy = midTurn(tmux, session, safeCapture(tmux, session.pane), parsed.force);
   if (busy) return refuse("rotate", busy);
 
   // The work is unfinished by definition — a rotation is what happens to a
@@ -344,7 +352,7 @@ export async function switchOne(
   const stale = staleServer(tmux, session);
   if (stale) return { code: EXIT_REFUSED, message: stale };
   const screen = safeCapture(tmux, session.pane);
-  const busy = midTurn(session, screen, opts.force);
+  const busy = midTurn(tmux, session, screen, opts.force);
   if (busy) return { code: EXIT_REFUSED, message: busy };
 
   // A switch of a conversation that had finished resumes without a

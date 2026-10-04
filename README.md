@@ -102,7 +102,7 @@ ms dashboard [--port N] [--no-open]
 - `ms rebalance` — ask, for every live session at once, whether it is still on the best account, and move the ones that are not. It prints SESSION, ACCOUNT, BETTER, REASON, OUTCOME; `--dry-run` decides and moves nothing, `--session` asks about one. See [Rebalance](#rebalance) for what moves and when. Exit 0 when nothing failed, 1 when a move was refused.
 - `ms stop` — stop managing a session. The CLI in the pane keeps running.
 - `ms dashboard` — serve the `ms status` tables on `127.0.0.1`, with rotate, switch, stop and Rebalance buttons. It prints its URL, opens it (unless `--no-open`), and exits about 90 s after the last request, so it is alive only while a tab polls it.
-- `--force` moves a session that is mid-turn; without it a busy session is refused. With no `<session|pane>`, `rotate`, `switch` and `stop` act on the current pane.
+- `--force` moves a session that is mid-turn, or whose Claude pane is still running background work (a workflow, a subagent, background shells or monitors, all of which a relaunch kills); without it such a session is refused, and so is a Claude pane in copy-mode, whose screen cannot be read. A walled pane is never refused for either: the wall has stopped its work too. With no `<session|pane>`, `rotate`, `switch` and `stop` act on the current pane.
 - A pane belongs to one session at a time: the one launched into it last. A launch (or `ms adopt`) into a pane marks any older session still naming that pane `stopped` and says so. `stop`, `rotate` and `switch` aimed at an older row that still names it (left by an older `ms`, say) never touch the pane, even after the later session has itself been stopped: `stop` just marks that row stopped, and `rotate` and `switch` refuse and close it out.
 
 ### Calendar
@@ -342,8 +342,9 @@ of two conditions holds:
   the current one's. That is the whole test: a sooner reset is worth more now regardless of
   how much the current account has used.
 
-**The guards**, all of which must pass: the pane reads idle (never mid-turn — it is re-read
-by the decision and again inside the transaction); no move of that session by any hand in
+**The guards**, all of which must pass: the pane reads idle (never mid-turn, and on a Claude
+pane never with a workflow, subagent or background shell running behind the prompt
+(`background-work`) — it is re-read by the decision and again inside the transaction); no move of that session by any hand in
 the last 6 h, and no wall-driven rotation of it in the last 30 min; the destination passes
 the same preflight a rotation runs; and the session is `running` or `continuing` — never
 `parked`, `waiting`, `stopped` or a pane that is gone. At most one session moves per hook

@@ -410,7 +410,7 @@ into a managed pane, to identify the session to the hooks.
 6. That worker takes the session lock, rechecks the wall, and picks the next account with room.
 7. It asks the CLI to exit, then respawns the same pane resuming the same conversation on the new account.
 8. If nothing has room, the session waits and a wake-up is scheduled.
-9. Every public verb first repairs stale state — a closed pane, a restarted tmux server, a dead worker.
+9. Every public verb first repairs stale state — a closed pane, a restarted or exited tmux server, a dead worker.
 10. `ms status` and `ms dashboard` read that same store. No daemon, no background poller.
 
 ## Troubleshooting
@@ -428,6 +428,14 @@ ms doctor --fix
 due for refresh, store paths whose mode drifted, a Codex home whose entries are not links
 to `~/.codex` yet (merged back, never replaced), and orphaned session state. It never repairs a dead credential, a malformed
 `accounts.json`, a symlink inside the store, or an `ms` on PATH that shadows this one.
+
+A session is orphaned when its pane is confirmed gone: not on its tmux server, on a server
+restarted since, or on a socket where no server is running at all — such as sessions still
+recorded on the pre-0.3.8 private server at `MS_HOME/tmux.sock` after it exited. `--fix`
+marks those stopped; the conversation itself is untouched, for `ms adopt <rollout-id>` (Codex)
+or `ms claude -- --resume <id>` (Claude) to pick up again.
+A server `ms` could not read — a timeout, a socket it may not open — is reported as not
+inspected and left alone, and anything `--fix` declined to repair is printed beside the row.
 
 ```bash
 ms setup --repair                     # hooks removed by a CLI upgrade or a dotfiles restore

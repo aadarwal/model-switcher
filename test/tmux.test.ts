@@ -110,3 +110,44 @@ test("paneDeadStatus answers the exit status, and null when there is none to rea
   assert.equal(t.paneDeadStatus("%5"), null);
   delete process.env.MS_TMUX_DEAD_STATUS;
 });
+
+// Issue #21: "the server has gone" and "I could not ask" are different facts,
+// and only the first licenses reconciliation to stop a row. The messages are
+// tmux 3.7c's own, read off a real `tmux -S`.
+test("serverState tells a server that has gone apart from one it could not read", async () => {
+  const { dir, stub } = stubDir();
+  stub("tmux", `if [ -n "$MS_TMUX_ERR" ]; then printf '%s\\n' "$MS_TMUX_ERR" >&2; exit "\${MS_TMUX_RC:-1}"; fi
+printf '%s\\n' "$MS_TMUX_OUT"
+exit 0`);
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  const { Tmux } = await import("../src/tmux.ts");
+  const t = new Tmux("/tmp/ms-old/tmux.sock");
+  const ask = (err: string, out = "", rc = "1") => {
+    process.env.MS_TMUX_ERR = err; process.env.MS_TMUX_OUT = out; process.env.MS_TMUX_RC = rc;
+    try { return t.serverState(); } finally { delete process.env.MS_TMUX_ERR; delete process.env.MS_TMUX_OUT; delete process.env.MS_TMUX_RC; }
+  };
+  assert.deepEqual(ask("", "4242:1789000000"), { up: "4242:1789000000" });
+  assert.equal(ask("", ""), "unreadable", "a server that answers with nothing has not named itself");
+  // Gone: a socket file nobody listens on, a path with no socket, a refused connect.
+  assert.equal(ask("no server running on /tmp/ms-old/tmux.sock"), "gone");
+  assert.equal(ask("error connecting to /tmp/ms-old/tmux.sock (No such file or directory)"), "gone");
+  assert.equal(ask("error connecting to /tmp/ms-old/tmux.sock (Connection refused)"), "gone");
+  // Not gone: a socket we may not open, a path that is not a socket, any other
+  // failure, and a failure that is not tmux's exit 1 (a kill, a timeout).
+  assert.equal(ask("error connecting to /tmp/ms-old/tmux.sock (Permission denied)"), "unreadable");
+  assert.equal(ask("error connecting to /tmp/ms-old/tmux.sock (Socket operation on non-socket)"), "unreadable");
+  assert.equal(ask("lost server"), "unreadable");
+  assert.equal(ask("no server running on /tmp/ms-old/tmux.sock", "", "2"), "unreadable");
+});
+
+test("serverState is unreadable, never gone, when there is no tmux to ask", async () => {
+  const { dir } = stubDir();
+  const saved = process.env.PATH;
+  process.env.PATH = dir; // an empty directory: no tmux anywhere
+  try {
+    const { Tmux } = await import("../src/tmux.ts");
+    assert.equal(new Tmux("/tmp/ms-old/tmux.sock").serverState(), "unreadable");
+  } finally {
+    process.env.PATH = saved;
+  }
+});

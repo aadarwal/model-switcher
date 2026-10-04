@@ -44,9 +44,8 @@ import { fetchCodexUsage, readCodexCredentials } from "./providers/codex-usage.t
 import { readLaunchToken } from "./launch-credentials.ts";
 import { codexAutorotateEnabled, codexAutorotateLine, rebalanceEnabled, rebalanceLine } from "./autorotate.ts";
 import { openState, type SessionRow } from "./state.ts";
-import { Tmux } from "./tmux.ts";
 import { resolveOnPath } from "./exec.ts";
-import { reconcile } from "./reconcile.ts";
+import { inspectSessions, reconcile } from "./reconcile.ts";
 
 export type Result = { ok: boolean; what: string; why?: string; fixed?: boolean };
 
@@ -723,55 +722,74 @@ export async function checkCodexAccount(a: Account, fix: boolean): Promise<Resul
 
 // --- Orphaned session state -------------------------------------------
 
-/** The live pane ids on one tmux socket, memoized for the run: with many
- *  sessions sharing a socket, `checkOrphaned` used to spawn one
- *  `tmux list-panes -a` per session. */
-function livePanes(socket: string, cache: Map<string, Set<string>>): Set<string> {
-  const key = socket;
-  const cached = cache.get(key);
-  if (cached) return cached;
-  const panes = new Set(
-    new Tmux(socket || null).run(["list-panes", "-a", "-F", "#{pane_id}"]).stdout.split("\n").filter(Boolean),
-  );
-  cache.set(key, panes);
-  return panes;
+/**
+ * Rows whose pane is gone, judged by reconciliation's own reading of tmux
+ * (`inspectSessions`, src/reconcile.ts) — so this check flags exactly the rows
+ * `--fix` will stop, and nothing it would leave alone.
+ *
+ * It used to read tmux itself, and the two readings disagreed about the one
+ * case that matters most: a server that has EXITED. Here a failed `list-panes`
+ * was an empty pane list (every row orphaned); in `reconcile()` it was a
+ * question it could not ask (no row repaired). The rows the pre-0.3.8 private
+ * server on `MS_HOME/tmux.sock` left behind sat between the two — reported on
+ * every `ms doctor`, repaired by no `ms doctor --fix` (issue #21).
+ * `Tmux.serverState` now tells "no server is listening there" apart from "the
+ * server would not answer", and both sides take the same answer.
+ *
+ * A row on a server that could not be read is still a ✗, but an honest one:
+ * it says the pane could not be looked for, which no repair here can change.
+ * A row with no pane recorded yet is not judged at all — a launch between
+ * writing its row and tmux naming its pane looks exactly like that, and
+ * reconciliation's rule (f) is what parks one whose pane never arrives.
+ * Inspected once per socket, however many rows share it.
+ */
+function findOrphaned(sessions: SessionRow[]): { id: string; result: Result }[] {
+  const out: { id: string; result: Result }[] = [];
+  for (const { session: s, presence, why } of inspectSessions(sessions)) {
+    if (presence === "absent") out.push({ id: s.id, result: { ok: false, what: `orphaned session ${s.id}`, why: `pane ${s.pane} is gone: ${why}` } });
+    else if (presence === "unknown" && why) out.push({ id: s.id, result: { ok: false, what: `session ${s.id} not inspected`, why: `${why}, so pane ${s.pane} could not be looked for` } });
+  }
+  return out;
 }
 
-function findOrphaned(sessions: SessionRow[], cache: Map<string, Set<string>>): SessionRow[] {
-  return sessions.filter((s) => s.state !== "stopped" && !livePanes(s.socket, cache).has(s.pane));
-}
-
-export async function checkOrphaned(fix: boolean): Promise<Result[]> {
+function readSessions(): SessionRow[] {
   const st = openState();
-  let sessions: SessionRow[];
   try {
-    sessions = st.listSessions();
+    return st.listSessions();
   } finally {
     st.close();
   }
-  let orphaned = findOrphaned(sessions, new Map());
-  if (orphaned.length === 0) return [{ ok: true, what: "orphaned session state" }];
+}
 
-  if (fix) {
-    // Reconciliation is the repair; a throw inside it must still leave the
-    // orphans reported (unfixed) rather than crash `ms doctor --fix`.
-    try {
-      reconcile();
-      const st2 = openState();
-      try {
-        sessions = st2.listSessions();
-      } finally {
-        st2.close();
-      }
-      orphaned = findOrphaned(sessions, new Map());
-      if (orphaned.length === 0) return [{ ok: true, what: "orphaned session state", fixed: true }];
-    } catch {
-      // reconcile threw — fall through and report whatever is still
-      // orphaned, unfixed.
-    }
+/**
+ * The orphaned-state check, and with `fix` its repair: reconciliation itself,
+ * which closes out every row whose pane is confirmed gone. `repair` is that
+ * call, a parameter only so a test can make it fail.
+ *
+ * Whatever the repair could not do is SAID, never swallowed: a throw becomes
+ * its own ✗ line carrying the message, and a row still flagged afterwards
+ * carries every line `reconcile()` reported about it (a worker holding it, a
+ * lock store too busy to decide), so the human sees why `--fix` left it.
+ */
+export async function checkOrphaned(fix: boolean, repair: () => string[] = reconcile): Promise<Result[]> {
+  let flagged = findOrphaned(readSessions());
+  if (flagged.length === 0) return [{ ok: true, what: "orphaned session state" }];
+  if (!fix) return flagged.map((f) => f.result);
+
+  let said: string[] = [];
+  let failure: Result | null = null;
+  try {
+    said = repair();
+  } catch (e) {
+    failure = { ok: false, what: "orphaned session repair", why: `reconcile failed: ${e instanceof Error ? e.message : String(e)}` };
   }
-
-  return orphaned.map((s) => ({ ok: false, what: `orphaned session ${s.id}`, why: `pane ${s.pane} is gone on ${s.socket || "(no socket)"}` }));
+  flagged = findOrphaned(readSessions());
+  if (flagged.length === 0 && !failure) return [{ ok: true, what: "orphaned session state", fixed: true }];
+  const results = flagged.map(({ id, result }) => {
+    const about = said.filter((l) => l.startsWith(`session ${id}: `)).map((l) => l.slice(`session ${id}: `.length));
+    return about.length ? { ...result, why: `${result.why}; --fix: ${about.join("; ")}` } : result;
+  });
+  return failure ? [failure, ...results] : results;
 }
 
 // --- ms on PATH ----------------------------------------------------------

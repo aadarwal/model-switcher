@@ -19,10 +19,12 @@
 //      A session a live worker is holding is not a session in need of repair —
 //      reconciliation steps over it and says so.
 //   2. **Absence must be confirmed, never assumed.** A tmux call that fails —
-//      no server, no tmux on PATH, a timeout — proves nothing about a pane. It
-//      is recorded as "could not inspect" and repairs nothing. Only a
-//      SUCCESSFUL query that shows a different server, or a pane list without
-//      our pane in it, is evidence a session is over.
+//      no tmux on PATH, a timeout, a socket we may not open — proves nothing
+//      about a pane. It is recorded as "could not inspect" and repairs nothing.
+//      Only a SUCCESSFUL query that shows a different server, a pane list
+//      without our pane in it, or tmux itself answering that NO server is
+//      listening on the socket (`Tmux.serverState`, src/tmux.ts) is evidence
+//      a session is over.
 //   3. **Every write is conditional on what was judged.** Ownership is
 //      released only for the exact owner/timestamp read (`releaseRecoveryIf`),
 //      and a wake-up cleared only for the exact deadline consumed
@@ -112,12 +114,17 @@ export function ownerDead(owner: string | null): boolean {
   return !alive(pid);
 }
 
-/** What one successful look at a tmux server saw. `identity`/`panes` are null
- * when the question could not be answered at all — never "nothing there". */
-type Look = { identity: string | null; panes: Set<string> | null; note: string | null };
+/** What one look at a tmux server saw. `identity`/`panes` are null when the
+ * question could not be answered at all — never "nothing there". `gone` is the
+ * one failure that IS an answer: tmux said no server is listening on the
+ * socket, so every pane ever recorded on it is gone with it. */
+type Look = { identity: string | null; panes: Set<string> | null; problem: string | null; gone: boolean };
+
+/** The one line reconciliation reports for a socket it could not read. */
+const lookNote = (look: Look): string | null => (look.problem ? `${look.problem}; nothing repaired there` : null);
 
 /** Where a session's pane is, as far as we can HONESTLY tell. */
-type Presence = "present" | "absent" | "unknown";
+export type Presence = "present" | "absent" | "unknown";
 
 /** One look per socket, however many sessions share it: every tmux call is a
  * subprocess, and reconciliation runs on every public verb. A look that failed
@@ -148,27 +155,35 @@ class Servers {
   private probe(socket: string): Look {
     const where = socket || "the default socket";
     const t = this.tmux(socket);
-    let identity: string | null = null;
-    try {
-      identity = t.serverIdentity().trim() || null;
-    } catch {
-      identity = null;
-    }
-    // A server that will not name itself is a server we cannot reason about:
-    // `tmux` may be missing, the call may have timed out, or the server may
-    // really be gone — and those are not the same fact.
-    if (identity === null) return { identity: null, panes: null, note: `could not read the tmux server on ${where}; nothing repaired there` };
+    // A server that will not name itself is one of two very different facts,
+    // and `serverState` keeps them apart. `tmux` may be missing, the call may
+    // have timed out, or the socket may refuse us: that is a question we could
+    // not ask, and it repairs nothing. Or tmux may have answered that nobody is
+    // listening there at all — and then there is no server for any pane on this
+    // socket to be on.
+    //
+    // That second case used to be read as the first, and it is not rare: 0.3.8
+    // moved launches off the private server on `MS_HOME/tmux.sock`, that
+    // server exited, and its socket file stayed. Every row still recorded on
+    // it was `unknown` on every pass for good — `ms doctor` called each one
+    // orphaned, `ms doctor --fix` repaired none of them, and `ms status`
+    // counted them as sessions nothing would ever rotate (issue #21).
+    const state = t.serverState();
+    if (state === "gone") return { identity: null, panes: new Set(), problem: null, gone: true };
+    if (state === "unreadable") return { identity: null, panes: null, problem: `could not read the tmux server on ${where}`, gone: false };
+    const identity = state.up;
     const r = t.run(["list-panes", "-a", "-F", "#{pane_id}"]);
-    if (r.code !== 0) return { identity, panes: null, note: `could not list panes on ${where}; nothing repaired there` };
-    return { identity, panes: new Set(r.stdout.split("\n").map((x) => x.trim()).filter(Boolean)), note: null };
+    if (r.code !== 0) return { identity, panes: null, problem: `could not list panes on ${where}`, gone: false };
+    return { identity, panes: new Set(r.stdout.split("\n").map((x) => x.trim()).filter(Boolean)), problem: null, gone: false };
   }
 }
 
 /**
- * Is this session's pane still there? Three ways to be sure it is not: the
- * server names itself as a DIFFERENT server (pane ids are per server, so `%7`
- * on a restarted one is a stranger's pane — never touch it), or the pane is
- * not in a list we actually got. Anything we could not ask is `unknown`.
+ * Is this session's pane still there? Three ways to be sure it is not: no
+ * server is listening on its socket at all, the server names itself as a
+ * DIFFERENT server (pane ids are per server, so `%7` on a restarted one is a
+ * stranger's pane — never touch it), or the pane is not in a list we actually
+ * got. Anything we could not ask is `unknown`.
  *
  * A session with no pane yet (the outside-tmux launch, between writing the row
  * and tmux naming the pane) has nothing to confirm; rule (f) catches it if the
@@ -176,6 +191,7 @@ class Servers {
  */
 function presenceOf(s: SessionRow, look: Look): Presence {
   if (!s.pane) return "unknown";
+  if (look.gone) return "absent";
   if (look.identity === null || look.panes === null) return "unknown";
   if (s.serverStart && look.identity !== s.serverStart) return "absent";
   return look.panes.has(s.pane) ? "present" : "absent";
@@ -251,11 +267,21 @@ function closeOut(st: State, s: SessionRow): void {
   st.updateSession(s.id, { state: "stopped" });
 }
 
+/** Why a pane `presenceOf` called absent is gone, in words a human can check
+ * with the tmux command it names. */
+function goneWhy(s: SessionRow, look: Look): string {
+  const where = s.socket || "the default socket";
+  if (look.gone) return `no tmux server is running on ${where}`;
+  if (s.serverStart && look.identity !== s.serverStart) return `the tmux server on ${where} is not the one it was started on`;
+  return `it is not on the tmux server on ${where}`;
+}
+
 /** (c) The pane is gone, so the session is over however it ended. */
-function stopGone(st: State, s: SessionRow): string[] {
+function stopGone(st: State, s: SessionRow, look: Look): string[] {
   closeOut(st, s);
-  log(s.id, s.generation, `pane ${s.pane} is gone; marked stopped`);
-  return [`session ${s.id}: pane ${s.pane} is gone, marked stopped`];
+  const why = goneWhy(s, look);
+  log(s.id, s.generation, `pane ${s.pane} is gone (${why}); marked stopped`);
+  return [`session ${s.id}: pane ${s.pane} is gone (${why}), marked stopped`];
 }
 
 /**
@@ -556,6 +582,33 @@ function wakeups(st: State, servers: Servers): string[] {
 }
 
 /**
+ * What reconciliation WOULD conclude about each row's pane, without repairing
+ * anything — so `ms doctor` (src/doctor.ts) reports exactly the rows that
+ * `ms doctor --fix`, which is `reconcile()`, will stop. The two used to read
+ * tmux separately, and disagreed: the check took a server with no answer for
+ * an empty pane list, while the repair (rightly, for a timeout) took it for a
+ * question it could not ask — so a row on a server that had exited was
+ * reported orphaned on every run and repaired on none (issue #21).
+ *
+ * `why` says what was seen: for an `absent` row, why its pane is gone; for an
+ * `unknown` one whose server could not be read, the reason; null for a row
+ * with nothing to judge yet (no pane recorded) or one that is plainly there.
+ * One look per socket, as in `reconcile()`. Stopped rows are skipped.
+ */
+export function inspectSessions(rows: SessionRow[]): { session: SessionRow; presence: Presence; why: string | null }[] {
+  const servers = new Servers();
+  return rows
+    .filter((s) => s.state !== "stopped")
+    .map((s) => {
+      if (!s.pane) return { session: s, presence: "unknown" as const, why: null };
+      const look = servers.look(s.socket);
+      const presence = presenceOf(s, look);
+      const why = presence === "absent" ? goneWhy(s, look) : presence === "unknown" ? look.problem : null;
+      return { session: s, presence, why };
+    });
+}
+
+/**
  * Repair everything a crashed worker, a restarted tmux server or a closed pane
  * left behind, and return one line per repair — or per deliberate abstention,
  * which is just as much a thing reconciliation did. The CLI prints them under
@@ -602,13 +655,14 @@ export function reconcile(): string[] {
         const s = st.getSession(scanned.id);
         if (!s || s.state === "stopped") continue;
         const look = servers.look(s.socket);
-        if (look.note && !noted.has(s.socket)) {
+        const note = lookNote(look);
+        if (note && !noted.has(s.socket)) {
           noted.add(s.socket);
-          out.push(look.note);
+          out.push(note);
         }
         const presence = presenceOf(s, look);
         if (presence === "absent") {
-          out.push(...stopGone(st, s)); // (c) — nothing else is worth asking about a gone pane
+          out.push(...stopGone(st, s, look)); // (c) — nothing else is worth asking about a gone pane
           continue;
         }
         if (s.state === "stopping") {

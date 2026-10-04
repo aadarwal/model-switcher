@@ -78,6 +78,39 @@ export class Tmux {
     return r.code === 0 && v ? v : null;
   }
   serverIdentity(): string { return this.must(["display-message", "-p", "#{pid}:#{start_time}"]).trim(); }
+  /**
+   * Is a server listening on this socket, and if so which one — as a THREE-way
+   * answer, because "it is gone" and "I could not ask" are different facts and
+   * only the first licenses anything (src/reconcile.ts, rule 2).
+   *
+   *   * `{ up: "<pid>:<start_time>" }` — the server answered and named itself;
+   *   * `"gone"` — nothing is listening, so no pane recorded on this socket can
+   *     still exist. tmux 3.x says so in two ways, both exit 1 (checked against
+   *     tmux 3.7c): `no server running on <path>` for a socket FILE with no
+   *     listener (the file a server leaves behind when it exits — the pre-0.3.8
+   *     `MS_HOME/tmux.sock` that issue #21 found holding rows nobody could
+   *     repair), and `error connecting to <path> (No such file or directory)`
+   *     for a path with no socket at all. `Connection refused` is the same fact
+   *     in errno's words, and is read the same way;
+   *   * `"unreadable"` — everything else: a timeout (a hung server is still a
+   *     server), `Permission denied`, a path that is not a socket, a tmux that is
+   *     not on PATH, or a server that answered with nothing.
+   *
+   * The socket path itself is never stat'ed here: tmux's own answer is the
+   * evidence, and it is the same answer `tmux -S <path> ls` gives the human.
+   */
+  serverState(): { up: string } | "gone" | "unreadable" {
+    const r = this.run(["display-message", "-p", "#{pid}:#{start_time}"]);
+    if (r.code === 0) {
+      const id = r.stdout.trim();
+      return id ? { up: id } : "unreadable";
+    }
+    if (r.code !== 1) return "unreadable"; // -1: timed out, or no tmux to run
+    const err = r.stderr.trim();
+    if (/^no server running on /m.test(err)) return "gone";
+    if (/^error connecting to .*\((No such file or directory|Connection refused)\)$/m.test(err)) return "gone";
+    return "unreadable";
+  }
   paneExists(pane: string): boolean { return this.run(["list-panes", "-a", "-F", "#{pane_id}"]).stdout.split("\n").includes(pane); }
   /**
    * One pane, one read. `deadStatus` rides along with `dead` on purpose: asked

@@ -28,13 +28,23 @@ const SHELL = "/bin/testsh";
  * what makes the "twice for one death" test mean anything.
  *
  * Every failure mode the repairs must tell apart is switchable:
- * `MS_TMUX_NO_SERVER` (the identity query fails), an empty `MS_TMUX_IDENTITY`
+ * `MS_TMUX_NO_SERVER` (the identity query fails in a way that says nothing
+ * about whether a server is there), an empty `MS_TMUX_IDENTITY`
  * (it answers nothing), and `MS_TMUX_LIST_FAILS` (list-panes fails). Panes are
  * alive unless a test says otherwise (`MS_TMUX_PANE_DEAD=1`): a corpse is an
  * event, and a fixture that leaves every pane dead by accident tests nothing.
+ *
+ * Three more answer per SOCKET, in tmux 3.x's own words (checked against tmux
+ * 3.7c): a socket in `MS_TMUX_GONE` is a socket file nobody is listening on
+ * ("no server running on <path>"), one in `MS_TMUX_ENOENT` is a path with no
+ * socket at all, and one in `MS_TMUX_EACCES` is a server we may not talk to.
  */
 const TMUX_STUB = `printf '%s\\n' "$*" >> "$MS_TMUX_LOG"
-if [ "$1" = "-S" ]; then shift 2; fi
+sock=""
+if [ "$1" = "-S" ]; then sock="$2"; shift 2; fi
+case " \${MS_TMUX_GONE:-} " in *" $sock "*) echo "no server running on $sock" >&2; exit 1 ;; esac
+case " \${MS_TMUX_ENOENT:-} " in *" $sock "*) echo "error connecting to $sock (No such file or directory)" >&2; exit 1 ;; esac
+case " \${MS_TMUX_EACCES:-} " in *" $sock "*) echo "error connecting to $sock (Permission denied)" >&2; exit 1 ;; esac
 verb="$1"
 pane=""; prev=""
 for a in "$@"; do
@@ -44,7 +54,7 @@ done
 deadfile="\${MS_TMUX_STATE}/dead\${pane}"
 case "$verb" in
   display-message)
-    if [ "\${MS_TMUX_NO_SERVER:-0}" = "1" ]; then echo "no server running" >&2; exit 1; fi
+    if [ "\${MS_TMUX_NO_SERVER:-0}" = "1" ]; then echo "lost server" >&2; exit 1; fi
     if [ -f "$deadfile" ]; then d=$(cat "$deadfile"); else d="\${MS_TMUX_PANE_DEAD:-0}"; fi
     case "$*" in
       *"#{pane_pid}"*) printf '%s\\t%s\\t%s\\t%s\\t%s\\n' 4242 claude "$d" /tmp/work "\${MS_TMUX_DEAD_STATUS:-0}" ;;
@@ -80,6 +90,9 @@ function world(): World {
   process.env.SHELL = SHELL;
   delete process.env.MS_TMUX_NO_SERVER;
   delete process.env.MS_TMUX_LIST_FAILS;
+  delete process.env.MS_TMUX_GONE;
+  delete process.env.MS_TMUX_ENOENT;
+  delete process.env.MS_TMUX_EACCES;
   delete process.env.MS_TMUX_PANE_DEAD;
   delete process.env.MS_TMUX_DEAD_STATUS;
   delete process.env.MS_TMUX_STATUS_SPLIT;
@@ -357,6 +370,47 @@ for (const [name, env] of [
     assert.equal(repaired.filter((l) => l.includes("could not")).length, 1, repaired.join("\n"));
   });
 }
+
+// A tmux server that has EXITED is not a server we could not read. The
+// pre-0.3.8 private server on MS_HOME/tmux.sock is the case that taught this
+// (issue #21): it left its socket file behind, tmux answers "no server running
+// on <path>", and every row on it sat `unknown` forever — reported orphaned by
+// `ms doctor`, and never repaired by `ms doctor --fix`.
+test("a row whose socket file has no server listening is absent and gets stopped; a row whose server could not be read (tmux timeout/EACCES) stays unknown", () => {
+  const w = world();
+  const gone = "/tmp/ms-t18-old-ms-home/tmux.sock";
+  const missing = "/tmp/ms-t18-no-such-dir/tmux.sock";
+  const denied = "/tmp/ms-t18-denied/tmux.sock";
+  process.env.MS_TMUX_GONE = gone;
+  process.env.MS_TMUX_ENOENT = missing;
+  process.env.MS_TMUX_EACCES = denied;
+  withState((st) => {
+    st.createSession({ id: "s-old-1", ...base, socket: gone, pane: "%3" });
+    st.createSession({ id: "s-old-2", ...base, socket: gone, pane: "%4", state: "parked" });
+    st.createSession({ id: "s-nofile", ...base, socket: missing, serverStart: "" });
+    st.createSession({ id: "s-denied", ...base, socket: denied, state: "walled" });
+    st.createSession({ id: "s-ok", ...base });
+    st.addRecovery({ sessionId: "s-old-1", generation: 1, turnId: null, kind: "weekly" });
+    st.setWakeup("s-old-1", nowSec() + 600);
+  });
+
+  const repaired = reconcile();
+
+  withState((st) => {
+    for (const id of ["s-old-1", "s-old-2", "s-nofile"]) assert.equal(st.getSession(id)!.state, "stopped", id);
+    assert.equal(st.getSession("s-old-1")!.wakeupAt, null, "the wake-up is cleared");
+    assert.equal(st.pendingRecovery("s-old-1"), null, "the pending recovery is obsolete");
+    assert.equal(st.getSession("s-denied")!.state, "walled", "a server we may not read is not a server that is gone");
+    assert.equal(st.getSession("s-ok")!.state, "running");
+  });
+  for (const id of ["s-old-1", "s-old-2", "s-nofile"]) {
+    assert.ok(repaired.some((l) => l.startsWith(`session ${id}:`) && /no tmux server is running/.test(l)), `${id}: ${repaired.join("\n")}`);
+  }
+  assert.ok(repaired.some((l) => l.includes("could not read") && l.includes(denied)), repaired.join("\n"));
+  assert.equal(respawns(w).length, 0, "nothing is respawned into a server that is gone");
+  // Asked once per socket: the gone server costs one call, not one per row.
+  assert.equal(tmuxLines(w).filter((l) => l.startsWith(`-S ${gone} `)).length, 1, tmuxLines(w).join("\n"));
+});
 
 // --- (d) due wake-ups ---------------------------------------------------
 

@@ -1,10 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.3.10
 
+- codex homes inherit the hook trust `~/.codex/config.toml` already granted (plugin keys
+  verbatim, linked hooks re-keyed to the home with the same hash), follow the base when it
+  re-trusts, and keep trust Codex wrote in the home on every re-render — no more
+  "Hooks need review" on every launch and rotation (#24)
+- `ms stop`, `ms rotate`/`switch`, recovery and reconciliation never act on a pane a later
+  session took over; a launch or adopt into a pane closes out any older row on it (#22)
+- a tmux server that has exited (e.g. the pre-0.3.8 `MS_HOME/tmux.sock`) is gone, not
+  unreadable: its rows are stopped by the next verb, `ms doctor` flags exactly what
+  `--fix` repairs, and a failing repair is reported instead of swallowed (#21)
 - `ms claude --continue` with a bare `--resume`/`-r` (the picker, no id) is refused with a usage
   error: the appended continuation became `--resume`'s value, i.e. the picker's search text,
-  leaving the pane in the picker with no conversation and the row with no cliSessionId
+  leaving the pane in the picker with no conversation and the row with no cliSessionId (#26)
 
 ## 0.3.9
 

@@ -32,11 +32,27 @@ jobs:
           # is what Homebrew's own node — the one the formula runs ms on — is.
           node-version-file: package.json
           cache: npm
-      - name: Install tmux
+      - name: Install tmux (and, on Linux, bsdtar as tar)
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then brew install tmux; else sudo apt-get update -q && sudo apt-get install -y -q tmux; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install tmux
+          else
+            # scripts/release.mjs runs on the maintainer's Mac and passes
+            # bsdtar's `--uid/--gid` (GNU tar spells them `--owner/--group`);
+            # test/release.test.ts runs it, so give Linux the same tar.
+            sudo apt-get update -q && sudo apt-get install -y -q tmux libarchive-tools
+            mkdir -p "$RUNNER_TEMP/bin" && ln -s "$(command -v bsdtar)" "$RUNNER_TEMP/bin/tar"
+            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          fi
           tmux -V
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      # `npm test`, one test file at a time. A hosted runner is a few slow
+      # cores, and the lock tests (test/lock.test.ts, test/reconcile.test.ts)
+      # hold SQLite's write lock in a child for a fixed few hundred ms: with
+      # other files' children competing for the CPU, the parent misses that
+      # window. Flags must precede the file list (npm's `-- <args>` would land
+      # after it, where node ignores them), hence the command spelled out.
+      - name: npm test (serial)
+        run: MS_ENTRY=src node --disable-warning=ExperimentalWarning --import ./test/setup-env.mjs --import tsx --test --test-concurrency=1 test/*.test.ts
       - run: npm run build

@@ -797,6 +797,37 @@ test("stop on a parked row never touches a pane a later session has taken over (
   assert.match(recoverLog(w), /pane %7 now belongs to s2; left alone/);
 });
 
+test("stop on a ghost whose successor has since been stopped still leaves the pane alone (#22)", async (t) => {
+  // The reported store, cleaned up in the obvious order: `ms stop B` first
+  // (an ordinary stop: B's CLI leaves, a shell comes back), then `ms stop A`.
+  // B being over does not hand %7 back to A — whatever runs there now is the
+  // human's, and A's stop must not type `/exit` into it or signal it.
+  const w = await world(t, { screen: IDLE_SCREEN, session: { state: "parked" } });
+  successor(w, { state: "stopped", desired: "stopped" });
+  const say = stderr(t);
+
+  assert.equal(await stopVerb(["s1"]), 0);
+
+  assert.equal(row("s1").state, "stopped");
+  const lines = logLines(w);
+  assert.ok(!lines.some((l) => /send-keys|respawn-pane|kill-pane|remain-on-exit/.test(l)), `the pane was touched:\n${lines.join("\n")}`);
+  assert.doesNotThrow(() => process.kill(w.pid, 0), "what runs in the pane now was signalled");
+  assert.match(say(), /pane %7 now belongs to s2; left alone/);
+});
+
+test("rotate on a ghost whose successor has since been stopped refuses, and respawns nothing (#22)", async (t) => {
+  // A wake-up timer or reconciliation dispatching `_recover` for the ghost
+  // meets the same guard: a respawn of %7 in A's name kills what is there now.
+  const w = await world(t, { wall: true, session: { state: "parked" } });
+  successor(w, { state: "stopped", desired: "stopped" });
+
+  assert.equal(await rotateVerb(["s1"]), 1);
+  const lines = logLines(w);
+  assert.ok(!lines.some((l) => /send-keys|respawn-pane|kill-pane/.test(l)), `the pane was touched:\n${lines.join("\n")}`);
+  assert.doesNotThrow(() => process.kill(w.pid, 0));
+  assert.equal(row("s1").state, "stopped");
+});
+
 test("an OLDER row on the same pane does not stop the newer one from ending its own CLI", async (t) => {
   const w = await world(t, { screen: IDLE_SCREEN });
   successor(w);

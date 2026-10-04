@@ -155,14 +155,23 @@ export class State {
   }
   /**
    * The row that took this row's pane over after it, or null when this row
-   * still owns it: the NEWEST other live row on the same pane (`othersOnPane`)
-   * that was written after this one. An OLDER row naming the pane is a ghost
-   * this row superseded, and never a reason for this one to stand down.
+   * still owns it: the NEWEST other row on the same pane (same socket, server
+   * and `%N`, as `othersOnPane`) that was written after this one. An OLDER row
+   * naming the pane is a ghost this row superseded, and never a reason for
+   * this one to stand down.
+   *
+   * In ANY state, stopped included. Every launch is made from the pane's own
+   * shell (or into a pane just made), so a later row's launch replaced
+   * whatever this row ran there; that row ending later does not give the pane
+   * back. The reported store, cleaned up in the obvious order — `ms stop B`,
+   * then `ms stop A` — would otherwise have A's stop type `/exit` into the
+   * shell B's stop handed back and signal it, and a recovery dispatched in A's
+   * name respawn over whatever the human started there since.
    */
   paneSuccessor(s: Pick<SessionRow, "id" | "socket" | "pane" | "serverStart">): SessionRow | null {
     if (!s.pane) return null;
     const r = this.db.prepare(`SELECT o.* FROM sessions o, (SELECT rowid AS r, createdAt AS c FROM sessions WHERE id=?) me
-      WHERE o.id<>? AND o.socket=? AND o.pane=? AND o.state<>'stopped'
+      WHERE o.id<>? AND o.socket=? AND o.pane=?
         AND (COALESCE(o.serverStart,'')='' OR ?='' OR o.serverStart=?)
         AND (o.createdAt>me.c OR (o.createdAt=me.c AND o.rowid>me.r))
       ORDER BY o.createdAt DESC, o.rowid DESC LIMIT 1`)

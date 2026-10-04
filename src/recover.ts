@@ -282,11 +282,15 @@ function isModal(screen: string): boolean {
 // is working; neither reading below is ever applied to a Codex pane.
 
 const COMPOSER = /^\s*[❯›]/;
-const RULE = /^\s*─+\s*$/;
+/** The composer's border. A bare rule, or — for a named session (`/rename`,
+ *  `--name`) — a rule with the name set into it ("───── fleet-builder ─"):
+ *  anything that OPENS with the rule is border, never transcript. */
+const RULE = /^\s*─{3,}/;
 /** A live spinner: one of the CLI's spinner frames, a verb ending in "…", and
  *  a running clock. A finished turn's "✻ Worked for 44m 6s · done 3:08 PM" has
- *  neither the "…" nor the parenthesised clock. */
-const SPINNER = /^(·|✢|✳|✶|✻|✽|\*)\s+\S+…\s+\(\d+[hms]/;
+ *  neither the "…" nor the parenthesised clock. The verb may be more than one
+ *  word: a `spinnerVerbs` setting can replace the built-in ones with anything. */
+const SPINNER = /^(·|✢|✳|✶|✻|✽|\*)\s+[^(]*?…\s+\(\d+[hms]/;
 
 /** The index of the composer line, or -1 when there is none on screen. */
 function composerAt(lines: string[]): number {
@@ -300,7 +304,7 @@ function composerAt(lines: string[]): number {
  *
  * Blank rows are skipped (the fullscreen layout leaves thirty of them between
  * the spinner and the composer), and so are the composer's own `───` border
- * and every indented line — a tip ("  ⎿  Tip: …") or a todo list drawn under
+ * (a named session's included) and every indented line — a tip ("  ⎿  Tip: …") or a todo list drawn under
  * the spinner. Indentation is also what keeps spinner text QUOTED in a tool
  * result ("  ⎿  ✻ Ruminating… (1m 22s · …)") from counting: it is somebody
  * else's spinner, captured in this pane's transcript.

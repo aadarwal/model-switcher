@@ -23,7 +23,7 @@ import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
 import { appendEvent, readEvents } from "../src/events.ts";
 import { openState, type SessionRow } from "../src/state.ts";
-import { backgroundWork, codexConversation, isBusy, recoverSession, takeFailReason } from "../src/recover.ts";
+import { backgroundReason, backgroundWork, codexConversation, isBusy, recoverSession, takeFailReason } from "../src/recover.ts";
 import * as screens from "./fixtures/claude-screens.ts";
 import { p } from "../src/paths.ts";
 
@@ -2318,6 +2318,8 @@ test("isBusy: a 2.1.288+ spinner line above the composer is a turn in progress",
     "with a tip under it": screens.WORKING_TIP_SCREEN,
     "fullscreen, thirty blank rows down": screens.WORKING_FULLSCREEN_SCREEN,
     "with a todo list under it": screens.WORKING_TODO_SCREEN,
+    "a named session's labelled border above the composer": screens.WORKING_NAMED_SCREEN,
+    "a custom spinner verb of two words": screens.WORKING_CUSTOM_VERB_SCREEN,
   })) {
     assert.equal(isBusy(screen, "claude"), true, name);
   }
@@ -2333,6 +2335,7 @@ test("isBusy: a finished turn, and spinner text quoted in a tool result, are not
   assert.equal(isBusy(screens.DONE_SCREEN, "claude"), false, "\"Worked for … · done\" is a turn that ended");
   assert.equal(isBusy(screens.QUOTED_SPINNER_SCREEN, "claude"), false, "an indented quote is somebody else's spinner");
   assert.equal(isBusy(screens.QUIET_SCREEN, "claude"), false);
+  assert.equal(isBusy(screens.claudeScreen(["✻ Worked for 44m 6s · done 3:08 PM", ""], undefined, screens.NAMED_BORDER), "claude"), false);
   // The spinner must be the LAST thing above the composer, not merely on screen.
   assert.equal(isBusy(screens.claudeScreen([screens.SPINNER_SPROUTING, "", "● The answer.", ""]), "claude"), false);
 });
@@ -2372,4 +2375,10 @@ test("backgroundWork: the agent hint, a usage bar and the /tasks hint are not ba
 test("backgroundWork: never for a Codex pane", () => {
   assert.equal(backgroundWork(screens.WORKFLOW_SCREEN, "codex"), null);
   assert.equal(backgroundWork(screens.SHELLS_SCREEN, "codex"), null);
+});
+
+test("backgroundReason: copy-mode refuses a Claude pane, never a Codex one", () => {
+  const inMode = { paneInMode: () => true } as never;
+  assert.match(backgroundReason(inMode, "%1", screens.QUIET_SCREEN, "claude") ?? "", /copy-mode/);
+  assert.equal(backgroundReason(inMode, "%1", screens.QUIET_SCREEN, "codex"), null);
 });

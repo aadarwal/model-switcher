@@ -28,9 +28,13 @@ export const MODE_LINE = "  ⏵⏵ bypass permissions on (shift+tab to cycle) ·
  * footer `below` it (the status line and mode line unless a test says
  * otherwise).
  */
-export function claudeScreen(above: string[], below: string[] = [STATUS_LINE, MODE_LINE]): string {
-  return ["❯ ship it", "", "● Reading the repository.", "", ...above, BORDER, "❯ ", BORDER, ...below, ""].join("\n");
+export function claudeScreen(above: string[], below: string[] = [STATUS_LINE, MODE_LINE], top: string = BORDER): string {
+  return ["❯ ship it", "", "● Reading the repository.", "", ...above, top, "❯ ", BORDER, ...below, ""].join("\n");
 }
+
+/** A named session (`/rename`, `--name`) carries its name in the composer's
+ *  top border — "───── fleet-builder ─", captured off a live 2.1.288 pane. */
+export const NAMED_BORDER = `${"─".repeat(60)} fleet-builder ─`;
 
 // --- Working (mid-turn) ----------------------------------------------------
 
@@ -45,6 +49,11 @@ export const WORKING_SCREEN = claudeScreen([SPINNER_SPROUTING, ""]);
 export const WORKING_TIP_SCREEN = claudeScreen([SPINNER_CHOREOGRAPHING, TIP_LINE, ""]);
 /** The fullscreen layout: ~30 blank rows between the spinner and the composer. */
 export const WORKING_FULLSCREEN_SCREEN = claudeScreen([SPINNER_RUMINATING, ...Array<string>(30).fill("")]);
+/** A working pane whose session has a name: the border above the composer is
+ *  not a bare rule, and must not hide the spinner above it. */
+export const WORKING_NAMED_SCREEN = claudeScreen([SPINNER_SPROUTING, ""], [STATUS_LINE, MODE_LINE], NAMED_BORDER);
+/** A custom `spinnerVerbs` setting can draw a verb of more than one word. */
+export const WORKING_CUSTOM_VERB_SCREEN = claudeScreen(["✶ Reticulating splines… (3m 2s · ↓ 9.1k tokens)", ""]);
 /** A working pane with its todo list (indented) under the spinner. */
 export const WORKING_TODO_SCREEN = claudeScreen([
   SPINNER_SPROUTING,

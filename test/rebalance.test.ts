@@ -256,6 +256,7 @@ test("paneReading: a 2.1.288+ spinner is busy, work behind the prompt is backgro
   // Busy wins: a working pane with a workflow behind it is mid-turn first.
   assert.equal(paneReading(true, screens.claudeScreen([screens.SPINNER_SPROUTING, ""], [screens.MODE_LINE, screens.WORKFLOW_LINE]), "claude"), "busy");
   assert.equal(paneReading(true, screens.WORKFLOW_SCREEN, "codex"), "idle");
+  assert.equal(paneReading(true, screens.QUIET_SCREEN, "codex", true), "idle", "copy-mode is Claude's rule, like the rest");
   assert.equal(paneReading(false, screens.WORKFLOW_SCREEN, "claude"), "gone");
 });
 

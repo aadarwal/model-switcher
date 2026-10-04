@@ -103,6 +103,7 @@ ms dashboard [--port N] [--no-open]
 - `ms stop` — stop managing a session. The CLI in the pane keeps running.
 - `ms dashboard` — serve the `ms status` tables on `127.0.0.1`, with rotate, switch, stop and Rebalance buttons. It prints its URL, opens it (unless `--no-open`), and exits about 90 s after the last request, so it is alive only while a tab polls it.
 - `--force` moves a session that is mid-turn; without it a busy session is refused. With no `<session|pane>`, `rotate`, `switch` and `stop` act on the current pane.
+- A pane belongs to one session at a time: the one launched into it last. A launch (or `ms adopt`) into a pane marks any older session still naming that pane `stopped` and says so. `stop`, `rotate` and `switch` aimed at an older row that still names it (left by an older `ms`, say) never touch the pane, even after the later session has itself been stopped: `stop` just marks that row stopped, and `rotate` and `switch` refuse and close it out.
 
 ### Calendar
 
@@ -176,6 +177,15 @@ That home's `config.toml` is rendered on every launch from your own
 `~/.codex/config.toml` — model, reasoning effort, MCP servers and all — plus the `ms`
 hook block and whatever Codex itself wrote into the home; your file is only ever read
 (`MS_CODEX_BASE_CONFIG` points somewhere else), and it wins any collision.
+Hook trust you granted in `~/.codex` comes along too, so an `ms` pane does not stop at
+"Hooks need review" for hooks you already trusted: Codex keys trust by the path a hook was
+loaded from, so a trust for a file the home links (`~/.codex/hooks.json`) is carried under
+the home's own path (`<home>/hooks.json`) with the same hash, and a plugin's trust (or a
+project's own `.codex` hooks, which are the same file from every home) is carried as it
+stands. A carried entry is marked `# ms-carried-trust: <hash>` and follows `~/.codex` on
+every launch, so re-trusting a changed hook there reaches every account. Trust you grant
+inside an account stays there and wins over the carried copy, wherever Codex wrote it in
+the file.
 
 Everything else in the home is yours, not the account's: since 0.3.6 a Codex home is a
 view of your own `~/.codex`. Every top-level entry there except `auth.json` and

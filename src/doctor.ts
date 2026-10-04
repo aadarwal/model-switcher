@@ -598,7 +598,10 @@ export async function checkClaudeAccount(a: Account, fix: boolean, book: Account
  * newer: a home is rendered from the human's own `~/.codex/config.toml`
  * (`codexBaseConfigPath`), so a home that predates an edit to that file is
  * STALE — it runs at Codex's default model and reasoning effort with none of
- * the MCP servers the human added. Both are the same fix (`installCodexHooks`
+ * the MCP servers the human added — or without the hook trust the human
+ * granted there, so every pane in it stops at "Hooks need review" (#24: the
+ * render carries that trust, re-keyed for the home, and a home rendered
+ * before it did is stale the same way). Both are the same fix (`installCodexHooks`
  * re-renders the file) and the same refusals, so they are one line rather
  * than two: this file either is what `ms` would write, or it is not.
  */
@@ -608,7 +611,7 @@ function checkCodexHooksLine(a: Account, home: string, fix: boolean): Result {
   const state = (): { ok: true } | { why: string } => {
     if (!codexHooksInstalled(home, msBin)) return { why: `not installed in ${codexConfigPath(home)}` };
     if (!codexHomeConfigCurrent(home, msBin)) {
-      return { why: `${codexConfigPath(home)} is stale — it is not what ${codexBaseConfigPath()} renders to` };
+      return { why: `${codexConfigPath(home)} is stale — it is not what ${codexBaseConfigPath()} renders to (settings, MCP servers or hook trust)` };
     }
     return { ok: true };
   };

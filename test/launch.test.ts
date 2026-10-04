@@ -61,6 +61,9 @@ globalThis.fetch = async (url, init = {}) => {
 /** tmux, as far as a launch drives it: logs every argv line, answers the
  *  identity query and the `-P -F #{pane_id}` spawns with a pane id.
  *
+ *  `list-panes` answers `MS_TMUX_PANES` (space-separated), empty by default —
+ *  every launch reconciles first, and a pane the server does not list is gone.
+ *
  *  It also copies the store aside the moment `respawn-pane` is issued, which
  *  is the only way a test can see what the session row said BEFORE the CLI
  *  was started (`ms` has already returned by the time the test looks). */
@@ -69,6 +72,7 @@ if [ "$1" = "-S" ]; then shift 2; fi
 case "$1" in
   display-message) case "$*" in *socket_path*) echo "${DEFAULT_SOCKET}" ;; *) echo "${IDENTITY}" ;; esac ;;
   new-session|new-window) echo "%42" ;;
+  list-panes) [ -z "\${MS_TMUX_PANES:-}" ] || printf '%s\\n' \${MS_TMUX_PANES} ;;
   has-session) exit "\${MS_TMUX_HAS_SESSION:-1}" ;;
   respawn-pane)
     mkdir -p "$MS_TMUX_SNAPSHOT"
@@ -248,6 +252,51 @@ test("inside tmux: picks, records, and respawns the caller's own pane", async ()
   const lastPick = path.join(w.msHome, "last-pick.json");
   assert.equal(statSync(lastPick).mode & 0o777, 0o600);
   assert.equal(JSON.parse(readFileSync(lastPick, "utf8")).any.name, "gmail");
+});
+
+test("a launch into a pane retires the older rows that still name it, and only those (#22)", async () => {
+  const w = await world();
+  process.env.HOME = w.home; process.env.MS_HOME = w.msHome;
+  const { openState } = await import("../src/state.ts");
+  const seed = openState();
+  const base = { provider: "claude" as const, cliSessionId: null, cwd: CWD, socket: TMUX_SOCKET, pane: PANE, serverStart: IDENTITY,
+    need: "any" as const, account: "work", generation: 1, desired: "running" as const, flags: [] };
+  let recId: number;
+  try {
+    // The ghost: an earlier launch into %7 that failed and was parked, with a
+    // recovery and a wake-up still pointing at it.
+    seed.createSession({ ...base, id: "ghost", state: "parked" });
+    recId = seed.addRecovery({ sessionId: "ghost", generation: 1, turnId: null, kind: "session" });
+    seed.setWakeup("ghost", Math.floor(Date.now() / 1000) + 3600);
+    // Not this launch's business: another pane, and a row that is already
+    // over. (The same %7 on ANOTHER server is test/manual.test.ts's: a launch
+    // reconciles first, and that closes a row whose server is gone.)
+    seed.createSession({ ...base, id: "elsewhere", pane: "%9", state: "running" });
+    seed.createSession({ ...base, id: "done", state: "stopped", desired: "stopped" });
+  } finally {
+    seed.close();
+  }
+
+  // Both panes are on the server, so the launch's own reconcile pass leaves
+  // both rows to what follows.
+  const r = run(["claude"], w.env({ MS_TMUX_PANES: "%7 %9" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /^ms: ghost no longer owns pane %7 \(a new launch is taking it\); marked stopped$/m);
+
+  const st = openState();
+  try {
+    const by = (id: string) => st.getSession(id)!;
+    assert.equal(by("ghost").state, "stopped", "the ghost row can no longer be stopped INTO the new session's pane");
+    assert.equal(by("ghost").desired, "stopped");
+    assert.equal(by("ghost").wakeupAt, null, "nothing wakes the ghost up into a pane it no longer owns");
+    assert.equal(st.pendingRecovery("ghost"), null, `recovery ${recId!} is still open`);
+    assert.equal(by("elsewhere").state, "running");
+    const fresh = st.listSessions().find((s) => !["ghost", "elsewhere", "done"].includes(s.id))!;
+    assert.equal(fresh.state, "launching", "the new launch itself is untouched");
+  } finally {
+    st.close();
+  }
+  assert.match(readFileSync(path.join(w.msHome, "sessions", "ghost", "recover.log"), "utf8"), /pane %7 taken over by a new launch \(\S+\); marked stopped/);
 });
 
 test("--need fable picks the account that has a fable window", async () => {

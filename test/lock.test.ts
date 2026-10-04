@@ -246,14 +246,14 @@ test("withLock gives up at its own deadline, not at the holder's convenience", a
 });
 
 test("a busy lock database reads as not-acquired, never as a bare Error", async () => {
-  // Another process holds SQLite's write lock (an open BEGIN IMMEDIATE) for
-  // ~600 ms — longer than the 250 ms busy_timeout, so every attempt inside the
+  // Another process holds SQLite's write lock (an open BEGIN IMMEDIATE) until
+  // this test lets go — longer than the 250 ms busy_timeout, so every attempt inside the
   // 300 ms wait comes back SQLITE_BUSY. That must surface as Locked and be
   // retried inside withLock's own deadline, not escape as `database is locked`
   // and not stretch the wait to waitMs plus a multiple of the busy timeout.
   const { home, msHome } = useTempHome();
   const sync = path.join(home, "busydb");
-  const holder = startChild("lock-busy-child.ts", [sync, "600"], { HOME: home, MS_HOME: msHome });
+  const holder = startChild("lock-busy-child.ts", [sync, "10000"], { HOME: home, MS_HOME: msHome });
 
   await bounded([holder], 20_000, async () => {
     assert.ok(await waitForFile(path.join(sync, "holding"), 15_000), "the other process holds the write lock");
@@ -266,6 +266,7 @@ test("a busy lock database reads as not-acquired, never as a bare Error", async 
     const elapsed = performance.now() - t0;
     assert.equal(entered, false);
     assert.ok(elapsed < 1_500, `gave up on its own deadline, not the busy timeout's (${Math.round(elapsed)} ms)`);
+    writeFileSync(path.join(sync, "release"), "");
     assert.equal(await holder.exit, 0, `the holder finished cleanly: ${holder.stderr()}`);
   });
 });

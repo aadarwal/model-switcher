@@ -460,6 +460,22 @@ test("ms claude --continue -- --resume <id> is accepted, and refused without a r
   assert.match(r.stderr, /ms claude --continue -- --resume <id>/);
 });
 
+test("ms claude --continue with a BARE --resume is a refusal: the continuation would become the picker's search text", async () => {
+  // Measured 2026-10-03: `ms claude --continue -- --model opus --chrome --resume`
+  // launched `claude ... --resume "Continue the unfinished work ..."`, and Claude
+  // Code read the continuation as the resume PICKER's search term ("No sessions
+  // match ..."): three panes sat in the picker with no conversation, and their
+  // rows carried no cliSessionId for a later rotation to resume.
+  const w = await adoptWorld();
+  for (const tail of [["--model", "opus", "--resume"], ["-r"], ["--resume", "--model", "opus"], ["--resume="]]) {
+    const r = run(["claude", "--continue", "--", ...tail], w.env());
+    assert.equal(r.code, 2, `${tail.join(" ")}: ${r.stderr}`);
+    assert.match(r.stderr, /--continue needs the id of the conversation to resume/, tail.join(" "));
+    assert.match(r.stderr, /ms claude --continue -- --resume <id>/, tail.join(" "));
+    assert.ok(!existsSync(w.log) || !readFileSync(w.log, "utf8").includes("respawn-pane"), `${tail.join(" ")}: nothing was launched`);
+  }
+});
+
 test("ms adopt takes a path, and still finds that rollout's sources under its own sessions root", async () => {
   const w = await adoptWorld();
   // Deliberately NOT under the caller's codex home: a file someone moved

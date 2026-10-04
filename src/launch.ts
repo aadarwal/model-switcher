@@ -132,6 +132,11 @@ export function claudeResumeId(args: string[]): string | null {
   return null;
 }
 
+/** A Claude `--resume`/`-r` that names no conversation: the picker. */
+function namesBareClaudeResume(args: string[]): boolean {
+  return args.some((a) => a === "--resume" || a === "-r" || a === "--resume=") && claudeResumeId(args) === null;
+}
+
 /**
  * `ms <cli> [--as name] [--need any|fable] [--continue] [-- <cli args>]`.
  *
@@ -468,6 +473,19 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
         ? ["it carries the unfinished work of a conversation you are resuming", `try: ms codex --continue -- resume <id>`]
         : ["it carries the unfinished work of a conversation you are resuming", `try: ms claude --continue -- --resume <id>`],
     );
+    return EXIT_USAGE_ERROR;
+  }
+  // A BARE `--resume`/`-r` (no id: Claude Code's own picker) cannot carry the
+  // continuation. Appended after it, the prompt becomes `--resume`'s VALUE, and
+  // Claude Code reads it as the picker's search text ("No sessions match
+  // ..."): measured 2026-10-03, three panes left in the picker with no
+  // conversation and a row with no cliSessionId for a rotation to resume.
+  // `--continue`/`-c` (most recent) is fine: it takes no value.
+  if (parsed.continueAfter && !resumeId && provider === "claude" && namesBareClaudeResume(parsed.args)) {
+    say("--continue needs the id of the conversation to resume, not the resume picker", [
+      "a bare --resume opens Claude Code's picker, and the continuation would land in its search box",
+      "try: ms claude --continue -- --resume <id>   (or drop --continue and pick by hand)",
+    ]);
     return EXIT_USAGE_ERROR;
   }
 

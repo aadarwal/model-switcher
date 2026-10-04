@@ -64,8 +64,9 @@ import { codexSessionsShared, isHomeOwn, isPreLinkBackup, shareCodexState } from
 /** The four lifecycle events the Codex hook subscribes to, with the snake_case
  * spelling Codex uses in a trust key and the timeout it applies by default.
  * SessionEnd's 1 s is Codex's own: the process is on its way out, so a hook
- * that takes longer would hold the exit open. */
-const EVENTS: readonly { table: string; snake: string; timeout: number }[] = [
+ * that takes longer would hold the exit open. Exported for the nightly canary
+ * (scripts/canary.mjs), which checks a new Codex still knows every name here. */
+export const EVENTS: readonly { table: string; snake: string; timeout: number }[] = [
   { table: "SessionStart", snake: "session_start", timeout: 600 },
   { table: "UserPromptSubmit", snake: "user_prompt_submit", timeout: 600 },
   { table: "Stop", snake: "stop", timeout: 600 },

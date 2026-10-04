@@ -11,8 +11,10 @@ type Settings = Record<string, unknown> & { hooks?: Record<string, HookEntry[]> 
  * else's problem and must not wake a recovery worker. `Stop` is its opposite
  * number: the turn that ENDED, which is the only moment rebalance
  * (src/rebalance.ts) is allowed to move a session, and which records no event
- * of its own — Claude Code needs no `stop` in the log the way Codex does. */
-const EVENTS: readonly [string, string][] = [
+ * of its own — Claude Code needs no `stop` in the log the way Codex does.
+ * Exported for the nightly canary (scripts/canary.mjs), which checks a new
+ * Claude Code still knows every event and matcher here. */
+export const EVENTS: readonly [string, string][] = [
   ["SessionStart", ""],
   ["UserPromptSubmit", ""],
   ["Stop", ""],

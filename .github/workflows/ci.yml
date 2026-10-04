@@ -1,0 +1,42 @@
+# The suite, the typecheck and the bundle, on every push to main and every
+# pull request into it. macOS is the platform ms is built for and the one that
+# must pass; Linux runs beside it (see the matrix note).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # engines.node (">=22.15"): the newest Node that satisfies it, which
+          # is what Homebrew's own node — the one the formula runs ms on — is.
+          node-version-file: package.json
+          cache: npm
+      - name: Install tmux
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install tmux; else sudo apt-get update -q && sudo apt-get install -y -q tmux; fi
+          tmux -V
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

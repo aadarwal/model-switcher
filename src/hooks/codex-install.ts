@@ -463,7 +463,7 @@ function baseDoc(): { entries: Entry[]; sections: Section[]; trust: Section[] } 
 //
 // The hash is over the hook's own content, never its path (`codexTrustedHash`
 // above is the recipe), so a trust entry carries across unchanged as long as
-// the KEY is right for this home. Three shapes, decided per key by
+// the KEY is right for this home. Four shapes, decided per key by
 // `carriedTrustKey`:
 //
 //   * a plugin's key, `<plugin>@<marketplace>:hooks/hooks.json:…` — not a
@@ -472,30 +472,35 @@ function baseDoc(): { entries: Entry[]; sections: Section[]; trust: Section[] } 
 //     but `CODEX_HOME_OWN`), `~/.codex/hooks.json:…` — Codex loads it here
 //     through the link, as `<home>/hooks.json`, so it is carried under that
 //     key with the same hash;
-//   * a file the home does NOT link — the base's own `config.toml`, whose
-//     `[[hooks.<Event>]]` tables are stripped above and never reach a home —
-//     or any other path: nothing here for it to apply to, so not carried.
+//   * a file in `~/.codex` the home does NOT link — the base's own
+//     `config.toml`, whose `[[hooks.<Event>]]` tables are stripped above and
+//     never reach a home: nothing here for it to apply to, so not carried;
+//   * any other absolute path — a project's own `.codex/hooks.json` — is the
+//     same file whichever CODEX_HOME loads it, so the same key: carried
+//     verbatim.
 //
 // The decision is by NAME, the same rule the link pass uses, not by looking
 // at the home: a launch renders before it links (`ensureCodexReady`), so a
 // new home has no links yet on its first render.
 //
-// The carried entries sit just ahead of our block, outside the markers, and
-// the HOME'S OWN entry for a key wins over a carried one: after the first
-// render a carried entry IS the home's (which is what keeps a second render
-// byte-identical), and a hash the human re-trusted in the account must not be
-// put back to the base's older one on the next launch — that would bring the
-// review back every time, the bug this exists to end. A key into this home's
-// own `config.toml` is never carried: those are our block's keys, and a copy
-// would be a duplicate TOML key Codex rejects the whole file for.
+// The carried entries sit just ahead of our block, outside the markers, each
+// marked with the hash it was carried at (`CARRIED`). An entry whose hash is
+// still that one is still the base's answer, so every render replaces it with
+// what the base says NOW — a re-trust in `~/.codex` (a plugin update, an edited
+// hooks.json) reaches every home, and a trust the base dropped leaves them.
+// Any other entry for a key is the HOME'S OWN and wins over the base's: Codex
+// rewrote the hash (the human re-trusted in the account) or wrote the entry
+// itself, and putting the base's older hash back on the next launch would
+// bring the review back every time, the bug this exists to end. A key into
+// this home's own `config.toml` is never carried: those are our block's keys,
+// and a copy would be a duplicate TOML key Codex rejects the whole file for.
 
-/** The base directory as every spelling a trust key may use for it: as
- *  configured, and resolved (a dotfiles-managed `~/.codex` is a link). */
-function baseDirSpellings(): string[] {
-  const dir = codexBaseDir();
-  let real = dir;
-  try { real = realpathSync(dir); } catch { /* no base yet: one spelling */ }
-  return real === dir ? [dir] : [dir, real];
+/** A base path as every spelling a trust key may use for it: as configured,
+ *  and resolved (a dotfiles-managed `~/.codex` is a link). */
+function spellings(p: string): string[] {
+  let real = p;
+  try { real = realpathSync(p); } catch { /* not there yet: one spelling */ }
+  return real === p ? [p] : [p, real];
 }
 
 /** A base trust key as this home would spell it, or null when it applies to
@@ -506,14 +511,53 @@ function carriedTrustKey(key: string, homeDir: string): string | null {
   const file = m[1]!;
   const position = m[2]!;
   if (!path.isAbsolute(file)) return key;
-  for (const base of baseDirSpellings()) {
+  // The base's own config.toml, wherever `MS_CODEX_BASE_CONFIG` puts it: its
+  // hook tables are stripped above, so their trust has nothing to apply to.
+  if (spellings(codexBaseConfigPath()).includes(file)) return null;
+  for (const base of spellings(codexBaseDir())) {
     if (!file.startsWith(`${base}/`)) continue;
     const rest = file.slice(base.length + 1);
     const first = rest.split("/")[0]!;
     if (first === "" || isHomeOwn(first) || isPreLinkBackup(first)) return null;
     return `${path.join(homeDir, rest)}${position}`;
   }
-  return null;
+  return key; // outside `~/.codex`: the same file from every home
+}
+
+/** The comment a carried trust entry carries, right under its header: the
+ *  hash it was carried at ("none" for an entry with no `trusted_hash`). */
+const CARRIED = "# ms-carried-trust:";
+const CARRIED_RE = /^\s*# ms-carried-trust:\s*(\S+)\s*$/;
+const TRUSTED_HASH_RE = /^\s*trusted_hash\s*=\s*(?:"([^"\\]*)"|'([^']*)')\s*$/;
+
+/** A trust entry's `trusted_hash`, or "none". */
+function trustedHashOf(s: Section): string {
+  for (const l of s.lines) {
+    const m = TRUSTED_HASH_RE.exec(stripComment(l));
+    if (m) return m[1] ?? m[2]!;
+  }
+  return "none";
+}
+
+/** Whether a home's trust entry is still exactly the copy a render carried in:
+ *  marked, and its hash still the one it was marked with. Codex rewriting the
+ *  hash (a re-trust in the account), or rewriting the table without our
+ *  comment, makes it the home's own. */
+function isCarriedCopy(s: Section): boolean {
+  if (classify(s.header)?.kind !== "state") return false;
+  const mark = s.lines.map((l) => CARRIED_RE.exec(l)?.[1]).find((x) => x !== undefined);
+  return mark !== undefined && mark === trustedHashOf(s);
+}
+
+/** A base trust entry rendered for this home under `key`, marked as carried —
+ *  or null when it holds no key at all (an empty table has nothing to carry,
+ *  and its mark would be a trailing comment the next read hands to the table
+ *  after it). */
+function carriedEntry(s: Section, key: string): string | null {
+  const at = s.lines.indexOf(s.header);
+  const body = s.lines.slice(at + 1).filter((l) => !CARRIED_RE.test(l));
+  if (!body.some((l) => stripComment(l).trim() !== "")) return null;
+  return textOf([...s.lines.slice(0, at), `[hooks.state.${tomlString(key)}]`, `${CARRIED} ${trustedHashOf(s)}`, ...body]);
 }
 
 /** `[hooks.state]` on its own — no quoted key after it. */
@@ -659,7 +703,8 @@ function compose(configPath: string, msBin: string, text: string): { next: strin
 
   const head = splitSections(parts.prefix);
   const tail = splitSections(parts.suffix);
-  const keep = (s: Section): boolean => mine(s) && !isEmptyBareState(s);
+  // A carried copy is re-rendered from the base below, never kept as it stands.
+  const keep = (s: Section): boolean => mine(s) && !isEmptyBareState(s) && !isCarriedCopy(s);
   const headOwn = [...head.sections, ...rescueFromBlock(configPath, parts.block)].filter(keep);
   const tailOwn = tail.sections.filter(keep);
 
@@ -677,8 +722,10 @@ function compose(configPath: string, msBin: string, text: string): { next: strin
     const h = classify(s.header);
     const key = h?.kind === "state" ? carriedTrustKey(h.key, homeDir) : null;
     if (key === null || taken.has(key) || key.startsWith(`${configPath}:`)) continue;
+    const entry = carriedEntry(s, key);
+    if (entry === null) continue;
     taken.add(key);
-    carried.push(textOf(s.lines.map((l) => (l === s.header ? `[hooks.state.${tomlString(key)}]` : l))));
+    carried.push(entry);
   }
 
   // (a) the base's preamble, then the home's own root keys the base does not

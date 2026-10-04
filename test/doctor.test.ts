@@ -1120,7 +1120,7 @@ test("checkCodexAccount: a home missing hook trust the base already granted is S
     const fixed = (await checkCodexAccount(codexAccount(), true)).find((r) => /hooks installed/.test(r.what))!;
     assert.deepEqual([fixed.ok, fixed.fixed], [true, true]);
     assert.ok(
-      readFileSync(path.join(dir, "config.toml"), "utf8").includes(`[hooks.state."${dir}/hooks.json:post_tool_use:0:0"]\ntrusted_hash = "${hash}"`),
+      readFileSync(path.join(dir, "config.toml"), "utf8").includes(`[hooks.state."${dir}/hooks.json:post_tool_use:0:0"]\n# ms-carried-trust: ${hash}\ntrusted_hash = "${hash}"`),
       "--fix carried the trust in, under the home's own path",
     );
   } finally {

@@ -504,7 +504,9 @@ function withBase<T>(text: string | null, fn: (basePath: string) => T): T {
   const saved = process.env.MS_CODEX_BASE_CONFIG;
   const dir = mkdtempSync(path.join(tmpdir(), "ms-base-"));
   const file = path.join(dir, "config.toml");
-  if (text !== null) writeFileSync(file, text, { mode: 0o600 });
+  // `@BASE_CONFIG@` is this base file's own path — what Codex keys the trust
+  // of the base's own `[[hooks.<Event>]]` tables by.
+  if (text !== null) writeFileSync(file, text.replaceAll("@BASE_CONFIG@", file), { mode: 0o600 });
   process.env.MS_CODEX_BASE_CONFIG = file;
   try {
     return fn(file);
@@ -532,7 +534,7 @@ const BASE = [
   "",
   "[hooks.state]",
   "",
-  '[hooks.state."/Users/a/.codex/config.toml:session_start:0:0"]',
+  '[hooks.state."@BASE_CONFIG@:session_start:0:0"]',
   'trusted_hash = "sha256:theirs"',
   "",
   "[[hooks.SessionStart]]",
@@ -545,7 +547,7 @@ const BASE = [
 ].join("\n");
 
 test("a home is rendered from the human's own config: preamble, tables and all — and its hooks are left behind", () => {
-  withBase(BASE, () => {
+  withBase(BASE, (basePath) => {
     const d = home();
     assert.equal(installCodexHooks(d, MS).changed, true);
     const text = read(d);
@@ -566,7 +568,7 @@ test("a home is rendered from the human's own config: preamble, tables and all �
     // own matcher index to 1 for a hook that is not in this file at all.
     assert.ok(!text.includes("their-own-hook"), "the base's own hook is not installed here");
     assert.ok(!text.includes("sha256:theirs"), "nor its trust");
-    assert.ok(!text.includes("/Users/a/.codex/config.toml:"), "nor a trust key naming another config");
+    assert.ok(!text.includes(`${basePath}:`), "nor a trust key naming the base's own config");
     assert.ok(text.includes(`[hooks.state."${config(d)}:session_start:0:0"]`), "ours stays at matcher index 0");
     assert.equal(codexHooksInstalled(d, MS), true);
   });
@@ -765,6 +767,10 @@ test("a render still refuses everything the installer refused, and writes nothin
 /** A base config carrying trust entries, keyed as Codex keys them. */
 const trustEntry = (key: string, hash: string): string => `[hooks.state."${key}"]\ntrusted_hash = "${hash}"`;
 const PLUGIN_KEY = "vercel-plugin@plugins-cli:hooks/hooks.json:session_start:0:0";
+/** The same entry as a render carries it into a home: marked with the hash it
+ *  was carried at, so the next render can tell it from the home's own. */
+const carriedEntry = (key: string, hash: string): string =>
+  `[hooks.state."${key}"]\n# ms-carried-trust: ${hash}\ntrusted_hash = "${hash}"`;
 
 test("a base trust for a linked hooks.json is carried into the home under the home's path, with the same hash", () => {
   const d = home();
@@ -786,8 +792,8 @@ test("a base trust for a linked hooks.json is carried into the home under the ho
   withBase(base, () => {
     assert.equal(installCodexHooks(d, MS).changed, true);
     const text = read(d);
-    assert.ok(text.includes(trustEntry(`${d}/hooks.json:post_tool_use:0:0`, "sha256:linked")), "re-keyed at the home's own link");
-    assert.ok(text.includes(trustEntry(`${d}/hooks/hooks.json:stop:1:0`, "sha256:nested")), "a nested path too");
+    assert.ok(text.includes(carriedEntry(`${d}/hooks.json:post_tool_use:0:0`, "sha256:linked")), "re-keyed at the home's own link");
+    assert.ok(text.includes(carriedEntry(`${d}/hooks/hooks.json:stop:1:0`, "sha256:nested")), "a nested path too");
     assert.ok(!text.includes(`${baseDir}/hooks.json:`), "never under the base's own path");
     assert.ok(!text.includes("sha256:baseconfig"), "a trust for the base's config.toml tables is not carried");
     assert.ok(text.indexOf("sha256:linked") < text.indexOf("# ms-hooks-begin"), "ahead of the ms block, outside it");
@@ -802,7 +808,7 @@ test("a plugin-keyed base trust is carried verbatim", () => {
   withBase(`[hooks.state]\n\n${trustEntry(PLUGIN_KEY, "sha256:plugin")}\n`, () => {
     installCodexHooks(d, MS);
     const text = read(d);
-    assert.ok(text.includes(trustEntry(PLUGIN_KEY, "sha256:plugin")), "the same key: it names no path");
+    assert.ok(text.includes(carriedEntry(PLUGIN_KEY, "sha256:plugin")), "the same key: it names no path");
     assert.equal(text.split(PLUGIN_KEY).length, 2, "exactly once");
     assert.equal(installCodexHooks(d, MS).changed, false, "and a second render keeps it, once");
     assert.equal(read(d).split(PLUGIN_KEY).length, 2);
@@ -853,7 +859,7 @@ test("an account-written [hooks.state] for a non-ms hook survives a re-render, w
       const block = text.slice(text.indexOf("# ms-hooks-begin"), text.indexOf("# ms-hooks-end"));
       assert.ok(!block.includes("sha256:account"), `${shape}: and it is outside our block now, where the next render keeps it`);
       if (shape.startsWith("inside")) assert.ok(text.includes('[projects."/Users/a/src/new"]'), "so is any other table Codex put there");
-      assert.ok(text.includes(trustEntry(PLUGIN_KEY, "sha256:plugin")), `${shape}: the carried trust stays`);
+      assert.ok(text.includes(carriedEntry(PLUGIN_KEY, "sha256:plugin")), `${shape}: the carried trust stays`);
       assert.equal(codexHooksInstalled(d, MS), true, shape);
       assert.equal(installCodexHooks(d, MS).changed, false, `${shape}: a second render is a no-op`);
       assert.equal(codexHomeConfigCurrent(d, MS), true, shape);
@@ -874,6 +880,58 @@ test("the home's own answer for a carried key wins: one entry, the account's has
     const text = read(d);
     assert.ok(text.includes("sha256:new") && !text.includes("sha256:old"), "the account's hash, not the base's");
     assert.ok(text.includes("sha256:plugin-new") && !text.includes("sha256:plugin-old"), "for a plugin key too");
+    assert.equal(installCodexHooks(d, MS).changed, false);
+  });
+});
+
+test("a trust for a hook outside the base dir (a project's own hooks) is carried verbatim: it is the same file from every home", () => {
+  // Codex loads a project's `.codex/hooks.json` by its own absolute path,
+  // whichever CODEX_HOME runs — so the key the human's `~/.codex` trusted is
+  // exactly the key a home asks for.
+  const d = home();
+  const project = "/Users/a/src/proj/.codex/hooks.json:stop:0:0";
+  withBase(`${trustEntry(project, "sha256:project")}\n`, () => {
+    assert.equal(installCodexHooks(d, MS).problem, undefined);
+    const text = read(d);
+    assert.ok(text.includes(`[hooks.state."${project}"]`), "carried under the same key");
+    assert.ok(text.includes('trusted_hash = "sha256:project"'), "with the same hash");
+    assert.equal(installCodexHooks(d, MS).changed, false, "and a second render is a no-op");
+  });
+});
+
+test("a carried trust follows the base when the human re-trusts there, but never over a hash the home granted itself", () => {
+  // A changed hooks.json (a plugin update) gets re-trusted in `~/.codex`. A
+  // carried copy is still the base's answer, so it must move with it — or
+  // every home stops at "Hooks need review" again. A hash Codex wrote in the
+  // home is the home's own answer, and stays.
+  const d = home();
+  const baseDir = process.env.MS_CODEX_BASE_DIR!;
+  const linked = `${baseDir}/hooks.json:stop:0:0`;
+  const at = `${d}/hooks.json:stop:0:0`;
+  withBase(`${trustEntry(linked, "sha256:v1")}\n\n${trustEntry(PLUGIN_KEY, "sha256:p1")}\n`, () => installCodexHooks(d, MS));
+  withBase(`${trustEntry(linked, "sha256:v2")}\n\n${trustEntry(PLUGIN_KEY, "sha256:p2")}\n`, () => {
+    assert.equal(codexHomeConfigCurrent(d, MS), false, "a home holding the base's older answer is stale");
+    assert.equal(installCodexHooks(d, MS).changed, true);
+    const text = read(d);
+    assert.ok(text.includes("sha256:v2") && !text.includes("sha256:v1"), "the linked key follows the base");
+    assert.ok(text.includes("sha256:p2") && !text.includes("sha256:p1"), "so does a plugin key");
+    assert.equal(text.split(at).length, 2, "once");
+    assert.equal(installCodexHooks(d, MS).changed, false, "and settles");
+    // Codex re-trusts the plugin hook in the home: it rewrites the value.
+    writeFileSync(config(d), text.replace('trusted_hash = "sha256:p2"', 'trusted_hash = "sha256:home"'), { mode: 0o600 });
+  });
+  withBase(`${trustEntry(linked, "sha256:v3")}\n\n${trustEntry(PLUGIN_KEY, "sha256:p3")}\n`, () => {
+    installCodexHooks(d, MS);
+    const text = read(d);
+    assert.ok(text.includes("sha256:home") && !text.includes("sha256:p3"), "the home's own hash wins");
+    assert.ok(text.includes("sha256:v3"), "while the untouched carried key still follows the base");
+    assert.equal(text.split(PLUGIN_KEY).length, 2, "one entry for the key");
+  });
+  withBase("", () => {
+    installCodexHooks(d, MS);
+    const text = read(d);
+    assert.ok(!text.includes(at), "a carried copy goes when the base no longer grants it");
+    assert.ok(text.includes("sha256:home"), "the home's own answer does not");
     assert.equal(installCodexHooks(d, MS).changed, false);
   });
 });

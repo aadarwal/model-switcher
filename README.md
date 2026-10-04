@@ -179,9 +179,12 @@ hook block and whatever Codex itself wrote into the home; your file is only ever
 Hook trust you granted in `~/.codex` comes along too, so an `ms` pane does not stop at
 "Hooks need review" for hooks you already trusted: Codex keys trust by the path a hook was
 loaded from, so a trust for a file the home links (`~/.codex/hooks.json`) is carried under
-the home's own path (`<home>/hooks.json`) with the same hash, and a plugin's trust is
-carried as it stands. Trust you grant inside an account stays there and wins over the
-carried copy, wherever Codex wrote it in the file.
+the home's own path (`<home>/hooks.json`) with the same hash, and a plugin's trust (or a
+project's own `.codex` hooks, which are the same file from every home) is carried as it
+stands. A carried entry is marked `# ms-carried-trust: <hash>` and follows `~/.codex` on
+every launch, so re-trusting a changed hook there reaches every account. Trust you grant
+inside an account stays there and wins over the carried copy, wherever Codex wrote it in
+the file.
 
 Everything else in the home is yours, not the account's: since 0.3.6 a Codex home is a
 view of your own `~/.codex`. Every top-level entry there except `auth.json` and

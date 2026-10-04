@@ -746,6 +746,53 @@ test("(h) a pane that is dead because a handoff is in flight is left to the work
 
 // --- ms _pane_died ------------------------------------------------------
 
+test("an abandoned stop never hands back a pane a later launch took over (#22)", () => {
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  withState((st) => {
+    // The ghost: a stop (from an older build) abandoned mid-flight on %7,
+    // which a later launch has since taken over. That launch's CLI is what
+    // died; its own row decides what happens to the pane.
+    st.createSession({ id: "ghost", ...base, state: "stopping", desired: "stopped" });
+    st.createSession({ id: "owner", ...base, cliSessionId: "c2" });
+  });
+  planted(w.msHome, "UPDATE sessions SET updatedAt=? WHERE id='ghost'", nowSec() - 3600);
+
+  reconcile();
+
+  assert.equal(stateOf("ghost"), "stopped", "the ghost's stop stands");
+  assert.deepEqual(respawns(w), [], "no shell over the owner's dead screen");
+  assert.equal(stateOf("owner"), "parked", "the owner's death is settled as the owner's: a crash, left for inspection");
+});
+
+test("the NEWEST row on a pane is its owner: an older ghost never stops it being handed back", () => {
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  withState((st) => {
+    st.createSession({ id: "ghost", ...base, desired: "stopped" });
+    st.createSession({ id: "owner", ...base, cliSessionId: "c2", desired: "stopped" });
+  });
+  reconcile();
+  assert.equal(stateOf("ghost"), "stopped");
+  assert.equal(stateOf("owner"), "stopped");
+  assert.deepEqual(respawns(w), [`-S ${SOCK} respawn-pane -k -c /tmp/work -t %7 '${SHELL}' '-l'`], "exactly one shell, in the owner's name");
+});
+
+test("_pane_died: a late callback for a row whose pane was taken over hands nothing back (#22)", async () => {
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  withState((st) => {
+    st.createSession({ id: "ghost", ...base, desired: "stopped" });
+    st.createSession({ id: "owner", ...base, cliSessionId: "c2" });
+  });
+
+  assert.equal(await paneDied(["ghost"]), 0);
+
+  assert.deepEqual(respawns(w), [], "the pane is the owner's; its own hook decides what happens to it");
+  assert.equal(stateOf("ghost"), "stopped");
+  assert.equal(stateOf("owner"), "running");
+});
+
 test("_pane_died: a normal end respawns the login shell and stops the session", async () => {
   const w = world();
   process.env.MS_TMUX_PANE_DEAD = "1"; // the pane is a corpse: that is why we are here

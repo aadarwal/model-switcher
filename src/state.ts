@@ -123,6 +123,66 @@ export class State {
   }
   getSession(id: string): SessionRow | null { return this.rowToSession(this.db.prepare("SELECT * FROM sessions WHERE id=?").get(id) as Record<string, unknown> | undefined); }
   listSessions(): SessionRow[] { return (this.db.prepare("SELECT * FROM sessions ORDER BY createdAt").all() as Record<string, unknown>[]).map((r) => this.rowToSession(r)!); }
+  /**
+   * The other rows that are not over and name the SAME pane as `s` — the same
+   * `%N` on the same socket of the same tmux server — oldest first.
+   *
+   * A pane id is not a session id. The human's pane outlives every CLI the
+   * tool launches into it, so a launch that failed and was parked, followed by
+   * a second launch into the same pane, leaves two rows naming one pane (#22).
+   * Only one of them can own what is running there: the one that launched into
+   * it LAST. Everything that is about to act on a pane on a row's behalf —
+   * `/exit`, a signal, a shell handed back — has to ask this first, or it acts
+   * on somebody else's CLI.
+   *
+   * "The same server" is `serverStart`, compared only when BOTH rows have one:
+   * pane ids restart from `%0` with the server, so `%7` on a restarted server
+   * is a stranger's pane and never a successor; a row that never recorded its
+   * server cannot rule itself out, and for the callers here (who use a match
+   * to stand DOWN, or to close out a row whose pane is being launched over) the
+   * cautious reading is that it might be the same pane.
+   *
+   * Order is `createdAt`, then insertion (`rowid`): `createdAt` is whole
+   * seconds, and a failed launch retried at once lands in the same second.
+   */
+  othersOnPane(s: Pick<SessionRow, "id" | "socket" | "pane" | "serverStart">): SessionRow[] {
+    if (!s.pane) return [];
+    const rows = this.db.prepare(`SELECT * FROM sessions
+      WHERE id<>? AND socket=? AND pane=? AND state<>'stopped'
+        AND (COALESCE(serverStart,'')='' OR ?='' OR serverStart=?)
+      ORDER BY createdAt, rowid`).all(s.id, s.socket ?? "", s.pane, s.serverStart ?? "", s.serverStart ?? "") as Record<string, unknown>[];
+    return rows.map((r) => this.rowToSession(r)!);
+  }
+  /**
+   * The row that took this row's pane over after it, or null when this row
+   * still owns it: the NEWEST other live row on the same pane (`othersOnPane`)
+   * that was written after this one. An OLDER row naming the pane is a ghost
+   * this row superseded, and never a reason for this one to stand down.
+   */
+  paneSuccessor(s: Pick<SessionRow, "id" | "socket" | "pane" | "serverStart">): SessionRow | null {
+    if (!s.pane) return null;
+    const r = this.db.prepare(`SELECT o.* FROM sessions o, (SELECT rowid AS r, createdAt AS c FROM sessions WHERE id=?) me
+      WHERE o.id<>? AND o.socket=? AND o.pane=? AND o.state<>'stopped'
+        AND (COALESCE(o.serverStart,'')='' OR ?='' OR o.serverStart=?)
+        AND (o.createdAt>me.c OR (o.createdAt=me.c AND o.rowid>me.r))
+      ORDER BY o.createdAt DESC, o.rowid DESC LIMIT 1`)
+      .get(s.id, s.id, s.socket ?? "", s.pane, s.serverStart ?? "", s.serverStart ?? "") as Record<string, unknown> | undefined;
+    return this.rowToSession(r);
+  }
+  /**
+   * Close out a row whose pane another row has taken over: no worker, timer or
+   * verb may act on its behalf again. Everything that could still reach the
+   * pane in its name goes with it — the open recovery (a worker dispatched for
+   * it would respawn the pane), the wake-up (a timer would dispatch one), and
+   * `desired` (a worker already inside its transaction rechecks it before
+   * every destructive step, src/recover.ts `stopRequested`). Touches no pane:
+   * the pane is not this row's to touch.
+   */
+  retireFromPane(id: string): void {
+    const rec = this.pendingRecovery(id);
+    if (rec) this.finishRecovery(rec.id, "obsolete");
+    this.db.prepare("UPDATE sessions SET state='stopped', desired='stopped', wakeupAt=NULL, updatedAt=? WHERE id=?").run(now(), id);
+  }
   updateSession(id: string, patch: Partial<SessionRow>): void {
     const cols = Object.keys(patch).filter((k) => SESSION_COLUMNS.has(k));
     if (!cols.length) return;

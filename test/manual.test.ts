@@ -761,6 +761,75 @@ test("stop on a pane that is already gone touches nothing and still marks the se
   assert.match(say(), /already gone/);
 });
 
+/** A second row on the world's own pane, written AFTER s1 — the later launch
+ * that reused the pane (#22). Same second as s1, so the tie on `createdAt`
+ * (unix seconds) is part of what the tests exercise. */
+function successor(w: World, patch: Partial<SessionRow> = {}): void {
+  const st = openState();
+  try {
+    st.createSession({
+      id: "s2", provider: "claude", cliSessionId: "c-2", cwd: w.cwd, socket: SOCKET, pane: PANE, serverStart: IDENTITY,
+      need: "any", account: "gmail", generation: 1, state: "running", desired: "running", flags: [],
+      ...patch,
+    });
+  } finally {
+    st.close();
+  }
+}
+
+test("stop on a parked row never touches a pane a later session has taken over (#22)", async (t) => {
+  // A: an adopt whose launch failed, left `parked` on %7. B: the second adopt
+  // into the same pane, running there now, mid-turn.
+  const w = await world(t, { screen: BUSY_SCREEN, session: { state: "parked" } });
+  successor(w);
+  const say = stderr(t);
+
+  assert.equal(await stopVerb(["s1"]), 0, "stopping a row that no longer owns its pane is not a failure");
+
+  assert.equal(row("s1").state, "stopped", "the parked row is closed out");
+  assert.equal(row("s1").desired, "stopped");
+  assert.equal(row("s2").state, "running", "the session that owns the pane now is untouched");
+  assert.equal(row("s2").desired, "running");
+  const lines = logLines(w);
+  assert.ok(!lines.some((l) => /send-keys|respawn-pane|kill-pane|remain-on-exit/.test(l)), `the pane was touched:\n${lines.join("\n")}`);
+  assert.doesNotThrow(() => process.kill(w.pid, 0), "the live CLI in the pane was signalled");
+  assert.match(say(), /^ms: s1 stopped \(pane %7 now belongs to s2; left alone\)$/m);
+  assert.match(recoverLog(w), /pane %7 now belongs to s2; left alone/);
+});
+
+test("an OLDER row on the same pane does not stop the newer one from ending its own CLI", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN });
+  successor(w);
+  // s2 is the one that owns %7 now; stopping it is an ordinary stop even though
+  // s1 (older, not stopped) still names the same pane.
+  assert.equal(await stopVerb(["s2"]), 0);
+  assert.ok(logLines(w).some((l) => l.includes("send-keys -t %7 /exit Enter")), "the owner's CLI was never asked to leave");
+  assert.equal(row("s2").state, "stopped");
+});
+
+test("a row on the same pane id of a DIFFERENT tmux server is not a successor", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN, session: { state: "parked" } });
+  successor(w, { serverStart: "9:9" });
+  assert.equal(await stopVerb(["s1"]), 0);
+  assert.ok(logLines(w).some((l) => l.includes("send-keys -t %7 /exit Enter")), "s1 still owns %7 on its own server");
+});
+
+test("rotate on a row whose pane was taken over refuses, and respawns nothing (#22)", async (t) => {
+  // The worker's own guard (src/recover.ts step 1b), which `ms switch` and a
+  // timer-dispatched `_recover` reach through the same transaction.
+  const w = await world(t, { wall: true, session: { state: "parked" } });
+  successor(w);
+  const say = stderr(t);
+
+  assert.equal(await rotateVerb(["s1"]), 1);
+  const lines = logLines(w);
+  assert.ok(!lines.some((l) => /send-keys|respawn-pane|kill-pane/.test(l)), `the pane was touched:\n${lines.join("\n")}`);
+  assert.doesNotThrow(() => process.kill(w.pid, 0), "the live CLI in the pane was signalled");
+  assert.match(say(), /pane %7 now belongs to s2/);
+  assert.equal(row("s1").state, "stopped", "a row with nothing left to manage is closed out");
+  assert.equal(row("s2").state, "running");
+});
+
 test("a stopped session refuses a later rotation", async (t) => {
   const w = await world(t, { screen: IDLE_SCREEN, wall: true, recovery: true });
   assert.equal(await stopVerb(["s1"]), 0);

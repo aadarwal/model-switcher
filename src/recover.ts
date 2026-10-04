@@ -182,8 +182,9 @@ export type RecoverCode = 0 | 1 | 2;
 
 /** One line per step, with the generation it belongs to (`?` when we failed
  * before reading one). The log is evidence, never a dependency: a line we
- * cannot write must not cost the rotation. */
-function logLine(id: string, generation: number, msg: string): void {
+ * cannot write must not cost the rotation. Exported for the other writers of
+ * this same log (src/launch.ts, src/manual.ts), so a reader finds one format. */
+export function logLine(id: string, generation: number, msg: string): void {
   try {
     ensureSessionDir(id);
     const f = p.recoverLog(id);
@@ -984,6 +985,22 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
       const open = st.pendingRecovery(id);
       if (open) st.finishRecovery(open.id, "obsolete");
       return fail(id, g, `${id} is stopping; the recovery is obsolete`);
+    }
+
+    // 1b. The pane is no longer this session's (#22). A later launch into the
+    //     same pane — the second `ms adopt` after the first failed and was
+    //     parked — owns what is running there now, and every step below acts
+    //     on the pane: a handoff types into it, kills its CLI and respawns it.
+    //     For this row that is somebody else's turn destroyed. Nothing here
+    //     can ever act on this row again, so it is closed out (with its
+    //     recovery and wake-up) and the refusal says whose pane it is.
+    //     This is where `ms rotate`/`ms switch` and every dispatched worker
+    //     (a wake-up's timer, reconciliation's re-dispatch) meet, so it is the
+    //     one guard all of them need.
+    const successor = st.paneSuccessor(session);
+    if (successor) {
+      st.retireFromPane(id);
+      return fail(id, g, `pane ${session.pane} now belongs to ${successor.id}; ${id} is closed out and the pane left alone`);
     }
 
     // A Codex session that asks for fable is not a session waiting for room.

@@ -36,12 +36,12 @@ import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import { parseNeed, pickAccounts, type Need, type PickInput } from "./pick.ts";
 import { syncCodexAutorotate, syncRebalance } from "./autorotate.ts";
-import { openState } from "./state.ts";
+import { openState, type SessionRow, type State } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
 import { codexLaunchCommand } from "./providers/codex-cli.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
-import { CONTINUATION } from "./recover.ts";
+import { CONTINUATION, logLine } from "./recover.ts";
 import { currentPane, outsideServer, shellWord, tmuxCommandFor, tmuxFor, tmuxFromEnv } from "./tmux.ts";
 
 /** Exit codes, fixed by spec §7 so a caller can branch on them. */
@@ -580,6 +580,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
         flags: parsed.args,
       });
       st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
+      retireSuperseded(st, { id: sessionId, socket, pane, serverStart });
 
       tmux.remainOnExit(pane, true);
       tmux.setPaneOption(pane, "@ms_session", sessionId);
@@ -612,6 +613,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
       need, account, generation: 1, state: "launching", desired: "running", flags: parsed.args,
     });
     st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
+    retireSuperseded(st, { id: sessionId, socket, pane, serverStart });
 
     tmux.remainOnExit(pane, true);
     tmux.setPaneOption(pane, "@ms_session", sessionId);
@@ -630,6 +632,43 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     return EXIT_OK;
   } finally {
     st.close(); // idempotent
+  }
+}
+
+/**
+ * Close out every older row that still names the pane this launch is taking
+ * (#22).
+ *
+ * The respawn that follows replaces whatever is in the pane, so from here on
+ * no other row can own it. Left open, such a row is a ghost holding the NEW
+ * session's pane id: the reported case was an `ms adopt` whose launch failed
+ * and was parked, then a second `ms adopt` into the same pane — and `ms stop`
+ * on the parked row typed `/exit` into the live replacement and SIGKILLed it.
+ * A recovery, a wake-up or a rotation in the ghost's name does the same thing
+ * by respawning the pane. Retiring the ghost the moment its pane is taken
+ * means there is never more than one live row per pane to choose between;
+ * `State.paneSuccessor` is the guard for stores written before this.
+ *
+ * Inside tmux this is the human's own pane, which outlives every CLI launched
+ * into it. Outside, the pane was just made and tmux never reuses a pane id on
+ * a running server, so this finds nothing — asked anyway, so the two launch
+ * paths cannot drift.
+ *
+ * Best effort: the new row and its launch are already written, and a launch
+ * that threw now would leave exactly the half-made row this function exists to
+ * prevent. A ghost it could not retire still cannot act on the pane — `ms
+ * stop`, the recovery worker (and so `ms rotate`/`switch`) and reconciliation's
+ * shell hand-back all stand down for a row with a successor on its pane.
+ */
+function retireSuperseded(st: State, launched: Pick<SessionRow, "id" | "socket" | "pane" | "serverStart">): void {
+  try {
+    for (const old of st.othersOnPane(launched)) {
+      st.retireFromPane(old.id);
+      logLine(old.id, old.generation, `pane ${old.pane} taken over by a new launch (${launched.id}); marked stopped`);
+      process.stderr.write(`ms: ${old.id} no longer owns pane ${old.pane} (a new launch is taking it); marked stopped\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`ms: could not retire older sessions on pane ${launched.pane}: ${(e as Error).message}\n`);
   }
 }
 

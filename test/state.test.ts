@@ -250,3 +250,26 @@ test("clearWakeupIf clears only the deadline it is consuming", async () => {
   assert.equal(st.clearWakeupIf("s1", 500), false, "there is nothing left to clear");
   st.close();
 });
+
+test("pane ownership: the newest live row on a socket+server+pane owns it, ties broken by insertion (#22)", async () => {
+  const { st } = await fresh();
+  // All in the same second: createdAt is whole seconds, so insertion order decides.
+  st.createSession({ id: "a", ...base, state: "parked" });
+  st.createSession({ id: "b", ...base, state: "running" });
+  st.createSession({ id: "done", ...base, state: "stopped" });
+  st.createSession({ id: "other-pane", ...base, pane: "%6" });
+  st.createSession({ id: "other-server", ...base, serverStart: "999" });
+  st.createSession({ id: "other-socket", ...base, socket: "/tmp/elsewhere" });
+
+  assert.equal(st.paneSuccessor(st.getSession("a")!)?.id, "b", "b launched into a's pane after it");
+  assert.equal(st.paneSuccessor(st.getSession("b")!), null, "an older row and a stopped one never outrank the owner");
+  assert.deepEqual(st.othersOnPane(st.getSession("b")!).map((s) => s.id), ["a"]);
+  assert.deepEqual(st.othersOnPane({ id: "new", socket: base.socket, pane: "%5", serverStart: "" }).map((s) => s.id),
+    ["a", "b", "other-server"], "a row with no server identity cannot rule any server out");
+  assert.equal(st.paneSuccessor({ id: "x", socket: base.socket, pane: "", serverStart: base.serverStart }), null, "no pane, no owner");
+
+  st.retireFromPane("a");
+  const a = st.getSession("a")!;
+  assert.equal(a.state, "stopped"); assert.equal(a.desired, "stopped"); assert.equal(a.wakeupAt, null);
+  st.close();
+});

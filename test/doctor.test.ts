@@ -1333,6 +1333,12 @@ async function makeSession(msHome: string, patch: Record<string, unknown> = {}) 
   st.close();
 }
 
+/** The stubs' answer to the identity query (`#{pid}:#{start_time}`), matching
+ *  makeSession's `serverStart`: the orphan check reads a server the way
+ *  reconciliation does, and a server that will not name itself is one it
+ *  cannot judge. */
+const NAMES_SERVER = `*"#{pid}:#{start_time}"*) echo "1" ;;`;
+
 test("checkOrphaned: no sessions is one ✓ line", async () => {
   base();
   const { checkOrphaned } = await import("../src/doctor.ts");
@@ -1344,7 +1350,7 @@ test("checkOrphaned: no sessions is one ✓ line", async () => {
 test("checkOrphaned: a session whose pane is gone on its socket is ✗", async () => {
   const { msHome } = base();
   const { dir, stub } = stubDir();
-  stub("tmux", 'case "$*" in *"list-panes -a"*) echo "%9" ;; esac\nexit 0');
+  stub("tmux", `case "$*" in *"list-panes -a"*) echo "%9" ;; ${NAMES_SERVER} esac\nexit 0`);
   process.env.PATH = `${dir}:${process.env.PATH}`;
   await makeSession(msHome, { pane: "%5" }); // %5 is not in the stub's pane list
   const { checkOrphaned } = await import("../src/doctor.ts");
@@ -1357,7 +1363,7 @@ test("checkOrphaned: a session whose pane is gone on its socket is ✗", async (
 test("checkOrphaned: a session whose pane exists is not flagged", async () => {
   const { msHome } = base();
   const { dir, stub } = stubDir();
-  stub("tmux", 'case "$*" in *"list-panes -a"*) echo "%5" ;; esac\nexit 0');
+  stub("tmux", `case "$*" in *"list-panes -a"*) echo "%5" ;; ${NAMES_SERVER} esac\nexit 0`);
   process.env.PATH = `${dir}:${process.env.PATH}`;
   await makeSession(msHome, { pane: "%5" });
   const { checkOrphaned } = await import("../src/doctor.ts");
@@ -1378,7 +1384,7 @@ test("checkOrphaned: a session already 'stopped' is not flagged even with no pan
   assert.equal(rs[0]!.ok, true);
 });
 
-test("checkOrphaned: --fix without reconcile.ts available still reports ✗ (graceful degrade)", async () => {
+test("checkOrphaned: --fix on a server it cannot read still reports ✗ (graceful degrade)", async () => {
   const { msHome } = base();
   const { dir, stub } = stubDir();
   stub("tmux", 'case "$*" in *"list-panes -a"*) echo "%9" ;; esac\nexit 0');
@@ -1394,7 +1400,7 @@ test("checkOrphaned: list-panes is memoized per socket — one tmux call for two
   const { msHome } = base();
   const { dir, stub } = stubDir();
   const log = path.join(dir, "calls.log");
-  stub("tmux", `case "$*" in *"list-panes -a"*) printf 'call\\n' >> "${log}"; echo "%5" ;; esac\nexit 0`);
+  stub("tmux", `case "$*" in *"list-panes -a"*) printf 'call\\n' >> "${log}"; echo "%5" ;; ${NAMES_SERVER} esac\nexit 0`);
   process.env.PATH = `${dir}:${process.env.PATH}`;
   process.env.MS_HOME = msHome;
   const { openState } = await import("../src/state.ts");
@@ -1412,6 +1418,62 @@ test("checkOrphaned: list-panes is memoized per socket — one tmux call for two
   const { readFileSync } = await import("node:fs");
   const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
   assert.equal(calls.length, 1, "two sessions on the same socket must share one list-panes call");
+});
+
+// Issue #21: rows left on the pre-0.3.8 private server (MS_HOME/tmux.sock).
+// That server has exited and left its socket file behind, so tmux answers
+// "no server running on <path>". The check called those rows orphaned and the
+// repair called the same server unreadable — so `--fix` repaired nothing,
+// forever, and said nothing about why.
+const OLD_SOCKET = "/tmp/ms-doctor-old-home/tmux.sock";
+const SERVER_GONE = `if [ "$1" = "-S" ] && [ "$2" = "${OLD_SOCKET}" ]; then echo "no server running on $2" >&2; exit 1; fi
+exit 0`;
+
+test("checkOrphaned --fix repairs rows on a socket with no server running", async () => {
+  const { msHome } = base();
+  const { dir, stub } = stubDir();
+  stub("tmux", SERVER_GONE);
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  await makeSession(msHome, { id: "s1", socket: OLD_SOCKET, pane: "%5" });
+  await makeSession(msHome, { id: "s2", socket: OLD_SOCKET, pane: "%6", state: "parked" });
+  const { checkOrphaned } = await import("../src/doctor.ts");
+
+  const before = await checkOrphaned(false);
+  assert.equal(before.length, 2, JSON.stringify(before));
+  for (const r of before) {
+    assert.equal(r.ok, false);
+    assert.match(r.why ?? "", /no tmux server is running on \/tmp\/ms-doctor-old-home\/tmux\.sock/);
+  }
+
+  const after = await checkOrphaned(true);
+  assert.deepEqual(after, [{ ok: true, what: "orphaned session state", fixed: true }]);
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    for (const id of ["s1", "s2"]) assert.equal(st.getSession(id)!.state, "stopped", id);
+  } finally {
+    st.close();
+  }
+  assert.deepEqual(await checkOrphaned(false), [{ ok: true, what: "orphaned session state" }], "and a later doctor is clean");
+});
+
+test("checkOrphaned --fix surfaces a reconcile() error instead of swallowing it", async () => {
+  const { msHome } = base();
+  const { dir, stub } = stubDir();
+  stub("tmux", SERVER_GONE);
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  await makeSession(msHome, { id: "s1", socket: OLD_SOCKET, pane: "%5" });
+  const { checkOrphaned } = await import("../src/doctor.ts");
+
+  const threw = await checkOrphaned(true, () => { throw new Error("state.sqlite is locked"); });
+  assert.ok(threw.some((r) => !r.ok && /state\.sqlite is locked/.test(r.why ?? "")), JSON.stringify(threw));
+  assert.ok(threw.some((r) => !r.ok && /s1/.test(r.what)), "the row it could not repair is still reported");
+
+  // A repair that ran but declined says why, on the row it declined.
+  const declined = await checkOrphaned(true, () => ["session s1: a worker holds it, left alone"]);
+  const row = declined.find((r) => /s1/.test(r.what));
+  assert.ok(row && !row.ok, JSON.stringify(declined));
+  assert.match(row!.why ?? "", /a worker holds it, left alone/);
 });
 
 // --- ms on PATH ----------------------------------------------------------

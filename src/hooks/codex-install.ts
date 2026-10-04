@@ -46,7 +46,7 @@
 // `codexHooksInstalled` reads false and the wizard re-installs. Nothing here
 // touches a credential; `config.toml` holds none.
 
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { backupThroughLink, resolveTarget, writeAtomicThroughLink } from "../fsx.ts";
@@ -57,8 +57,9 @@ import { ensureCodexTrust, stripComment } from "../providers/codex-cli.ts";
 // The user's own `~/.codex/config.toml` — the base every home is rendered
 // from. Named in src/paths.ts beside every other path this tool resolves.
 import { codexBaseConfigPath, codexBaseDir } from "../paths.ts";
-// Everything else in a home is the base's own, linked (0.3.6).
-import { codexSessionsShared, shareCodexState } from "../codex-share.ts";
+// Everything else in a home is the base's own, linked (0.3.6) — which is also
+// what decides whose hook trust a home can inherit (see `carriedTrustKey`).
+import { codexSessionsShared, isHomeOwn, isPreLinkBackup, shareCodexState } from "../codex-share.ts";
 
 /** The four lifecycle events the Codex hook subscribes to, with the snake_case
  * spelling Codex uses in a trust key and the timeout it applies by default.
@@ -218,21 +219,22 @@ function unquoteTomlKey(quoted: string): string {
 }
 
 /** Lines of the file that are not ours: everything before the begin marker and
- * everything after the end marker. A file with no markers is all prefix, so a
- * first install appends.
+ * everything after the end marker — and, as `block`, what sits between them,
+ * because Codex's own writer puts tables there (see `rescueFromBlock`). A file
+ * with no markers is all prefix, so a first install appends.
  *
  * A begin marker with no end is NOT ours to the end of the file: a half-written
  * file or a hand edit would then have everything below it swallowed into our
  * block and replaced. `end < 0` is returned as a refusal instead, because the
  * one thing an installer must never do is delete configuration it did not
  * write. */
-function split(text: string): { prefix: string[]; suffix: string[] } | null {
+function split(text: string): { prefix: string[]; block: string[]; suffix: string[] } | null {
   const lines = text.split("\n");
   const begin = lines.findIndex((l) => BEGIN_RE.test(l));
-  if (begin < 0) return { prefix: lines, suffix: [] };
+  if (begin < 0) return { prefix: lines, block: [], suffix: [] };
   const end = lines.findIndex((l, i) => i > begin && END_RE.test(l));
   if (end < 0) return null;
-  return { prefix: lines.slice(0, begin), suffix: lines.slice(end + 1) };
+  return { prefix: lines.slice(0, begin), block: lines.slice(begin + 1, end), suffix: lines.slice(end + 1) };
 }
 
 // --- The base config a home is rendered from ----------------------------
@@ -251,14 +253,20 @@ function split(text: string): { prefix: string[]; suffix: string[] } | null {
 // file is RENDERED instead, on every launch, from three parts:
 //
 //   (a) the human's own `~/.codex/config.toml` (`codexBaseConfigPath`), with
-//       every `hooks` table stripped — their hook trust is keyed on THEIR
-//       config path and means nothing here, and a bare `[hooks.state]` (the
-//       real file has one) would otherwise be a header this tool refuses on;
+//       every `hooks` table stripped — its `[[hooks.<Event>]]` tables are
+//       hooks of THAT file, not of this one, and a bare `[hooks.state]` (the
+//       real file has one) would otherwise be a header this tool refuses on —
+//       except the hook TRUST the human already granted, which is carried
+//       across re-keyed for this home where it applies here at all (see
+//       "Hook trust the base already granted" below);
 //   (b) our block: the four hook tables and their pre-computed trust, the
 //       same recipe and the same hashes as before;
 //   (c) everything Codex itself wrote into the home — `[projects."…"]`
-//       trust, `[tui]`, `[tui.*]`, anything else — that (a) does not already
-//       define. Base wins a collision; Codex-written state is never dropped.
+//       trust, `[tui]`, `[tui.*]`, its own `[hooks.state."…"]`, anything
+//       else — that (a) does not already define, WHEREVER in the file Codex
+//       put it, our block included (`rescueFromBlock`). Base wins a
+//       collision, except for hook trust, where the home's own answer does;
+//       Codex-written state is never dropped.
 //
 // Rendering, not merging: the parts are whole top-level sections, copied
 // byte for byte, never re-serialised (a zero-dependency tool has no TOML
@@ -421,12 +429,14 @@ function textOf(lines: string[]): string {
   return out.join("\n");
 }
 
-/** The human's own config, as the parts a home inherits. Missing, or
+/** The human's own config, as the parts a home inherits: its root keys, its
+ *  tables, and — apart from those, because they are re-keyed rather than
+ *  copied — its `[hooks.state."<key>"]` trust entries. Missing, or
  *  unreadable, is an empty base — a home renders to exactly what it rendered
  *  to before this existed. */
-function baseDoc(): { entries: Entry[]; sections: Section[] } {
+function baseDoc(): { entries: Entry[]; sections: Section[]; trust: Section[] } {
   let text: string;
-  try { text = readFileSync(codexBaseConfigPath(), "utf8"); } catch { return { entries: [], sections: [] }; }
+  try { text = readFileSync(codexBaseConfigPath(), "utf8"); } catch { return { entries: [], sections: [], trust: [] }; }
   // A base that carries an ms block of its own (somebody pointed this tool at
   // their own `~/.codex` once) contributes neither its tables nor its markers.
   const parts = split(text);
@@ -437,7 +447,115 @@ function baseDoc(): { entries: Entry[]; sections: Section[] } {
   return {
     entries: splitEntries(doc.preamble).filter((e) => e.key !== "hooks" && !e.key.startsWith("hooks\u0000")),
     sections: doc.sections.filter((s) => !isHooksHeader(s.header)),
+    trust: doc.sections.filter((s) => classify(s.header)?.kind === "state"),
   };
+}
+
+// --- Hook trust the base already granted (#24) ----------------------------
+//
+// Codex 0.157 keys hook trust by WHERE the hook was loaded from:
+// `[hooks.state."<file>:<event_snake>:<matcher idx>:<hook idx>"]`. Through
+// 0.3.9 the render dropped every `hooks` table of the base, trust included,
+// so a home inherited none of it — and every launch and every rotation of an
+// unattended pane stopped at "Hooks need review — N hooks are new or changed"
+// for hooks the human had long since trusted in their own `~/.codex`. A pane
+// waiting on that prompt is a pane nobody is answering.
+//
+// The hash is over the hook's own content, never its path (`codexTrustedHash`
+// above is the recipe), so a trust entry carries across unchanged as long as
+// the KEY is right for this home. Three shapes, decided per key by
+// `carriedTrustKey`:
+//
+//   * a plugin's key, `<plugin>@<marketplace>:hooks/hooks.json:…` — not a
+//     path at all, the same in every home: carried verbatim;
+//   * a file the home LINKS (src/codex-share.ts: everything in `~/.codex`
+//     but `CODEX_HOME_OWN`), `~/.codex/hooks.json:…` — Codex loads it here
+//     through the link, as `<home>/hooks.json`, so it is carried under that
+//     key with the same hash;
+//   * a file the home does NOT link — the base's own `config.toml`, whose
+//     `[[hooks.<Event>]]` tables are stripped above and never reach a home —
+//     or any other path: nothing here for it to apply to, so not carried.
+//
+// The decision is by NAME, the same rule the link pass uses, not by looking
+// at the home: a launch renders before it links (`ensureCodexReady`), so a
+// new home has no links yet on its first render.
+//
+// The carried entries sit just ahead of our block, outside the markers, and
+// the HOME'S OWN entry for a key wins over a carried one: after the first
+// render a carried entry IS the home's (which is what keeps a second render
+// byte-identical), and a hash the human re-trusted in the account must not be
+// put back to the base's older one on the next launch — that would bring the
+// review back every time, the bug this exists to end. A key into this home's
+// own `config.toml` is never carried: those are our block's keys, and a copy
+// would be a duplicate TOML key Codex rejects the whole file for.
+
+/** The base directory as every spelling a trust key may use for it: as
+ *  configured, and resolved (a dotfiles-managed `~/.codex` is a link). */
+function baseDirSpellings(): string[] {
+  const dir = codexBaseDir();
+  let real = dir;
+  try { real = realpathSync(dir); } catch { /* no base yet: one spelling */ }
+  return real === dir ? [dir] : [dir, real];
+}
+
+/** A base trust key as this home would spell it, or null when it applies to
+ *  nothing here (see the three shapes above). */
+function carriedTrustKey(key: string, homeDir: string): string | null {
+  const m = /^(.+)(:[a-z0-9_]+:\d+:\d+)$/.exec(key);
+  if (!m) return null; // not a shape Codex writes: never guessed at
+  const file = m[1]!;
+  const position = m[2]!;
+  if (!path.isAbsolute(file)) return key;
+  for (const base of baseDirSpellings()) {
+    if (!file.startsWith(`${base}/`)) continue;
+    const rest = file.slice(base.length + 1);
+    const first = rest.split("/")[0]!;
+    if (first === "" || isHomeOwn(first) || isPreLinkBackup(first)) return null;
+    return `${path.join(homeDir, rest)}${position}`;
+  }
+  return null;
+}
+
+/** `[hooks.state]` on its own — no quoted key after it. */
+const BARE_STATE = new RegExp(String.raw`^\[\s*${HOOKS}\s*\.\s*${STATE}\s*\]$`);
+
+/** An explicit `[hooks.state]` with nothing in it but blanks and comments.
+ *  Codex writes one (the real `~/.codex/config.toml` has it) and it says
+ *  nothing its `[hooks.state."…"]` sub-tables do not already imply — so a
+ *  render drops it rather than refuse the home on a header that holds no
+ *  key. One that DOES hold keys is still refused (`unsafe`): a quoted trust
+ *  key written inside it could be one of ours. */
+function isEmptyBareState(s: Section): boolean {
+  const at = s.lines.indexOf(s.header);
+  return BARE_STATE.test(stripComment(s.header).trim()) &&
+    s.lines.slice(at + 1).every((l) => stripComment(l).trim() === "");
+}
+
+/**
+ * The tables Codex wrote INSIDE our markers, which are the home's, not ours.
+ *
+ * Codex edits `config.toml` with `toml_edit`, whose encoder places a table
+ * it adds right after the table that precedes it in key order — so a new
+ * `[hooks.state."…"]` (the human trusting a hook in the account) lands after
+ * the last trust entry in the file, which is ours, ahead of `# ms-hooks-end`.
+ * (That is a reading of the encoder, matching the 10 → 4 the issue measured;
+ * it was not driven live, because doing so needs Codex's trust dialog.)
+ * Rewriting the block used to delete it, and the review came back on the
+ * next launch. So a render keeps every table between the
+ * markers that is not one of the two shapes this block holds — a
+ * `[[hooks.<Event>]]` table, or a trust entry for a hook of THIS file
+ * (`<home>/config.toml:…`, the only file whose hooks the block defines) — and
+ * moves it out of the block, with the home's own tables, where the next
+ * render leaves it alone.
+ */
+function rescueFromBlock(configPath: string, block: string[]): Section[] {
+  return splitSections(block).sections.filter((s) => {
+    if (isEmptyBareState(s)) return false;
+    const h = classify(s.header);
+    if (h?.kind === "event") return false;
+    if (h?.kind === "state" && h.key.startsWith(`${configPath}:`)) return false;
+    return true;
+  });
 }
 
 /** How many `[[hooks.<Event>]]` tables for this event the home already has
@@ -516,8 +634,9 @@ function unsafe(configPath: string, msBin: string, prefix: string[], suffix: str
  * never do is lose configuration: a begin marker with no end is a refusal,
  * not a licence to rebuild the file from the half of it we can read.
  *
- * Then the three parts, in order — the base (hooks stripped), our block, and
- * whatever the home has that the base does not define — with our block left
+ * Then the three parts, in order — the base (hooks stripped, its hook trust
+ * carried re-keyed), our block, and whatever the home has that the base does
+ * not define, including what Codex wrote inside the markers — with our block left
  * exactly where the markers already were. That last detail is what keeps a
  * home Codex has appended to (`[projects."<cwd>"]`, `[tui]`) rendering to
  * byte-identical output rather than shuffling the block to the end on every
@@ -540,6 +659,27 @@ function compose(configPath: string, msBin: string, text: string): { next: strin
 
   const head = splitSections(parts.prefix);
   const tail = splitSections(parts.suffix);
+  const keep = (s: Section): boolean => mine(s) && !isEmptyBareState(s);
+  const headOwn = [...head.sections, ...rescueFromBlock(configPath, parts.block)].filter(keep);
+  const tailOwn = tail.sections.filter(keep);
+
+  // The base's hook trust, re-keyed for this home — minus every key the home
+  // already answers for itself (its own answer wins), and never one of this
+  // file's own keys (see "Hook trust the base already granted" above).
+  const homeDir = path.dirname(configPath);
+  const taken = new Set<string>();
+  for (const s of [...headOwn, ...tailOwn]) {
+    const h = classify(s.header);
+    if (h?.kind === "state") taken.add(h.key);
+  }
+  const carried: string[] = [];
+  for (const s of base.trust) {
+    const h = classify(s.header);
+    const key = h?.kind === "state" ? carriedTrustKey(h.key, homeDir) : null;
+    if (key === null || taken.has(key) || key.startsWith(`${configPath}:`)) continue;
+    taken.add(key);
+    carried.push(textOf(s.lines.map((l) => (l === s.header ? `[hooks.state.${tomlString(key)}]` : l))));
+  }
 
   // (a) the base's preamble, then the home's own root keys the base does not
   //     claim — both ahead of every table, where root keys must be.
@@ -547,13 +687,14 @@ function compose(configPath: string, msBin: string, text: string): { next: strin
     base.entries.map((e) => textOf(e.lines)).filter((t) => t !== "").join("\n"),
     splitEntries(head.preamble).filter((e) => !baseRoots.has(e.key)).map((e) => textOf(e.lines)).filter((t) => t !== "").join("\n"),
     ...base.sections.map((s) => textOf(s.lines)),
-    ...head.sections.filter(mine).map((s) => textOf(s.lines)),
+    ...headOwn.map((s) => textOf(s.lines)),
+    ...carried,
   ].filter((t) => t !== "");
   // Anything after our block: its own leading lines (in practice blank —
   // `ensureCodexTrust` appends a table) kept as they stand, then the sections.
   const suffixPieces = [
     textOf(tail.preamble),
-    ...tail.sections.filter(mine).map((s) => textOf(s.lines)),
+    ...tailOwn.map((s) => textOf(s.lines)),
   ].filter((t) => t !== "");
 
   const headText = prefixPieces.join("\n\n");

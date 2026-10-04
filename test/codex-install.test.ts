@@ -752,3 +752,128 @@ test("a render still refuses everything the installer refused, and writes nothin
     }
   });
 });
+
+// --- Hook trust the base already granted (#24) ----------------------------
+//
+// Codex 0.157 keys hook trust by the path a hook was LOADED from. A home
+// loads `hooks.json` through its own link (`<home>/hooks.json`), so the
+// human's `[hooks.state."~/.codex/hooks.json:…"]` never matched there, and
+// every launch and rotation stopped at "Hooks need review". A plugin's key
+// names no path at all, and still never arrived: the render dropped every
+// `hooks` table of the base.
+
+/** A base config carrying trust entries, keyed as Codex keys them. */
+const trustEntry = (key: string, hash: string): string => `[hooks.state."${key}"]\ntrusted_hash = "${hash}"`;
+const PLUGIN_KEY = "vercel-plugin@plugins-cli:hooks/hooks.json:session_start:0:0";
+
+test("a base trust for a linked hooks.json is carried into the home under the home's path, with the same hash", () => {
+  const d = home();
+  const baseDir = process.env.MS_CODEX_BASE_DIR!;
+  const base = [
+    'model = "gpt-6-astra"',
+    "",
+    "[hooks.state]",
+    "",
+    trustEntry(`${baseDir}/hooks.json:post_tool_use:0:0`, "sha256:linked"),
+    "",
+    trustEntry(`${baseDir}/hooks/hooks.json:stop:1:0`, "sha256:nested"),
+    "",
+    // The base's own config.toml tables are not in the home (it gets its
+    // own), so their trust has nothing to apply to.
+    trustEntry(`${baseDir}/config.toml:session_start:0:0`, "sha256:baseconfig"),
+    "",
+  ].join("\n");
+  withBase(base, () => {
+    assert.equal(installCodexHooks(d, MS).changed, true);
+    const text = read(d);
+    assert.ok(text.includes(trustEntry(`${d}/hooks.json:post_tool_use:0:0`, "sha256:linked")), "re-keyed at the home's own link");
+    assert.ok(text.includes(trustEntry(`${d}/hooks/hooks.json:stop:1:0`, "sha256:nested")), "a nested path too");
+    assert.ok(!text.includes(`${baseDir}/hooks.json:`), "never under the base's own path");
+    assert.ok(!text.includes("sha256:baseconfig"), "a trust for the base's config.toml tables is not carried");
+    assert.ok(text.indexOf("sha256:linked") < text.indexOf("# ms-hooks-begin"), "ahead of the ms block, outside it");
+    assert.equal(codexHooksInstalled(d, MS), true);
+    assert.equal(codexHomeConfigCurrent(d, MS), true);
+    assert.equal(installCodexHooks(d, MS).changed, false, "a second render is a no-op");
+  });
+});
+
+test("a plugin-keyed base trust is carried verbatim", () => {
+  const d = home();
+  withBase(`[hooks.state]\n\n${trustEntry(PLUGIN_KEY, "sha256:plugin")}\n`, () => {
+    installCodexHooks(d, MS);
+    const text = read(d);
+    assert.ok(text.includes(trustEntry(PLUGIN_KEY, "sha256:plugin")), "the same key: it names no path");
+    assert.equal(text.split(PLUGIN_KEY).length, 2, "exactly once");
+    assert.equal(installCodexHooks(d, MS).changed, false, "and a second render keeps it, once");
+    assert.equal(read(d).split(PLUGIN_KEY).length, 2);
+  });
+});
+
+test("the bare [hooks.state] header is not emitted, and a second render is unchanged", () => {
+  // From the base (the real `~/.codex/config.toml` has one) or written into
+  // the home by Codex: an empty explicit `[hooks.state]` says nothing its
+  // sub-tables do not, and left in place it is a header the installer refuses.
+  const d = home();
+  withBase(`[hooks.state]\n\n${trustEntry(PLUGIN_KEY, "sha256:plugin")}\n`, () => {
+    writeFileSync(config(d), "[hooks.state]\n\n[tui]\nscreen_reader_detection_done = true\n", { mode: 0o600 });
+    const r = installCodexHooks(d, MS);
+    assert.equal(r.problem, undefined);
+    assert.equal(r.changed, true);
+    const text = read(d);
+    assert.equal(text.match(/^\[hooks\.state\]/gm), null, "no bare [hooks.state] anywhere");
+    assert.ok(text.includes("screen_reader_detection_done = true"), "what followed it is kept");
+    assert.equal(installCodexHooks(d, MS).changed, false);
+    assert.equal(read(d), text, "byte for byte");
+    assert.equal(codexHomeConfigCurrent(d, MS), true);
+  });
+});
+
+test("an account-written [hooks.state] for a non-ms hook survives a re-render, wherever Codex put it", () => {
+  // Codex's TOML writer places a NEW `hooks.state` sub-table right after the
+  // last existing one — and the last existing one is ours, inside the
+  // markers. So the trust the human granted in the account lands in our
+  // block, and the next render used to throw it away (10 entries → 4).
+  const own = (d: string) => trustEntry(`${d}/hooks.json:post_tool_use:0:0`, "sha256:account");
+  const shapes: Record<string, (d: string, rendered: string) => string> = {
+    "appended after the block": (d, t) => `${t}\n${own(d)}\n`,
+    "inside the block, before the end marker": (d, t) =>
+      t.replace("# ms-hooks-end", `\n${own(d)}\n\n[projects."/Users/a/src/new"]\ntrust_level = "trusted"\n# ms-hooks-end`),
+    "under an explicit [hooks.state] table": (d, t) => `${t}\n[hooks.state]\n\n${own(d)}\n`,
+  };
+  for (const [shape, write] of Object.entries(shapes)) {
+    const d = home();
+    withBase(`${trustEntry(PLUGIN_KEY, "sha256:plugin")}\n`, () => {
+      installCodexHooks(d, MS);
+      writeFileSync(config(d), write(d, read(d)), { mode: 0o600 });
+      const r = installCodexHooks(d, MS);
+      assert.equal(r.problem, undefined, shape);
+      const text = read(d);
+      assert.ok(text.includes(own(d)), `${shape}: the account's own trust survives`);
+      assert.equal(text.split(`${d}/hooks.json:post_tool_use:0:0`).length, 2, `${shape}: exactly once`);
+      const block = text.slice(text.indexOf("# ms-hooks-begin"), text.indexOf("# ms-hooks-end"));
+      assert.ok(!block.includes("sha256:account"), `${shape}: and it is outside our block now, where the next render keeps it`);
+      if (shape.startsWith("inside")) assert.ok(text.includes('[projects."/Users/a/src/new"]'), "so is any other table Codex put there");
+      assert.ok(text.includes(trustEntry(PLUGIN_KEY, "sha256:plugin")), `${shape}: the carried trust stays`);
+      assert.equal(codexHooksInstalled(d, MS), true, shape);
+      assert.equal(installCodexHooks(d, MS).changed, false, `${shape}: a second render is a no-op`);
+      assert.equal(codexHomeConfigCurrent(d, MS), true, shape);
+    });
+  }
+});
+
+test("the home's own answer for a carried key wins: one entry, the account's hash, and no refusal", () => {
+  // The human re-trusted a changed hooks.json in the account; the base still
+  // holds the old hash. Carrying the base's over it would bring the review
+  // back on every launch, and carrying both is a duplicate key Codex rejects.
+  const d = home();
+  const baseDir = process.env.MS_CODEX_BASE_DIR!;
+  withBase(`${trustEntry(`${baseDir}/hooks.json:stop:0:0`, "sha256:old")}\n\n${trustEntry(PLUGIN_KEY, "sha256:plugin-old")}\n`, () => {
+    writeFileSync(config(d), `${trustEntry(`${d}/hooks.json:stop:0:0`, "sha256:new")}\n\n${trustEntry(PLUGIN_KEY, "sha256:plugin-new")}\n`, { mode: 0o600 });
+    const r = installCodexHooks(d, MS);
+    assert.equal(r.problem, undefined);
+    const text = read(d);
+    assert.ok(text.includes("sha256:new") && !text.includes("sha256:old"), "the account's hash, not the base's");
+    assert.ok(text.includes("sha256:plugin-new") && !text.includes("sha256:plugin-old"), "for a plugin key too");
+    assert.equal(installCodexHooks(d, MS).changed, false);
+  });
+});

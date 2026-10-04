@@ -1091,6 +1091,45 @@ test("checkCodexAccount: a home that no longer matches the human's ~/.codex is S
   }
 });
 
+test("checkCodexAccount: a home missing hook trust the base already granted is STALE → ✗; --fix carries it in (#24)", async () => {
+  // The human trusts `~/.codex/hooks.json` in a plain `codex`. Codex keys that
+  // trust by the path it loaded the file from, and a home loads it through its
+  // own link — so until the home carries it under `<home>/hooks.json`, every
+  // pane in it stops at "Hooks need review". Its own four hooks are fine
+  // throughout, which is exactly why `codexHooksInstalled` cannot see this.
+  const { msHome } = base();
+  const savedBase = process.env.MS_CODEX_BASE_CONFIG;
+  const savedFetch = globalThis.fetch;
+  const baseFile = path.join(mkdtempSync(path.join(tmpdir(), "ms-doctor-base-")), "config.toml");
+  writeFileSync(baseFile, 'model = "gpt-6-astra"\n', { mode: 0o600 });
+  process.env.MS_CODEX_BASE_CONFIG = baseFile;
+  stubCodexUsageOk();
+  try {
+    const dir = await writeHealthyCodexAccountFiles(msHome, "codexacct");
+    const { checkCodexAccount } = await import("../src/doctor.ts");
+    const { codexBaseDir } = await import("../src/paths.ts");
+    assert.equal((await checkCodexAccount(codexAccount(), false)).find((r) => /hooks installed/.test(r.what))!.ok, true);
+
+    const hash = "sha256:" + "a".repeat(64);
+    writeFileSync(baseFile, `model = "gpt-6-astra"\n\n[hooks.state]\n\n[hooks.state."${codexBaseDir()}/hooks.json:post_tool_use:0:0"]\ntrusted_hash = "${hash}"\n`, { mode: 0o600 });
+    const stale = (await checkCodexAccount(codexAccount(), false)).find((r) => /hooks installed/.test(r.what))!;
+    assert.equal(stale.ok, false, "a home without the base's trust is behind its base");
+    assert.match(stale.why ?? "", /is stale/);
+    assert.match(stale.why ?? "", /hook trust/, "and the line says hook trust is part of what it compares");
+
+    const fixed = (await checkCodexAccount(codexAccount(), true)).find((r) => /hooks installed/.test(r.what))!;
+    assert.deepEqual([fixed.ok, fixed.fixed], [true, true]);
+    assert.ok(
+      readFileSync(path.join(dir, "config.toml"), "utf8").includes(`[hooks.state."${dir}/hooks.json:post_tool_use:0:0"]\ntrusted_hash = "${hash}"`),
+      "--fix carried the trust in, under the home's own path",
+    );
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedBase === undefined) delete process.env.MS_CODEX_BASE_CONFIG;
+    else process.env.MS_CODEX_BASE_CONFIG = savedBase;
+  }
+});
+
 test("checkCodexAccount: --fix on a config.toml it cannot safely rewrite surfaces the refusal verbatim, never 'nothing to do'", async () => {
   const { msHome } = base();
   process.env.MS_HOME = msHome;

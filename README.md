@@ -176,6 +176,12 @@ That home's `config.toml` is rendered on every launch from your own
 `~/.codex/config.toml` — model, reasoning effort, MCP servers and all — plus the `ms`
 hook block and whatever Codex itself wrote into the home; your file is only ever read
 (`MS_CODEX_BASE_CONFIG` points somewhere else), and it wins any collision.
+Hook trust you granted in `~/.codex` comes along too, so an `ms` pane does not stop at
+"Hooks need review" for hooks you already trusted: Codex keys trust by the path a hook was
+loaded from, so a trust for a file the home links (`~/.codex/hooks.json`) is carried under
+the home's own path (`<home>/hooks.json`) with the same hash, and a plugin's trust is
+carried as it stands. Trust you grant inside an account stays there and wins over the
+carried copy, wherever Codex wrote it in the file.
 
 Everything else in the home is yours, not the account's: since 0.3.6 a Codex home is a
 view of your own `~/.codex`. Every top-level entry there except `auth.json` and

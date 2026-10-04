@@ -235,7 +235,24 @@ function park(st: State, s: SessionRow, why: string): string {
  * made it dead again, `pane-died` fired, found a session already `stopped` and
  * returned, and the pane stayed a corpse.
  */
-function respawnShell(servers: Servers, s: SessionRow): void {
+function respawnShell(st: State, servers: Servers, s: SessionRow): void {
+  // A dead pane is not necessarily THIS row's corpse (#22). A pane id names a
+  // pane, not a session: the human's pane outlives every CLI launched into it,
+  // so a launch that failed and was parked followed by a second launch into
+  // the same pane leaves two rows naming one `%N`, and the newer one owns what
+  // is (or was) running there (`State.paneSuccessor`). Its death is that row's
+  // to settle — its own pane-died hook, its own recovery, the dead screen left
+  // for the human to read — and a login shell respawned in the older row's
+  // name would destroy all three. The older row is closed out by its caller
+  // either way; the pane is left alone. (Launches retire such rows themselves,
+  // src/launch.ts `retireSuperseded`; this covers a store written before they
+  // did. A `_recover` dispatched in such a row's name refuses on its own,
+  // src/recover.ts step 1b.)
+  const owner = st.paneSuccessor(s);
+  if (owner) {
+    log(s.id, s.generation, `pane ${s.pane} now belongs to ${owner.id}; not handed back to a shell`);
+    return;
+  }
   try {
     handBackShell(servers.tmux(s.socket), s.pane, s.cwd);
   } catch {
@@ -290,7 +307,7 @@ function abandonedStopping(st: State, servers: Servers, s: SessionRow, presence:
   const rec = st.pendingRecovery(s.id);
   if (handoffIsLive(s, rec)) return [];
   if (s.desired === "stopped") {
-    if (presence === "present" && paneIsDead(servers, s)) respawnShell(servers, s);
+    if (presence === "present" && paneIsDead(servers, s)) respawnShell(st, servers, s);
     closeOut(st, s);
     log(s.id, s.generation, "handoff abandoned while stopping; the stop stands");
     return [`session ${s.id}: abandoned mid-stop, marked stopped`];
@@ -335,7 +352,7 @@ function settleDeadPane(st: State, servers: Servers, s: SessionRow, presence: Pr
   // branch below never needs the second one at all.
   if (s.desired === "stopped") {
     closeOut(st, s);
-    respawnShell(servers, s);
+    respawnShell(st, servers, s);
     log(s.id, s.generation, "pane ended; the login shell is back and the session is stopped");
     return [`session ${s.id}: pane ended, login shell restored, marked stopped`];
   }
@@ -347,7 +364,7 @@ function settleDeadPane(st: State, servers: Servers, s: SessionRow, presence: Pr
     // find a live pane (the shell we are about to put there) and respawn claude
     // over the human's prompt.
     closeOut(st, s);
-    respawnShell(servers, s);
+    respawnShell(st, servers, s);
     log(s.id, s.generation, "pane ended; the login shell is back and the session is stopped");
     return [`session ${s.id}: pane ended, login shell restored, marked stopped`];
   }

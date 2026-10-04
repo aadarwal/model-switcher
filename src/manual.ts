@@ -41,7 +41,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { handBackShell, releasePane } from "./handback.ts";
 import { Locked, withLock } from "./lock.ts";
-import { HANDOFF_SLOTS, isBusy, recoverSession, safeCapture, sessionLockName, stopPane, takeFailReason } from "./recover.ts";
+import { HANDOFF_SLOTS, isBusy, logLine, recoverSession, safeCapture, sessionLockName, stopPane, takeFailReason } from "./recover.ts";
 import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
@@ -649,6 +649,23 @@ export const stopVerb: Verb = async (argv) => {
           // account may all have moved. The CLI we ask to leave is that one.
           const fresh = st.getSession(session.id) ?? session;
           obsoleteRecovery(st, fresh.id);
+          // Is the pane still this session's? (#22) A later launch into the
+          // same pane — the second `ms adopt` after a first one failed and was
+          // parked — leaves this row naming a pane whose CLI is somebody
+          // else's. `staleServer` cannot see that (same server, same `%N`), and
+          // `endPane` would type `/exit` into the live replacement and then
+          // SIGKILL it. The README's promise is the other way round: `ms stop`
+          // stops MANAGING a session. So the row is closed out and the pane,
+          // which already belongs to the newer row, is left exactly as it is.
+          // Asked under the lock and of the re-read row, like everything below.
+          const owner = st.paneSuccessor(fresh);
+          if (owner) {
+            const note = `pane ${fresh.pane} now belongs to ${owner.id}; left alone`;
+            st.retireFromPane(fresh.id);
+            logLine(fresh.id, fresh.generation, `ms stop: ${note}`);
+            process.stderr.write(`ms: ${fresh.id} stopped (${note})\n`);
+            return EXIT_OK;
+          }
           const ended = await endPane(new Tmux(fresh.socket || null), fresh);
           if (!ended.stopped) return refuse("stop", `${fresh.id}: ${ended.note}`);
           st.updateSession(fresh.id, { state: "stopped" });

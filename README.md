@@ -103,6 +103,7 @@ ms dashboard [--port N] [--no-open]
 - `ms stop` — stop managing a session. The CLI in the pane keeps running.
 - `ms dashboard` — serve the `ms status` tables on `127.0.0.1`, with rotate, switch, stop and Rebalance buttons. It prints its URL, opens it (unless `--no-open`), and exits about 90 s after the last request, so it is alive only while a tab polls it.
 - `--force` moves a session that is mid-turn; without it a busy session is refused. With no `<session|pane>`, `rotate`, `switch` and `stop` act on the current pane.
+- A pane belongs to one session at a time: the one launched into it last. A launch (or `ms adopt`) into a pane marks any older session still naming that pane `stopped` and says so. `stop`, `rotate` and `switch` aimed at an older row that still names it (left by an older `ms`, say) never touch the pane, even after the later session has itself been stopped: `stop` just marks that row stopped, and `rotate` and `switch` refuse and close it out.
 
 ### Calendar
 

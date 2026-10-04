@@ -415,6 +415,17 @@ test("a wrapped command that does not exist still exits 0 with just the badge (t
   assert.equal(r.stdout, "[gmail] ");
 });
 
+test("a wrapped command that exits without reading stdin is not an EPIPE crash: exit 0, just the badge", () => {
+  // Claude Code's statusline JSON is written to a command that may never
+  // read it. Megabytes of input make the closed pipe certain rather than a
+  // race (the case above hit it now and then on a loaded runner).
+  const env = stubDir();
+  configDirWith(env.dir, "/no/such/binary-at-all");
+  const r = run(["_statusline"], { MS_ACCOUNT: "gmail", CLAUDE_CONFIG_DIR: env.dir, ...GENEROUS_TIMEOUT_ENV }, "x".repeat(4 << 20));
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, "[gmail] ");
+});
+
 // --- installAlias / removeAlias ---------------------------------------------
 
 test("installAlias creates a missing rc file at 0644 with the alias block, no backup", () => {

@@ -325,6 +325,13 @@ function runWrapped(cmd: string[], input: string, timeoutMs: number): Promise<st
     child.on("error", () => finish(out));
     child.on("close", () => finish(out));
 
+    // A wrapped command that exits without reading its stdin (a missing
+    // binary, a `printf` that ignores the JSON) closes the pipe under us, and
+    // the write fails ASYNCHRONOUSLY with EPIPE — an 'error' on the stream,
+    // which the try/catch below never sees and which, unhandled, crashed
+    // `ms _statusline` with exit 1 and no badge. Nothing more needs doing: the
+    // close handler above finishes with whatever the command printed.
+    child.stdin?.on("error", () => {});
     try {
       child.stdin?.write(input);
       child.stdin?.end();

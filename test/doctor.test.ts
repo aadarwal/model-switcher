@@ -30,11 +30,10 @@ esac
 exit 0`;
 const HEALTHY_CLAUDE = `case "$1" in --version) echo "1.2.3 (Claude Code)" ;; esac
 exit 0`;
-// The tested range (spike record 2026-09-16): reporting a DIFFERENT minor
-// must still be a ✓ line (checkCodexBinary never fails on it), so this
-// fixture deliberately stays inside 0.153.x rather than proving that by
-// accident.
-const HEALTHY_CODEX = `case "$1" in --version) echo "codex-cli 0.153.4" ;; esac
+// At the tested version (src/compat.ts). A NEWER one must still be a ✓ line
+// (checkCodexBinary never fails on it), so this fixture deliberately stays at
+// it rather than proving that by accident.
+const HEALTHY_CODEX = `case "$1" in --version) echo "codex-cli 0.160.0" ;; esac
 exit 0`;
 
 function stubHealthyBinaries(): { dir: string } {
@@ -200,32 +199,50 @@ test("checkClaudeBinary: ok when present, fails when missing", async (t) => {
 
 // --- codex ---------------------------------------------------------------
 
-test("checkCodexBinary(true): ok, and reports the version, when in the tested 0.153.x range", async (t) => {
+test("checkCodexBinary(true): ok, and reports the version, at or below the tested version — no note", async (t) => {
   base();
   const savedPath = process.env.PATH;
   t.after(() => { process.env.PATH = savedPath; });
   const { checkCodexBinary } = await import("../src/doctor.ts");
+  const { COMPAT } = await import("../src/compat.ts");
   const { dir, stub } = stubDir();
-  stub("codex", 'case "$1" in --version) echo "codex-cli 0.153.4" ;; esac\nexit 0');
   process.env.PATH = `${dir}:${process.env.PATH}`;
-  const r = checkCodexBinary(true);
-  assert.equal(r.ok, true);
-  assert.match(r.what, /0\.153\.4/);
-  assert.doesNotMatch(r.what, /different minor/);
+  for (const v of [COMPAT.codex.testedUpTo, "0.153.4"]) {
+    stub("codex", `case "$1" in --version) echo "codex-cli ${v}" ;; esac\nexit 0`);
+    const r = checkCodexBinary(true);
+    assert.equal(r.ok, true);
+    assert.ok(r.what.includes(v), r.what);
+    assert.doesNotMatch(r.what, /newer than/);
+  }
 });
 
-test("checkCodexBinary(true): a different minor is still ok — never a failure — with a note in the line", async (t) => {
+test("checkCodexBinary(true): a version newer than tested is still ok — never a failure — with the tested version in the line", async (t) => {
   base();
   const savedPath = process.env.PATH;
   t.after(() => { process.env.PATH = savedPath; });
   const { checkCodexBinary } = await import("../src/doctor.ts");
+  const { COMPAT } = await import("../src/compat.ts");
   const { dir, stub } = stubDir();
-  stub("codex", 'case "$1" in --version) echo "codex-cli 0.160.2" ;; esac\nexit 0');
+  stub("codex", 'case "$1" in --version) echo "codex-cli 99.0.1" ;; esac\nexit 0');
   process.env.PATH = `${dir}:${process.env.PATH}`;
   const r = checkCodexBinary(true);
   assert.equal(r.ok, true);
-  assert.match(r.what, /0\.160\.2/);
-  assert.match(r.what, /different minor/);
+  assert.match(r.what, /99\.0\.1/);
+  assert.ok(r.what.includes(`newer than ${COMPAT.codex.testedUpTo}`), r.what);
+});
+
+test("checkClaudeBinary: a version newer than tested is still ok, with the tested version in the line", async (t) => {
+  base();
+  const savedPath = process.env.PATH;
+  t.after(() => { process.env.PATH = savedPath; });
+  const { checkClaudeBinary } = await import("../src/doctor.ts");
+  const { COMPAT } = await import("../src/compat.ts");
+  const { dir, stub } = stubDir();
+  stub("claude", 'echo "99.1.0 (Claude Code)"');
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  const r = checkClaudeBinary();
+  assert.equal(r.ok, true);
+  assert.ok(r.what.includes(`newer than ${COMPAT.claude.testedUpTo}, the newest Claude Code`), r.what);
 });
 
 test("checkCodexBinary(true): ✗ (bounded) when codex is missing", async (t) => {

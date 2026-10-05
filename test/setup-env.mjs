@@ -43,3 +43,11 @@ export const TEST_MS_HOME = path.join(tmpdir(), `ms-test-store-${process.pid}`, 
 process.env.MS_HOME = TEST_MS_HOME;
 export const TEST_CODEX_BASE = path.join(tmpdir(), `ms-test-codex-base-${process.pid}`, ".codex");
 process.env.MS_CODEX_BASE_DIR = TEST_CODEX_BASE;
+
+// `ms` looks for a newer release of itself at most once a day, from a
+// detached child (src/update-check.ts). A test must never reach GitHub, so
+// that is off for the whole suite — the module also turns itself off under
+// node:test's own NODE_TEST_CONTEXT, but the variable is the documented
+// switch, and children spawned through `run()` inherit it either way. A test
+// of the check itself passes an env of its own.
+process.env.MS_NO_UPDATE_CHECK = "1";

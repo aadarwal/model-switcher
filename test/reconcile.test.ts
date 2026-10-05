@@ -1060,9 +1060,10 @@ test("_pane_died: an unmanaged pane is not ours", async () => {
 test("a busy lock database skips that item and never aborts the pass", async () => {
   const w = world();
   const sync = path.join(w.home, "busy");
-  // Held long enough that every acquire in the pass below comes back Locked
-  // (the lock module's busy timeout is 250 ms), then released.
-  const holder = holdLockDb(w.msHome, sync, 2_000);
+  // Held until the pass below is over, so every acquire in it comes back
+  // Locked (the lock module's busy timeout is 250 ms), then released — a fixed
+  // 2 s hold ran out mid-pass on a hosted macOS runner.
+  const holder = holdLockDb(w.msHome, sync, 15_000);
   try {
     assert.ok(await waitForFile(path.join(sync, "holding"), 15_000), "the other process holds the write lock");
     withState((st) => {
@@ -1079,6 +1080,7 @@ test("a busy lock database skips that item and never aborts the pass", async () 
       `both sessions and the wake-up are each accounted for:\n${repaired.join("\n")}`);
     assert.equal(stateOf("s-gone"), "running", "and nothing was repaired on a lock we never took");
     assert.deepEqual(dispatches(w), []);
+    writeFileSync(path.join(sync, "release"), "");
     assert.equal(await holder.exit, 0);
   } finally {
     holder.child.kill();

@@ -405,10 +405,29 @@ backfill above — display only, and stored at rest in that same 0600 file.
 | `CLAUDE_CONFIG_DIR` | Claude Code's own override of `~/.claude`. Honoured everywhere `ms` reads or writes that settings file. |
 | `MS_TMUX_SOCKET` | An override, not a default: outside tmux, put launches, imports and `ms attach` on a private tmux server on this socket path (`tmux -S <path>`) instead of the default server. Ignored inside tmux, where the current server always wins. Before 0.3.8 this was the default, at `MS_HOME/tmux.sock`; set it to that path to reach a server started then. |
 | `MS_VERBOSE` | `1` prints what each invocation's start-of-run repair did. |
+| `MS_NO_UPDATE_CHECK` | `1` (any non-empty value but `0`) turns off the [new-release notice](#versions). Off on its own when `CI` is set and under the test suite. |
 | `MS_ENTRY` | `src` or `dist` — which entry point `bin/ms` runs. For development; the brew shim sets `dist`. |
 
 `MS_SESSION`, `MS_GENERATION`, `MS_SOCKET`, `MS_PANE` and `MS_ACCOUNT` are exported by `ms`
 into a managed pane, to identify the session to the hooks.
+
+### Versions
+
+Each release of `ms` names the newest Codex and Claude Code it has been verified against
+(`src/compat.ts`; `ms doctor` prints both CLIs against it). Both CLIs update themselves,
+so when a user-facing verb (`ms claude`, `ms codex`, `ms status`, …) finds a newer one on
+`PATH` it prints one line to stderr — a newer CLI is not an error, just a version nobody has
+checked yet, and the line says what to do if something misbehaves. The `--version` answer is
+cached per binary in `MS_HOME/cli-versions.json`, so a launch does not start the CLI twice.
+
+Once a day at most, a user-facing verb also checks for a newer `ms`: a detached background
+process makes **one unauthenticated GET** to
+`https://api.github.com/repos/aadarwal/model-switcher/releases/latest` (with a
+`User-Agent: model-switcher/<version>` header and nothing else — no account, path, token or
+usage figure) and writes the answer to `MS_HOME/update-check.json`. The verb never waits for
+it; the next one prints `ms X.Y.Z is available (you have A.B.C) — brew upgrade model-switcher`
+from that file. `MS_NO_UPDATE_CHECK=1` turns it off; so does `CI`. Neither notice is printed
+by the hooks, the statusline or any other internal verb, nor when stderr is not a terminal.
 
 ## How it works
 
@@ -472,6 +491,15 @@ npm run build     # esbuild bundle to dist/ms.js, then verify it
 npm run release -- vX.Y.Z --dry-run
 npm run release -- vX.Y.Z --publish [--tap <path>]
 ```
+
+CI (`.github/workflows/ci.yml`) runs the typecheck, the suite and the build on every pull
+request. A nightly canary (`.github/workflows/canary.yml`, `scripts/canary.mjs`) installs the
+newest Codex and Claude Code from npm and checks, without any login, that they still carry
+what `ms` keys on — hook events, rollout and hook fields, wall text, and Codex's per-home
+daemon state staying inside an `ms` account home; a failing scheduled run opens one issue per
+CLI version, from a separate job (`scripts/canary-issues.mjs`) that alone may write issues and
+never runs the code the canary installed. When it passes against a newer version, bump
+`src/compat.ts`.
 
 The release script refuses a dirty tree, a version that does not match `package.json`, an
 existing tag, or a HEAD on no remote branch. It builds the tarball and prints its sha256;

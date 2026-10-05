@@ -56,7 +56,8 @@ ms attach [session]
 Exit codes for `ms claude` / `ms codex`: 0 launched, 1 the account (not registered, no launch
 credential on this device, an unreadable registry), 2 the command line itself (or `mesh` with no
 terminal), 3 no account has room, 4 usage unreachable and no recent pick, 130 the `mesh` picker
-was cancelled — nothing was launched or written.
+was cancelled — nothing was launched or written (128 + the signal's number when a signal ended
+it instead).
 
 ### Import
 
@@ -337,18 +338,22 @@ solo before shared. No projections, no thresholds below 100.
 
 `ms claude mesh` (or `ms codex mesh`, with the launcher's usual arguments after it) shows that
 provider's accounts in an [fzf](https://github.com/junegunn/fzf) picker and launches the one
-you choose. In a tmux pane it opens as a popup (fzf 0.53 or later); anywhere else, and in a
-pane whose session no client is attached to, fzf takes the terminal.
+you choose. In a tmux pane it opens as a popup (fzf 0.53 or later); anywhere else fzf takes
+the terminal — and so it does in a pane whose session no client is attached to, or one
+watched through a control-mode client (`tmux -C`, iTerm2's tmux integration), which cannot
+draw a popup.
 
-- **Rows.** One per account: `★` on the account a plain `ms claude` would pick right now, `✗`
-  on one it cannot use (out of the ranking for want of room or a reading, or with no
-  launch credential on this device). Then STATE, the 5h, weekly and (Claude only) Fable
-  percentages, the soonest weekly reset and the number of live panes on it. The ranked
-  accounts come first, in the chooser's order, then the rest by name.
+- **Rows.** One per account: `★` on the account a plain `ms claude` would pick right now
+  (when no usage can be read, that is the pick it remembers), `✗` on one it cannot use (out
+  of the ranking for want of room or a reading, or with no launch credential on this
+  device). Then STATE, the 5h, weekly and (Claude only) Fable percentages, the soonest
+  weekly reset and the number of live panes on it. The ranked accounts come first, in the
+  chooser's order, then the rest by name; the `★` always leads, so enter alone takes it.
 - **Preview.** The account's e-mail, its rank, a bar and a reset per window, whether this
   device can launch it, the panes running on it and how old the reading is.
 - **Keys.** enter launches the highlighted account; ctrl-r takes a fresh usage reading and
-  redraws the rows and the previews; esc cancels.
+  redraws the rows, the previews and the line saying what `★` is (with fzf 0.71 or later
+  the cursor stays on its account as the rows re-rank); esc cancels.
 - **The pin.** The session is pinned to the account you chose: rebalance never moves it,
   and `ms rebalance` and `ms status` say so. A usage wall still rotates it, so the work goes
   on, and that rotation ends the pin; so do `ms rotate`, `ms switch` and launching that pane
@@ -357,7 +362,8 @@ pane whose session no client is attached to, fzf takes the terminal.
   why, and its first wall rotates it. One with no credential on this device is refused
   exactly as `--as` would refuse it.
 - **Cancel.** esc, or enter on a query that matches nothing, exits 130 with nothing
-  launched and nothing written.
+  launched and nothing written. A signal while the picker is open (its pane or terminal
+  closing, a kill) cancels the same way, exiting 128 + the signal's number.
 - **Without fzf.** The same rows, numbered, and `pick 1-N [1], q to cancel:` on the
   terminal. enter alone takes row 1 (the `★` one); `q` or ctrl-d cancels; a bad answer is
   asked again three times, then taken as a cancel.

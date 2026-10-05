@@ -62,7 +62,8 @@ globalThis.fetch = async (url, init = {}) => {
 }
 
 /** tmux, as far as a launch drives it: logs every argv line, answers the
- *  identity query and the `-P -F #{pane_id}` spawns with a pane id.
+ *  identity query and the `-P -F #{pane_id}` spawns with a pane id, and says
+ *  one terminal client is attached (the `mesh` picker's popup check).
  *
  *  `list-panes` answers `MS_TMUX_PANES` (space-separated), empty by default —
  *  every launch reconciles first, and a pane the server does not list is gone.
@@ -73,7 +74,8 @@ globalThis.fetch = async (url, init = {}) => {
 const TMUX_STUB = `printf '%s\\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
 case "$1" in
-  display-message) case "$*" in *socket_path*) echo "${DEFAULT_SOCKET}" ;; *session_attached*) echo 1 ;; *) echo "${IDENTITY}" ;; esac ;;
+  display-message) case "$*" in *socket_path*) echo "${DEFAULT_SOCKET}" ;; *) echo "${IDENTITY}" ;; esac ;;
+  list-clients) echo 0 ;;
   new-session|new-window) echo "%42" ;;
   list-panes) [ -z "\${MS_TMUX_PANES:-}" ] || printf '%s\\n' \${MS_TMUX_PANES} ;;
   has-session) exit "\${MS_TMUX_HAS_SESSION:-1}" ;;
@@ -1363,18 +1365,109 @@ test("ms claude mesh: a pick this device holds no launch token for is the launch
   assert.equal((await readState(w)).sessions.length, 0);
 });
 
-test("ms claude mesh: ctrl-r runs the real `ms _mesh_rows`, which re-reads usage and prints the rows fzf then shows", async () => {
+test("ms claude mesh: ctrl-r runs the real `ms _mesh_rows`, which re-reads usage and prints the status line and the rows fzf then shows", async () => {
   const w = await world();
   const rowsOut = path.join(path.dirname(w.log), "rows.out");
-  const r = run(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_RELOAD: "1", MS_TEST_FZF_ROWS: rowsOut }));
+  const headerOut = path.join(path.dirname(w.log), "header.out");
+  const r = run(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_RELOAD: "1", MS_TEST_FZF_ROWS: rowsOut, MS_TEST_FZF_HEADER: headerOut }));
   assert.equal(r.code, 0, r.stderr);
   const rows = readFileSync(rowsOut, "utf8").trimEnd().split("\n");
   assert.equal(rows.length, 2, rows.join("\n"));
-  for (const row of rows) assert.match(row, /^[01]\t/, "only rows: no header, no log line");
+  for (const row of rows) assert.match(row, /^[01]\t/, "then only rows: no log line");
   assert.ok(rows.some((row) => row.includes("gmail")) && rows.some((row) => row.includes("work")));
+  // The header's status line came back with them, from the reload's reading.
+  assert.match(stripAnsi(readFileSync(headerOut, "utf8")), /^-\t★ what plain `ms claude` would pick · usage \d+s old\n$/);
   const s = (await readState(w)).sessions[0]!;
   assert.equal(s.account, "work", "the pick came from the reloaded rows");
   assert.equal(s.pinnedAccount, "work");
+});
+
+const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+async function until(what: string, ok: () => boolean, ms = 30_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/** `ms <argv>` started the way a shell starts a job — a process group of its
+ *  own — so a test can hang up the whole job, as a closing terminal does, or
+ *  signal `ms` alone. */
+function startJob(argv: string[], env: Record<string, string>) {
+  const child = spawn(process.execPath, ["--import", "tsx", MS_BIN, ...argv], {
+    detached: true,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { NODE_OPTIONS: "--disable-warning=ExperimentalWarning", ...process.env, ...env },
+  });
+  let stderr = "";
+  child.stderr!.on("data", (d: Buffer) => { stderr += d.toString(); });
+  const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null; stderr: string }>((resolve) =>
+    child.on("close", (code, signal) => resolve({ code, signal, stderr })));
+  return { child, done };
+}
+
+/** The picker's directory, once the stub fzf is up and holding it. */
+async function pickerUp(w: World): Promise<string> {
+  let dir = "";
+  await until("the picker to open", () => {
+    const args = fzfArgsOf(w);
+    const m = args && args.includes("--preview") ? /^cat '(.*)'\/\{1\}$/.exec(args[args.indexOf("--preview") + 1] ?? "") : null;
+    dir = m?.[1] ?? "";
+    return !!dir && existsSync(dir);
+  });
+  return dir;
+}
+
+test("ms claude mesh: the terminal closing under the picker leaves nothing behind — no launch, no row, no directory", async () => {
+  // Measured before: a SIGHUP (the pane killed, the window closed) killed
+  // node inside spawnSync, before the `finally` that removes the directory,
+  // and every account's name, e-mail and usage stayed in $TMPDIR.
+  const w = await world();
+  const { child, done } = startJob(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_WAIT: "30" }));
+  const dir = await pickerUp(w);
+  process.kill(-child.pid!, "SIGHUP"); // the whole foreground job hangs up, fzf with it
+  const r = await done;
+  assert.equal(r.code, 129, `${r.signal ?? ""} ${r.stderr}`);
+  assert.match(r.stderr, /^ms claude: cancelled — nothing launched$/m);
+  assert.equal(existsSync(dir), false, "the picker's directory went with it");
+  assert.equal((await readState(w)).sessions.length, 0);
+  assert.deepEqual(tmuxActed(w), []);
+});
+
+test("ms claude mesh: a kill while the picker is open is a cancel, even when fzf then hands back a pick", async () => {
+  const w = await world();
+  const { child, done } = startJob(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_WAIT: "2" }));
+  const dir = await pickerUp(w);
+  process.kill(child.pid!, "SIGTERM"); // ms alone: fzf goes on, and picks work
+  const r = await done;
+  assert.equal(r.code, 143, `${r.signal ?? ""} ${r.stderr}`);
+  assert.match(r.stderr, /^ms claude: cancelled — nothing launched$/m);
+  assert.doesNotMatch(r.stderr, /^ms: work/m, "nothing launched on the far side of a kill");
+  assert.equal(existsSync(dir), false);
+  assert.equal((await readState(w)).sessions.length, 0);
+  assert.deepEqual(tmuxActed(w), []);
+});
+
+test("ms claude mesh: usage unreachable, the ★ and the first row are the remembered pick — what plain `ms claude` launches", async () => {
+  // No account's usage can be read, and a pick from a minute ago is
+  // remembered: a plain launch takes it, so the picker stars it.
+  const w = await world({ gmail: { status: 503 }, work: { status: 503 } });
+  writeFileSync(path.join(w.msHome, "last-pick.json"), JSON.stringify({ any: { name: "work", at: Date.now() - 60_000 } }), { mode: 0o600 });
+  const rowsOut = path.join(path.dirname(w.log), "rows.out");
+  const headerOut = path.join(path.dirname(w.log), "header.out");
+  const r = run(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_ROWS: rowsOut, MS_TEST_FZF_HEADER: headerOut }));
+  assert.equal(r.code, 0, r.stderr);
+  const rows = readFileSync(rowsOut, "utf8").trimEnd().split("\n").map(stripAnsi);
+  assert.match(rows[0]!, /^\d\t★ work /, rows.join("\n"));
+  assert.match(rows[1]!, /^\d\t✗ gmail /);
+  assert.match(stripAnsi(readFileSync(headerOut, "utf8")), /^-\tusage unreachable — ★ the last pick, what plain `ms claude` launches now · nothing read yet\n$/);
+  assert.match(r.stderr, /^ms: work \(any, pinned\) → pane %7$/m);
+
+  const plain = run(["claude"], w.env());
+  assert.equal(plain.code, 0, plain.stderr);
+  assert.match(plain.stderr, /^ms: work \(any\) → pane %7$/m, "plain `ms claude` takes the same account");
 });
 
 test("ms claude mesh: refused before the picker for --as, for a second mesh, and for no terminal", async () => {

@@ -22,10 +22,12 @@
 // of which would otherwise leak it.
 //
 // fzf is the human's own, found on PATH and run on their terminal (it opens
-// /dev/tty itself): as a tmux popup in a real pane that someone is looking at,
-// when the fzf is new enough (0.53+), full screen otherwise — inside a
-// display-popup too, which has no pane of its own. ctrl-r runs `ms _mesh_rows`, which takes a fresh reading,
-// re-renders the previews and prints the rows again. With no fzf on PATH, a
+// /dev/tty itself): as a tmux popup in a real pane that someone is looking at
+// on a client that can draw one, when the fzf is new enough (0.53+), full
+// screen otherwise — inside a display-popup too, which has no pane of its
+// own. ctrl-r runs `ms _mesh_rows`, which has a fresh reading taken (by `ms
+// _mesh_poll`, in a process fzf cannot kill), re-renders the previews and
+// prints the header's status line and the rows again. With no fzf on PATH, a
 // numbered menu on the terminal does the same job.
 //
 // Everything a provider or the registry says is display text here and never
@@ -35,7 +37,7 @@
 // quoted), and control characters are stripped before any of it reaches the
 // terminal.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, closeSync, lstatSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -44,7 +46,7 @@ import { resolveOnPath } from "./exec.ts";
 import { msBinary } from "./paths.ts";
 import { pickAccounts, type Need, type Window } from "./pick.ts";
 import { NAME_PATTERN, findAccount, loadRegistry, type Provider, type Registry } from "./registry.ts";
-import { DEFAULT_MAX_AGE_MS, ageLabel, cachedAccounts, getSnapshot, toPickInputs, type AccountUsage, type Snapshot } from "./snapshot.ts";
+import { DEFAULT_MAX_AGE_MS, ageLabel, getSnapshot, lastSnapshot, toPickInputs, type AccountUsage, type Snapshot } from "./snapshot.ts";
 import { openState, type SessionRow } from "./state.ts";
 import { computeAccount, sessionsByAccount, type AccountState } from "./status.ts";
 import { Tmux, shellQuote } from "./tmux.ts";
@@ -95,7 +97,14 @@ export type MeshView = {
   rows: MeshRow[];
   /** How many accounts have room — the "of N" in a preview's Rank line. */
   ranked: number;
-  takenAt: number | null;
+  /** Why a row carries ★: the chooser ranked it first, or — nothing ranked,
+   *  because no reading could be taken — it is the launch's remembered pick,
+   *  which is what a plain launch takes then. Null when there is no ★. */
+  starredBy: "ranking" | "last pick" | null;
+  /** When the newest of these accounts' readings was taken, or null when none
+   *  has ever been read. Not the snapshot's `takenAt`: that moves on every
+   *  poll, the ones that read nothing included. */
+  readAt: number | null;
   /** Every account's reading failed for a transient reason: the launch's own
    *  "usage unreachable" (`usageUnreachable`, src/launch.ts). */
   unreachable: boolean;
@@ -111,8 +120,11 @@ const DASH = "—";
 /** How long `fzf --version` gets. It answers at once; this only stops a
  *  wedged binary from hanging a launch. */
 const VERSION_TIMEOUT_MS = 3_000;
-/** fzf learned `--tmux` in 0.53.0. */
+/** fzf learned `--tmux` (and `--no-tmux`) in 0.53.0. */
 const POPUP_SINCE: FzfVersion = [0, 53, 0];
+/** fzf learned `--id-nth` — finding the item it tracks again after a
+ *  reload — in 0.71.0. */
+const TRACK_SINCE: FzfVersion = [0, 71, 0];
 /** A preview lists this many panes, then counts the rest. */
 const MAX_PANES = 6;
 /** Bad answers the menu re-asks before it gives up. */
@@ -195,6 +207,10 @@ export type MeshInput = {
   registry: Registry;
   snapshot: Snapshot;
   ready: Ready;
+  /** The launch's remembered pick for this provider and need (`readLastPick`,
+   *  src/launch.ts), or null. A plain launch takes it when usage is
+   *  unreachable, so then it is the ★. Handed in, like `ready`. */
+  lastPick?: string | null;
   /** The store's sessions, any state: the finished ones are left out here,
    *  by `ms status`'s own rule (`sessionsByAccount`). */
   sessions: { id: string; provider: string; account: string; state: string; pane: string; cwd: string }[];
@@ -212,6 +228,10 @@ export type MeshInput = {
  * would give. An account it ranks but this device holds no credential for is
  * crossed out too, while keeping its place in the ranking: it has room, and
  * cannot be launched here.
+ *
+ * With nothing ranked because no reading could be taken (usage unreachable),
+ * a plain launch takes its remembered pick, and so the ★ is that, leading the
+ * list: the default row is always what a plain launch would run.
  */
 export function meshRows(input: MeshInput): MeshView {
   const { provider, need, registry, snapshot } = input;
@@ -222,7 +242,15 @@ export function meshRows(input: MeshInput): MeshView {
   const rankOf = new Map(ranking.picks.map((p, i) => [p.name, i + 1]));
   const outOf = new Map(ranking.out.map((o) => [o.name, o.why]));
   const usageOf = new Map(rows.map((a) => [a.name, a]));
-  const star = ranking.picks[0]?.name ?? null;
+  // The launch's own test (`usageUnreachable`): every reading failed in
+  // passing, and none of them is recent enough to stand in for one.
+  const unreachable = rows.length > 0 && rows.every((a) => a.errorKind === "transient") && inputs.every((i) => i.error !== null);
+  // And the launch's own answer to it: the remembered pick, while it is still
+  // registered (`launchWith`, src/launch.ts).
+  const last = input.lastPick ?? null;
+  const remembered = !ranking.picks.length && unreachable && last !== null && wanted.has(last) && findAccount(registry, last, provider) ? last : null;
+  const star = ranking.picks[0]?.name ?? remembered;
+  const seen = rows.map((a) => a.observedAt).filter((t): t is number => t !== null);
   const live = sessionsByAccount(input.sessions);
   const cwdOf = new Map(input.sessions.map((s) => [s.id, s.cwd]));
 
@@ -257,17 +285,18 @@ export function meshRows(input: MeshInput): MeshView {
     };
   });
   const ranked = all.filter((r) => r.rank !== null).sort((x, y) => x.rank! - y.rank!);
-  const rest = all.filter((r) => r.rank === null).sort((x, y) => x.name.localeCompare(y.name));
+  // A ★ the ranking did not give (the remembered pick) heads the rest.
+  const rest = all.filter((r) => r.rank === null)
+    .sort((x, y) => Number(y.name === star) - Number(x.name === star) || x.name.localeCompare(y.name));
   return {
     provider,
     need,
     names: [...input.names],
     rows: [...ranked, ...rest],
     ranked: ranked.length,
-    takenAt: snapshot.takenAt,
-    // The launch's own test (`usageUnreachable`): every reading failed in
-    // passing, and none of them is recent enough to stand in for one.
-    unreachable: rows.length > 0 && rows.every((a) => a.errorKind === "transient") && inputs.every((i) => i.error !== null),
+    starredBy: ranking.picks.length ? "ranking" : remembered !== null ? "last pick" : null,
+    readAt: seen.length ? Math.max(...seen) : null,
+    unreachable,
     now: input.now,
   };
 }
@@ -320,10 +349,20 @@ export function renderRows(view: MeshView): string[] {
   return view.rows.map((r) => renderRow(r, view, widths));
 }
 
-/** What fzf reads on stdin: `<key>\t<row>`, one line per account. */
+/** The hidden key of the header's status line: never a row's (those are
+ *  digits), so nothing can mistake it for one. */
+const STATUS_KEY = "-";
+
+/**
+ * What fzf reads on stdin: the header's status line first (★ and the
+ * reading's age, `meshHeader`), which `--header-lines 1` keeps out of the
+ * list, then `<key>\t<row>`, one line per account. ctrl-r's reload prints the
+ * same, so the status line is redrawn with the rows it describes; a fixed
+ * `--header` would go on promising a ★ the new rows no longer have.
+ */
 export function fzfInput(view: MeshView): string {
   const lines = renderRows(view);
-  return view.rows.map((r, i) => `${r.key}\t${lines[i]}\n`).join("");
+  return `${STATUS_KEY}\t${meshHeader(view)[1]}\n` + view.rows.map((r, i) => `${r.key}\t${lines[i]}\n`).join("");
 }
 
 // --- The preview and the header ---------------------------------------------
@@ -344,8 +383,12 @@ function windowText(read: boolean, w: Window | null | undefined, now: number): s
   return `${paint(bar, severity(used))} ${" ".repeat(Math.max(0, 4 - text.length))}${paint(text, severity(used))}${reset}`;
 }
 
-function statusText(row: MeshRow, provider: Provider): string {
-  if (row.mark === "★") return `${row.state} — ${paint("★", SGR.star)} what \`ms ${provider}\` would pick now`;
+function statusText(row: MeshRow, view: MeshView): string {
+  const star = paint("★", SGR.star);
+  if (row.mark === "★" && view.starredBy === "last pick") {
+    return `${row.state} — ${star} the last pick: what \`ms ${view.provider}\` launches while usage is unreachable`;
+  }
+  if (row.mark === "★") return `${row.state} — ${star} what \`ms ${view.provider}\` would pick now`;
   if (row.rank !== null) return `${row.state} — has room`;
   const why = row.out ?? "not ranked";
   // `pickAccounts` already says "error: …" for a reading that failed.
@@ -375,7 +418,7 @@ export function renderPreview(row: MeshRow, view: MeshView): string {
   const lines = [
     ` ${who.join("  ·  ")}`,
     ` ${"─".repeat(42)}`,
-    field("Status", statusText(row, view.provider)),
+    field("Status", statusText(row, view)),
     field("Rank", row.rank !== null ? `${row.rank} of ${view.ranked} with room (need: ${view.need})` : `not ranked (need: ${view.need})`),
     field("5h", windowText(read, row.usage?.session, view.now)),
     field("Week", windowText(read, row.usage?.weeklyAll, view.now)),
@@ -406,17 +449,22 @@ export function renderPreview(row: MeshRow, view: MeshView): string {
 const HEADER_KEYS = "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel";
 
 /** fzf's two header lines: the keys, then what ★ means and how old the
- *  reading behind it is — or why there is no ★. */
+ *  newest reading behind it is — or why there is no ★. The first is fixed
+ *  (`--header`); the second travels with the rows (`fzfInput`). */
 export function meshHeader(view: MeshView): [string, string] {
   const cmd = `ms ${view.provider}`;
-  const age = view.takenAt === null ? null : ageLabel(view.now - view.takenAt);
+  const age = view.readAt === null ? null : ageLabel(view.now - view.readAt);
+  const star = paint("★", SGR.star);
+  if (view.unreachable) {
+    const newest = age === null ? "nothing read yet" : `newest reading ${age} old`;
+    return [HEADER_KEYS, view.starredBy === "last pick"
+      ? `usage unreachable — ${star} the last pick, what plain \`${cmd}\` launches now · ${newest}`
+      : `usage unreachable — no account could be read just now · ${newest}`];
+  }
   const reading = age === null ? "no usage reading yet" : `usage ${age} old`;
-  const status = view.unreachable
-    ? `usage unreachable — no account could be read just now${age === null ? "" : `; last reading ${age} old`}`
-    : view.rows.some((r) => r.mark === "★")
-      ? `${paint("★", SGR.star)} what plain \`${cmd}\` would pick · ${reading}`
-      : `no account has room — plain \`${cmd}\` would refuse · ${reading}`;
-  return [HEADER_KEYS, status];
+  return [HEADER_KEYS, view.starredBy !== null
+    ? `${star} what plain \`${cmd}\` would pick · ${reading}`
+    : `no account has room — plain \`${cmd}\` would refuse · ${reading}`];
 }
 
 // --- fzf -------------------------------------------------------------------
@@ -462,11 +510,10 @@ export type FzfArgsInput = {
   dir: string;
   /** This tool's own binary, for ctrl-r (`msBinary()`). */
   self: string;
-  /** A real tmux pane (`$TMUX` and `$TMUX_PANE` both set) whose session a
-   *  client is attached to (`paneWatched`). */
+  /** A real tmux pane (`$TMUX` and `$TMUX_PANE` both set) whose session is
+   *  watched only by clients that can draw a popup (`paneWatched`). */
   inPane: boolean;
   fzfVersion: FzfVersion | null;
-  header: [string, string];
 };
 
 /**
@@ -482,19 +529,31 @@ export type FzfArgsInput = {
 export function fzfArgs(i: FzfArgsInput): string[] {
   const reload = shellQuote([i.self, "_mesh_rows", i.provider, i.need, i.dir]);
   const pair = ACTION_DELIMITERS.find(([, close]) => !reload.includes(close));
+  // A reload re-ranks the rows, and fzf keeps the cursor's PLACE across one,
+  // not its row: enter straight after a refresh would launch, and pin,
+  // whichever account moved under it. Tracked by its hidden key (field 1)
+  // for that one reload, the cursor stays on the account. An older fzf keeps
+  // the place, and its preview shows which account that now is.
+  const track = atLeast(i.fzfVersion, TRACK_SINCE);
   const args = [
     "--layout=reverse", "--ansi", "--no-sort", "--delimiter", "\t", "--with-nth", "2..",
     "--prompt", `${i.provider} account> `,
-    "--header", i.header.join("\n"),
+    // The keys. The status line under them is the input's first line
+    // (`fzfInput`), so a reload redraws it with the rows.
+    "--header", HEADER_KEYS, "--header-lines", "1",
     "--preview", `cat ${shellQuote([i.dir])}/{1}`,
     "--preview-window", "right,50%,wrap,<80(down,50%,wrap)",
     // The `:` form needs no closing delimiter, but nothing may follow it — so
     // it is only the fallback for a path that holds every closer above.
-    "--bind", pair ? `ctrl-r:reload${pair[0]}${reload}${pair[1]}+refresh-preview` : `ctrl-r:reload:${reload}`,
+    "--bind", `ctrl-r:${track ? "track-current+" : ""}${pair ? `reload${pair[0]}${reload}${pair[1]}+refresh-preview` : `reload:${reload}`}`,
+    ...(track ? ["--id-nth", "1"] : []),
   ];
   // A popup only from a real pane. A display-popup has `$TMUX` but no pane
-  // of its own, and a popup cannot open another one.
-  if (i.inPane && atLeast(i.fzfVersion, POPUP_SINCE)) args.push("--tmux", "center,80%,60%");
+  // of its own, and a popup cannot open another one. No popup is said out
+  // loud to an fzf that knows the flag: a `--tmux` in the human's
+  // FZF_DEFAULT_OPTS would otherwise open one anyway, where nobody can see it
+  // — and fail ("no current client", which reads as a cancel) or never return.
+  if (atLeast(i.fzfVersion, POPUP_SINCE)) args.push(...(i.inPane ? ["--tmux", "center,80%,60%"] : ["--no-tmux"]));
   return args;
 }
 
@@ -582,6 +641,8 @@ type ViewOptions = {
   provider: Provider;
   need: Need;
   ready: Ready;
+  /** Read after the snapshot, so it is as current as the reading beside it. */
+  lastPick: () => string | null;
   /** The key space; the registry's accounts for this provider when absent. */
   names?: string[];
   snapshot: () => Promise<Snapshot>;
@@ -602,14 +663,16 @@ async function meshView(o: ViewOptions): Promise<MeshView | { error: string }> {
   } catch {
     /* the panes column is a courtesy; a store we cannot read costs only that */
   }
-  return meshRows({ provider: o.provider, need: o.need, names, registry, snapshot, ready: o.ready, sessions, now: o.now });
+  return meshRows({ provider: o.provider, need: o.need, names, registry, snapshot, ready: o.ready, lastPick: o.lastPick(), sessions, now: o.now });
 }
 
 // --- Choosing ------------------------------------------------------------------
 
 export type ChooseResult =
   | { name: string; out: string | null }
-  | { cancelled: true }
+  /** `signal`: what ended the picker when it was not the human's esc — the
+   *  terminal closing, a kill. Nothing is launched either way. */
+  | { cancelled: true; signal?: NodeJS.Signals }
   | { error: string; exit: number };
 
 export type FzfRun = (fzf: string, args: string[], input: string, env: NodeJS.ProcessEnv) =>
@@ -626,6 +689,10 @@ export type ChooseDeps = {
   provider: Provider;
   need: Need;
   ready: Ready;
+  /** The launch's remembered pick (`readLastPick`, src/launch.ts): the ★ when
+   *  usage is unreachable, as it is a plain launch's choice then. Default:
+   *  none. */
+  lastPick?: () => string | null;
   /** The terminal: fzf opens /dev/tty itself, and this is checked first and
    *  read by the menu. `MS_MESH_TTY` points it elsewhere (the tests). */
   tty?: string;
@@ -643,18 +710,23 @@ export type ChooseDeps = {
 };
 
 /**
- * Is a client attached to this pane's session? fzf draws its popup on a
- * client, and with none attached — a command typed into a detached session
- * by something other than a person — `fzf --tmux` simply never returns
- * (fzf 0.73.1: still running, and runnable, 20 s later), where plain fzf sits
- * on the pane for whoever attaches. One bounded tmux call; an answer that is
- * not a count of clients is not a yes.
+ * Can a popup reach whoever is looking at this pane? fzf draws its popup on
+ * the client tmux picks for the pane's session. With no client attached — a
+ * command typed into a detached session by something other than a person —
+ * `fzf --tmux` fails or never returns (fzf 0.73.1: still running 20 s later),
+ * where plain fzf sits on the pane for whoever attaches. A control-mode
+ * client (`tmux -C`: iTerm2's tmux integration, scripts) is attached but
+ * draws nothing, so a popup handed to it hangs the same way; and tmux hands
+ * the popup to the client most recently active, which with a terminal beside
+ * it can still be the control client. So: at least one client, and none in
+ * control mode. One bounded tmux call; any other answer is not a yes.
  */
 function paneWatched(env: NodeJS.ProcessEnv): boolean {
   const socket = (env.TMUX ?? "").split(",")[0];
   if (!socket || !env.TMUX_PANE) return false;
-  const r = new Tmux(socket).run(["display-message", "-p", "-t", env.TMUX_PANE, "#{session_attached}"]);
-  return r.code === 0 && /^[1-9]\d*$/.test(r.stdout.trim());
+  const r = new Tmux(socket).run(["list-clients", "-t", env.TMUX_PANE, "-F", "#{client_control_mode}"]);
+  const modes = r.stdout.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  return r.code === 0 && modes.length > 0 && modes.every((m) => m === "0");
 }
 
 function opens(file: string): boolean {
@@ -682,16 +754,51 @@ export async function chooseAccount(deps: ChooseDeps): Promise<ChooseResult> {
     provider: deps.provider,
     need: deps.need,
     ready: deps.ready,
+    lastPick: deps.lastPick ?? (() => null),
     snapshot: deps.snapshot ?? (() => getSnapshot({ maxAgeMs: DEFAULT_MAX_AGE_MS })),
     now: (deps.now ?? Date.now)(),
   });
   if ("error" in view) return { error: view.error, exit: EXIT_FAILED };
   if (!view.rows.length) return { error: `no ${deps.provider} account is registered`, exit: EXIT_FAILED };
   const fzf = deps.fzf !== undefined ? deps.fzf : resolveOnPath("fzf");
-  return fzf ? pickWithFzf(fzf, view, deps, env) : pickFromMenu(view, tty, deps.write);
+  return fzf ? await pickWithFzf(fzf, view, deps, env) : pickFromMenu(view, tty, deps.write);
 }
 
-function pickWithFzf(fzf: string, view: MeshView, deps: ChooseDeps, env: NodeJS.ProcessEnv): ChooseResult {
+/** What ends a terminal program without asking it: the terminal going away
+ *  (SIGHUP — the pane killed, the window closed), ctrl-c arriving as a
+ *  signal, and kill's default. */
+const ENDING_SIGNALS: readonly NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGTERM"];
+
+/**
+ * fzf, with the signals that would end this process held for as long as it
+ * runs.
+ *
+ * Unheld, any of them kills node inside spawnSync, before the `finally` that
+ * removes the picker's directory — which then stays in $TMPDIR with every
+ * account's name, e-mail, usage and pane directories in it. Held, node lives
+ * on: fzf dies of the same hangup (or finishes, when the signal was ours
+ * alone), spawnSync returns, the directory goes, and only then is the signal
+ * answered: as a cancel, whatever fzf printed, so nothing is ever launched on
+ * the far side of one.
+ */
+async function pickWithFzf(fzf: string, view: MeshView, deps: ChooseDeps, env: NodeJS.ProcessEnv): Promise<ChooseResult> {
+  const held: { signal: NodeJS.Signals | null } = { signal: null };
+  const hold = (signal: NodeJS.Signals) => { held.signal ??= signal; };
+  for (const s of ENDING_SIGNALS) process.on(s, hold);
+  try {
+    const result = pickInDir(fzf, view, deps, env);
+    // A signal that came while spawnSync held the thread is caught but not
+    // yet handed over: node delivers it on the event loop's next turn.
+    await new Promise((resolve) => setImmediate(resolve));
+    return held.signal ? { cancelled: true, signal: held.signal } : result;
+  } finally {
+    for (const s of ENDING_SIGNALS) process.off(s, hold);
+  }
+}
+
+/** fzf over the picker's own directory, which is gone again by the time this
+ *  returns or throws. */
+function pickInDir(fzf: string, view: MeshView, deps: ChooseDeps, env: NodeJS.ProcessEnv): ChooseResult {
   const self = deps.self ?? msBinary();
   const dir = mkdtempSync(path.join(tmpdir(), DIR_PREFIX));
   try {
@@ -708,7 +815,6 @@ function pickWithFzf(fzf: string, view: MeshView, deps: ChooseDeps, env: NodeJS.
       self,
       inPane: !!env.TMUX && !!env.TMUX_PANE && paneWatched(env),
       fzfVersion: fzfVersion(fzf),
-      header: meshHeader(view),
     });
     const r = (deps.run ?? runFzf)(fzf, args, fzfInput(view), env);
     if (r.error) return { error: `could not run ${fzf}: ${r.error.message}`, exit: EXIT_FAILED };
@@ -812,28 +918,81 @@ function pickFromMenu(view: MeshView, tty: string, write?: (s: string) => void):
 // --- ctrl-r: `ms _mesh_rows <provider> <need> <dir>` ------------------------------
 
 const ROWS_USAGE = "usage: ms _mesh_rows <claude|codex> <any|fable> <dir>";
+const POLL_USAGE = "usage: ms _mesh_poll <account>...";
+
+/** What the reload needs from the launch, handed in by src/cli.ts as the
+ *  picker gets it from the launch itself: which accounts this device can
+ *  launch (`launchCredential`), and the remembered pick (`readLastPick`). */
+export type LaunchFacts = {
+  ready: (provider: Provider, name: string) => { error: string } | null;
+  lastPick: (provider: Provider, need: Need) => string | null;
+};
 
 export type MeshRowsDeps = {
-  /** The usage reading at this freshness. Default: the coalesced snapshot. */
-  snapshot?: (maxAgeMs: number) => Promise<Snapshot>;
+  /** A fresh reading of these accounts. Default: `pollApart`. */
+  poll?: (names: string[]) => Promise<Snapshot>;
   now?: () => number;
 };
 
 /**
+ * ctrl-r's fresh reading, taken where fzf cannot reach it.
+ *
+ * fzf SIGKILLs the reload's whole process group when ctrl-r is pressed again
+ * and when the picker closes with a reload still running — and a forced poll
+ * refreshes every grant within a minute of its expiry. The token endpoint
+ * spends the old refresh token as it answers, so a poll killed between that
+ * answer and the write-back leaves the account holding a dead grant until
+ * `ms accounts login`. So the poll is `ms _mesh_poll`, detached: a process
+ * group (and session) of its own, which fzf's kill misses — killing this
+ * process now costs the rows and never a grant. Scoped to the picker's
+ * accounts: a Claude picker has no business refreshing Codex grants.
+ *
+ * Resolves to the snapshot file as that poll left it. Rejects when the poll
+ * did not run or failed; the caller then serves the last file.
+ */
+async function pollApart(names: string[]): Promise<Snapshot> {
+  const since = Date.now();
+  const code = await new Promise<number | null>((resolve) => {
+    try {
+      const child = spawn(msBinary(), ["_mesh_poll", ...names], { detached: true, stdio: "ignore" });
+      child.on("error", () => resolve(null));
+      child.on("exit", (c) => resolve(c));
+    } catch {
+      resolve(null);
+    }
+  });
+  if (code !== 0) throw new Error(code === null ? "the usage poll did not run" : `the usage poll exited ${code}`);
+  // A file that poll did not rewrite (another process held the snapshot lock
+  // throughout) is an old file, and is read as one.
+  return lastSnapshot(since);
+}
+
+/**
+ * `ms _mesh_poll <account>...`: a forced reading of these accounts, written
+ * to the snapshot file, and nothing else — `pollApart` runs it detached so
+ * that a token refresh, once begun, is always written back.
+ */
+export async function meshPollVerb(argv: string[]): Promise<number> {
+  if (!argv.length || !argv.every((n) => NAME_PATTERN.test(n))) {
+    process.stderr.write(`${POLL_USAGE}\n`);
+    return EXIT_USAGE;
+  }
+  await getSnapshot({ maxAgeMs: 0, only: argv });
+  return 0;
+}
+
+/**
  * fzf's ctrl-r: a FRESH reading of the same key space, the previews in the
- * picker's directory re-rendered from it, and the rows — only the rows — on
- * stdout for fzf to show. A reading that cannot be taken falls back on the
- * last one on disk rather than leaving the human an empty list.
+ * picker's directory re-rendered from it, and on stdout exactly what fzf
+ * reads — the header's status line and the rows (`fzfInput`), nothing else.
+ * A reading that cannot be taken falls back on the last one on disk rather
+ * than leaving the human an empty list.
  *
  * Internal (the `_` keeps reconciliation and the startup notices off it), and
  * careful with its one argument that is a path: a directory that is not
  * exactly a picker's own is refused, exit 2, before anything is written.
  */
-export async function meshRowsVerb(
-  argv: string[],
-  ready: (provider: Provider, name: string) => { error: string } | null,
-  deps: MeshRowsDeps = {},
-): Promise<number> {
+export async function meshRowsVerb(argv: string[], launch: LaunchFacts, deps: MeshRowsDeps = {}): Promise<number> {
   const [provider, need, dir, ...extra] = argv;
   if ((provider !== "claude" && provider !== "codex") || (need !== "any" && need !== "fable") || !dir || extra.length
     || (provider === "codex" && need === "fable")) {
@@ -846,17 +1005,20 @@ export async function meshRowsVerb(
     process.stderr.write(`ms _mesh_rows: ${dir}: ${problem ?? `no ${ROWS_FILE} a picker wrote`}\n`);
     return EXIT_USAGE;
   }
-  const take = deps.snapshot ?? ((maxAgeMs: number) => getSnapshot({ maxAgeMs }));
+  const poll = deps.poll ?? pollApart;
   const view = await meshView({
     provider,
     need,
     names: keys.names,
-    ready: (name) => ready(provider, name),
+    ready: (name) => launch.ready(provider, name),
+    lastPick: () => launch.lastPick(provider, need),
     snapshot: async () => {
       try {
-        return await take(0);
+        return await poll(keys.names);
       } catch {
-        return { takenAt: null, accounts: cachedAccounts(), registryError: null };
+        // Every row of it stale (`lastSnapshot`): an errorless reading from
+        // days ago says `stale: false` too, and would rank as current.
+        return lastSnapshot();
       }
     },
     now: (deps.now ?? Date.now)(),

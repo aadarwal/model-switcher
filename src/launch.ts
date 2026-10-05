@@ -28,7 +28,7 @@
 
 import { randomUUID } from "node:crypto";
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, constants as osConstants } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
 import { codexBaseDir, ensureStore, msBinary, p } from "./paths.ts";
@@ -53,6 +53,7 @@ const EXIT_USAGE_ERROR = 2; // the command line itself is wrong
 const EXIT_NO_ROOM = 3; // nothing has room
 const EXIT_UNREACHABLE = 4; // usage is down and there is no recent pick
 const EXIT_CANCELLED = 130; // the human cancelled the `mesh` picker: nothing launched, nothing written
+// (a signal that ends the picker exits 128 + its number, with nothing launched either)
 
 /** The session a launch from outside tmux lands in, on the default server (or
  *  on the `MS_TMUX_SOCKET` override). */
@@ -570,9 +571,17 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
       provider,
       need,
       ready: plan.credential,
+      // What the branch below falls back on when usage is unreachable, so
+      // the picker's ★ is this launch's own answer in that case too.
+      lastPick: () => readLastPick(provider, need)?.name ?? null,
       snapshot: () => getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS }),
     });
-    if ("cancelled" in chosen) { say("cancelled — nothing launched"); return EXIT_CANCELLED; }
+    if ("cancelled" in chosen) {
+      say("cancelled — nothing launched");
+      // A signal (the terminal closing, a kill) keeps the shell's own
+      // reading of it, 128 + its number; esc is the 130 that ctrl-c is.
+      return chosen.signal ? 128 + osConstants.signals[chosen.signal] : EXIT_CANCELLED;
+    }
     if ("error" in chosen) { say(chosen.error); return chosen.exit; }
     // Re-read, not trusted from before the picker: a human can take their
     // time, and an account can be removed meanwhile.

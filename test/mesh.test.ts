@@ -8,22 +8,25 @@
 //     fzf at all, for the numbered menu), over a throwaway MS_HOME whose
 //     snapshot file is fresh, so nothing here touches the network;
 //   * `ms _mesh_rows`, ctrl-r's reload, in-process with an injected reading,
-//     and once through the real CLI for the refusals.
+//     and through the real CLI for the refusals and for the one thing only a
+//     real process group can show: fzf killing a reload mid-refresh.
 //
 // No test opens /dev/tty: the chooser is handed a "terminal" that is a file.
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { run, stubDir, tempHome } from "./helpers.ts";
 import { FZF_STUB } from "./fixtures/fzf-stub.ts";
 import {
   chooseAccount,
   clean,
   fzfArgs,
+  fzfInput,
   meshDirProblem,
   meshHeader,
   meshRows,
@@ -291,18 +294,68 @@ test("clean: control characters from a label, an e-mail or an error never reach 
 
 // --- The header and fzf's command line ----------------------------------------
 
-test("meshHeader: the keys, then ★ and how old the reading is — or the banner when usage is unreachable", () => {
-  const [keys, status] = meshHeader(view());
-  assert.equal(keys, "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel");
-  assert.match(plain(status), /^★ what plain `ms claude` would pick · usage 1\ds old$/);
-
+test("meshHeader: the keys, then ★ and how old the newest reading is — or the banner when usage is unreachable", () => {
   const p = pool();
+  // The file was written a moment ago by a poll that read nothing new: the
+  // age is the newest READING's (14 s), not the file's.
+  const aged = { ...p.snapshot, takenAt: now(), accounts: p.snapshot.accounts.map((a) => (a.observedAt === null ? a : { ...a, observedAt: now() - (a.name === "alpha" ? 14_000 : 95_000) })) };
+  const v = meshRows({ provider: "claude", need: "any", names: p.names, registry: p.registry, snapshot: aged, ready: p.ready, sessions: [], now: now() });
+  const [keys, status] = meshHeader(v);
+  assert.equal(keys, "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel");
+  assert.match(plain(status), /^★ what plain `ms claude` would pick · usage 1[45]s old$/);
+
   const down = {
     ...p.snapshot,
     accounts: p.snapshot.accounts.map((a) => ({ ...a, usage: null, error: "fetch failed", errorKind: "transient" as const, observedAt: null, stale: true })),
   };
-  const v = meshRows({ provider: "claude", need: "any", names: p.names, registry: p.registry, snapshot: down, ready: () => null, sessions: [], now: now() });
-  assert.match(plain(meshHeader(v)[1]), /^usage unreachable — no account could be read just now/);
+  const u = meshRows({ provider: "claude", need: "any", names: p.names, registry: p.registry, snapshot: down, ready: () => null, sessions: [], now: now() });
+  assert.match(plain(meshHeader(u)[1]), /^usage unreachable — no account could be read just now · nothing read yet$/);
+});
+
+/** Every reading failed in passing, the last good ones twenty minutes ago:
+ *  usage is unreachable, and a plain launch takes its remembered pick. */
+function unreachablePool(): { registry: Registry; snapshot: Snapshot; names: string[] } {
+  const p = pool();
+  const twentyMinutesAgo = now() - 20 * 60_000;
+  return {
+    ...p,
+    snapshot: {
+      takenAt: now() - 6_000,
+      registryError: null,
+      accounts: p.snapshot.accounts.map((a) => ({ ...a, error: "the usage endpoint could not be reached", errorKind: "transient" as const, observedAt: a.usage ? twentyMinutesAgo : null, stale: true })),
+    },
+  };
+}
+
+test("meshRows: usage unreachable, the ★ is the remembered pick a plain launch takes — first, so enter takes it", () => {
+  const p = unreachablePool();
+  const v = meshRows({ provider: "claude", need: "any", names: p.names, registry: p.registry, snapshot: p.snapshot, ready: () => null, lastPick: "echo", sessions: [], now: now() });
+  assert.equal(v.unreachable, true);
+  assert.equal(v.starredBy, "last pick");
+  assert.deepEqual(v.rows.map((r) => r.name), ["echo", "alpha", "bravo", "charlie", "delta"]);
+  assert.deepEqual(v.rows.map((r) => r.mark), ["★", "✗", "✗", "✗", "✗"]);
+  // Picking it still says why it was out: the reading failed.
+  assert.equal(v.rows[0]!.out, "error: the usage endpoint could not be reached");
+  // The header names it, and the age is the newest READING's, not the 6 s
+  // old file a failed poll wrote.
+  assert.match(plain(meshHeader(v)[1]), /^usage unreachable — ★ the last pick, what plain `ms claude` launches now · newest reading 20m old$/);
+  assert.match(plain(renderPreview(v.rows[0]!, v)), /^ Status {4}transient — ★ the last pick: what `ms claude` launches while usage is unreachable$/m);
+  assert.match(plain(fzfInput(v)).split("\n")[1]!, /^\d\t★ echo /, "the first row fzf shows, the cursor's");
+
+  // No remembered pick, or one that is no longer registered: no ★, as a
+  // plain launch would refuse (exit 4).
+  for (const lastPick of [null, "zulu"]) {
+    const w = meshRows({ provider: "claude", need: "any", names: p.names, registry: p.registry, snapshot: p.snapshot, ready: () => null, lastPick, sessions: [], now: now() });
+    assert.equal(w.starredBy, null, String(lastPick));
+    assert.ok(w.rows.every((r) => r.mark === "✗"));
+    assert.match(plain(meshHeader(w)[1]), /^usage unreachable — no account could be read just now · newest reading 20m old$/);
+  }
+  // With room somewhere, the ranking's ★ stands and the remembered pick is
+  // nobody's business.
+  const q = pool();
+  const ranked = meshRows({ provider: "claude", need: "any", names: q.names, registry: q.registry, snapshot: q.snapshot, ready: q.ready, lastPick: "alpha", sessions: [], now: now() });
+  assert.equal(ranked.starredBy, "ranking");
+  assert.equal(ranked.rows[0]!.name, "bravo");
 });
 
 test("parseFzfVersion reads what fzf --version prints, and nothing else", () => {
@@ -312,21 +365,45 @@ test("parseFzfVersion reads what fzf --version prints, and nothing else", () => 
   assert.equal(parseFzfVersion("fzf: unknown option"), null);
 });
 
-const BASE = { provider: "claude" as const, need: "any" as const, self: "/opt/ms/bin/ms", header: ["keys", "status"] as [string, string] };
+const BASE = { provider: "claude" as const, need: "any" as const, self: "/opt/ms/bin/ms" };
 
-test("fzfArgs: the fixed flags, the prompt, a two-line header, the preview and ctrl-r", () => {
-  const args = fzfArgs({ ...BASE, dir: "/tmp/ms-mesh-abc123", inPane: false, fzfVersion: [0, 73, 1] });
+test("fzfArgs: the fixed flags, the prompt, the header (keys, then the input's status line), the preview and ctrl-r", () => {
+  const args = fzfArgs({ ...BASE, dir: "/tmp/ms-mesh-abc123", inPane: false, fzfVersion: [0, 53, 0] });
   const value = (flag: string) => args[args.indexOf(flag) + 1];
   for (const flag of ["--layout=reverse", "--ansi", "--no-sort"]) assert.ok(args.includes(flag), flag);
   assert.equal(value("--delimiter"), "\t");
   assert.equal(value("--with-nth"), "2..");
   assert.equal(value("--prompt"), "claude account> ");
-  assert.equal(value("--header"), "keys\nstatus");
+  assert.equal(value("--header"), "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel");
+  // Line 2 is the first line of fzf's input, so a reload rewrites it too.
+  assert.equal(value("--header-lines"), "1");
   assert.equal(value("--preview"), "cat '/tmp/ms-mesh-abc123'/{1}");
   assert.equal(value("--preview-window"), "right,50%,wrap,<80(down,50%,wrap)");
   assert.equal(value("--bind"), "ctrl-r:reload('/opt/ms/bin/ms' '_mesh_rows' 'claude' 'any' '/tmp/ms-mesh-abc123')+refresh-preview");
   assert.equal(args.includes("--tmux"), false);
   assert.equal(fzfArgs({ ...BASE, provider: "codex", dir: "/tmp/d", inPane: false, fzfVersion: null })[args.indexOf("--prompt") + 1], "codex account> ");
+});
+
+test("fzfInput: the header's status line first (a key no row has), then the rows", () => {
+  const v = view();
+  const lines = fzfInput(v).split("\n");
+  assert.equal(lines[0], `-\t${meshHeader(v)[1]}`);
+  assert.deepEqual(lines.slice(1, -1).map((l) => l.split("\t")[0]), v.rows.map((r) => r.key));
+  assert.equal(lines.at(-1), "", "newline-terminated");
+  assert.equal(selectedKey(`${lines[0]}\n`), null, "the status line can never be read as a selection");
+});
+
+test("fzfArgs: with fzf 0.71+, ctrl-r keeps the cursor on its account (tracked by the hidden key), not on its place", () => {
+  const bindOf = (v: [number, number, number] | null) => {
+    const args = fzfArgs({ ...BASE, dir: "/tmp/ms-mesh-abc123", inPane: false, fzfVersion: v });
+    return { bind: args[args.indexOf("--bind") + 1], idNth: args.includes("--id-nth") ? args[args.indexOf("--id-nth") + 1] : null };
+  };
+  const reload = "reload('/opt/ms/bin/ms' '_mesh_rows' 'claude' 'any' '/tmp/ms-mesh-abc123')+refresh-preview";
+  assert.deepEqual(bindOf([0, 71, 0]), { bind: `ctrl-r:track-current+${reload}`, idNth: "1" });
+  assert.deepEqual(bindOf([0, 73, 1]), { bind: `ctrl-r:track-current+${reload}`, idNth: "1" });
+  // Older fzf has no --id-nth, and its tracking does not survive a reload.
+  assert.deepEqual(bindOf([0, 70, 9]), { bind: `ctrl-r:${reload}`, idNth: null });
+  assert.deepEqual(bindOf(null), { bind: `ctrl-r:${reload}`, idNth: null });
 });
 
 test("fzfArgs: a tmux popup only in a real pane, and only with an fzf that has --tmux (0.53+)", () => {
@@ -341,6 +418,18 @@ test("fzfArgs: a tmux popup only in a real pane, and only with an fzf that has -
   assert.equal(popup(true, [0, 52, 9]), null, "older fzf has no --tmux");
   assert.equal(popup(true, null), null, "an fzf that would not say its version is not trusted with it");
   assert.equal(popup(false, [0, 73, 1]), null, "outside a pane — or in a display-popup — plain fzf");
+});
+
+test("fzfArgs: no popup is said out loud (--no-tmux), so a --tmux in FZF_DEFAULT_OPTS cannot open one anyway", () => {
+  // Measured with fzf 0.73.1 in a session no client is attached to:
+  // FZF_DEFAULT_OPTS=--tmux alone fails with "no current client" (exit 1,
+  // which the picker would read as a cancel); with --no-tmux, plain fzf.
+  const has = (inPane: boolean, v: [number, number, number] | null) => fzfArgs({ ...BASE, dir: "/tmp/d", inPane, fzfVersion: v }).includes("--no-tmux");
+  assert.equal(has(false, [0, 73, 1]), true);
+  assert.equal(has(false, [0, 53, 0]), true, "0.53 knows --no-tmux: its own popups run the inner fzf with it");
+  assert.equal(has(true, [0, 73, 1]), false, "a popup is asked for instead");
+  assert.equal(has(false, [0, 52, 9]), false, "an fzf from before --tmux would reject the flag");
+  assert.equal(has(false, null), false);
 });
 
 test("fzfArgs: the preview and ctrl-r commands survive a directory with spaces, quotes and shell syntax", (t) => {
@@ -362,7 +451,7 @@ test("fzfArgs: the preview and ctrl-r commands survive a directory with spaces, 
     assert.equal(shown.stdout, "PREVIEW-0", `${shell}: ${shown.stderr}`);
 
     const bind = args[args.indexOf("--bind") + 1]!;
-    const m = /^ctrl-r:reload(.)(.*)(.)\+refresh-preview$/s.exec(bind);
+    const m = /^ctrl-r:track-current\+reload(.)(.*)(.)\+refresh-preview$/s.exec(bind);
     assert.ok(m, bind);
     // The delimiter fzf would end the argument at is not in the argument.
     assert.ok(!m![2]!.includes(m![3]!), `the argument contains its own closing ${m![3]}: ${bind}`);
@@ -381,6 +470,9 @@ test("fzfArgs: a path holding every closing delimiter falls back on reload's ope
   const args = fzfArgs({ ...BASE, dir, inPane: false, fzfVersion: null });
   // The `:` form runs to the end of the binding, so nothing may follow it.
   assert.equal(args[args.indexOf("--bind") + 1], `ctrl-r:reload:'/opt/ms/bin/ms' '_mesh_rows' 'claude' 'any' '${dir}'`);
+  // Tracking goes in front of it, where it can.
+  const tracked = fzfArgs({ ...BASE, dir, inPane: false, fzfVersion: [0, 73, 1] });
+  assert.equal(tracked[tracked.indexOf("--bind") + 1], `ctrl-r:track-current+reload:'/opt/ms/bin/ms' '_mesh_rows' 'claude' 'any' '${dir}'`);
 });
 
 test("selectedKey: the selected row's key, whatever FZF_DEFAULT_OPTS adds around it", () => {
@@ -408,13 +500,15 @@ function chooserWorld(t: TestContext, o: { tokens?: string[] } = {}): ChooserWor
   process.env.MS_HOME = msHome;
   const { dir, stub } = stubDir();
   stub("fzf", FZF_STUB);
-  // tmux, as far as the picker asks it anything: whether a client is
-  // looking at the pane's session (MS_TEST_TMUX_ATTACHED, default 1).
-  stub("tmux", `case "$*" in *session_attached*) echo "\${MS_TEST_TMUX_ATTACHED:-1}" ;; esac`);
+  // tmux, as far as the picker asks it anything: the clients attached to the
+  // pane's session, one control-mode flag each (MS_TEST_TMUX_CLIENTS,
+  // space-separated; default one terminal client, "0"; empty: none).
+  stub("tmux", `[ "$1" != "-S" ] || shift 2
+case "$1" in list-clients) for m in \${MS_TEST_TMUX_CLIENTS-0}; do echo "$m"; done ;; esac`);
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
   t.after(() => {
     process.env.PATH = ORIGINAL_PATH;
-    for (const k of Object.keys(process.env)) if (k.startsWith("MS_TEST_FZF_") || k === "MS_TEST_TMUX_ATTACHED") delete process.env[k];
+    for (const k of Object.keys(process.env)) if (k.startsWith("MS_TEST_FZF_") || k === "MS_TEST_TMUX_CLIENTS") delete process.env[k];
   });
   writeFileSync(path.join(msHome, "accounts.json"), JSON.stringify({
     version: 1,
@@ -452,14 +546,18 @@ test("chooseAccount: fzf's selection is the account launched, and the picker's d
   process.env.MS_TEST_FZF_PICK = "alpha";
   process.env.MS_TEST_FZF_PREVIEW = w.previewOut;
   process.env.MS_TEST_FZF_ROWS = w.rowsOut;
+  const headerOut = `${w.rowsOut}.header`;
+  process.env.MS_TEST_FZF_HEADER = headerOut;
 
   const r = await chooseAccount({ provider: "claude", need: "any", ready: claudeReady, tty: w.tty, env: { ...process.env, TMUX: "", TMUX_PANE: "" } });
   assert.deepEqual(r, { name: "alpha", out: null });
 
-  // What fzf was shown: the claude accounts only, in the chooser's order.
+  // What fzf was shown: the claude accounts only, in the chooser's order,
+  // under the status line that says what the ★ is.
   const shown = readFileSync(w.rowsOut, "utf8").trim().split("\n").map((l) => plain(l.split("\t").slice(1).join("\t")));
   assert.deepEqual(shown.map((l) => l.slice(2).split(" ")[0]), ["bravo", "alpha", "charlie"]);
   assert.ok(shown[0]!.startsWith("★ bravo"));
+  assert.match(plain(readFileSync(headerOut, "utf8")), /^-\t★ what plain `ms claude` would pick · usage \d+s old\n$/);
   // The preview fzf ran for the row it selected was that row's.
   assert.match(plain(readFileSync(w.previewOut, "utf8")), /^ alpha {2}· {2}alpha@example\.com {2}· {2}claude$/m);
 
@@ -484,10 +582,28 @@ test("chooseAccount: a pane nobody is attached to gets plain fzf, not a popup th
   // still running after 20 s). Plain fzf sits on the pane for whoever attaches.
   const w = chooserWorld(t);
   process.env.MS_TEST_FZF_PICK = "bravo";
-  process.env.MS_TEST_TMUX_ATTACHED = "0";
+  process.env.MS_TEST_TMUX_CLIENTS = "";
   const r = await chooseAccount({ provider: "claude", need: "any", ready: claudeReady, tty: w.tty, env: { ...process.env, TMUX: "/tmp/sock,1,0", TMUX_PANE: "%3" } });
   assert.deepEqual(r, { name: "bravo", out: null });
   assert.equal(fzfArgv(w).includes("--tmux"), false);
+  assert.equal(fzfArgv(w).includes("--no-tmux"), true);
+});
+
+test("chooseAccount: a control-mode client (tmux -C, iTerm2's integration) draws no popup, so it gets plain fzf", async (t) => {
+  // Measured on a private server with only `tmux -C attach` on the session:
+  // #{session_attached} is 1, and `fzf --tmux` in the pane never returned.
+  // Beside a terminal client it may still be the one tmux hands the popup.
+  const w = chooserWorld(t);
+  process.env.MS_TEST_FZF_PICK = "bravo";
+  for (const clients of ["1", "0 1", "1 0"]) {
+    process.env.MS_TEST_TMUX_CLIENTS = clients;
+    const r = await chooseAccount({ provider: "claude", need: "any", ready: claudeReady, tty: w.tty, env: { ...process.env, TMUX: "/tmp/sock,1,0", TMUX_PANE: "%3" } });
+    assert.deepEqual(r, { name: "bravo", out: null });
+    assert.equal(fzfArgv(w).includes("--tmux"), false, `clients ${clients}`);
+  }
+  process.env.MS_TEST_TMUX_CLIENTS = "0 0";
+  await chooseAccount({ provider: "claude", need: "any", ready: claudeReady, tty: w.tty, env: { ...process.env, TMUX: "/tmp/sock,1,0", TMUX_PANE: "%3" } });
+  assert.equal(fzfArgv(w).includes("--tmux"), true, "two terminals: the popup");
 });
 
 test("chooseAccount: esc (130) and nothing-matched (1) both cancel; any other exit is an error", async (t) => {
@@ -597,27 +713,34 @@ async function captured(fn: () => Promise<number>): Promise<{ code: number; stdo
   }
 }
 
-test("_mesh_rows: a fresh reading, the previews re-rendered, and only the rows on stdout", async (t) => {
+/** What `_mesh_rows` is handed by src/cli.ts, for these tests. */
+const LAUNCH = { ready: (_p: Provider, n: string) => claudeReady(n), lastPick: () => null };
+
+test("_mesh_rows: a fresh reading of the picker's accounts, the previews re-rendered, and on stdout the status line and the rows", async (t) => {
   chooserWorld(t);
   const p = pool();
-  const before = meshRows({ provider: "claude", need: "any", names: ["alpha", "bravo", "charlie"], registry: p.registry, snapshot: p.snapshot, ready: claudeReady, sessions: [], now: now() });
+  // Opened while every week was full: no ★, and the status line said so.
+  const full = { ...p.snapshot, accounts: p.snapshot.accounts.map((a) => (a.usage ? { ...a, usage: { ...a.usage, weeklyAll: { usedPercent: 100, resetsAt: inHours(5) } } } : a)) };
+  const before = meshRows({ provider: "claude", need: "any", names: ["alpha", "bravo", "charlie"], registry: p.registry, snapshot: full, ready: claudeReady, sessions: [], now: now() });
+  assert.match(plain(meshHeader(before)[1]), /^no account has room/);
   const dir = pickerDir(t, before);
-  const asked: number[] = [];
-  // charlie's week has reset since the picker opened.
+  const asked: string[][] = [];
+  // Since then the weeks have reset, charlie's soonest.
   const fresh: Snapshot = {
     takenAt: now(), registryError: null,
-    accounts: [reading("alpha", { weekly: { used: 20, resetIn: 72 } }), reading("bravo", { weekly: { used: 30, resetIn: 24 } }), reading("charlie", { weekly: { used: 1, resetIn: 160 } }), reading("alpha", { provider: "codex" })],
+    accounts: [reading("alpha", { weekly: { used: 20, resetIn: 72 } }), reading("bravo", { weekly: { used: 30, resetIn: 24 } }), reading("charlie", { weekly: { used: 1, resetIn: 12 } }), reading("alpha", { provider: "codex" })],
   };
-  const r = await captured(() => meshRowsVerb(["claude", "any", dir], (_p, n) => claudeReady(n), { snapshot: async (maxAgeMs) => { asked.push(maxAgeMs); return fresh; } }));
+  const r = await captured(() => meshRowsVerb(["claude", "any", dir], LAUNCH, { poll: async (names) => { asked.push(names); return fresh; } }));
   assert.equal(r.code, 0, r.stderr);
-  assert.deepEqual(asked, [0], "ctrl-r forces a new reading");
+  assert.deepEqual(asked, [["alpha", "bravo", "charlie"]], "one fresh reading, of the picker's own accounts and no others");
   const lines = r.stdout.trimEnd().split("\n");
-  assert.equal(lines.length, 3);
-  for (const l of lines) assert.match(l, /^[0-2]\t/, `only rows: ${JSON.stringify(l)}`);
-  const charlie = lines.find((l) => plain(l).includes("charlie"))!;
-  assert.doesNotMatch(plain(charlie), /✗/, "charlie has room again, and the row says so");
-  // The key space is the one the chooser wrote: charlie is still key 2.
-  assert.ok(charlie.startsWith("2\t"));
+  assert.equal(lines.length, 4);
+  // The status line comes first and is the NEW one: fzf's header changes with
+  // the rows it describes.
+  assert.match(plain(lines[0]!), /^-\t★ what plain `ms claude` would pick · usage \ds old$/);
+  for (const l of lines.slice(1)) assert.match(l, /^[0-2]\t/, `then only rows: ${JSON.stringify(l)}`);
+  const charlie = lines[1]!;
+  assert.match(plain(charlie), /^2\t★ charlie /, "charlie has room again, the soonest reset, and the ★");
   assert.match(plain(readFileSync(path.join(dir, "2"), "utf8")), /^ Week {6}\[░{12}\] {3}1%/m, "its preview was re-rendered from the new reading");
   assert.deepEqual(JSON.parse(readFileSync(path.join(dir, "rows.json"), "utf8")).out, [null, null, null]);
 });
@@ -626,11 +749,125 @@ test("_mesh_rows: a reading that throws falls back on the cached snapshot", asyn
   chooserWorld(t);
   const p = pool();
   const dir = pickerDir(t, meshRows({ provider: "claude", need: "any", names: ["alpha", "bravo", "charlie"], registry: p.registry, snapshot: p.snapshot, ready: claudeReady, sessions: [], now: now() }));
-  const r = await captured(() => meshRowsVerb(["claude", "any", dir], (_p, n) => claudeReady(n), { snapshot: async () => { throw new Error("locks.sqlite is busy"); } }));
+  const r = await captured(() => meshRowsVerb(["claude", "any", dir], LAUNCH, { poll: async () => { throw new Error("locks.sqlite is busy"); } }));
   assert.equal(r.code, 0, r.stderr);
   const lines = r.stdout.trimEnd().split("\n").map(plain);
-  assert.equal(lines.length, 3);
+  assert.equal(lines.length, 4);
   assert.match(lines.find((l) => l.includes("charlie"))!, /✗ charlie .*wk 100%/, "the cached file's numbers");
+  assert.match(lines.find((l) => l.includes("bravo"))!, /^\d\t★ bravo /, "a cached reading this young still ranks");
+});
+
+test("_mesh_rows: the cached fallback is read as old — a reading from days ago never ranks as if it were current", async (t) => {
+  // Every successful poll writes its rows `stale: false`, and the file keeps
+  // saying so however long nobody polls again.
+  const w = chooserWorld(t);
+  const threeDaysAgo = now() - 3 * 24 * HOUR;
+  writeFileSync(path.join(w.msHome, "snapshot.json"), JSON.stringify({
+    takenAt: threeDaysAgo,
+    accounts: [
+      reading("alpha", { weekly: { used: 30, resetIn: 72 }, observedAt: threeDaysAgo }),
+      reading("bravo", { weekly: { used: 100, resetIn: 24 }, observedAt: threeDaysAgo }),
+    ],
+    backoff: {},
+  }), { mode: 0o600 });
+  const p = pool();
+  const dir = pickerDir(t, meshRows({ provider: "claude", need: "any", names: ["alpha", "bravo"], registry: p.registry, snapshot: p.snapshot, ready: claudeReady, sessions: [], now: now() }));
+  const r = await captured(() => meshRowsVerb(["claude", "any", dir], LAUNCH, { poll: async () => { throw new Error("disk I/O error"); } }));
+  assert.equal(r.code, 0, r.stderr);
+  const lines = r.stdout.trimEnd().split("\n").map(plain);
+  assert.equal(lines.some((l) => l.includes("★")), false, `no ★ on a three-day-old reading:\n${lines.join("\n")}`);
+  assert.match(lines.find((l) => l.includes("alpha"))!, /✗ alpha /);
+  // bravo's week has long since reset: what it is out for is the age of the
+  // reading, so picking it never warns "weekly window at 100".
+  assert.deepEqual(JSON.parse(readFileSync(path.join(dir, "rows.json"), "utf8")).out, ["error: usage stale (3d)", "error: usage stale (3d)"]);
+});
+
+test("_mesh_rows: the remembered pick is the ★ when the reload finds usage unreachable, as the launch's own would be", async (t) => {
+  chooserWorld(t);
+  const p = pool();
+  const dir = pickerDir(t, meshRows({ provider: "claude", need: "any", names: ["alpha", "bravo", "charlie"], registry: p.registry, snapshot: p.snapshot, ready: claudeReady, sessions: [], now: now() }));
+  const down: Snapshot = {
+    takenAt: now(), registryError: null,
+    accounts: ["alpha", "bravo", "charlie"].map((n) => reading(n, { noUsage: true, error: "fetch failed", errorKind: "transient", observedAt: null, stale: true })),
+  };
+  const asked: [Provider, string][] = [];
+  const r = await captured(() => meshRowsVerb(["claude", "any", dir], { ...LAUNCH, lastPick: (provider, need) => { asked.push([provider, need]); return "charlie"; } }, { poll: async () => down }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(asked, [["claude", "any"]]);
+  const lines = r.stdout.trimEnd().split("\n").map(plain);
+  assert.match(lines[0]!, /^-\tusage unreachable — ★ the last pick/);
+  assert.match(lines[1]!, /^2\t★ charlie /);
+});
+
+async function until(what: string, ok: () => boolean, ms = 30_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+test("_mesh_rows: fzf killing the reload mid-refresh cannot cost the account its grant — the poll runs apart from it", async (t) => {
+  // fzf SIGKILLs a reload's whole process group when ctrl-r is pressed again
+  // and when the picker closes mid-reload. A forced poll refreshes a grant
+  // that is due, and the token endpoint spends the old refresh token as it
+  // answers: killed before the write-back, the account was left holding a
+  // spent one (`invalid_grant`) until a fresh login.
+  const { home, msHome } = tempHome();
+  writeFileSync(path.join(msHome, "accounts.json"), JSON.stringify({
+    version: 1,
+    accounts: [{ name: "alpha", provider: "claude", label: "Alpha", shared: false, email: "alpha@example.com" }],
+  }), { mode: 0o600 });
+  const grantDir = path.join(msHome, "claude", "alpha");
+  mkdirSync(grantDir, { recursive: true, mode: 0o700 });
+  const grant = path.join(grantDir, ".credentials.json");
+  writeFileSync(grant, JSON.stringify({ claudeAiOauth: { accessToken: "at-spent", refreshToken: "rt-old", expiresAt: Date.now() - 1_000 } }), { mode: 0o600 });
+  // The token endpoint, rotating: it notes the refresh token it was handed
+  // the moment the request lands, and answers 1.5 s later.
+  const endpointLog = path.join(home, "endpoint.log");
+  const stub = path.join(home, "endpoint-stub.mjs");
+  writeFileSync(stub, `import { appendFileSync } from "node:fs";
+const log = ${JSON.stringify(endpointLog)};
+globalThis.fetch = async (url, init = {}) => {
+  const u = String(url);
+  if (u.includes("/oauth/token")) {
+    appendFileSync(log, "token " + JSON.parse(init.body).refresh_token + "\\n");
+    await new Promise((r) => setTimeout(r, 1500));
+    return new Response(JSON.stringify({ access_token: "at-new", refresh_token: "rt-new", expires_in: 3600 }), { status: 200 });
+  }
+  if (u.includes("/api/oauth/usage")) {
+    return new Response(JSON.stringify({ limits: [{ kind: "session", percent: 10, resets_at: "2026-09-16T00:00:00Z" }, { kind: "weekly_all", percent: 20, resets_at: "2026-09-18T00:00:00Z" }] }), { status: 200 });
+  }
+  return new Response("unexpected " + u, { status: 500 });
+};
+`);
+  process.env.HOME = home;
+  process.env.MS_HOME = msHome;
+  const p = pool();
+  const dir = pickerDir(t, meshRows({ provider: "claude", need: "any", names: ["alpha"], registry: p.registry, snapshot: p.snapshot, ready: () => null, sessions: [], now: now() }));
+
+  // The reload exactly as fzf starts it: a process group of its own.
+  const reload = spawn(process.execPath, ["--import", "tsx", path.resolve("bin/ms"), "_mesh_rows", "claude", "any", dir], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, HOME: home, MS_HOME: msHome, NODE_OPTIONS: `--disable-warning=ExperimentalWarning --import ${pathToFileURL(stub).href}` },
+  });
+  const gone = new Promise((resolve) => reload.on("exit", resolve));
+  t.after(() => { try { process.kill(-reload.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  await until("the refresh to reach the token endpoint", () => existsSync(endpointLog) && readFileSync(endpointLog, "utf8").includes("token rt-old"));
+  process.kill(-reload.pid!, "SIGKILL"); // ctrl-r again, or enter, mid-reload
+  await gone;
+
+  // The rotated grant still lands on disk, and the reading with it.
+  await until("the refreshed grant to be written back", () => JSON.parse(readFileSync(grant, "utf8")).claudeAiOauth.refreshToken === "rt-new");
+  assert.equal(readFileSync(endpointLog, "utf8"), "token rt-old\n", "the grant was spent exactly once");
+  await until("the poll to write its reading", () => {
+    try {
+      return (JSON.parse(readFileSync(path.join(msHome, "snapshot.json"), "utf8")) as { accounts: AccountUsage[] }).accounts.some((a) => a.name === "alpha" && a.usage !== null);
+    } catch {
+      return false;
+    }
+  });
 });
 
 test("_mesh_rows refuses any directory that is not a picker's own, and writes nothing", async (t) => {
@@ -654,24 +891,31 @@ test("_mesh_rows refuses any directory that is not a picker's own, and writes no
   chmodSync(empty, 0o700);
   t.after(() => { for (const d of [open, other, link, empty]) rmSync(d, { recursive: true, force: true }); });
 
+  const nothing = { ready: () => null, lastPick: () => null };
   for (const dir of [nested, open, other, link, path.join(tmpdir(), "ms-mesh-nope"), "relative/ms-mesh-x", empty]) {
     const before = existsSync(dir) && !dir.endsWith("link" + process.pid) ? readdirSync(dir) : [];
-    const r = await captured(() => meshRowsVerb(["claude", "any", dir], () => null, { snapshot: async () => { throw new Error("must not be read"); } }));
+    const r = await captured(() => meshRowsVerb(["claude", "any", dir], nothing, { poll: async () => { throw new Error("must not be read"); } }));
     assert.equal(r.code, 2, `${dir}: ${r.stderr}`);
     assert.equal(r.stdout, "", "nothing on stdout for fzf to show");
     if (existsSync(dir) && !dir.endsWith("link" + process.pid)) assert.deepEqual(readdirSync(dir), before, `${dir} was written to`);
   }
   for (const argv of [[], ["claude"], ["claude", "any"], ["gemini", "any", good], ["claude", "most", good], ["codex", "fable", good], ["claude", "any", good, "extra"]]) {
-    const r = await captured(() => meshRowsVerb(argv, () => null));
+    const r = await captured(() => meshRowsVerb(argv, nothing));
     assert.equal(r.code, 2, JSON.stringify(argv));
     assert.match(r.stderr, /usage: ms _mesh_rows/);
   }
 });
 
-test("ms _mesh_rows is a registered verb, and through the real CLI a bad directory is exit 2 with nothing on stdout", () => {
+test("ms _mesh_rows and ms _mesh_poll are registered verbs, and through the real CLI bad arguments are exit 2 with nothing on stdout", () => {
   const { home, msHome } = tempHome();
   const r = run(["_mesh_rows", "claude", "any", path.join(tmpdir(), "ms-mesh-missing")], { HOME: home, MS_HOME: msHome });
   assert.equal(r.code, 2, r.stderr);
   assert.equal(r.stdout, "");
   assert.match(r.stderr, /^ms _mesh_rows: /m);
+  for (const argv of [["_mesh_poll"], ["_mesh_poll", "../alpha"], ["_mesh_poll", "alpha", "-x"]]) {
+    const p = run(argv, { HOME: home, MS_HOME: msHome });
+    assert.equal(p.code, 2, `${argv.join(" ")}: ${p.stderr}`);
+    assert.equal(p.stdout, "");
+    assert.match(p.stderr, /^usage: ms _mesh_poll <account>\.\.\.$/m);
+  }
 });

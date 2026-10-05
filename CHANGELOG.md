@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.11
+
+- Claude Code 2.1.288+ panes read as busy again: it no longer prints "esc to interrupt", so
+  a live spinner line above the prompt (`✻ Sprouting… (1m 14s · …)`) now counts, while a
+  finished `✻ Worked for …` line and spinner text quoted in a tool result do not (PR #32)
+- a Claude pane still running background work (a workflow, a subagent, background shells
+  or monitors) is never relaunched: rotate/switch and the recovery transaction refuse it
+  (naming what they saw; `--force` overrides), rebalance skips it as `background-work`, and
+  a pane in copy-mode is refused too; walled panes and `ms stop` are unchanged (PR #32)
+- `src/compat.ts` names the newest verified CLIs (Codex 0.160.0, Claude Code 2.1.289);
+  `ms doctor` prints both against it, and a user-facing verb prints one stderr line when a
+  newer, not-yet-verified CLI is on `PATH` (PR #31)
+- at most once a day a user-facing verb checks GitHub for a newer `ms` in the background
+  (one unauthenticated GET) and the next verb prints `ms X.Y.Z is available`;
+  `MS_NO_UPDATE_CHECK=1` or `CI` turns it off (PR #31)
+- CI runs typecheck, tests and build on every pull request (macOS and Ubuntu); a nightly
+  canary installs the newest Codex and Claude Code and checks what `ms` keys on, opening an
+  issue per CLI version when it fails (PR #31)
+- `ms _statusline` no longer exits 1 with EPIPE when the wrapped command never reads stdin
+  (PR #31)
+- `scripts/release.mjs` commits the tap formula with the Com8 co-author trailer in place of
+  the pre-rename Homi one — exactly the three standard trailers, once each
+
 ## 0.3.10
 
 - codex homes inherit the hook trust `~/.codex/config.toml` already granted (plugin keys

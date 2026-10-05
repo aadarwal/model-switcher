@@ -13,7 +13,9 @@
     the reason
   - a relaunch that still lands on the lock card is ended, waited for and respawned once, which
     sends the continuation as its argument (R in the TUI would only restore it as a draft). A
-    second lock card parks with the reason
+    second lock card parks with the reason. The card counts only when the pane's own process
+    does not hold the conversation's lock file: a resumed conversation whose history quotes the
+    card's words is still its writer, and is never ended or sent the continuation twice
   - `ms codex -- resume <id>` (and adopt/import) waits the same way and refuses if the lock stays
     held, launching nothing
   - Codex ≥ 0.157 panes run in-process (`--no-daemon`, added at exec time). The lock is released

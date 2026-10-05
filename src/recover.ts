@@ -46,7 +46,7 @@ import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
 import { pickAccounts, type PickInput, type Window } from "./pick.ts";
 import { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand } from "./providers/codex-cli.ts";
-import { RELEASE_BUDGET_MS, showsLockCard, waitForWriterRelease, writerLockDirs, probeConversation, type LockState } from "./codex-writer-lock.ts";
+import { RELEASE_BUDGET_MS, lockCardMeansReadOnly, waitForWriterRelease, writerLockDirs, probeConversation, type LockState } from "./codex-writer-lock.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
 import { ownerDead } from "./reconcile.ts";
@@ -854,7 +854,15 @@ type Ready = "ok" | "resume-broken" | "timeout" | "dead" | "unconfirmed" | "lock
  * CLI had exited at +1 s. `paneDead` is null when tmux could not be asked,
  * which is not a death and never ends the wait (src/tmux.ts).
  */
-async function waitForReady(id: string, generation: number, cliSessionId: string | null, tmux: Tmux, pane: string, codex = false): Promise<Ready> {
+async function waitForReady(
+  id: string,
+  generation: number,
+  cliSessionId: string | null,
+  tmux: Tmux,
+  pane: string,
+  codex = false,
+  lockThread: string | null = null,
+): Promise<Ready> {
   const deadline = performance.now() + readyMs();
   for (;;) {
     for (const e of readEvents(id)) {
@@ -868,7 +876,7 @@ async function waitForReady(id: string, generation: number, cliSessionId: string
     // draws a read-only view, keeps the continuation as an unsent draft, and
     // would sit there for the whole minute and then be parked as a "timeout"
     // that names nothing. Its card is what says why (src/codex-writer-lock.ts).
-    if (codex && showsLockCard(safeCapture(tmux, pane))) return "locked";
+    if (codex && lockedOut(tmux, pane, lockThread)) return "locked";
     // After the log, not before it: a CLI that reported itself and then exited
     // has still resumed, and the report is the thing this step is waiting for.
     if (tmux.paneDead(pane) === true) return "dead";
@@ -909,7 +917,7 @@ async function waitForReady(id: string, generation: number, cliSessionId: string
  * pure confirmation by then, and it is the hook — not this — that adopts the
  * conversation id Codex chose (src/hooks/codex-hook.ts).
  */
-async function waitForSettle(id: string, generation: number, tmux: Tmux, pane: string): Promise<Ready> {
+async function waitForSettle(id: string, generation: number, tmux: Tmux, pane: string, lockThread: string | null = null): Promise<Ready> {
   const deadline = performance.now() + settleMs();
   for (;;) {
     const info = tmux.paneInfo(pane);
@@ -918,7 +926,7 @@ async function waitForSettle(id: string, generation: number, tmux: Tmux, pane: s
     // A live pane is the report here — and a Codex in its read-only view is a
     // live pane. Its card is the one thing on screen that says this relaunch
     // is not the conversation at all (see `waitForReady`).
-    if (showsLockCard(safeCapture(tmux, pane))) return "locked";
+    if (lockedOut(tmux, pane, lockThread)) return "locked";
     const left = deadline - performance.now();
     if (left <= 0) {
       if (!live) return "unconfirmed";
@@ -930,6 +938,14 @@ async function waitForSettle(id: string, generation: number, tmux: Tmux, pane: s
 }
 
 // --- A Codex conversation's writer -------------------------------------
+
+/** The pane shows Codex's read-only card and its process is not the
+ *  conversation's writer (`lockCardMeansReadOnly`: the card's words in a
+ *  re-rendered history are not the card). */
+function lockedOut(tmux: Tmux, pane: string, threadId: string | null): boolean {
+  const screen = safeCapture(tmux, pane);
+  return lockCardMeansReadOnly(screen, threadId ? tmux.paneInfo(pane)?.pid : null, threadId);
+}
 
 /**
  * Wait for `threadId` to be let go by whatever process still writes it, once
@@ -1737,8 +1753,8 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   const reportsItself = !codex || continuing;
   const awaitReady = (): Promise<Ready> =>
     reportsItself
-      ? waitForReady(id, next, codex && fresh ? null : session.cliSessionId!, tmux, session.pane, codex)
-      : waitForSettle(id, next, tmux, session.pane);
+      ? waitForReady(id, next, codex && fresh ? null : session.cliSessionId!, tmux, session.pane, codex, codex && !fresh ? session.cliSessionId : null)
+      : waitForSettle(id, next, tmux, session.pane, codex && !fresh ? session.cliSessionId : null);
   let ready = await awaitReady();
   // A Codex relaunch that landed in the read-only view: something took the
   // conversation between the release and the relaunch, or the probe could

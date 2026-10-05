@@ -51,7 +51,7 @@
 // the answer is "unknown" and the caller falls back to what the screen says.
 
 import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { readdirSync, readlinkSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -150,6 +150,52 @@ const LOCK_CARD = /open in another app|conversation is read-only or unavailable/
 
 export function showsLockCard(screen: string): boolean {
   return LOCK_CARD.test(screen);
+}
+
+/**
+ * Does process `pid` have conversation `threadId`'s writer lock file open?
+ * A writer keeps it open for as long as it holds the lock, while a Codex that
+ * could not take the lock closes the file at once (writer_lock.rs: the
+ * `WouldBlock` arm drops the `File`) — so this is the difference between a
+ * TUI that IS the conversation's writer and one showing the read-only card.
+ * Null when it cannot be asked (no /proc and no lsof, or the pid is gone).
+ * Matched by the `thread-writer-locks/<id>.lock` tail, so it does not depend
+ * on how a home's link to the shared directory is spelled.
+ */
+export function holdsWriterLock(pid: number, threadId: string): boolean | null {
+  if (!Number.isInteger(pid) || pid <= 0 || !threadId || threadId.includes("/")) return null;
+  const tail = `/${WRITER_LOCK_DIR}/${threadId}.lock`;
+  try {
+    const fds = readdirSync(`/proc/${pid}/fd`);
+    return fds.some((fd) => {
+      try {
+        return readlinkSync(`/proc/${pid}/fd/${fd}`).endsWith(tail);
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    /* no /proc (macOS), or no such process: ask lsof */
+  }
+  const r = spawnSync("lsof", ["-nP", "-a", "-p", String(pid), "-F", "n"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] });
+  if (r.error || r.signal || !r.stdout) return null;
+  return r.stdout.split("\n").some((l) => l.startsWith("n") && l.endsWith(tail));
+}
+
+/**
+ * The read-only view, as evidence: the card on screen AND the pane's own
+ * process not holding the conversation. The card's words are ordinary text,
+ * and a conversation ABOUT this lock — the very conversations that hit it —
+ * shows them in its re-rendered history; a TUI that holds the lock is the
+ * writer whatever its history says, and ending it would interrupt a turn the
+ * continuation already started and send the continuation twice. When the
+ * holder cannot be asked (`pid`/`threadId` unknown, no /proc or lsof), the
+ * screen alone decides, as before.
+ */
+export function lockCardMeansReadOnly(screen: string, pid: number | null | undefined, threadId: string | null | undefined): boolean {
+  if (!showsLockCard(screen)) return false;
+  if (!pid || !threadId) return true;
+  return holdsWriterLock(pid, threadId) !== true;
 }
 
 /** How long a background server may keep a conversation after its last

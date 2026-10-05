@@ -14,6 +14,8 @@ import path from "node:path";
 import {
   probeConversation,
   probeWriterLock,
+  holdsWriterLock,
+  lockCardMeansReadOnly,
   showsLockCard,
   waitForWriterRelease,
   writerLockDirs,
@@ -142,4 +144,35 @@ test("the lock card and the read-only refusal are both recognised; an ordinary s
   assert.equal(showsLockCard("■ This conversation is read-only or unavailable; no operation was sent."), true);
   assert.equal(showsLockCard("❯ ship it\n\n  Done.\n\n❯ "), false);
   assert.equal(showsLockCard("You've hit your usage limit."), false);
+});
+
+test("holdsWriterLock: a process with the conversation's lock open is its writer; one without it is not", async (t) => {
+  const dir = lockDir();
+  const file = path.join(dir, `${ID}.lock`);
+  writeFileSync(file, "");
+  const child = spawn("perl", ["-e", 'use Fcntl ":flock"; open(F, "<", $ARGV[0]) or die; flock(F, LOCK_EX) or die; $|=1; print "held\\n"; sleep 60', file], {
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  t.after(() => child.kill("SIGKILL"));
+  await new Promise<void>((resolve) => child.stdout!.once("data", () => resolve()));
+  assert.equal(holdsWriterLock(child.pid!, ID), true);
+  assert.equal(holdsWriterLock(process.pid, ID), false, "this test process never opened it");
+  assert.equal(holdsWriterLock(child.pid!, "01a10951-0000-7000-8000-000000000000"), false, "another conversation's lock is not this one");
+});
+
+test("lockCardMeansReadOnly: the card counts only when the pane's process is not the writer", async (t) => {
+  const card = "🔒 This conversation is open in another app — Close it there and press R to continue here";
+  const dir = lockDir();
+  const file = path.join(dir, `${ID}.lock`);
+  writeFileSync(file, "");
+  const child = spawn("perl", ["-e", 'use Fcntl ":flock"; open(F, "<", $ARGV[0]) or die; flock(F, LOCK_EX) or die; $|=1; print "held\\n"; sleep 60', file], {
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  t.after(() => child.kill("SIGKILL"));
+  await new Promise<void>((resolve) => child.stdout!.once("data", () => resolve()));
+  assert.equal(lockCardMeansReadOnly(card, child.pid!, ID), false, "the writer showing the words in its history");
+  assert.equal(lockCardMeansReadOnly(card, process.pid, ID), true, "a TUI without the lock showing the card");
+  assert.equal(lockCardMeansReadOnly(card, null, ID), true, "no pid: the screen decides");
+  assert.equal(lockCardMeansReadOnly(card, child.pid!, null), true, "no conversation id: the screen decides");
+  assert.equal(lockCardMeansReadOnly("› ", process.pid, ID), false, "no card, nothing to decide");
 });

@@ -2523,3 +2523,43 @@ test("codex: a relaunch with no prompt that lands on the lock card is not taken 
   assert.equal(session(w).state, "parked");
   assert.match(takeFailReason("s1") ?? "", /open in another codex process/);
 });
+
+test("codex: the card's words in a resumed conversation's own history are not the card — a relaunch that holds the conversation is never ended", async (t) => {
+  // The conversations that hit the lock are the ones that talk about it, and
+  // `codex resume` re-renders their history. A TUI that holds the writer lock
+  // IS the conversation's writer whatever its screen says; ending it would
+  // interrupt the turn the continuation started and send the continuation twice.
+  const w = await codexWorld(t);
+  const dir = path.dirname(w.screen);
+  const lockDir = path.join(w.msHome, "codex", "home", "thread-writer-locks");
+  mkdirSync(lockDir, { recursive: true });
+  const lockFile = path.join(lockDir, "cx-1.lock");
+  const pidFile = path.join(dir, "writer.pid");
+  writeFileSync(path.join(dir, "respawn-screen"), ["› why did it say this?", "", "  Codex printed: This conversation is open in another app — Close it there and press R to continue here.", "", "› "].join("\n"));
+  // The respawned "codex": a real process holding the conversation's lock open, as a writer does.
+  process.env.MS_TMUX_ON_MATCH = "respawn-pane";
+  process.env.MS_TMUX_ON =
+    `perl -e 'use Fcntl ":flock"; open(F, ">>", $ARGV[0]) or die; flock(F, LOCK_EX) or die; open(R, ">", $ARGV[1]); close R; sleep 30' "${lockFile}" "${dir}/writer.ready" </dev/null >/dev/null 2>&1 & ` +
+    `echo $! > "${pidFile}"; while [ ! -f "${dir}/writer.ready" ]; do sleep 0.05; done; ` +
+    `printf 'pane_pid=%s\\n' "$(cat "${pidFile}")" >> "$MS_TMUX_STATE"; cp "${dir}/respawn-screen" "${w.screen}"`;
+  t.after(() => {
+    try {
+      process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+    } catch {
+      /* never started, or already gone */
+    }
+  });
+  // The report comes late, so the screen is read many times before it.
+  const timer = setInterval(() => {
+    if (!existsSync(path.join(dir, "writer.ready"))) return;
+    clearInterval(timer);
+    setTimeout(() => appendEvent({ t: nowSeconds(), kind: "resumed", session: "s1", generation: 3, cliSessionId: "cx-1" }), 800);
+  }, 10);
+  t.after(() => clearInterval(timer));
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.equal(respawnLines(w).length, 1, "the writer was never ended and relaunched");
+  assert.equal(sendKeys(w).length, 2, "only the walled CLI was asked to leave");
+  assert.equal(session(w).state, "continuing");
+  assert.doesNotMatch(recoverLog(w), /shows .* open in another app/);
+});

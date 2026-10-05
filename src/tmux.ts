@@ -176,6 +176,18 @@ export class Tmux {
     const n = Number(v);
     return Number.isInteger(n) ? n : null;
   }
+  /**
+   * `#{pane_in_mode}`: true while the pane is in copy-mode (or another mode),
+   * when the human is scrolled back through it and what a capture shows is no
+   * longer simply the CLI's own live screen. Null when tmux did not answer,
+   * the same three-way rule `paneDead` follows.
+   */
+  paneInMode(pane: string): boolean | null {
+    const r = this.run(["display-message", "-p", "-t", pane, "#{pane_in_mode}"]);
+    if (r.code !== 0) return null;
+    const v = r.stdout.trim();
+    return v === "1" ? true : v === "0" ? false : null;
+  }
   setPaneOption(pane: string, name: string, value: string): void { this.must(["set-option", "-p", "-t", pane, name, value]); }
   unsetPaneOption(pane: string, name: string): void { this.run(["set-option", "-pu", "-t", pane, name]); }
   paneOptions(pane: string): Record<string, string> {

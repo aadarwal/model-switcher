@@ -29,6 +29,7 @@ import { appendEvent } from "../src/events.ts";
 import { openState, type SessionRow } from "../src/state.ts";
 import { rotateVerb, stopVerb, switchAll, switchVerb } from "../src/manual.ts";
 import { HANDOFF_SLOTS } from "../src/recover.ts";
+import * as screens from "./fixtures/claude-screens.ts";
 
 const CONTINUATION =
   "Continue the unfinished work from this conversation. Check the latest tool results and the current state of the files before retrying any action whose outcome is uncertain. Do not repeat completed actions. If the last user message was already answered, or needs nothing more, say so in one line and wait for the user; do not start new work.";
@@ -62,6 +63,7 @@ case "$1" in
         printf '%s\t%s\t%s\t%s\n' "$(get pane_pid)" "$(get command)" "$(get pane_dead)" "$(get cwd)" ;;
       *pane_dead_status*) get pane_dead_status ;;
       *pane_dead*) get pane_dead ;;
+      *pane_in_mode*) get pane_in_mode ;;
       *) get identity ;;
     esac ;;
   capture-pane) cat "$MS_TMUX_SCREEN" 2>/dev/null ;;
@@ -169,6 +171,8 @@ type WorldOptions = {
   failOn?: string;
   /** Raw accounts.json content, for the unreadable-registry case. */
   registry?: string;
+  /** Put the pane in copy-mode (`#{pane_in_mode}` answers 1). */
+  inMode?: boolean;
 };
 
 async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
@@ -191,6 +195,7 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
       `pane_pid=${pid}`,
       "command=claude",
       "pane_dead=0",
+      `pane_in_mode=${opts.inMode ? 1 : 0}`,
       `cwd=${cwd}`,
       `identity=${opts.identity ?? IDENTITY}`,
       "",
@@ -583,6 +588,86 @@ test("a wall on screen means the turn ended there, so neither verb calls the pan
   const stop2 = reportOnRespawn(w2);
   t.after(stop2);
   assert.equal(await rotateVerb(["s1"]), 0, "rotate reads the same screen the same way");
+});
+
+// --- Claude Code 2.1.288+: the spinner, and the work behind the prompt -----
+
+test("switch and rotate refuse a 2.1.288+ pane that is working, though it never says \"esc to interrupt\"", async (t) => {
+  const say = stderr(t);
+  for (const screen of [screens.WORKING_SCREEN, screens.WORKING_TIP_SCREEN, screens.WORKING_FULLSCREEN_SCREEN]) {
+    const w = await world(t, { screen });
+    const from = say().length;
+    assert.equal(await switchVerb(["s1", "--to", "work"]), 1);
+    assert.match(say().slice(from), /^ms switch: s1 is mid-turn/m);
+    assert.equal(await rotateVerb(["s1"]), 1);
+    assert.match(say().slice(from), /^ms rotate: s1 is mid-turn/m);
+    assert.ok(!typedAnything(w), "a working pane is never typed into");
+    assert.ok(!respawnLine(w));
+    assert.equal(session(w).account, "dirk");
+  }
+});
+
+test("switch refuses an idle pane with background work, says why and how to override, and --force proceeds", async (t) => {
+  const say = stderr(t);
+  for (const [screen, seen] of [
+    [screens.WORKFLOW_SCREEN, /◯ fix-codex-launch-v2/],
+    [screens.PAUSED_WORKFLOW_SCREEN, /⏸ oct04-backlog-sweep/],
+    [screens.SUBAGENT_SCREEN, /◯ general-purpose/],
+    [screens.SHELLS_SCREEN, /1 shell, 1 monitor/],
+  ] as const) {
+    const w = await world(t, { screen });
+    const from = say().length;
+    assert.equal(await switchVerb(["s1", "--to", "work"]), 1);
+    const out = say().slice(from);
+    assert.match(out, /^ms switch: s1 is running background work/m);
+    assert.match(out, seen, "the refusal names what it saw");
+    assert.match(out, /a relaunch would kill it \(use --force\)/);
+    assert.ok(!typedAnything(w), "the pane running the work is never typed into");
+    assert.ok(!respawnLine(w));
+    assert.equal(session(w).account, "dirk");
+    assert.equal(rows(w, "recoveries").length, 0, "a refused switch opens no recovery");
+  }
+
+  const w = await world(t, { screen: screens.WORKFLOW_SCREEN });
+  const stop = reportOnRespawn(w);
+  t.after(stop);
+  assert.equal(await switchVerb(["s1", "--to", "work", "--force"]), 0, "--force is the human saying the work may die");
+  assert.equal(session(w).account, "work");
+});
+
+test("rotate refuses an idle pane with background work; a walled one rotates, work and all", async (t) => {
+  const w = await world(t, { screen: screens.SUBAGENT_SCREEN });
+  const say = stderr(t);
+  assert.equal(await rotateVerb(["s1"]), 1);
+  assert.match(say(), /^ms rotate: s1 is running background work \(◯ general-purpose/m);
+  assert.ok(!typedAnything(w));
+  assert.equal(rows(w, "recoveries").length, 0);
+
+  // The wall has stopped the background work as surely as the turn.
+  const walled = screens.claudeScreen(
+    ["⎿  You've hit your usage limit. Your limit will reset at 9pm.", ""],
+    [screens.STATUS_LINE, screens.MODE_LINE, screens.WORKFLOW_LINE],
+  );
+  const w2 = await world(t, { screen: walled, wall: true, recovery: true });
+  const stop = reportOnRespawn(w2);
+  t.after(stop);
+  assert.equal(await rotateVerb(["s1"]), 0);
+  assert.equal(session(w2).account, "gmail");
+});
+
+test("a Claude pane in copy-mode cannot be read, so it is not moved without --force", async (t) => {
+  const w = await world(t, { screen: screens.QUIET_SCREEN, inMode: true });
+  const say = stderr(t);
+  assert.equal(await switchVerb(["s1", "--to", "work"]), 1);
+  assert.match(say(), /copy-mode/);
+  assert.ok(!typedAnything(w));
+  assert.equal(session(w).account, "dirk");
+
+  // Out of copy-mode, the same quiet screen is a pane like any other.
+  const w2 = await world(t, { screen: screens.QUIET_SCREEN });
+  const stop = reportOnRespawn(w2);
+  t.after(stop);
+  assert.equal(await switchVerb(["s1", "--to", "work"]), 0);
 });
 
 // --- stop --------------------------------------------------------------

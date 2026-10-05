@@ -122,7 +122,7 @@ export async function rebalanceFleet(opts: FleetOptions = {}): Promise<Rebalance
           lastMoveAt: null,
           lastWallAt: lastWallAtMs(row.id),
           gate: true,
-          pane: readPane(row.socket, row.pane),
+          pane: readPane(row.socket, row.pane, row.provider),
         }),
       });
     }

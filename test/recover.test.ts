@@ -23,7 +23,8 @@ import path from "node:path";
 import { tempHome, stubDir } from "./helpers.ts";
 import { appendEvent, readEvents } from "../src/events.ts";
 import { openState, type SessionRow } from "../src/state.ts";
-import { codexConversation, recoverSession } from "../src/recover.ts";
+import { backgroundReason, backgroundWork, codexConversation, isBusy, recoverSession, takeFailReason } from "../src/recover.ts";
+import * as screens from "./fixtures/claude-screens.ts";
 import { p } from "../src/paths.ts";
 
 /** The continuation text, spelled out here rather than imported: the whole
@@ -924,6 +925,43 @@ test("a busy pane refuses a manual move unless forced", async (t) => {
   assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
   assert.equal(session(w).account, "dirk");
   assert.equal(rows(w, "recoveries").length, 0, "a refused manual move opens no recovery");
+});
+
+test("a Claude Code 2.1.288+ pane that is working refuses a manual move unless forced", async (t) => {
+  // No "esc to interrupt" anywhere on this screen: the spinner line above the
+  // composer is the only sign of a turn in progress.
+  const w = await world(t, { screen: screens.WORKING_TIP_SCREEN, recovery: false, wall: false });
+
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "work", continueAfter: true } }), 1);
+  assert.match(takeFailReason("s1") ?? "", /busy/);
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")));
+  assert.equal(session(w).account, "dirk");
+  assert.equal(rows(w, "recoveries").length, 0, "a refused manual move opens no recovery");
+});
+
+test("an idle pane with background work refuses a manual move unless forced; a walled one moves", async (t) => {
+  const w = await world(t, { screen: screens.WORKFLOW_SCREEN, recovery: false, wall: false });
+
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "work", continueAfter: false } }), 1);
+  const why = takeFailReason("s1") ?? "";
+  assert.match(why, /background work/);
+  assert.match(why, /fix-codex-launch-v2/, "the refusal names what it saw");
+  assert.match(why, /--force/);
+  assert.ok(!logLines(w).some((l) => l.includes("send-keys")), "the pane running the workflow is never touched");
+  assert.equal(session(w).account, "dirk");
+  assert.equal(rows(w, "recoveries").length, 0);
+
+  // A wall stops the background work as surely as the turn: rotating off it
+  // is what the wall asks for, and nothing here may stand in its way.
+  const walled = screens.claudeScreen(
+    ["⎿  You've hit your usage limit. Your limit will reset at 9pm.", ""],
+    [screens.STATUS_LINE, screens.MODE_LINE, screens.WORKFLOW_LINE],
+  );
+  const w2 = await world(t, { screen: walled, recovery: false, wall: false });
+  const stop = reportOnRespawn(w2, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "work", continueAfter: true } }), 0);
+  assert.ok(respawnLine(w2), "the walled pane was rotated");
 });
 
 test("a tmux that fails mid-handoff is a failed recovery, not an exception", async (t) => {
@@ -2267,4 +2305,80 @@ test("a rollout search matches the whole filename: id `1` does not claim `cx-1`'
   writeFileSync(path.join(day, "rollout-2026-09-16T10-00-00-cx-1.jsonl"), "{}\n");
   assert.equal(codexConversation({ cliSessionId: "1", transcriptPath: null } as never), "gone");
   assert.equal(codexConversation({ cliSessionId: "cx-1", transcriptPath: null } as never), "on-disk");
+});
+
+// --- Reading a Claude Code 2.1.288+ screen -------------------------------
+//
+// Every screen below is built from lines captured off live 2.1.289 panes
+// (test/fixtures/claude-screens.ts).
+
+test("isBusy: a 2.1.288+ spinner line above the composer is a turn in progress", () => {
+  for (const [name, screen] of Object.entries({
+    plain: screens.WORKING_SCREEN,
+    "with a tip under it": screens.WORKING_TIP_SCREEN,
+    "fullscreen, thirty blank rows down": screens.WORKING_FULLSCREEN_SCREEN,
+    "with a todo list under it": screens.WORKING_TODO_SCREEN,
+    "a named session's labelled border above the composer": screens.WORKING_NAMED_SCREEN,
+    "a custom spinner verb of two words": screens.WORKING_CUSTOM_VERB_SCREEN,
+  })) {
+    assert.equal(isBusy(screen, "claude"), true, name);
+  }
+});
+
+test("isBusy: every spinner frame counts, not just the one a capture happened to catch", () => {
+  for (const frame of ["·", "✢", "✳", "✶", "✻", "✽", "*"]) {
+    assert.equal(isBusy(screens.claudeScreen([`${frame} Sprouting… (2h 1m · ↓ 2.8k tokens)`, ""]), "claude"), true, frame);
+  }
+});
+
+test("isBusy: a finished turn, and spinner text quoted in a tool result, are not busy", () => {
+  assert.equal(isBusy(screens.DONE_SCREEN, "claude"), false, "\"Worked for … · done\" is a turn that ended");
+  assert.equal(isBusy(screens.QUOTED_SPINNER_SCREEN, "claude"), false, "an indented quote is somebody else's spinner");
+  assert.equal(isBusy(screens.QUIET_SCREEN, "claude"), false);
+  assert.equal(isBusy(screens.claudeScreen(["✻ Worked for 44m 6s · done 3:08 PM", ""], undefined, screens.NAMED_BORDER), "claude"), false);
+  // The spinner must be the LAST thing above the composer, not merely on screen.
+  assert.equal(isBusy(screens.claudeScreen([screens.SPINNER_SPROUTING, "", "● The answer.", ""]), "claude"), false);
+});
+
+test("isBusy: the spinner rule is Claude's; Codex and older Claude keep \"esc to interrupt\"", () => {
+  assert.equal(isBusy(screens.WORKING_SCREEN, "codex"), false, "a Codex pane is never read by Claude's spinner rule");
+  const interrupt = ["› ship it", "", "• Working (5s • esc to interrupt)", ""].join("\n");
+  assert.equal(isBusy(interrupt, "codex"), true);
+  assert.equal(isBusy(["❯ ship it", "", "  Composing… (esc to interrupt)", ""].join("\n"), "claude"), true);
+});
+
+test("backgroundWork: a workflow, a paused workflow, a subagent and shells below the composer are named", () => {
+  assert.match(backgroundWork(screens.WORKFLOW_SCREEN, "claude") ?? "", /^◯ fix-codex-launch-v2/);
+  assert.match(backgroundWork(screens.PAUSED_WORKFLOW_SCREEN, "claude") ?? "", /^⏸ oct04-backlog-sweep +paused/);
+  assert.match(backgroundWork(screens.SUBAGENT_SCREEN, "claude") ?? "", /^◯ general-purpose +Footer probe/);
+  assert.equal(backgroundWork(screens.SHELLS_SCREEN, "claude"), "1 shell, 1 monitor");
+});
+
+test("backgroundWork: a running workflow is read off its bar and count, whatever its glyph", () => {
+  // The bar and the "done/total · elapsed" count are the evidence; the leading
+  // glyph of a workflow further along than 0/3 is not something to bet on.
+  const running = "  ◔ fix-codex-launch-v2  ▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱  1/3 · 2m 10s · ↓ 201.7k tokens";
+  assert.match(backgroundWork(screens.claudeScreen([], [screens.MODE_LINE, running]), "claude") ?? "", /fix-codex-launch-v2/);
+  const finished = "  ✓ fix-codex-launch-v2  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰  3/3 · 5m 2s · done";
+  assert.equal(backgroundWork(screens.claudeScreen([], [screens.MODE_LINE, finished]), "claude"), null);
+});
+
+test("backgroundWork: the agent hint, a usage bar and the /tasks hint are not background work", () => {
+  assert.equal(backgroundWork(screens.QUIET_SCREEN, "claude"), null);
+  assert.equal(backgroundWork(screens.DONE_SCREEN, "claude"), null);
+  // Plan mode leads its mode line with the same ⏸ a paused workflow does.
+  assert.equal(backgroundWork(screens.claudeScreen([], [screens.STATUS_LINE, "  ⏸ plan mode on (shift+tab to cycle) · ← 1 agent"]), "claude"), null);
+  // Only BELOW the composer: the same line in the transcript is history.
+  assert.equal(backgroundWork(screens.claudeScreen([screens.WORKFLOW_LINE, ""]), "claude"), null);
+});
+
+test("backgroundWork: never for a Codex pane", () => {
+  assert.equal(backgroundWork(screens.WORKFLOW_SCREEN, "codex"), null);
+  assert.equal(backgroundWork(screens.SHELLS_SCREEN, "codex"), null);
+});
+
+test("backgroundReason: copy-mode refuses a Claude pane, never a Codex one", () => {
+  const inMode = { paneInMode: () => true } as never;
+  assert.match(backgroundReason(inMode, "%1", screens.QUIET_SCREEN, "claude") ?? "", /copy-mode/);
+  assert.equal(backgroundReason(inMode, "%1", screens.QUIET_SCREEN, "codex"), null);
 });

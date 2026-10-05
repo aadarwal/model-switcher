@@ -12,12 +12,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   decide,
+  paneReading,
   refreshIfStale,
   REBALANCE_RULES,
   type DecisionInput,
   type RebalanceSession,
 } from "../src/rebalance.ts";
 import type { PickInput } from "../src/pick.ts";
+import * as screens from "./fixtures/claude-screens.ts";
 
 const NOW = Date.parse("2026-09-19T12:00:00Z");
 const HOUR = 3_600_000;
@@ -235,6 +237,27 @@ test("a parked, waiting or stopped row is never moved; a running one is", () => 
     assert.equal(d.reason, `the session is ${state}`);
   }
   assert.equal(decide(input({ ...moving, session: sess({ state: "running" }) })).move, true);
+});
+
+test("a pane with background work behind an idle prompt is never moved, and says so", () => {
+  const moving = { accounts: [acct("here", { session: w(90, at(3)) }), acct("there", { weeklyAll: w(20, at(48)) })] };
+  const d = decide(input({ ...moving, pane: "background" }));
+  assert.equal(d.move, false);
+  assert.match(d.reason, /^background-work: /);
+  assert.equal(d.better, "there", "still the better place to be — just not while the work runs");
+});
+
+test("paneReading: a 2.1.288+ spinner is busy, work behind the prompt is background, Codex is read as before", () => {
+  assert.equal(paneReading(true, screens.WORKING_TIP_SCREEN, "claude"), "busy");
+  assert.equal(paneReading(true, screens.WORKFLOW_SCREEN, "claude"), "background");
+  assert.equal(paneReading(true, screens.SHELLS_SCREEN, "claude"), "background");
+  assert.equal(paneReading(true, screens.QUIET_SCREEN, "claude"), "idle");
+  assert.equal(paneReading(true, screens.QUIET_SCREEN, "claude", true), "background", "copy-mode is never free to relaunch");
+  // Busy wins: a working pane with a workflow behind it is mid-turn first.
+  assert.equal(paneReading(true, screens.claudeScreen([screens.SPINNER_SPROUTING, ""], [screens.MODE_LINE, screens.WORKFLOW_LINE]), "claude"), "busy");
+  assert.equal(paneReading(true, screens.WORKFLOW_SCREEN, "codex"), "idle");
+  assert.equal(paneReading(true, screens.QUIET_SCREEN, "codex", true), "idle", "copy-mode is Claude's rule, like the rest");
+  assert.equal(paneReading(false, screens.WORKFLOW_SCREEN, "claude"), "gone");
 });
 
 test("a pane that is mid-turn, or gone, is never moved", () => {
@@ -634,6 +657,18 @@ test("a pane that has gone busy since the turn ended moves nothing", async (t) =
   const { d, calls } = deps(MOVING, { pane: () => "busy" });
   assert.equal((await rebalanced("s1", d)).reason, "the pane is mid-turn");
   assert.deepEqual(calls.dispatch, []);
+});
+
+test("a pane with background work moves nothing, and the reading is asked about this session's provider", async (t) => {
+  const w = world();
+  t.after(() => w.st.close());
+  session(w.st, "s1");
+  gateOn(w.st);
+  const asked: string[] = [];
+  const { d, calls } = deps(MOVING, { pane: (_socket, _pane, provider) => { asked.push(provider); return "background"; } });
+  assert.match((await rebalanced("s1", d)).reason, /^background-work: /);
+  assert.deepEqual(calls.dispatch, []);
+  assert.deepEqual(asked, ["claude"]);
 });
 
 test("nothing to move for: the snapshot is read, the pane is not moved", async (t) => {

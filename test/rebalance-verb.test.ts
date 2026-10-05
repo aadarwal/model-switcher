@@ -23,6 +23,7 @@ import { openState } from "../src/state.ts";
 import { saveLaunchToken } from "../src/launch-credentials.ts";
 import { rebalanceFleet, type RebalanceReport } from "../src/rebalance-verb.ts";
 import type { Switcher } from "../src/rebalance.ts";
+import * as screens from "./fixtures/claude-screens.ts";
 
 const SOCKET = "/tmp/ms-rebalance-verb-test.sock";
 const IDENTITY = "1:2";
@@ -43,7 +44,11 @@ if [ "$1" = "-S" ]; then shift 2; fi
 case "$1" in
   list-panes) printf '%s\n' $MS_TMUX_PANES ;;
   capture-pane) cat "$MS_TMUX_SCREEN" 2>/dev/null ;;
-  display-message) printf '%s\n' "$MS_TMUX_IDENTITY" ;;
+  display-message)
+    case "$*" in
+      *pane_in_mode*) m="$MS_TMUX_IN_MODE"; [ -n "$m" ] || m=0; printf '%s\n' "$m" ;;
+      *) printf '%s\n' "$MS_TMUX_IDENTITY" ;;
+    esac ;;
 esac
 exit 0`;
 
@@ -198,6 +203,28 @@ test("rebalance: a session that is neither running nor continuing is skipped BY 
 
   assert.deepEqual(report.rows.map((r) => r.session).sort(), ["s1", "s3"]);
   assert.deepEqual(report.skipped, [{ session: "s2", why: "the session is parked" }]);
+});
+
+test("rebalance reads a Claude Code 2.1.288+ pane: a spinner is mid-turn, work behind the prompt is background-work", async (t) => {
+  await world(t);
+  for (const [screen, reason] of [
+    [screens.WORKING_TIP_SCREEN, /^the pane is mid-turn$/],
+    [screens.WORKFLOW_SCREEN, /^background-work: /],
+  ] as const) {
+    writeFileSync(process.env.MS_TMUX_SCREEN!, screen);
+    const { calls, switcher } = fakeSwitcher();
+    const report = await rebalanceFleet({ dryRun: false, switcher });
+    assert.match(rowFor(report, "s1").reason, reason);
+    assert.equal(calls.length, 0, "nothing is moved out from under its own work");
+  }
+
+  // A quiet screen in copy-mode is a screen nobody can vouch for.
+  writeFileSync(process.env.MS_TMUX_SCREEN!, screens.QUIET_SCREEN);
+  process.env.MS_TMUX_IN_MODE = "1";
+  t.after(() => { delete process.env.MS_TMUX_IN_MODE; });
+  assert.match(rowFor(await rebalanceFleet({ dryRun: true, switcher: fakeSwitcher().switcher }), "s1").reason, /^background-work: /);
+  process.env.MS_TMUX_IN_MODE = "0";
+  assert.equal(rowFor(await rebalanceFleet({ dryRun: true, switcher: fakeSwitcher().switcher }), "s1").reason, "imminent-wall");
 });
 
 // --- The guards: one waived, one never --------------------------------------

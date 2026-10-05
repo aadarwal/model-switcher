@@ -625,3 +625,14 @@ test("flagsForResume drops a stored resume for either CLI, and keeps every other
   // And nothing else changed: a value-taking flag still keeps its value.
   assert.deepEqual(flagsForResume(["--model", "gpt-5", "do the thing"]), ["--model", "gpt-5"]);
 });
+
+test("flagsForResume drops the stored id even when flags stand between `resume` and it", async () => {
+  // `codex resume --no-daemon <id>` is Codex's own documented spelling of an
+  // in-process resume, and `resume --yolo <id>` is as legal. Reading the id
+  // as the flag's VALUE kept it, and the next rotation ran
+  // `codex resume <id> <CONT> --no-daemon <id>` — the conversation named twice.
+  const { flagsForResume } = await import("../src/recover.ts");
+  assert.deepEqual(flagsForResume(["resume", "--no-daemon", LEAF]), ["--no-daemon"]);
+  assert.deepEqual(flagsForResume(["--yolo", "resume", "--yolo", LEAF]), ["--yolo", "--yolo"]);
+  assert.deepEqual(flagsForResume(["resume", "--model", "gpt-5", LEAF, "--search"]), ["--model", "gpt-5", "--search"]);
+});

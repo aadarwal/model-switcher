@@ -4,6 +4,8 @@ import type { Verb } from "./cli.ts";
 import { openState, type Provider } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { msBinary, p } from "./paths.ts";
+import { cliVersion } from "./compat.ts";
+import { withNoDaemon } from "./providers/codex-cli.ts";
 
 // spec §7 step 4, §11: `ms _exec <launch-id>` is the command tmux runs in
 // the pane. It loads the launch record and the account's launch credential
@@ -150,6 +152,9 @@ export const execLaunch: Verb = async (args) => {
   env.MS_ACCOUNT = launch.account;
   env.MS_BIN = msBinary();
 
-  execve(cli, [cli, ...launch.command.slice(1)], env);
+  // A Codex pane runs its conversation in its own process when the CLI can
+  // (`withNoDaemon` says why): decided against the binary about to run.
+  const argv = provider === "codex" ? withNoDaemon(launch.command, cliVersion(cli)) : launch.command;
+  execve(cli, [cli, ...argv.slice(1)], env);
   return 0; // unreachable: a successful execve replaces this process image
 };

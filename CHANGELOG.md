@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Codex 0.160 lets one process write a conversation, and an account's background server keeps
+  a conversation it loaded for ~60 s after the pane's window closed, so a rotation, `ms switch`,
+  rebalance or `ms adopt`/`import` resume in that minute opened a read-only view ("This
+  conversation is open in another app") with the continuation unsent, then parked after 60 s.
+  Now:
+  - a handoff ends only the pane's own CLI, then waits (up to 75 s) for the conversation's
+    writer lock to be free before relaunching. Nothing is stopped or signalled, because the
+    server hosts other panes' conversations. A conversation that stays open is parked with
+    the reason
+  - a relaunch that still lands on the lock card is ended, waited for and respawned once, which
+    sends the continuation as its argument (R in the TUI would only restore it as a draft). A
+    second lock card parks with the reason
+  - `ms codex -- resume <id>` (and adopt/import) waits the same way and refuses if the lock stays
+    held, launching nothing
+  - Codex ≥ 0.157 panes run in-process (`--no-daemon`, added at exec time). The lock is released
+    when the pane exits, and hooks report with the pane's own `MS_*` environment, not that of
+    whichever pane started the account's shared server
+  - `flagsForResume` drops a stored resume id even when flags stand between `resume` and the id
+    (`resume --no-daemon <id>`)
+
 ## 0.3.11
 
 - Claude Code 2.1.288+ panes read as busy again: it no longer prints "esc to interrupt", so

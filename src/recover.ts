@@ -46,6 +46,7 @@ import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
 import { pickAccounts, type PickInput, type Window } from "./pick.ts";
 import { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand } from "./providers/codex-cli.ts";
+import { RELEASE_BUDGET_MS, showsLockCard, waitForWriterRelease, writerLockDirs, probeConversation, type LockState } from "./codex-writer-lock.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
 import { ownerDead } from "./reconcile.ts";
@@ -162,6 +163,9 @@ export const CHANGE_WINDOW_SECONDS = 600;
 const pollMs = (): number => Number(process.env.MS_POLL_MS) || 500;
 const readyMs = (): number => Number(process.env.MS_READY_MS) || READY_MS;
 const settleMs = (): number => Number(process.env.MS_SETTLE_MS) || SETTLE_MS;
+/** How long a Codex conversation is waited for after the pane's own CLI left
+ *  (src/codex-writer-lock.ts says why it can take a minute). */
+const releaseMs = (): number => Number(process.env.MS_CODEX_RELEASE_MS) || RELEASE_BUDGET_MS;
 const nowSeconds = (): number => Math.floor(Date.now() / 1000);
 
 export type ManualRecovery = {
@@ -827,7 +831,9 @@ export async function stopPane(tmux: Tmux, session: SessionRow, generation: numb
   return true;
 }
 
-type Ready = "ok" | "resume-broken" | "timeout" | "dead" | "unconfirmed";
+/** `locked`: the relaunched Codex is showing its read-only view — another
+ *  process holds the conversation, and the continuation was NOT sent. */
+type Ready = "ok" | "resume-broken" | "timeout" | "dead" | "unconfirmed" | "locked";
 
 /**
  * The resumed CLI reports itself through its own SessionStart hook — we never
@@ -848,7 +854,7 @@ type Ready = "ok" | "resume-broken" | "timeout" | "dead" | "unconfirmed";
  * CLI had exited at +1 s. `paneDead` is null when tmux could not be asked,
  * which is not a death and never ends the wait (src/tmux.ts).
  */
-async function waitForReady(id: string, generation: number, cliSessionId: string | null, tmux: Tmux, pane: string): Promise<Ready> {
+async function waitForReady(id: string, generation: number, cliSessionId: string | null, tmux: Tmux, pane: string, codex = false): Promise<Ready> {
   const deadline = performance.now() + readyMs();
   for (;;) {
     for (const e of readEvents(id)) {
@@ -857,6 +863,12 @@ async function waitForReady(id: string, generation: number, cliSessionId: string
       if (cliSessionId === null || e.cliSessionId === cliSessionId) return "ok";
       if (e.cliSessionId) return "resume-broken";
     }
+    // The one failure that never ends on its own. A Codex that could not take
+    // the conversation's writer lock does not exit and does not report: it
+    // draws a read-only view, keeps the continuation as an unsent draft, and
+    // would sit there for the whole minute and then be parked as a "timeout"
+    // that names nothing. Its card is what says why (src/codex-writer-lock.ts).
+    if (codex && showsLockCard(safeCapture(tmux, pane))) return "locked";
     // After the log, not before it: a CLI that reported itself and then exited
     // has still resumed, and the report is the thing this step is waiting for.
     if (tmux.paneDead(pane) === true) return "dead";
@@ -903,6 +915,10 @@ async function waitForSettle(id: string, generation: number, tmux: Tmux, pane: s
     const info = tmux.paneInfo(pane);
     const live = !!info && !info.dead && !!info.pid && alive(info.pid);
     if (info && !live) return "dead";
+    // A live pane is the report here — and a Codex in its read-only view is a
+    // live pane. Its card is the one thing on screen that says this relaunch
+    // is not the conversation at all (see `waitForReady`).
+    if (showsLockCard(safeCapture(tmux, pane))) return "locked";
     const left = deadline - performance.now();
     if (left <= 0) {
       if (!live) return "unconfirmed";
@@ -911,6 +927,46 @@ async function waitForSettle(id: string, generation: number, tmux: Tmux, pane: s
     }
     await sleep(Math.min(pollMs(), left));
   }
+}
+
+// --- A Codex conversation's writer -------------------------------------
+
+/**
+ * Wait for `threadId` to be let go by whatever process still writes it, once
+ * the pane's own CLI has left. Codex 0.160 allows one writer per conversation
+ * (an flock every account home shares), and a conversation the pane had
+ * loaded in `from`'s background server stays loaded there for about a minute
+ * after the pane's TUI goes. A relaunch inside that minute is a read-only
+ * view, never a handoff. Nothing is stopped or signalled to shorten the wait:
+ * that server hosts other panes' conversations too, and Codex offers no way
+ * to unload one conversation from it (src/codex-writer-lock.ts).
+ *
+ * `unknown` (the probe could not run) is not a reason to hold the relaunch:
+ * the on-screen check after it is the fallback.
+ */
+async function releaseConversation(id: string, generation: number, threadId: string, from: string, to: string): Promise<LockState> {
+  const dirs = writerLockDirs([codexHome(from), codexHome(to)]);
+  if (!dirs.length) return "free";
+  const first = probeConversation(dirs, threadId);
+  if (first === "unknown") logLine(id, generation, `could not read ${threadId}'s writer lock (is perl on PATH?); relaunching, and the screen will say if it is still open elsewhere`);
+  if (first !== "held") return first;
+  logLine(
+    id,
+    generation,
+    `${threadId} is still open in another codex process (its writer lock is held); waiting up to ${Math.round(releaseMs() / 1000)}s — a background server keeps a conversation about a minute after its last window closes`,
+  );
+  const t0 = performance.now();
+  const after = await waitForWriterRelease(dirs, threadId, releaseMs(), pollMs());
+  if (after !== "held") logLine(id, generation, `${threadId} was released after ${Math.round((performance.now() - t0) / 1000)}s`);
+  return after;
+}
+
+/** The refusal for a conversation that stayed open elsewhere. */
+function heldElsewhere(threadId: string, id: string, where: string): string {
+  return (
+    `${threadId} is still open in another codex process ${where} — another pane, the Codex app, or a background server ` +
+    `has it loaded, and codex lets only one of them write it; close it there, then run: ms rotate ${id}`
+  );
 }
 
 // --- Candidates --------------------------------------------------------
@@ -1345,18 +1401,32 @@ function claimManual(st: State, session: SessionRow, tmux: Tmux, opts: RecoverOp
  */
 const RESUME_TOKENS = new Set(["resume", "--resume", "-r"]);
 
+/** A conversation id, as both CLIs spell one. */
+const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function flagsForResume(flags: string[]): string[] {
   const out: string[] = [];
   let mayBeAValue = false;
+  // A resume whose id did not follow it directly: flags stood in between
+  // (`resume --no-daemon <id>`, Codex's own spelling). The id is still the
+  // stored resume's and goes with it — found by its shape, because a flag
+  // before it would otherwise claim it as a value and keep it.
+  let idPending = false;
   for (let i = 0; i < flags.length; i++) {
     const a = flags[i]!;
     if (a === "--") break; // everything past it is positional by definition
+    if (idPending && CONVERSATION_ID.test(a)) {
+      idPending = false;
+      mayBeAValue = false;
+      continue;
+    }
     // Before the flag/value rules, because `--yolo resume` would otherwise
     // read `resume` as `--yolo`'s value and keep it.
     if (RESUME_TOKENS.has(a) || a.startsWith("--resume=")) {
       if (!a.includes("=")) {
         const next = flags[i + 1];
         if (next !== undefined && !next.startsWith("-")) i++; // its conversation id
+        else idPending = next !== undefined;
       }
       mayBeAValue = false;
       continue;
@@ -1552,6 +1622,23 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // 6. Ask the CLI to leave; make it leave if it will not.
   const forced = await stopPane(tmux, session, g);
 
+  // 6½. A Codex conversation moves only once nothing else writes it — the
+  // pane's CLI leaving is not enough when the conversation was loaded in the
+  // old account's background server (`releaseConversation`). Before the
+  // checks below, so a human's stop that lands during this wait still wins.
+  if (session.provider === "codex" && session.cliSessionId) {
+    const released = await releaseConversation(id, g, session.cliSessionId, from, to);
+    if (released === "held") {
+      return park(
+        st,
+        id,
+        rec.id,
+        g,
+        `${heldElsewhere(session.cliSessionId, id, `${Math.round(releaseMs() / 1000)}s after ${from}'s CLI left`)}. ${id} is parked with its CLI stopped`,
+      );
+    }
+  }
+
   if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, g, "before the respawn");
   const workedBeforeRespawn = manual ? null : workedPastWall(session, rec);
   if (workedBeforeRespawn) return standDownObsolete(st, tmux, session, rec, g, workedBeforeRespawn, "before the respawn");
@@ -1648,9 +1735,37 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // line". Claude Code reports SessionStart at startup either way and is
   // unchanged.
   const reportsItself = !codex || continuing;
-  const ready = reportsItself
-    ? await waitForReady(id, next, codex && fresh ? null : session.cliSessionId!, tmux, session.pane)
-    : await waitForSettle(id, next, tmux, session.pane);
+  const awaitReady = (): Promise<Ready> =>
+    reportsItself
+      ? waitForReady(id, next, codex && fresh ? null : session.cliSessionId!, tmux, session.pane, codex)
+      : waitForSettle(id, next, tmux, session.pane);
+  let ready = await awaitReady();
+  // A Codex relaunch that landed in the read-only view: something took the
+  // conversation between the release and the relaunch, or the probe could
+  // not run. Pressing R there would load it but only RESTORE the continuation
+  // to the composer, never send it (tui/src/app/session_lifecycle.rs) — so the
+  // read-only TUI is ended, the conversation waited for again, and the SAME
+  // launch respawned, which submits the continuation as its argument. Once.
+  if (ready === "locked" && codex && session.cliSessionId) {
+    const cid = session.cliSessionId;
+    logLine(id, next, `the relaunch on ${to} shows "${cid} is open in another app" (read-only; the continuation was not sent); ending it, waiting for the conversation, relaunching once`);
+    await stopPane(tmux, session, next);
+    if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, next, "before the retry");
+    const again = await releaseConversation(id, next, cid, from, to);
+    if (again === "held") {
+      st.addAttempt({ recoveryId: rec.id, account: to, outcome: "resume-broken", note: "locked" });
+      return park(st, id, rec.id, next, `${heldElsewhere(cid, id, `after the relaunch on ${to}`)}. ${id} is parked with its CLI stopped`);
+    }
+    try {
+      tmux.respawn(session.pane, session.cwd, [msBinary(), "_exec", launchId]);
+    } catch (e) {
+      const why = (e as Error).message;
+      st.addAttempt({ recoveryId: rec.id, account: to, outcome: "infra", note: `respawn failed: ${why}` });
+      return park(st, id, rec.id, next, `could not respawn the pane: ${why}; ${id} is parked with its CLI stopped`);
+    }
+    logLine(id, next, `respawned pane ${session.pane} on ${to} again (launch ${launchId})`);
+    ready = await awaitReady();
+  }
   if (ready !== "ok") {
     // The exit status first: it is the one fact that says WHY, and it is gone
     // the moment anything respawns over the corpse.
@@ -1672,7 +1787,9 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
           ? `no resume report within ${Math.round(readyMs() / 1000)}s; ${id} is parked`
           : ready === "unconfirmed"
             ? `could not confirm the relaunched pane is alive ${Math.round(settleMs() / 1000)}s after the respawn; ${id} is parked`
-            : `the resume started a new conversation; ${id} is parked`,
+            : ready === "locked"
+              ? `${session.cliSessionId} is open in another codex process: the relaunch on ${to} showed codex's "open in another app" card twice — close it there, then press R in this pane (and Enter: R restores the continuation without sending it), or run: ms rotate ${id}`
+              : `the resume started a new conversation; ${id} is parked`,
     );
   }
 

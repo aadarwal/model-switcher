@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSy
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand, ensureCodexTrust } = await import("../src/providers/codex-cli.ts");
+const { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand, ensureCodexTrust, withNoDaemon } = await import("../src/providers/codex-cli.ts");
 
 // Resolved: `os.tmpdir()` is `/tmp` on macOS, itself a symlink to `/private/tmp`,
 // and `src/paths.ts`'s `msHome()` now resolves `MS_HOME` the same way — so an
@@ -276,4 +276,43 @@ test("a 'projects' key inside somebody else's table is not a projects definition
 
   assert.deepEqual(ensureCodexTrust(home, cwd), { changed: true });
   assert.match(read(home), /^trust_level = "trusted"$/m);
+});
+
+// --- in-process: `--no-daemon` ---------------------------------------------
+//
+// A pane that runs its conversation in its own process lets go of it the
+// instant it exits, and its hooks run with ITS environment — never with the
+// environment of whichever pane happened to start the account's shared
+// background server. Added at exec time, for a CLI that has the flag.
+
+const ID = "01a10951-a81b-7a52-9a37-6c3f1d1f0c11";
+
+test("a resume runs in-process: --no-daemon goes right after the subcommand", () => {
+  assert.deepEqual(
+    withNoDaemon(["codex", "resume", ID, "continue", "--model", "gpt-5"], "0.160.0"),
+    ["codex", "resume", "--no-daemon", ID, "continue", "--model", "gpt-5"],
+  );
+  assert.deepEqual(withNoDaemon(["codex", "--yolo", "resume", ID], "0.160.0"), ["codex", "--yolo", "resume", "--no-daemon", ID]);
+  assert.deepEqual(withNoDaemon(["codex", "fork", ID], "0.160.0"), ["codex", "fork", "--no-daemon", ID]);
+});
+
+test("a new conversation runs in-process too: --no-daemon at the top level", () => {
+  assert.deepEqual(withNoDaemon(["codex", "--model", "gpt-5"], "0.157.0"), ["codex", "--no-daemon", "--model", "gpt-5"]);
+  assert.deepEqual(withNoDaemon(["codex"], "0.160.0"), ["codex", "--no-daemon"]);
+  // Past `--` everything is the prompt: a `resume` there is a word, not a subcommand.
+  assert.deepEqual(withNoDaemon(["codex", "--", "resume"], "0.160.0"), ["codex", "--no-daemon", "--", "resume"]);
+});
+
+test("--no-daemon is never added twice, never to a CLI without it, and never to a non-interactive subcommand", () => {
+  // Codex refuses the flag given twice ("cannot be used multiple times").
+  const own = ["codex", "resume", ID, "--no-daemon"];
+  assert.deepEqual(withNoDaemon(own, "0.160.0"), own);
+  // 0.157.0 is the oldest Codex seen with the flag; older ones refuse it.
+  const cmd = ["codex", "resume", ID];
+  assert.deepEqual(withNoDaemon(cmd, "0.156.9"), cmd);
+  assert.deepEqual(withNoDaemon(cmd, null), cmd, "a version we could not read is not one we know has it");
+  for (const sub of ["exec", "e", "review", "login", "app-server", "mcp"]) {
+    const c = ["codex", sub, "x"];
+    assert.deepEqual(withNoDaemon(c, "0.160.0"), c, sub);
+  }
 });

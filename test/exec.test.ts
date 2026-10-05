@@ -235,3 +235,22 @@ test("a codex launch.env cannot shadow CODEX_HOME or the MS_* identity", async (
   assert.equal(lines.OPENAI_API_KEY, "<unset>");
   assert.equal(lines.MS_ACCOUNT, "work");
 });
+
+test("a codex that has --no-daemon is run in-process, and one without it is run as recorded", async () => {
+  // Since Codex 0.157 a TUI hands its conversation to the account home's
+  // shared background server unless told not to — and that server keeps the
+  // conversation for a minute after the pane is gone, and runs every pane's
+  // hooks with the environment of the pane that started it.
+  for (const [version, args] of [
+    ["0.160.0", "resume --no-daemon cx-1 hello"],
+    ["0.153.4", "resume cx-1 hello"],
+  ] as const) {
+    const { home, msHome } = tempHome();
+    const { dir, stub } = stubDir();
+    await seedLaunch({ home, msHome, account: "work", provider: "codex", command: ["codex", "resume", "cx-1", "hello"] });
+    stub("codex", `if [ "$1" = "--version" ]; then echo "codex-cli ${version}"; exit 0; fi\n${CODEX_STUB}`);
+    const r = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(envOf(r.stdout).ARGS, args, version);
+  }
+});

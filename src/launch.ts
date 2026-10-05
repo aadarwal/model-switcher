@@ -31,7 +31,7 @@ import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Verb } from "./cli.ts";
-import { ensureStore, msBinary, p } from "./paths.ts";
+import { codexBaseDir, ensureStore, msBinary, p } from "./paths.ts";
 import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import { parseNeed, pickAccounts, type Need, type PickInput } from "./pick.ts";
@@ -40,6 +40,7 @@ import { openState, type SessionRow, type State } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
 import { codexLaunchCommand } from "./providers/codex-cli.ts";
+import { RELEASE_BUDGET_MS, probeConversation, waitForWriterRelease, writerLockDirs } from "./codex-writer-lock.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { CONTINUATION, logLine } from "./recover.ts";
 import { currentPane, outsideServer, shellWord, tmuxCommandFor, tmuxFor, tmuxFromEnv } from "./tmux.ts";
@@ -131,6 +132,21 @@ export function claudeResumeId(args: string[]): string | null {
   }
   return null;
 }
+
+/**
+ * WHICH conversation a Codex command line resumes, when it names one by id —
+ * the id is what Codex's writer lock is named after
+ * (src/codex-writer-lock.ts). Found by its shape after `resume`, because Codex
+ * takes flags between the subcommand and the id (`resume --no-daemon <id>`).
+ * Null for `--last`, the picker, a thread NAME, and anything past `--`.
+ */
+export function codexResumeId(args: string[]): string | null {
+  const end = args.indexOf("--") < 0 ? args.length : args.indexOf("--");
+  const at = args.indexOf("resume");
+  if (at < 0 || at >= end) return null;
+  return args.slice(at + 1, end).find((a) => CONVERSATION_ID.test(a)) ?? null;
+}
+const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** A Claude `--resume`/`-r` that names no conversation: the picker. */
 function namesBareClaudeResume(args: string[]): boolean {
@@ -557,6 +573,30 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   // not started, and must leave nothing behind saying it did.
   const unprepared = plan.prepare(account, cwd);
   if (unprepared) { say(unprepared.error); return EXIT_ACCOUNT; }
+
+  // A Codex conversation can be launched only once nothing else writes it.
+  // The human typically just closed it somewhere — a plain `codex`, another
+  // pane — and that home's background server keeps it loaded for about a
+  // minute afterwards; a launch inside that minute is a read-only view
+  // (src/codex-writer-lock.ts). After `prepare`, which is what links this
+  // home's lock directory at the one every home shares.
+  const resumes = provider === "codex" ? (resumeId ?? codexResumeId(parsed.args)) : null;
+  if (resumes) {
+    const dirs = writerLockDirs([p.codexHome(account), codexBaseDir()]);
+    if (probeConversation(dirs, resumes) === "held") {
+      const budget = Number(process.env.MS_CODEX_RELEASE_MS) || RELEASE_BUDGET_MS;
+      process.stderr.write(
+        `ms codex: ${resumes} is still open in another codex process; waiting up to ${Math.round(budget / 1000)}s for it to be let go (a background server keeps a conversation about a minute after its window closes)\n`,
+      );
+      if ((await waitForWriterRelease(dirs, resumes, budget, Number(process.env.MS_POLL_MS) || 500)) === "held") {
+        say(`${resumes} is still open in another codex process`, [
+          "another pane, the Codex app, or a background server has it loaded, and codex lets only one of them write it",
+          "close it there, then run this again — nothing was launched",
+        ]);
+        return EXIT_ACCOUNT;
+      }
+    }
+  }
 
   const sessionId = randomUUID();
   const cliSessionId = plan.cliSessionId();

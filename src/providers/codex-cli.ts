@@ -27,6 +27,7 @@
 
 import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { compareVersions } from "../compat.ts";
 import { writeAtomicThroughLink } from "../fsx.ts";
 import { p } from "../paths.ts";
 
@@ -69,6 +70,57 @@ export function codexLaunchCommand(flags: string[]): string[] {
  */
 export function codexResumeCommand(cliSessionId: string, continuation: string | null, flags: string[]): string[] {
   return ["codex", "resume", cliSessionId, ...(continuation ? [continuation] : []), ...flags];
+}
+
+/** The oldest Codex seen with `--no-daemon` (0.157.0, checked 2026-10-04; the
+ *  flag arrived with the per-home background server it turns off). An older
+ *  CLI refuses an argument it does not know, so it is never given one. */
+export const CODEX_NO_DAEMON_SINCE = "0.157.0";
+
+/** Subcommands that are not the interactive TUI: `--no-daemon` is a TUI flag,
+ *  and a command line naming one of these is left exactly as recorded. */
+const NOT_THE_TUI = new Set([
+  "exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "app", "completion",
+  "update", "doctor", "sandbox", "debug", "apply", "a", "queue", "archive", "delete", "migrate-rollouts",
+  "unarchive", "cloud", "exec-server", "features", "help", "agents", "mcp-server",
+]);
+
+/**
+ * The command line a Codex pane is actually started with: the recorded one,
+ * run IN-PROCESS (`--no-daemon`) when the CLI has the flag.
+ *
+ * Since 0.157 an interactive Codex hands its conversation to its home's
+ * shared background server (`app-server --managed-daemon`, one per
+ * CODEX_HOME) unless told not to, and two things about that server break a
+ * pane this tool moves between accounts (verified against codex-rs
+ * rust-v0.160.0 and the live 0.160 handoff of 2026-10-04):
+ *
+ *   * it keeps the conversation LOADED — holding its writer lock — for about
+ *     a minute after the pane's TUI is gone, so a relaunch on another account
+ *     in that minute opens a read-only view with the continuation unsent
+ *     (src/codex-writer-lock.ts). In-process, the lock dies with the pane;
+ *   * it runs every conversation's hooks with ITS OWN environment, inherited
+ *     from whichever pane spawned it — that pane's `MS_SESSION`, `MS_PANE`
+ *     and `MS_GENERATION` — so a second pane on the same account would report
+ *     its turns as the first pane's session (hooks/src/registry.rs:76-81,
+ *     app-server-daemon/src/backend/pid_start.rs:93-133). In-process, the
+ *     hooks see this pane's own `ms _exec` environment.
+ *
+ * Added here, at exec time, rather than recorded in the launch: it depends on
+ * the CLI binary actually being run, which can change between a launch and
+ * its next rotation. After the `resume`/`fork` subcommand when there is one
+ * (where Codex documents it), else at the top level; never twice (Codex
+ * refuses a repeated flag), never past `--`, and never for a non-interactive
+ * subcommand. A version that could not be read is not one known to have it.
+ */
+export function withNoDaemon(command: string[], version: string | null): string[] {
+  if (!version || compareVersions(version, CODEX_NO_DAEMON_SINCE) < 0) return command;
+  const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
+  const head = command.slice(1, end);
+  if (head.includes("--no-daemon") || head.some((a) => NOT_THE_TUI.has(a))) return command;
+  const sub = head.findIndex((a) => a === "resume" || a === "fork");
+  const at = sub < 0 ? 1 : sub + 2;
+  return [...command.slice(0, at), "--no-daemon", ...command.slice(at)];
 }
 
 /** How a Codex pane is asked to leave: the keys, and how long the TUI is

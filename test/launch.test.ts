@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { run, tempHome, stubDir } from "./helpers.ts";
@@ -1192,4 +1194,64 @@ test("a config.toml this tool cannot add to safely stops the launch, naming the 
   assert.match(r.stderr, new RegExp(`^ms codex: ${esc(config)} already defines 'projects'`, "m"));
   assert.equal(readFileSync(config, "utf8"), before, "a refusal writes nothing at all");
   assert.equal((await readState(w)).sessions.length, 0);
+});
+
+// --- ms codex: a conversation that is still open somewhere else ---------------
+//
+// `ms adopt`, `ms import` and `ms codex -- resume <id>` all resume a
+// conversation the human was just running somewhere — often a plain `codex`
+// whose home's background server keeps it loaded for a minute after its
+// window closed. Codex lets one process write a conversation (an flock in the
+// `thread-writer-locks` every home shares), so a launch inside that minute is a
+// read-only view. The launch waits for the lock, and refuses when it stays.
+
+const CONVERSATION = "01a10951-a81b-7a52-9a37-6c3f1d1f0c11";
+
+/** A base ~/.codex of this test's own, whose `thread-writer-locks` every
+ *  account home is linked at — with `CONVERSATION`'s lock held by a real flock
+ *  for `seconds`. Resolves once the lock is held. */
+async function heldConversation(seconds: number): Promise<{ base: string; holder: ReturnType<typeof spawn> }> {
+  const base = realpathSync(mkdtempSync(path.join(tmpdir(), "ms-launch-base-")));
+  const dir = path.join(base, "thread-writer-locks");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, ".coordination.lock"), "");
+  const file = path.join(dir, `${CONVERSATION}.lock`);
+  writeFileSync(file, "");
+  const holder = spawn("perl", ["-e", `use Fcntl ":flock"; open(F, "<", $ARGV[0]) or die; flock(F, LOCK_EX) or die; $|=1; print "held\\n"; sleep ${seconds}`, file], {
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  await new Promise<void>((resolve) => holder.stdout!.once("data", () => resolve()));
+  return { base, holder };
+}
+
+test("ms codex -- resume <id> waits for a conversation another codex still holds, then launches", async (t) => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const { base, holder } = await heldConversation(1);
+  t.after(() => holder.kill("SIGKILL"));
+  const r = run(["codex", "--", "resume", CONVERSATION], w.env({ MS_CODEX_BASE_DIR: base, MS_CODEX_RELEASE_MS: "15000", MS_POLL_MS: "50" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, new RegExp(`${CONVERSATION} is still open in another codex process`));
+  assert.ok(logLines(w).some((l) => l.includes("respawn-pane")), "launched once the lock was let go");
+});
+
+test("ms codex -- resume <id> refuses a conversation that stays open elsewhere, and launches nothing", async (t) => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const { base, holder } = await heldConversation(60);
+  t.after(() => holder.kill("SIGKILL"));
+  const r = run(["codex", "--", "resume", CONVERSATION], w.env({ MS_CODEX_BASE_DIR: base, MS_CODEX_RELEASE_MS: "300", MS_POLL_MS: "50" }));
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, new RegExp(`${CONVERSATION} is still open in another codex process`));
+  assert.match(r.stderr, /close it there/);
+  assert.ok(!existsSync(w.log) || !readFileSync(w.log, "utf8").includes("respawn-pane"), "nothing was launched");
+});
+
+test("codexResumeId reads the conversation a codex command line resumes, flags between or not", async () => {
+  const { codexResumeId } = await import("../src/launch.ts");
+  assert.equal(codexResumeId(["resume", CONVERSATION]), CONVERSATION);
+  assert.equal(codexResumeId(["--yolo", "resume", "--no-daemon", CONVERSATION, "go on"]), CONVERSATION);
+  assert.equal(codexResumeId(["resume", "--last"]), null, "the most recent: Codex's to choose");
+  assert.equal(codexResumeId(["resume"]), null, "the picker");
+  assert.equal(codexResumeId(["resume", "my-named-thread"]), null, "a name is not a lock file");
+  assert.equal(codexResumeId(["--", "resume", CONVERSATION]), null, "past `--` it is a prompt");
+  assert.equal(codexResumeId(["--model", "gpt-5"]), null);
 });

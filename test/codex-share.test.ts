@@ -609,3 +609,22 @@ test("generic: a directory holding a live unix socket is runtime state — not l
     await Promise.all([closed(baseIpc), closed(homeRt), closed(baseRt2)]);
   }
 });
+
+test("thread-writer-locks is SHARED, not runtime state: one lock namespace for every account and the human's own codex", () => {
+  // Codex 0.160 lets ONE process write a conversation: an flock on
+  // `thread-writer-locks/<id>.lock`. A home with its own directory would let a
+  // pane on this account and a pane or server on another append to the same
+  // rollout at once. It is a directory of `.lock` files — the shape
+  // `isRuntimeState` must not mistake for one process's own state.
+  const w = world();
+  put(path.join(w.base, "thread-writer-locks", ".coordination.lock"), "");
+  put(path.join(w.base, "thread-writer-locks", "01a10951-a81b-7a52-9a37-6c3f1d1f0c11.lock"), "");
+  assert.equal(isRuntimeState(path.join(w.base, "thread-writer-locks")), false);
+
+  const r = shareCodexState(w.acct);
+
+  assert.deepEqual(r.problems, []);
+  const link = path.join(w.acct, "thread-writer-locks");
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+  assert.equal(realpathSync(link), realpathSync(path.join(w.base, "thread-writer-locks")));
+});

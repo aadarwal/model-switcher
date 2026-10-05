@@ -2382,3 +2382,184 @@ test("backgroundReason: copy-mode refuses a Claude pane, never a Codex one", () 
   assert.match(backgroundReason(inMode, "%1", screens.QUIET_SCREEN, "claude") ?? "", /copy-mode/);
   assert.equal(backgroundReason(inMode, "%1", screens.QUIET_SCREEN, "codex"), null);
 });
+
+// --- Codex 0.160: a conversation that is still open somewhere else ----------
+//
+// Codex lets ONE process write a conversation: an flock on
+// `thread-writer-locks/<id>.lock`, which every account home shares. The pane's
+// own CLI leaving is not enough when the conversation was loaded in that
+// home's background server, which keeps it for ~60 s after its last client
+// goes; a relaunch inside that window opens a read-only view ("This
+// conversation is open in another app") with the continuation left unsent.
+// The lock here is a REAL flock, held by a Perl child — the same lock Codex
+// takes (Rust's `File::try_lock` is flock(2)).
+
+/** Hold `<home>/thread-writer-locks/<id>.lock` until the returned release. */
+async function holdConversation(t: TestContext, home: string, id: string): Promise<() => Promise<void>> {
+  const dir = path.join(home, "thread-writer-locks");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, ".coordination.lock"), "");
+  const file = path.join(dir, `${id}.lock`);
+  writeFileSync(file, "");
+  const child = spawn("perl", ["-e", 'use Fcntl ":flock"; open(F, "<", $ARGV[0]) or die; flock(F, LOCK_EX) or die; $|=1; print "held\\n"; sleep 60', file], {
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  const gone = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  t.after(() => child.kill("SIGKILL"));
+  await new Promise<void>((resolve) => child.stdout!.once("data", () => resolve()));
+  return async () => {
+    child.kill("SIGKILL");
+    await gone;
+  };
+}
+
+const LOCK_CARD_SCREEN = [
+  "❯ ship it",
+  "",
+  "🔒 This conversation is open in another app — Close it there and press R to continue here",
+  "",
+].join("\n");
+
+/** On every respawn, put the next screen up: the first respawn draws
+ *  `screens[0]`, the second `screens[1]`, and so on (the last one repeats). */
+function screensOnRespawn(w: World, ...screens: string[]): void {
+  const dir = path.dirname(w.screen);
+  screens.forEach((s, i) => writeFileSync(path.join(dir, `respawn-screen-${i + 1}`), s));
+  process.env.MS_TMUX_ON_MATCH = "respawn-pane";
+  process.env.MS_TMUX_ON = `n=$(cat "${dir}/respawns" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "${dir}/respawns"; ` +
+    `f="${dir}/respawn-screen-$n"; [ -f "$f" ] || f="${dir}/respawn-screen-${screens.length}"; cp "$f" "${w.screen}"`;
+}
+
+const respawnLines = (w: World): string[] => logLines(w).filter((l) => l.includes("respawn-pane"));
+
+/** Report the resume once the `n`th respawn appears — the hook's SessionStart
+ *  fires only inside the first turn, i.e. only once the continuation went in. */
+function reportOnNthRespawn(w: World, n: number, event: { generation: number; cliSessionId: string }): () => void {
+  const timer = setInterval(() => {
+    if (respawnLines(w).length < n) return;
+    clearInterval(timer);
+    appendEvent({ t: nowSeconds(), kind: "resumed", session: "s1", generation: event.generation, cliSessionId: event.cliSessionId });
+  }, 10);
+  return () => clearInterval(timer);
+}
+
+test("codex: a conversation the old account's server still holds is waited for, then resumed — never relaunched into the lock", async (t) => {
+  const w = await codexWorld(t);
+  process.env.MS_CODEX_RELEASE_MS = "10000";
+  t.after(() => { delete process.env.MS_CODEX_RELEASE_MS; });
+  const release = await holdConversation(t, path.join(w.msHome, "codex", "work"), "cx-1");
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  const running = recoverSession("s1");
+  // The CLI has been asked to leave, and the relaunch is HELD while the lock is.
+  await sleep(600);
+  assert.equal(sendKeys(w).length, 2, "the pane's own CLI is ended first — that is all that is ever ended");
+  assert.equal(respawnLine(w), undefined, "no relaunch while another process still writes the conversation");
+  assert.match(recoverLog(w), /cx-1 is still open in another codex process/);
+  await release();
+
+  assert.equal(await running, 0);
+  assert.equal(session(w).state, "continuing");
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-5"]);
+  assert.match(recoverLog(w), /cx-1 was released after/);
+});
+
+test("codex: a conversation that stays open elsewhere is refused with the reason, and nothing is relaunched", async (t) => {
+  const w = await codexWorld(t);
+  process.env.MS_CODEX_RELEASE_MS = "300";
+  t.after(() => { delete process.env.MS_CODEX_RELEASE_MS; });
+  await holdConversation(t, path.join(w.msHome, "codex", "work"), "cx-1");
+
+  assert.equal(await recoverSession("s1"), 1);
+  assert.equal(respawnLine(w), undefined, "a relaunch into a held conversation is a read-only view, never a handoff");
+  const s = session(w);
+  assert.equal(s.state, "parked");
+  assert.equal(s.account, "work", "the session never left the account");
+  assert.equal(s.generation, 2);
+  const why = takeFailReason("s1") ?? "";
+  assert.match(why, /cx-1 is still open in another codex process/);
+  assert.match(why, /close it there/);
+  assert.match(why, /ms rotate/);
+});
+
+test("codex: a relaunch that lands on the lock card is ended, released and relaunched ONCE — and the continuation goes in", async (t) => {
+  const w = await codexWorld(t);
+  screensOnRespawn(w, LOCK_CARD_SCREEN, CODEX_IDLE_SCREEN);
+  const stop = reportOnNthRespawn(w, 2, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  const respawns = respawnLines(w);
+  assert.equal(respawns.length, 2, "exactly one retry");
+  assert.equal(respawns[0], respawns[1], "the same launch, so the continuation travels as its argument again");
+  assert.equal(sendKeys(w).length, 4, "the read-only TUI is asked to leave the same way the walled one was");
+  const s = session(w);
+  assert.equal(s.state, "continuing");
+  assert.equal(s.account, "home");
+  assert.equal(s.generation, 3);
+  assert.match(recoverLog(w), /open in another app/);
+  assert.equal(rows(w, "recoveries")[0].status, "done");
+});
+
+test("codex: a relaunch that lands on the lock card twice is parked with the reason", async (t) => {
+  const w = await codexWorld(t);
+  screensOnRespawn(w, LOCK_CARD_SCREEN);
+
+  assert.equal(await recoverSession("s1"), 1);
+  assert.equal(respawnLines(w).length, 2, "one retry, never a loop");
+  assert.equal(session(w).state, "parked");
+  const why = takeFailReason("s1") ?? "";
+  assert.match(why, /cx-1 is open in another codex process/);
+  assert.match(why, /close it there/);
+});
+
+test("codex: a relaunch with no prompt that lands on the lock card is not taken for ready", async (t) => {
+  // The settle reads a live pane as ready — and a read-only TUI is a live pane.
+  const w = await codexWorld(t, { screen: CODEX_IDLE_SCREEN, recovery: false, wall: false });
+  screensOnRespawn(w, LOCK_CARD_SCREEN);
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "home", continueAfter: false } }), 1);
+  assert.equal(respawnLines(w).length, 2);
+  assert.equal(session(w).state, "parked");
+  assert.match(takeFailReason("s1") ?? "", /open in another codex process/);
+});
+
+test("codex: the card's words in a resumed conversation's own history are not the card — a relaunch that holds the conversation is never ended", async (t) => {
+  // The conversations that hit the lock are the ones that talk about it, and
+  // `codex resume` re-renders their history. A TUI that holds the writer lock
+  // IS the conversation's writer whatever its screen says; ending it would
+  // interrupt the turn the continuation started and send the continuation twice.
+  const w = await codexWorld(t);
+  const dir = path.dirname(w.screen);
+  const lockDir = path.join(w.msHome, "codex", "home", "thread-writer-locks");
+  mkdirSync(lockDir, { recursive: true });
+  const lockFile = path.join(lockDir, "cx-1.lock");
+  const pidFile = path.join(dir, "writer.pid");
+  writeFileSync(path.join(dir, "respawn-screen"), ["› why did it say this?", "", "  Codex printed: This conversation is open in another app — Close it there and press R to continue here.", "", "› "].join("\n"));
+  // The respawned "codex": a real process holding the conversation's lock open, as a writer does.
+  process.env.MS_TMUX_ON_MATCH = "respawn-pane";
+  process.env.MS_TMUX_ON =
+    `perl -e 'use Fcntl ":flock"; open(F, ">>", $ARGV[0]) or die; flock(F, LOCK_EX) or die; open(R, ">", $ARGV[1]); close R; sleep 30' "${lockFile}" "${dir}/writer.ready" </dev/null >/dev/null 2>&1 & ` +
+    `echo $! > "${pidFile}"; while [ ! -f "${dir}/writer.ready" ]; do sleep 0.05; done; ` +
+    `printf 'pane_pid=%s\\n' "$(cat "${pidFile}")" >> "$MS_TMUX_STATE"; cp "${dir}/respawn-screen" "${w.screen}"`;
+  t.after(() => {
+    try {
+      process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+    } catch {
+      /* never started, or already gone */
+    }
+  });
+  // The report comes late, so the screen is read many times before it.
+  const timer = setInterval(() => {
+    if (!existsSync(path.join(dir, "writer.ready"))) return;
+    clearInterval(timer);
+    setTimeout(() => appendEvent({ t: nowSeconds(), kind: "resumed", session: "s1", generation: 3, cliSessionId: "cx-1" }), 800);
+  }, 10);
+  t.after(() => clearInterval(timer));
+
+  assert.equal(await recoverSession("s1"), 0);
+  assert.equal(respawnLines(w).length, 1, "the writer was never ended and relaunched");
+  assert.equal(sendKeys(w).length, 2, "only the walled CLI was asked to leave");
+  assert.equal(session(w).state, "continuing");
+  assert.doesNotMatch(recoverLog(w), /shows .* open in another app/);
+});

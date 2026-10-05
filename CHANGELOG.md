@@ -4,7 +4,7 @@
 
 - `ms claude mesh` / `ms codex mesh` (with the launcher's usual arguments after it): choose
   the account by hand. An fzf picker — a tmux popup in a pane with fzf 0.53+, full screen
-  otherwise — lists the provider's accounts in the chooser's own ranking, `★` on what a plain
+  otherwise, and in a pane no client is attached to — lists the provider's accounts in the chooser's own ranking, `★` on what a plain
   launch would pick and `✗` on what it cannot use, with a preview per account (e-mail, rank,
   window bars and resets, whether this device can launch it, the panes on it, the reading's
   age). ctrl-r takes a fresh reading (`ms _mesh_rows`); without fzf, a numbered menu on the

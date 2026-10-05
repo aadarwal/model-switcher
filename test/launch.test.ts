@@ -73,7 +73,7 @@ globalThis.fetch = async (url, init = {}) => {
 const TMUX_STUB = `printf '%s\\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
 case "$1" in
-  display-message) case "$*" in *socket_path*) echo "${DEFAULT_SOCKET}" ;; *) echo "${IDENTITY}" ;; esac ;;
+  display-message) case "$*" in *socket_path*) echo "${DEFAULT_SOCKET}" ;; *session_attached*) echo 1 ;; *) echo "${IDENTITY}" ;; esac ;;
   new-session|new-window) echo "%42" ;;
   list-panes) [ -z "\${MS_TMUX_PANES:-}" ] || printf '%s\\n' \${MS_TMUX_PANES} ;;
   has-session) exit "\${MS_TMUX_HAS_SESSION:-1}" ;;

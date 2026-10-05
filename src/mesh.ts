@@ -22,9 +22,9 @@
 // of which would otherwise leak it.
 //
 // fzf is the human's own, found on PATH and run on their terminal (it opens
-// /dev/tty itself): as a tmux popup in a real pane when the fzf is new enough
-// (0.53+), full screen otherwise — inside a display-popup too, which has no
-// pane of its own. ctrl-r runs `ms _mesh_rows`, which takes a fresh reading,
+// /dev/tty itself): as a tmux popup in a real pane that someone is looking at,
+// when the fzf is new enough (0.53+), full screen otherwise — inside a
+// display-popup too, which has no pane of its own. ctrl-r runs `ms _mesh_rows`, which takes a fresh reading,
 // re-renders the previews and prints the rows again. With no fzf on PATH, a
 // numbered menu on the terminal does the same job.
 //
@@ -47,7 +47,7 @@ import { NAME_PATTERN, findAccount, loadRegistry, type Provider, type Registry }
 import { DEFAULT_MAX_AGE_MS, ageLabel, cachedAccounts, getSnapshot, toPickInputs, type AccountUsage, type Snapshot } from "./snapshot.ts";
 import { openState, type SessionRow } from "./state.ts";
 import { computeAccount, sessionsByAccount, type AccountState } from "./status.ts";
-import { shellQuote } from "./tmux.ts";
+import { Tmux, shellQuote } from "./tmux.ts";
 
 /** Why this device cannot launch an account, or null when it can. It is the
  *  launch's own credential check (`launchCredential`, src/launch.ts), handed
@@ -462,7 +462,8 @@ export type FzfArgsInput = {
   dir: string;
   /** This tool's own binary, for ctrl-r (`msBinary()`). */
   self: string;
-  /** A real tmux pane: `$TMUX` and `$TMUX_PANE` both set. */
+  /** A real tmux pane (`$TMUX` and `$TMUX_PANE` both set) whose session a
+   *  client is attached to (`paneWatched`). */
   inPane: boolean;
   fzfVersion: FzfVersion | null;
   header: [string, string];
@@ -641,6 +642,21 @@ export type ChooseDeps = {
   snapshot?: () => Promise<Snapshot>;
 };
 
+/**
+ * Is a client attached to this pane's session? fzf draws its popup on a
+ * client, and with none attached — a command typed into a detached session
+ * by something other than a person — `fzf --tmux` simply never returns
+ * (fzf 0.73.1: still running, and runnable, 20 s later), where plain fzf sits
+ * on the pane for whoever attaches. One bounded tmux call; an answer that is
+ * not a count of clients is not a yes.
+ */
+function paneWatched(env: NodeJS.ProcessEnv): boolean {
+  const socket = (env.TMUX ?? "").split(",")[0];
+  if (!socket || !env.TMUX_PANE) return false;
+  const r = new Tmux(socket).run(["display-message", "-p", "-t", env.TMUX_PANE, "#{session_attached}"]);
+  return r.code === 0 && /^[1-9]\d*$/.test(r.stdout.trim());
+}
+
 function opens(file: string): boolean {
   try {
     closeSync(openSync(file, "r"));
@@ -690,7 +706,7 @@ function pickWithFzf(fzf: string, view: MeshView, deps: ChooseDeps, env: NodeJS.
       need: view.need,
       dir,
       self,
-      inPane: !!env.TMUX && !!env.TMUX_PANE,
+      inPane: !!env.TMUX && !!env.TMUX_PANE && paneWatched(env),
       fzfVersion: fzfVersion(fzf),
       header: meshHeader(view),
     });

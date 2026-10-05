@@ -408,10 +408,13 @@ function chooserWorld(t: TestContext, o: { tokens?: string[] } = {}): ChooserWor
   process.env.MS_HOME = msHome;
   const { dir, stub } = stubDir();
   stub("fzf", FZF_STUB);
+  // tmux, as far as the picker asks it anything: whether a client is
+  // looking at the pane's session (MS_TEST_TMUX_ATTACHED, default 1).
+  stub("tmux", `case "$*" in *session_attached*) echo "\${MS_TEST_TMUX_ATTACHED:-1}" ;; esac`);
   process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
   t.after(() => {
     process.env.PATH = ORIGINAL_PATH;
-    for (const k of Object.keys(process.env)) if (k.startsWith("MS_TEST_FZF_")) delete process.env[k];
+    for (const k of Object.keys(process.env)) if (k.startsWith("MS_TEST_FZF_") || k === "MS_TEST_TMUX_ATTACHED") delete process.env[k];
   });
   writeFileSync(path.join(msHome, "accounts.json"), JSON.stringify({
     version: 1,
@@ -474,6 +477,17 @@ test("chooseAccount: in a real pane, fzf 0.53+ opens as a tmux popup", async (t)
   assert.deepEqual(r, { name: "bravo", out: null });
   const args = fzfArgv(w);
   assert.equal(args[args.indexOf("--tmux") + 1], "center,80%,60%");
+});
+
+test("chooseAccount: a pane nobody is attached to gets plain fzf, not a popup that would wait for ever", async (t) => {
+  // fzf 0.73.1's --tmux in a session with no client never returns (measured:
+  // still running after 20 s). Plain fzf sits on the pane for whoever attaches.
+  const w = chooserWorld(t);
+  process.env.MS_TEST_FZF_PICK = "bravo";
+  process.env.MS_TEST_TMUX_ATTACHED = "0";
+  const r = await chooseAccount({ provider: "claude", need: "any", ready: claudeReady, tty: w.tty, env: { ...process.env, TMUX: "/tmp/sock,1,0", TMUX_PANE: "%3" } });
+  assert.deepEqual(r, { name: "bravo", out: null });
+  assert.equal(fzfArgv(w).includes("--tmux"), false);
 });
 
 test("chooseAccount: esc (130) and nothing-matched (1) both cancel; any other exit is an error", async (t) => {

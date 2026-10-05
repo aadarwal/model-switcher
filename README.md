@@ -337,8 +337,8 @@ solo before shared. No projections, no thresholds below 100.
 
 `ms claude mesh` (or `ms codex mesh`, with the launcher's usual arguments after it) shows that
 provider's accounts in an [fzf](https://github.com/junegunn/fzf) picker and launches the one
-you choose. In a tmux pane it opens as a popup (fzf 0.53 or later); anywhere else, fzf takes
-the terminal.
+you choose. In a tmux pane it opens as a popup (fzf 0.53 or later); anywhere else, and in a
+pane whose session no client is attached to, fzf takes the terminal.
 
 - **Rows.** One per account: `★` on the account a plain `ms claude` would pick right now, `✗`
   on one it cannot use (out of the ranking for want of room or a reading, or with no

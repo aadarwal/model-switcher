@@ -155,9 +155,12 @@ export function sessionsByAccount(sessions: { id: string; provider: string; acco
   return map;
 }
 
-function computeAccount(a: AccountUsage, registry: Registry): AccountComputed {
+/** `hasToken` is read here unless the caller already knows it: the mesh
+ *  picker (src/mesh.ts) has just asked the launch's own credential check, and
+ *  reading the token a second time to learn the same fact would be one more
+ *  place a credential is read for no reason. */
+export function computeAccount(a: AccountUsage, registry: Registry, hasToken = !!readLaunchToken(a.name)): AccountComputed {
   const row = findAccount(registry, a.name, a.provider);
-  const hasToken = !!readLaunchToken(a.name);
   return { label: row?.label ?? a.name, state: accountState(a, hasToken), email: row?.email ?? null };
 }
 

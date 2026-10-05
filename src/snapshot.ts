@@ -643,9 +643,10 @@ export function getSnapshot(opts: SnapshotOptions = {}): Promise<Snapshot> {
   return promise;
 }
 
-/** Rounded, human-sized, and never precise: this only ever lands in an error
- *  string a person reads. */
-function ageLabel(ms: number): string {
+/** Rounded, human-sized, and never precise: this only ever lands in text a
+ *  person reads — an error string here, the mesh picker's "usage 14s old"
+ *  (src/mesh.ts). */
+export function ageLabel(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 90) return `${s}s`;
   const m = Math.round(s / 60);

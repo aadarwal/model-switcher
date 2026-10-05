@@ -42,6 +42,7 @@ import { readCodexAuth } from "./providers/codex-probe.ts";
 import { codexLaunchCommand } from "./providers/codex-cli.ts";
 import { RELEASE_BUDGET_MS, probeConversation, waitForWriterRelease, writerLockDirs } from "./codex-writer-lock.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
+import { chooseAccount } from "./mesh.ts";
 import { CONTINUATION, logLine } from "./recover.ts";
 import { currentPane, outsideServer, shellWord, tmuxCommandFor, tmuxFor, tmuxFromEnv } from "./tmux.ts";
 
@@ -51,6 +52,7 @@ const EXIT_ACCOUNT = 1; // named account missing, or no launch token
 const EXIT_USAGE_ERROR = 2; // the command line itself is wrong
 const EXIT_NO_ROOM = 3; // nothing has room
 const EXIT_UNREACHABLE = 4; // usage is down and there is no recent pick
+const EXIT_CANCELLED = 130; // the human cancelled the `mesh` picker: nothing launched, nothing written
 
 /** The session a launch from outside tmux lands in, on the default server (or
  *  on the `MS_TMUX_SOCKET` override). */
@@ -78,7 +80,7 @@ function sayFor(provider: Provider) {
 
 // --- The command line --------------------------------------------------
 
-type Parsed = { as: string | null; need: Need | null; continueAfter: boolean; args: string[] };
+type Parsed = { as: string | null; need: Need | null; continueAfter: boolean; mesh: boolean; args: string[] };
 
 /**
  * Does this command line bring an existing conversation back?
@@ -154,7 +156,7 @@ function namesBareClaudeResume(args: string[]): boolean {
 }
 
 /**
- * `ms <cli> [--as name] [--need any|fable] [--continue] [-- <cli args>]`.
+ * `ms <cli> [mesh] [--as name] [--need any|fable] [--continue] [-- <cli args>]`.
  *
  * `--` is the boundary, and it is a hard one: everything after it is the
  * user's own command line for the CLI and passes through untouched, and
@@ -162,6 +164,11 @@ function namesBareClaudeResume(args: string[]): boolean {
  * than a guess (a mistyped `--need` must not silently become an argument to
  * the CLI). `cli` appears only in that refusal, so the human is told where
  * their own argument belongs in the command they actually typed.
+ *
+ * `mesh` is the one bare word on our side of it: pick the account by hand
+ * (src/mesh.ts). It is the whole of the choice, so it cannot be said twice
+ * or beside `--as`, which is a choice already made. After `--` it is the
+ * CLI's own argument like any other.
  *
  * `--continue` is the launch-time half of what a rotation does for free: the
  * SAME `CONTINUATION` (src/recover.ts), submitted the SAME way — as the
@@ -173,11 +180,17 @@ export function parseLaunchArgs(argv: string[], cli = "claude"): Parsed | { erro
   let as: string | null = null;
   let need: Need | null = null;
   let continueAfter = false;
+  let mesh = false;
   const args: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--") { args.push(...argv.slice(i + 1)); break; }
     if (a === "--continue") { continueAfter = true; continue; }
+    if (a === "mesh") {
+      if (mesh) return { error: "mesh is given twice" };
+      mesh = true;
+      continue;
+    }
     if (a === "--as" || a.startsWith("--as=")) {
       const v = a.startsWith("--as=") ? a.slice("--as=".length) : argv[++i];
       if (!v) return { error: "--as needs an account name" };
@@ -193,12 +206,13 @@ export function parseLaunchArgs(argv: string[], cli = "claude"): Parsed | { erro
     }
     return { error: `unexpected argument ${JSON.stringify(a)} — put ${cli}'s own arguments after --` };
   }
+  if (mesh && as !== null) return { error: "mesh chooses the account; drop --as or drop mesh" };
   // `--session-id` is how the launch keeps its grip on the CLI session across
   // a rotation; a user-supplied one would break the only handle we have.
   if (args.some((a) => a === "--session-id" || a.startsWith("--session-id="))) {
     return { error: "--session-id is set by ms; remove it" };
   }
-  return { as, need, continueAfter, args };
+  return { as, need, continueAfter, mesh, args };
 }
 
 // --- What the run needs ------------------------------------------------
@@ -348,6 +362,31 @@ export const attachVerb: Verb = async (argv) => {
 };
 
 /**
+ * Existence of an account's launch credential on this device, and nothing
+ * more: null when there is one, else why not. The launch asks it before
+ * anything is written (`ProviderPlan.credential`), and the `mesh` picker asks
+ * it to mark the accounts this device cannot launch (src/mesh.ts) — one
+ * definition, so the picker can never offer what the launch would refuse.
+ * The VALUE never leaves the module that reads it.
+ */
+export function launchCredential(provider: Provider, account: string): { error: string } | null {
+  if (provider === "codex") {
+    // Existence of a USABLE credential, and nothing more: the value stays
+    // in the module that read it, and `_exec` hands the CLI the
+    // DIRECTORY, never a byte of the file. A present-but-empty `auth.json`
+    // — a login that was interrupted, a file someone truncated — is not a
+    // credential, and answering "yes" for it would put the modal-free
+    // launch in front of a CLI that cannot authenticate.
+    return readCodexAuth(p.codexHome(account))?.accessToken
+      ? null
+      : { error: `no codex credential for account '${account}' (run: ms accounts login ${account} --provider codex)` };
+  }
+  return readLaunchToken(account)
+    ? null
+    : { error: `no launch token for account '${account}' (run: ms accounts login ${account})` };
+}
+
+/**
  * What one provider's launch does differently, and nothing else.
  *
  * The spine below is identical for both CLIs — parse, choose, record, respawn,
@@ -392,16 +431,7 @@ function planFor(provider: Provider, parsed: Parsed, extras: LaunchExtras = {}):
       // `--need fable` is not a preference this provider can fail to meet —
       // it is a question about a window that does not exist.
       need: parsed.need === "fable" ? { error: "codex has no fable window" } : "any",
-      credential: (account) =>
-        // Existence of a USABLE credential, and nothing more: the value stays
-        // in the module that read it, and `_exec` hands the CLI the
-        // DIRECTORY, never a byte of the file. A present-but-empty `auth.json`
-        // — a login that was interrupted, a file someone truncated — is not a
-        // credential, and answering "yes" for it would put the modal-free
-        // launch in front of a CLI that cannot authenticate.
-        readCodexAuth(p.codexHome(account))?.accessToken
-          ? null
-          : { error: `no codex credential for account '${account}' (run: ms accounts login ${account} --provider codex)` },
+      credential: (account) => launchCredential("codex", account),
       prepare: (account, cwd) => {
         // Trust (a modal an unattended launch must never meet) and the hooks
         // (a home with none starts fine and reports NOTHING — see
@@ -442,10 +472,7 @@ function planFor(provider: Provider, parsed: Parsed, extras: LaunchExtras = {}):
   const resumes = namesAResume("claude", parsed.args);
   return {
     need: parsed.need ?? autoNeed(parsed.args),
-    credential: (account) =>
-      readLaunchToken(account)
-        ? null
-        : { error: `no launch token for account '${account}' (run: ms accounts login ${account})` },
+    credential: (account) => launchCredential("claude", account),
     prepare: () => null,
     cliSessionId: () => (resumes ? claudeResumeId(parsed.args) : randomUUID()),
     command: (id, args) => (resumes ? ["claude", ...args] : ["claude", "--session-id", id!, ...args]),
@@ -515,19 +542,45 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   // A pick is only worth remembering once it has actually been launched: a
   // fallback the tool never managed to run is a trap for the next launch.
   let remember: (() => void) | null = null;
+  // A hand pick (`mesh`): the session row carries it as its pin.
+  let pinned = false;
+  // Why a hand-picked account was out of the ranking, said once its
+  // credential is known to be here — "launching anyway" on a launch about to
+  // be refused would be a sentence that never comes true.
+  let noRoom: string | null = null;
 
+  // This provider's accounts. `--as` names one and does not need them.
+  const mine = new Set(registry.accounts.filter((a) => a.provider === provider).map((a) => a.name));
   if (parsed.as) {
     const named = findAccount(registry, parsed.as, provider);
     if (!named) { say(`no such account '${parsed.as}'`); return EXIT_ACCOUNT; }
     account = named.name;
-  } else {
-    const mine = new Set(registry.accounts.filter((a) => a.provider === provider).map((a) => a.name));
+  } else if (!mine.size) {
     // Not "the pool is full" — there is no pool. A configuration answer.
-    if (!mine.size) {
-      const how = provider === "claude" ? "" : ` --provider ${provider}`;
-      say(`no ${provider} account is registered (run: ms accounts add <name>${how})`);
-      return EXIT_ACCOUNT;
-    }
+    const how = provider === "claude" ? "" : ` --provider ${provider}`;
+    say(`no ${provider} account is registered (run: ms accounts add <name>${how})`);
+    return EXIT_ACCOUNT;
+  } else if (parsed.mesh) {
+    // The human chooses, from the ranking this launch would otherwise act on
+    // (src/mesh.ts), BEFORE any credential is checked, any home is prepared or
+    // any row, launch or tmux call is made — so a cancel is exit 130 with
+    // nothing behind it. The pick is not remembered as a last pick: it is the
+    // human's answer, not the chooser's.
+    const chosen = await chooseAccount({
+      provider,
+      need,
+      ready: plan.credential,
+      snapshot: () => getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS }),
+    });
+    if ("cancelled" in chosen) { say("cancelled — nothing launched"); return EXIT_CANCELLED; }
+    if ("error" in chosen) { say(chosen.error); return chosen.exit; }
+    // Re-read, not trusted from before the picker: a human can take their
+    // time, and an account can be removed meanwhile.
+    if (!findAccount(loadRegistry().registry, chosen.name, provider)) { say(`no such account '${chosen.name}'`); return EXIT_ACCOUNT; }
+    account = chosen.name;
+    pinned = true;
+    noRoom = chosen.out;
+  } else {
     const snapshot = await getSnapshot({ maxAgeMs: SNAPSHOT_MAX_AGE_MS });
     // The registry can break between our read and the snapshot's own.
     if (snapshot.registryError) { say(`cannot read the registry: ${snapshot.registryError}`); return EXIT_ACCOUNT; }
@@ -564,6 +617,9 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   // never here, and never in a message.
   const missing = plan.credential(account);
   if (missing) { say(missing.error); return EXIT_ACCOUNT; }
+  // The human overrules the chooser: an account it passed over still
+  // launches, and the first wall moves the work on as it always would.
+  if (noRoom) say(`${account} has no room (${noRoom}) — launching anyway; the first wall will rotate it`);
 
   const msBin = msBinary();
   const cwd = process.cwd();
@@ -602,7 +658,8 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   const cliSessionId = plan.cliSessionId();
   const launchId = randomUUID();
   const command = plan.command(cliSessionId, cliArgs);
-  const label = plan.label(need);
+  // A hand pick says so on the one line the human reads.
+  const label = `${plan.label(need)}${pinned ? ", pinned" : ""}`;
   const inside = !!process.env.TMUX && !!process.env.TMUX_PANE;
   const outside = outsideServer();
   const tmux = inside ? tmuxFromEnv() : tmuxFor(outside);
@@ -636,6 +693,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
         // The pass-through arguments verbatim: a rotation re-applies exactly
         // what this launch was asked for.
         flags: parsed.args,
+        pinnedAccount: pinned ? account : null,
       });
       st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
       retireSuperseded(st, { id: sessionId, socket, pane, serverStart });
@@ -669,6 +727,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     st.createSession({
       id: sessionId, provider, cliSessionId, cwd, socket, pane, serverStart,
       need, account, generation: 1, state: "launching", desired: "running", flags: parsed.args,
+      pinnedAccount: pinned ? account : null,
     });
     st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
     retireSuperseded(st, { id: sessionId, socket, pane, serverStart });

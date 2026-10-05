@@ -101,6 +101,13 @@ function isUniqueConstraintError(e: unknown): boolean {
   return code === "ERR_SQLITE_ERROR" && /UNIQUE constraint failed/.test(e.message);
 }
 
+/** SQLite's answer to adding a column the table already has. */
+function isDuplicateColumnError(e: unknown, col: string): boolean {
+  if (!(e instanceof Error)) return false;
+  const code = (e as { code?: unknown }).code;
+  return code === "ERR_SQLITE_ERROR" && e.message === `duplicate column name: ${col}`;
+}
+
 export class State {
   private closed = false;
   constructor(private db: DatabaseSync) {
@@ -110,10 +117,22 @@ export class State {
   }
   /** Bring a store written by an older build up to the current shape. Additive
    * only: it never drops or rewrites a column, so downgrading is survivable
-   * and a half-applied migration simply finishes on the next open. */
+   * and a half-applied migration simply finishes on the next open.
+   *
+   * Two processes can open one old store at the same moment (two panes'
+   * hooks, right after an upgrade): both see a column missing, and the second
+   * ALTER finds the first one's column. That migration is done, not failed —
+   * failing it would cost that invocation its whole run (a hook its event). */
   private migrate(): void {
     const have = new Set((this.db.prepare("PRAGMA table_info(sessions)").all() as { name: string }[]).map((r) => r.name));
-    for (const [col, ddl] of ADDED_SESSION_COLUMNS) if (!have.has(col)) this.db.exec(`ALTER TABLE sessions ADD COLUMN ${ddl}`);
+    for (const [col, ddl] of ADDED_SESSION_COLUMNS) {
+      if (have.has(col)) continue;
+      try {
+        this.db.exec(`ALTER TABLE sessions ADD COLUMN ${ddl}`);
+      } catch (e) {
+        if (!isDuplicateColumnError(e, col)) throw e;
+      }
+    }
   }
   private rowToSession(r: Record<string, unknown> | undefined): SessionRow | null {
     if (!r) return null;

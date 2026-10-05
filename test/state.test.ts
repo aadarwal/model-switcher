@@ -313,3 +313,36 @@ test("a store written before the pin gains the column, at null, on its next open
   const again = openState();
   try { assert.equal(again.getSession("old")!.pinnedAccount, "dirk", "a second open adds nothing twice"); } finally { again.close(); }
 });
+
+test("two opens of one old store at once: the one that finds the column already added opens anyway", async () => {
+  // Two processes (two panes' hooks, right after an upgrade) both read the
+  // old shape; the first adds the column, and the second's ALTER then finds
+  // it — `duplicate column name`, which used to fail that whole invocation.
+  // The second process's look is replayed here, from before the first's ALTER.
+  const { home, msHome } = tempHome();
+  process.env.HOME = home; process.env.MS_HOME = msHome;
+  const { DatabaseSync } = await import("node:sqlite");
+  const file = `${msHome}/state.sqlite`;
+  const old = new DatabaseSync(file);
+  old.exec(`CREATE TABLE sessions (id TEXT PRIMARY KEY, provider TEXT, cliSessionId TEXT, cwd TEXT, socket TEXT, pane TEXT,
+    serverStart TEXT, need TEXT, account TEXT, generation INTEGER, state TEXT, desired TEXT, flags TEXT, wakeupAt INTEGER, createdAt INTEGER, updatedAt INTEGER,
+    transcriptPath TEXT, rolloutOffset INTEGER NOT NULL DEFAULT 0, lastMoveAt INTEGER)`);
+  const shapeBefore = old.prepare("PRAGMA table_info(sessions)").all();
+  old.exec("ALTER TABLE sessions ADD COLUMN pinnedAccount TEXT"); // the first process, done
+  old.close();
+
+  const { State } = await import("../src/state.ts");
+  const db = new DatabaseSync(file);
+  const late = new Proxy(db, {
+    get(target, prop) {
+      if (prop === "prepare") return (sql: string) => (/table_info/.test(sql) ? { all: () => shapeBefore } : target.prepare(sql));
+      const v = Reflect.get(target, prop) as unknown;
+      return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+  const st = new State(late as unknown as InstanceType<typeof DatabaseSync>);
+  try {
+    st.createSession({ id: "s", ...base, pinnedAccount: "gmail" });
+    assert.equal(st.getSession("s")!.pinnedAccount, "gmail", "the store works, column and all");
+  } finally { st.close(); }
+});

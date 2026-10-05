@@ -256,6 +256,36 @@ test("rebalance never waives the 30 m wall guard — a session that just rotated
   assert.equal(calls.length, 0);
 });
 
+test("rebalance leaves a session pinned by hand where it is, even when asked on purpose; a stale pin is no pin", async (t) => {
+  await world(t);
+  const st = openState();
+  try {
+    st.updateSession("s1", { pinnedAccount: "dirk" });
+  } finally {
+    st.close();
+  }
+
+  const { calls, switcher } = fakeSwitcher();
+  const report = await rebalanceFleet({ dryRun: false, switcher });
+
+  const s1 = rowFor(report, "s1");
+  assert.equal(s1.reason, "pinned to dirk by hand");
+  assert.equal(s1.better, "gmail", "the rule's opinion is still reported");
+  assert.equal(s1.outcome, "—");
+  assert.equal(calls.length, 0, "an explicit run waives the cooldown, never the human's own pick");
+
+  // The pin names an account s1 is no longer on: the normal rules apply.
+  const again = openState();
+  try {
+    again.updateSession("s1", { pinnedAccount: "gmail" });
+  } finally {
+    again.close();
+  }
+  const stale = await rebalanceFleet({ dryRun: true, switcher: fakeSwitcher().switcher });
+  assert.equal(rowFor(stale, "s1").reason, "imminent-wall");
+  assert.equal(rowFor(stale, "s1").outcome, "would move");
+});
+
 // --- A real run -------------------------------------------------------------
 
 test("rebalance without --dry-run runs the same transaction the hook does: no continuation, never forced", async (t) => {

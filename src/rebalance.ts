@@ -92,8 +92,22 @@ export type PaneReading = "idle" | "busy" | "background" | "gone";
 const BACKGROUND_WORK = "background-work: the pane is running a workflow, subagent or shell a relaunch would kill";
 
 /** The part of a session row this decision reads. Structural, so a test can
- *  build one in a line and a caller can pass a whole `SessionRow`. */
-export type RebalanceSession = Pick<SessionRow, "provider" | "account" | "need" | "state">;
+ *  build one in a line and a caller can pass a whole `SessionRow`. The pin is
+ *  optional here only so that one line can leave it out: a row read from the
+ *  store always carries it, null when nobody pinned anything. */
+export type RebalanceSession = Pick<SessionRow, "provider" | "account" | "need" | "state"> & Partial<Pick<SessionRow, "pinnedAccount">>;
+
+/**
+ * Is this session where a human pinned it (`ms claude mesh`, src/mesh.ts)?
+ *
+ * Only while the pin still names the account the session is ON. A pin that
+ * names another account is stale — a rotation moved the session off it, and
+ * the transaction that did so clears the pin in the same write — and a stale
+ * pin is no pin at all: the rule judges that session like any other.
+ */
+export function isPinned(s: { account: string; pinnedAccount?: string | null }): boolean {
+  return !!s.pinnedAccount && s.pinnedAccount === s.account;
+}
 
 export type DecisionInput = {
   session: RebalanceSession;
@@ -228,6 +242,11 @@ export function decide(input: DecisionInput): Decision {
 
   if (!input.gate) return no("the gate is off");
   if (NEVER_STATES.has(session.state)) return no(`the session is ${session.state}`);
+  // A human chose this account by hand. The rule's opinion (`better`) is
+  // still worth reporting; acting on it would undo the choice at the next
+  // turn end. A wall still moves the session — that is a rotation, not this
+  // rule — and that move is what ends the pin.
+  if (isPinned(session)) return no(`pinned to ${session.account} by hand`);
   if (input.pane === "gone") return no("the pane is gone");
   if (input.pane === "busy") return no("the pane is mid-turn");
   if (input.pane === "background") return no(BACKGROUND_WORK);

@@ -239,6 +239,31 @@ test("a parked, waiting or stopped row is never moved; a running one is", () => 
   assert.equal(decide(input({ ...moving, session: sess({ state: "running" }) })).move, true);
 });
 
+test("a session pinned by hand to the account it is on never moves, and `better` is still the rule's answer", () => {
+  // `ms claude mesh` put it here; condition 1 holds, and it stays put.
+  const moving = { accounts: [acct("here", { session: w(90, at(3)) }), acct("there", { weeklyAll: w(20, at(48)) })] };
+  const d = decide(input({ ...moving, session: sess({ pinnedAccount: "here" }) }));
+  assert.deepEqual(d, { move: false, better: "there", reason: "pinned to here by hand" });
+  // Asked right after the states the rule never touches, before the pane: a
+  // pinned session's REASON is the pin, whatever the pane is doing.
+  assert.equal(decide(input({ ...moving, session: sess({ pinnedAccount: "here" }), pane: "busy" })).reason, "pinned to here by hand");
+  assert.equal(decide(input({ ...moving, session: sess({ pinnedAccount: "here", state: "parked" }) })).reason, "the session is parked");
+  // The control: the same pool, unpinned, moves.
+  assert.equal(decide(input({ ...moving, session: sess({ pinnedAccount: null }) })).move, true);
+});
+
+test("a stale pin — one naming an account the session has since left — changes nothing", () => {
+  // A wall rotated the session off its pin; the recovery clears it, but a row
+  // that still says `elsewhere` is judged exactly as if it said nothing.
+  const moving = { accounts: [acct("here", { session: w(90, at(3)) }), acct("there", { weeklyAll: w(20, at(48)) })] };
+  assert.deepEqual(
+    decide(input({ ...moving, session: sess({ pinnedAccount: "elsewhere" }) })),
+    { move: true, to: "there", better: "there", reason: "imminent-wall" },
+  );
+  assert.equal(decide(input({ session: sess({ pinnedAccount: "there" }) })).reason, "neither condition holds",
+    "a pin on the account the rule would choose is still not the account the session is on");
+});
+
 test("a pane with background work behind an idle prompt is never moved, and says so", () => {
   const moving = { accounts: [acct("here", { session: w(90, at(3)) }), acct("there", { weeklyAll: w(20, at(48)) })] };
   const d = decide(input({ ...moving, pane: "background" }));
@@ -552,6 +577,19 @@ test("the gate on and a condition true: one dispatch, one event, one stamp", asy
     ["here", "there", "imminent-wall", 1, Math.floor(NOW / 1000)],
   );
   assert.equal(w.st.getSession("s1")!.lastMoveAt, Math.floor(NOW / 1000), "the hysteresis stamp is written with the move");
+});
+
+test("a turn end on a session pinned by hand moves nothing: the stored pin is what the hook reads", async (t) => {
+  const w = world();
+  t.after(() => w.st.close());
+  session(w.st, "s1", { pinnedAccount: "here" });
+  gateOn(w.st);
+  const { d, calls } = deps();
+  const decision = await rebalanced("s1", d);
+  assert.deepEqual(decision, { move: false, better: "there", reason: "pinned to here by hand" });
+  assert.deepEqual(calls.dispatch, [], "nothing was dispatched");
+  assert.equal(w.st.getSession("s1")!.lastMoveAt, null, "and no cooldown was spent on a move that never happened");
+  assert.deepEqual(events(w.msHome, "s1").filter((e) => e.kind === "rebalance"), []);
 });
 
 test("the dispatched argv is the switch worker for this session and account", () => {

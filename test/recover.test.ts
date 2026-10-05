@@ -400,6 +400,34 @@ test("the happy path: dirk hands off to gmail and the resumed session continues"
   assert.match(recoverLog(w), /s1: dirk → gmail \(session wall, generation 3\)/);
 });
 
+test("a wall still rotates a session pinned by hand, and the move ends the pin", async (t) => {
+  // `ms claude mesh` pinned s1 to dirk; dirk walled. Work goes on, on gmail,
+  // and nothing is left saying the human chose gmail — they did not.
+  const w = await world(t, { session: { pinnedAccount: "dirk" } });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+
+  assert.equal(await recoverSession("s1"), 0);
+  const s = session(w);
+  assert.equal(s.account, "gmail");
+  assert.equal(s.pinnedAccount, null);
+});
+
+test("a human's own switch ends the pin too, and a refused one keeps it", async (t) => {
+  const w = await world(t, { screen: IDLE_SCREEN, recovery: false, wall: false, session: { pinnedAccount: "dirk", state: "running" } });
+  // Refused first: the named destination is not an account. Nothing moved, so
+  // nothing about the pin changed either.
+  assert.notEqual(await recoverSession("s1", { manual: { toAccount: "nope", continueAfter: false } }), 0);
+  assert.equal(session(w).pinnedAccount, "dirk");
+
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1", { manual: { toAccount: "work", continueAfter: false } }), 0);
+  const s = session(w);
+  assert.equal(s.account, "work");
+  assert.equal(s.pinnedAccount, null, "the account changed, so the pin ended with the move");
+});
+
 test("a wall after a /clear resumes the conversation the human is actually in", async (t) => {
   // End to end, with Claude Code's own SessionStart hook in the middle: the
   // human cleared the conversation (a new CLI session id, one process), went on

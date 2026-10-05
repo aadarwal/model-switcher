@@ -32,7 +32,14 @@ export type SessionRow = { id: string; provider: Provider; cliSessionId: string 
    *  wall's rotation both count as moves, and both are read out of the
    *  `launches` table by `lastAccountChangeAt` — so nothing here needs to
    *  be back-filled for an old store. */
-  lastMoveAt: number | null };
+  lastMoveAt: number | null;
+  /** The account a human picked by hand for this session (`ms claude mesh`,
+   *  src/mesh.ts), or null. While it still names `account`, rebalance leaves
+   *  the session where the human put it (src/rebalance.ts `decide`). A wall
+   *  still rotates it, and every account change — a rotation, `ms rotate`,
+   *  `ms switch` — writes null here in the same update that moves `account`
+   *  (src/recover.ts): the pin lasts until the first wall, and no longer. */
+  pinnedAccount: string | null };
 export type LaunchRow = { id: string; sessionId: string; generation: number; account: string; command: string[]; env: Record<string, string>; createdAt: number };
 export type WallKind = "session" | "weekly" | "fable" | "unknown";
 export type RecoveryRow = { id: number; sessionId: string; generation: number; turnId: string | null; kind: WallKind;
@@ -44,7 +51,7 @@ type RecoveryInput = Omit<RecoveryRow, "id" | "status" | "owner" | "attempts" | 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, provider TEXT, cliSessionId TEXT, cwd TEXT, socket TEXT, pane TEXT,
   serverStart TEXT, need TEXT, account TEXT, generation INTEGER, state TEXT, desired TEXT, flags TEXT, wakeupAt INTEGER, createdAt INTEGER, updatedAt INTEGER,
-  transcriptPath TEXT, rolloutOffset INTEGER NOT NULL DEFAULT 0, lastMoveAt INTEGER);
+  transcriptPath TEXT, rolloutOffset INTEGER NOT NULL DEFAULT 0, lastMoveAt INTEGER, pinnedAccount TEXT);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS launches (id TEXT PRIMARY KEY, sessionId TEXT, generation INTEGER, account TEXT, command TEXT, env TEXT, createdAt INTEGER);
 CREATE TABLE IF NOT EXISTS recoveries (id INTEGER PRIMARY KEY AUTOINCREMENT, sessionId TEXT, generation INTEGER, turnId TEXT, kind TEXT,
@@ -66,7 +73,7 @@ const now = () => Math.floor(Date.now() / 1000);
 const SESSION_COLUMNS = new Set<string>([
   "provider", "cliSessionId", "cwd", "socket", "pane", "serverStart", "need",
   "account", "generation", "state", "desired", "flags", "wakeupAt",
-  "transcriptPath", "rolloutOffset", "lastMoveAt",
+  "transcriptPath", "rolloutOffset", "lastMoveAt", "pinnedAccount",
 ]);
 
 /**
@@ -85,6 +92,7 @@ const ADDED_SESSION_COLUMNS: readonly [string, string][] = [
   ["transcriptPath", "transcriptPath TEXT"],
   ["rolloutOffset", "rolloutOffset INTEGER NOT NULL DEFAULT 0"],
   ["lastMoveAt", "lastMoveAt INTEGER"],
+  ["pinnedAccount", "pinnedAccount TEXT"],
 ];
 
 function isUniqueConstraintError(e: unknown): boolean {
@@ -115,11 +123,14 @@ export class State {
    * nothing knows a Codex rollout path before the CLI has reported one, and the
    * offset starts at zero by definition. Both take their column defaults and
    * are written later through `updateSession`. `lastMoveAt` joins them for the
-   * same reason: a session that was only just created has never been moved. */
-  createSession(s: Omit<SessionRow, "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset" | "lastMoveAt">): void {
+   * same reason: a session that was only just created has never been moved.
+   * `pinnedAccount` is optional rather than absent: only a hand-picked launch
+   * (`ms claude mesh`) has one to give, and every other caller leaves it null. */
+  createSession(s: Omit<SessionRow, "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset" | "lastMoveAt" | "pinnedAccount">
+    & { pinnedAccount?: string | null }): void {
     const t = now();
-    this.db.prepare(`INSERT INTO sessions (id,provider,cliSessionId,cwd,socket,pane,serverStart,need,account,generation,state,desired,flags,wakeupAt,createdAt,updatedAt)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(s.id, s.provider, s.cliSessionId, s.cwd, s.socket, s.pane, s.serverStart, s.need, s.account, s.generation, s.state, s.desired, JSON.stringify(s.flags), null, t, t);
+    this.db.prepare(`INSERT INTO sessions (id,provider,cliSessionId,cwd,socket,pane,serverStart,need,account,generation,state,desired,flags,wakeupAt,createdAt,updatedAt,pinnedAccount)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(s.id, s.provider, s.cliSessionId, s.cwd, s.socket, s.pane, s.serverStart, s.need, s.account, s.generation, s.state, s.desired, JSON.stringify(s.flags), null, t, t, s.pinnedAccount ?? null);
   }
   getSession(id: string): SessionRow | null { return this.rowToSession(this.db.prepare("SELECT * FROM sessions WHERE id=?").get(id) as Record<string, unknown> | undefined); }
   listSessions(): SessionRow[] { return (this.db.prepare("SELECT * FROM sessions ORDER BY createdAt").all() as Record<string, unknown>[]).map((r) => this.rowToSession(r)!); }

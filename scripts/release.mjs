@@ -41,10 +41,12 @@ export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url
 
 const TARBALL_ENTRIES = ["dist/ms.js", "bin/ms", "bin/resolve-entry.mjs", "package.json", "LICENSE", "README.md"];
 
+// The third trailer is Com8 (the project formerly named HOMI; same GitHub
+// user id 322615700). A tap commit must carry exactly these three, once each.
 const THREE_TRAILERS = [
   "Co-Authored-By: Claude <noreply@anthropic.com>",
   "Co-authored-by: Codex <codex@openai.com>",
-  "Co-authored-by: Homi <322615700+Homi@users.noreply.github.com>",
+  "Co-authored-by: Com8 <322615700+Com8@users.noreply.github.com>",
 ].join("\n");
 
 /** Pure: substitute the formula template's three placeholders. Throws

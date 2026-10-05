@@ -32,7 +32,7 @@ assert.equal(REAL_REPO_ROOT, REAL_REPO);
 // every git commit in these tests — including the ones scripts/release.mjs
 // itself makes — would go through that hook too, and it would silently
 // paper over a release.mjs that got a trailer wrong (proven live: mutating
-// the Homi trailer's email here without this override still left the commit
+// the Com8 trailer's email here without this override still left the commit
 // with a correct line, added by the ambient hook, not by the code under
 // test). Isolating HOME is what makes the trailer assertions below actually
 // prove something about this script rather than about this machine.
@@ -288,7 +288,10 @@ test("--publish records `gh release create`, writes+commits the formula into the
   const commitBody = execFileSync(realGit, ["-C", tap, "log", "-1", "--format=%B"], { encoding: "utf8", env: { ...process.env, ...GIT_ENV } });
   assert.match(commitBody, /Co-Authored-By: Claude <noreply@anthropic\.com>/);
   assert.match(commitBody, /Co-authored-by: Codex <codex@openai\.com>/);
-  assert.match(commitBody, /Co-authored-by: Homi <322615700\+Homi@users\.noreply\.github\.com>/);
+  assert.match(commitBody, /Co-authored-by: Com8 <322615700\+Com8@users\.noreply\.github\.com>/);
+  // Exactly the three, once each: the pre-rename Homi line must not come back.
+  assert.doesNotMatch(commitBody, /Homi/);
+  assert.equal((commitBody.match(/^Co-authored-by: /gim) ?? []).length, 3, commitBody);
 
   assert.match(r.stdout, new RegExp(`git -C ${tap.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} push`));
 

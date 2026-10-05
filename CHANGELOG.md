@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.12
 
 - Codex 0.160 lets one process write a conversation, and an account's background server keeps
   a conversation it loaded for ~60 s after the pane's window closed, so a rotation, `ms switch`,

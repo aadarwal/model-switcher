@@ -6,7 +6,7 @@
 // install itself. It answers one question before a human has to: does the
 // CLI that shipped today still have the things `ms` keys on?
 //
-//   node --import tsx scripts/canary.mjs [--json <file>] [--issues]
+//   node --import tsx scripts/canary.mjs [--json <file>]
 //
 // Everything `ms` code is imported from src/ (tsx), so the canary checks the
 // rules this checkout actually ships — the hook event tables, the runtime-
@@ -35,9 +35,10 @@
 // the scratch daemon's own `pid-update-loop` (Codex 0.160 leaves it running
 // after `daemon stop`), found by the pid file in the scratch home.
 //
-// `--issues` (the scheduled run): for each CLI with a failing check, open —
-// or comment on, if one is already open — ONE issue titled
-// "Canary: <tool> <version> breaks ms", through `gh` and GITHUB_TOKEN.
+// Filing issues is NOT done here: this script runs right after an
+// `npm install -g` of code nobody has read yet, so the job it runs in holds a
+// read-only token. The scheduled run's failure hands `--json`'s report to
+// scripts/canary-issues.mjs, in a job of its own with `issues: write`.
 //
 // Exit status: 0 when every check passed, 1 when any failed.
 
@@ -45,6 +46,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { markdown } from "./canary-issues.mjs";
 
 // --- A scratch world, before any `ms` module reads its environment ----------
 
@@ -71,7 +73,6 @@ const { ensureCodexHome } = await import("../src/accounts-codex.ts");
 
 const args = process.argv.slice(2);
 const jsonOut = args.includes("--json") ? args[args.indexOf("--json") + 1] : null;
-const fileIssues = args.includes("--issues");
 
 /** @type {{ tool: "codex" | "claude", version: string | null, results: { name: string, ok: boolean, detail: string }[], notes: string[] }[]} */
 const reports = [];
@@ -367,7 +368,7 @@ function daemonCheck(report, bin) {
   if (killed) report.notes.push(`killed the home daemon's stray pid-update-loop (${killed})`);
 }
 
-// --- Run, report, and (scheduled) file -------------------------------------
+// --- Run and report ----------------------------------------------------------
 
 try {
   codexCanary();
@@ -380,41 +381,12 @@ try {
   reports.push({ tool: "claude", version: null, results: [{ name: "canary ran", ok: false, detail: String(e?.stack ?? e) }], notes: [] });
 }
 
-const NAMES = { codex: "Codex", claude: "Claude Code" };
-function markdown(r) {
-  const lines = [`### ${NAMES[r.tool]} ${r.version ?? "(version unknown)"}`, ""];
-  for (const x of r.results) lines.push(`- ${x.ok ? "✓" : "✗"} ${x.name} — ${x.detail}`);
-  if (r.notes.length) lines.push("", ...r.notes.map((n) => `- note: ${n}`));
-  return lines.join("\n");
-}
 const text = reports.map(markdown).join("\n\n");
 process.stdout.write(text + "\n");
 if (process.env.GITHUB_STEP_SUMMARY) writeFileSync(process.env.GITHUB_STEP_SUMMARY, `## ms canary\n\n${text}\n`, { flag: "a" });
 if (jsonOut) writeFileSync(jsonOut, JSON.stringify(reports, null, 2) + "\n");
 
 const failing = reports.filter((r) => r.results.some((x) => !x.ok));
-if (fileIssues) {
-  for (const r of failing) {
-    const title = `Canary: ${NAMES[r.tool]} ${r.version ?? "(version unknown)"} breaks ms`;
-    const runUrl = process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` : "(local run)";
-    const failed = r.results.filter((x) => !x.ok).map((x) => `- ✗ ${x.name} — ${x.detail}`).join("\n");
-    const body = `The nightly canary found checks failing against ${NAMES[r.tool]} ${r.version ?? ""}.\n\nRun: ${runUrl}\n\n**Failing**\n\n${failed}\n\n<details><summary>Full report</summary>\n\n${markdown(r)}\n\n</details>\n`;
-    const list = run("gh", ["issue", "list", "--state", "open", "--search", `"${title}" in:title`, "--json", "number,title", "--limit", "20"]);
-    let existing = null;
-    try {
-      existing = JSON.parse(list.stdout).find((i) => i.title === title) ?? null;
-    } catch {
-      /* treat as none */
-    }
-    const bodyFile = path.join(scratch, `issue-${r.tool}.md`);
-    writeFileSync(bodyFile, body);
-    const res = existing
-      ? run("gh", ["issue", "comment", String(existing.number), "--body-file", bodyFile])
-      : run("gh", ["issue", "create", "--title", title, "--body-file", bodyFile]);
-    process.stdout.write(`${existing ? `commented on #${existing.number}` : "opened an issue"}: ${res.ok ? res.stdout.trim() : `FAILED: ${res.stderr.trim()}`}\n`);
-  }
-}
-
 try {
   rmSync(scratch, { recursive: true, force: true });
 } catch {

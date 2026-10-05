@@ -496,8 +496,10 @@ CI (`.github/workflows/ci.yml`) runs the typecheck, the suite and the build on e
 request. A nightly canary (`.github/workflows/canary.yml`, `scripts/canary.mjs`) installs the
 newest Codex and Claude Code from npm and checks, without any login, that they still carry
 what `ms` keys on — hook events, rollout and hook fields, wall text, and Codex's per-home
-daemon state staying inside an `ms` account home; a failing check opens one issue per CLI
-version. When it passes against a newer version, bump `src/compat.ts`.
+daemon state staying inside an `ms` account home; a failing scheduled run opens one issue per
+CLI version, from a separate job (`scripts/canary-issues.mjs`) that alone may write issues and
+never runs the code the canary installed. When it passes against a newer version, bump
+`src/compat.ts`.
 
 The release script refuses a dirty tree, a version that does not match `package.json`, an
 existing tag, or a HEAD on no remote branch. It builds the tarball and prints its sha256;

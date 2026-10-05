@@ -4,6 +4,13 @@
 # one issue per CLI version, "Canary: <tool> <version> breaks ms". A pull
 # request that touches the canary runs it too, so a change to it is exercised
 # before it lands; there it only fails the check, it never files an issue.
+#
+# Two jobs, so the only token that can write anything never meets the code the
+# canary installs: `canary` runs `npm install -g …@latest` (install scripts and
+# binaries nobody has read yet) with a read-only token and no git credential
+# left on disk; `issues` runs only after a scheduled or manual canary failed,
+# holds `issues: write`, and reads nothing but the uploaded JSON report
+# (scripts/canary-issues.mjs).
 name: Canary
 
 on:
@@ -14,19 +21,23 @@ on:
     branches: [main]
     paths:
       - scripts/canary.mjs
+      - scripts/canary-issues.mjs
       - .github/workflows/canary.yml
       - src/compat.ts
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   canary:
     runs-on: macos-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version-file: package.json
@@ -38,13 +49,33 @@ jobs:
           codex --version
           claude --version
       - name: Contract checks
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUES: ${{ github.event_name != 'pull_request' && '--issues' || '' }}
-        run: node --disable-warning=ExperimentalWarning --import tsx scripts/canary.mjs --json canary-report.json $ISSUES
+        run: node --disable-warning=ExperimentalWarning --import tsx scripts/canary.mjs --json canary-report.json
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: canary-report
           path: canary-report.json
           if-no-files-found: ignore
+
+  issues:
+    needs: canary
+    if: failure() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/canary-issues.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: canary-report
+      - name: Open or comment on one issue per failing CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/canary-issues.mjs canary-report.json

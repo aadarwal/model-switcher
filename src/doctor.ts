@@ -46,6 +46,7 @@ import { codexAutorotateEnabled, codexAutorotateLine, rebalanceEnabled, rebalanc
 import { openState, type SessionRow } from "./state.ts";
 import { resolveOnPath } from "./exec.ts";
 import { inspectSessions, reconcile } from "./reconcile.ts";
+import { COMPAT, ISSUES_URL, msVersion, parseVersion, standing, type Cli } from "./compat.ts";
 
 export type Result = { ok: boolean; what: string; why?: string; fixed?: boolean };
 
@@ -56,10 +57,6 @@ const MIN_NODE = [22, 15, 0] as const;
  *  refresh token just to look at it. */
 const REFRESH_DUE_MS = 60_000;
 const REFRESH_TIMEOUT_MS = 10_000;
-/** The MAJOR.MINOR family the spike record (2026-09-16) proved live. A
- *  different minor is never a failure — Codex's own compatibility is not
- *  this tool's to judge — just a line worth a human's eye. */
-const CODEX_TESTED_MINOR = "0.153";
 /** Bounded, and never a refresh: `ms doctor` proves a Codex credential with
  *  the access token already on disk, exactly as it never refreshes a Claude
  *  poll grant outside `--fix` (see `checkClaudeAccount` below). */
@@ -127,14 +124,37 @@ export function checkClaudeBinary(hasClaudeAccounts = true): Result {
   const what = "claude --version";
   if (!hasClaudeAccounts) return { ok: true, what: `${what} — not needed (no claude accounts)` };
   const r = runBounded("claude", ["--version"], 10_000);
-  return r.ok ? { ok: true, what: `${what} (${r.stdout.trim() || "ok"})` } : { ok: false, what, why: r.stderr };
+  return r.ok ? versionResult("claude", what, r.stdout.trim()) : { ok: false, what, why: r.stderr };
 }
 
-/** Report the Codex CLI's own version; never fail on it. A different minor
- *  than the tested `0.153.x` family is worth a note in the ✓ line — this
- *  tool's Codex support (hook TOML shape, wall text, rollout record fields)
- *  was verified against that range, not proven broken on another one, so a
- *  ✗ here would be a guess this tool has no business making.
+/**
+ * A CLI's `--version` output against the tested-version table
+ * (src/compat.ts). Within it, or older: a plain ✓. Newer: still ✓ — most
+ * releases change nothing this tool touches, so a ✗ would be a guess — with
+ * the tested version beside it, which is the line a bug report needs. Below a
+ * KNOWN-incompatible floor: ✗, because that one is not a guess. Output with
+ * no version in it is reported as it came.
+ */
+export function versionResult(cli: Cli, what: string, out: string): Result {
+  const shown = `${what} (${out || "ok"})`;
+  const version = parseVersion(out);
+  if (!version) return { ok: true, what: shown };
+  const c = COMPAT[cli];
+  switch (standing(cli, version)) {
+    case "incompatible":
+      return { ok: false, what, why: `${version} is below ${c.incompatibleBelow}, which ms ${msVersion()} is known not to work with — upgrade ${c.name}` };
+    case "newer":
+      return { ok: true, what: `${shown} — newer than ${c.testedUpTo}, the newest ${c.name} ms ${msVersion()} is tested with; if anything misbehaves, report it with this output at ${ISSUES_URL}` };
+    default:
+      return { ok: true, what: shown };
+  }
+}
+
+/** Report the Codex CLI's own version against the tested-version table
+ *  (`versionResult` above): a newer one is a note in the ✓ line, never a ✗ —
+ *  this tool's Codex support (hook TOML shape, rollout record fields, the
+ *  per-home daemon) was verified up to that version, not proven broken past
+ *  it, so a ✗ there would be a guess this tool has no business making.
  *
  *  `hasCodexAccounts` gates whether this even SPAWNS `codex`. A Claude-only
  *  machine has no reason to have the Codex CLI installed at all — the tool
@@ -146,13 +166,7 @@ export function checkCodexBinary(hasCodexAccounts: boolean): Result {
   if (!hasCodexAccounts) return { ok: true, what: `${what} — not needed (no codex accounts)` };
   const r = runBounded("codex", ["--version"], 10_000);
   if (!r.ok) return { ok: false, what, why: r.stderr };
-  const out = r.stdout.trim() || "ok";
-  const m = out.match(/(\d+)\.(\d+)\.\d+/);
-  const minor = m ? `${m[1]}.${m[2]}` : null;
-  if (minor && minor !== CODEX_TESTED_MINOR) {
-    return { ok: true, what: `${what} (${out}) — tested range is ${CODEX_TESTED_MINOR}.x, this is a different minor` };
-  }
-  return { ok: true, what: `${what} (${out})` };
+  return versionResult("codex", what, r.stdout.trim());
 }
 
 // --- Claude hooks ----------------------------------------------------------

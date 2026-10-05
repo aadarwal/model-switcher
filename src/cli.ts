@@ -1,7 +1,6 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-import { execLaunch } from "./exec.ts";
+import { execLaunch, resolveOnPath } from "./exec.ts";
+import { cliVersion, compatNotices, msVersion, type Cli, type Found } from "./compat.ts";
+import { updateCheck } from "./update-check.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
 import { codexHook, codexWatch } from "./hooks/codex-hook.ts";
 import { attachVerb, launchClaude, launchCodex } from "./launch.ts";
@@ -60,10 +59,6 @@ const USAGE = `usage: ms <verb> [args]
   setup | claude | codex | adopt | import | status | calendar | accounts | rotate | switch | rebalance | stop | doctor | attach | dashboard
   (internal: _exec _hook _codex_watch _recover _rebalance _pane_died _statusline)`;
 
-function version(): string {
-  const pkg = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-  return JSON.parse(readFileSync(pkg, "utf8")).version;
-}
 
 /**
  * Node prints `ExperimentalWarning: SQLite …` to stderr the moment `node:sqlite`
@@ -104,14 +99,52 @@ function runReconcile(verb: string): void {
   }
 }
 
+/**
+ * Which CLIs a verb's version notice is about: the one a launch is about to
+ * run, both for every other user-facing verb, none for `ms doctor` (which
+ * reports both on lines of its own, against the same table).
+ */
+const NOTICE_CLIS: Record<string, Cli[]> = { claude: ["claude"], codex: ["codex"], adopt: ["codex"], doctor: [] };
+
+/**
+ * The lines a human sees before a public verb runs (src/compat.ts,
+ * src/update-check.ts): the CLI on PATH is newer than this `ms` was verified
+ * against, or a newer `ms` is out. Never for an internal verb — `_hook`'s
+ * stderr lands in a Claude transcript, `_statusline`'s on the status line —
+ * and only when stderr is a terminal: these are for a human, not for the
+ * script that pipes `ms status` somewhere, and not for the test suite.
+ *
+ * Like `runReconcile`, nothing here may fail or delay the verb: a probe is
+ * cached per binary, the release check reads a file and leaves the network to
+ * a detached child, and any error is no notice at all.
+ */
+export function startupNotices(verb: string, out: { isTTY?: boolean; write(s: string): unknown } = process.stderr): void {
+  if (verb.startsWith("_") || !out.isTTY) return;
+  try {
+    const found: Found[] = [];
+    for (const cli of NOTICE_CLIS[verb] ?? (["claude", "codex"] as Cli[])) {
+      const bin = resolveOnPath(cli);
+      const version = bin ? cliVersion(bin) : null;
+      if (version) found.push({ cli, version });
+    }
+    const lines = compatNotices(found);
+    const update = updateCheck();
+    if (update) lines.push(update);
+    for (const line of lines) out.write(`${line}\n`);
+  } catch {
+    /* a notice is a courtesy */
+  }
+}
+
 export async function main(argv: string[]): Promise<number> {
   quietExperimentalWarnings();
   const [verb, ...rest] = argv;
   if (!verb || verb === "-h" || verb === "--help") { process.stderr.write(USAGE + "\n"); return verb ? 0 : 2; }
-  if (verb === "--version" || verb === "-V") { process.stdout.write(version() + "\n"); return 0; }
+  if (verb === "--version" || verb === "-V") { process.stdout.write(msVersion() + "\n"); return 0; }
   const fn = verbs.get(verb);
   if (!fn) { process.stderr.write(`ms: unknown verb '${verb}'\n${USAGE}\n`); return 2; }
   runReconcile(verb);
+  startupNotices(verb);
   try { return await fn(rest); }
   catch (e) { process.stderr.write(`ms ${verb}: ${(e as Error).message}\n`); return 1; }
 }

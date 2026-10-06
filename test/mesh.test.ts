@@ -38,6 +38,7 @@ import {
   renderRows,
   rowWidths,
   writeMeshDir,
+  type MeshRowsDeps,
   type MeshView,
   type Ready,
 } from "../src/mesh.ts";
@@ -698,19 +699,15 @@ function pickerDir(t: TestContext, v: MeshView): string {
   return dir;
 }
 
-async function captured(fn: () => Promise<number>): Promise<{ code: number; stdout: string; stderr: string }> {
+/** `_mesh_rows`'s output, through the writers it is handed — never by swapping
+ *  process.stdout, which node:test's own reporter writes to as well: a report
+ *  landing while the verb awaits would be read as the verb's (seen on CI, as
+ *  the serialized `test:complete` of the test before). */
+async function captured(fn: (io: Required<Pick<MeshRowsDeps, "out" | "err">>) => Promise<number>): Promise<{ code: number; stdout: string; stderr: string }> {
   const out: string[] = [];
   const err: string[] = [];
-  const o = process.stdout.write.bind(process.stdout);
-  const e = process.stderr.write.bind(process.stderr);
-  process.stdout.write = ((s: string) => { out.push(String(s)); return true; }) as typeof process.stdout.write;
-  process.stderr.write = ((s: string) => { err.push(String(s)); return true; }) as typeof process.stderr.write;
-  try {
-    return { code: await fn(), stdout: out.join(""), stderr: err.join("") };
-  } finally {
-    process.stdout.write = o;
-    process.stderr.write = e;
-  }
+  const code = await fn({ out: (s) => { out.push(s); }, err: (s) => { err.push(s); } });
+  return { code, stdout: out.join(""), stderr: err.join("") };
 }
 
 /** What `_mesh_rows` is handed by src/cli.ts, for these tests. */
@@ -730,7 +727,7 @@ test("_mesh_rows: a fresh reading of the picker's accounts, the previews re-rend
     takenAt: now(), registryError: null,
     accounts: [reading("alpha", { weekly: { used: 20, resetIn: 72 } }), reading("bravo", { weekly: { used: 30, resetIn: 24 } }), reading("charlie", { weekly: { used: 1, resetIn: 12 } }), reading("alpha", { provider: "codex" })],
   };
-  const r = await captured(() => meshRowsVerb(["claude", "any", dir], LAUNCH, { poll: async (names) => { asked.push(names); return fresh; } }));
+  const r = await captured((io) => meshRowsVerb(["claude", "any", dir], LAUNCH, { ...io, poll: async (names) => { asked.push(names); return fresh; } }));
   assert.equal(r.code, 0, r.stderr);
   assert.deepEqual(asked, [["alpha", "bravo", "charlie"]], "one fresh reading, of the picker's own accounts and no others");
   const lines = r.stdout.trimEnd().split("\n");
@@ -749,7 +746,7 @@ test("_mesh_rows: a reading that throws falls back on the cached snapshot", asyn
   chooserWorld(t);
   const p = pool();
   const dir = pickerDir(t, meshRows({ provider: "claude", need: "any", names: ["alpha", "bravo", "charlie"], registry: p.registry, snapshot: p.snapshot, ready: claudeReady, sessions: [], now: now() }));
-  const r = await captured(() => meshRowsVerb(["claude", "any", dir], LAUNCH, { poll: async () => { throw new Error("locks.sqlite is busy"); } }));
+  const r = await captured((io) => meshRowsVerb(["claude", "any", dir], LAUNCH, { ...io, poll: async () => { throw new Error("locks.sqlite is busy"); } }));
   assert.equal(r.code, 0, r.stderr);
   const lines = r.stdout.trimEnd().split("\n").map(plain);
   assert.equal(lines.length, 4);
@@ -772,7 +769,7 @@ test("_mesh_rows: the cached fallback is read as old — a reading from days ago
   }), { mode: 0o600 });
   const p = pool();
   const dir = pickerDir(t, meshRows({ provider: "claude", need: "any", names: ["alpha", "bravo"], registry: p.registry, snapshot: p.snapshot, ready: claudeReady, sessions: [], now: now() }));
-  const r = await captured(() => meshRowsVerb(["claude", "any", dir], LAUNCH, { poll: async () => { throw new Error("disk I/O error"); } }));
+  const r = await captured((io) => meshRowsVerb(["claude", "any", dir], LAUNCH, { ...io, poll: async () => { throw new Error("disk I/O error"); } }));
   assert.equal(r.code, 0, r.stderr);
   const lines = r.stdout.trimEnd().split("\n").map(plain);
   assert.equal(lines.some((l) => l.includes("★")), false, `no ★ on a three-day-old reading:\n${lines.join("\n")}`);
@@ -791,7 +788,7 @@ test("_mesh_rows: the remembered pick is the ★ when the reload finds usage unr
     accounts: ["alpha", "bravo", "charlie"].map((n) => reading(n, { noUsage: true, error: "fetch failed", errorKind: "transient", observedAt: null, stale: true })),
   };
   const asked: [Provider, string][] = [];
-  const r = await captured(() => meshRowsVerb(["claude", "any", dir], { ...LAUNCH, lastPick: (provider, need) => { asked.push([provider, need]); return "charlie"; } }, { poll: async () => down }));
+  const r = await captured((io) => meshRowsVerb(["claude", "any", dir], { ...LAUNCH, lastPick: (provider, need) => { asked.push([provider, need]); return "charlie"; } }, { ...io, poll: async () => down }));
   assert.equal(r.code, 0, r.stderr);
   assert.deepEqual(asked, [["claude", "any"]]);
   const lines = r.stdout.trimEnd().split("\n").map(plain);
@@ -894,13 +891,13 @@ test("_mesh_rows refuses any directory that is not a picker's own, and writes no
   const nothing = { ready: () => null, lastPick: () => null };
   for (const dir of [nested, open, other, link, path.join(tmpdir(), "ms-mesh-nope"), "relative/ms-mesh-x", empty]) {
     const before = existsSync(dir) && !dir.endsWith("link" + process.pid) ? readdirSync(dir) : [];
-    const r = await captured(() => meshRowsVerb(["claude", "any", dir], nothing, { poll: async () => { throw new Error("must not be read"); } }));
+    const r = await captured((io) => meshRowsVerb(["claude", "any", dir], nothing, { ...io, poll: async () => { throw new Error("must not be read"); } }));
     assert.equal(r.code, 2, `${dir}: ${r.stderr}`);
     assert.equal(r.stdout, "", "nothing on stdout for fzf to show");
     if (existsSync(dir) && !dir.endsWith("link" + process.pid)) assert.deepEqual(readdirSync(dir), before, `${dir} was written to`);
   }
   for (const argv of [[], ["claude"], ["claude", "any"], ["gemini", "any", good], ["claude", "most", good], ["codex", "fable", good], ["claude", "any", good, "extra"]]) {
-    const r = await captured(() => meshRowsVerb(argv, nothing));
+    const r = await captured((io) => meshRowsVerb(argv, nothing, io));
     assert.equal(r.code, 2, JSON.stringify(argv));
     assert.match(r.stderr, /usage: ms _mesh_rows/);
   }

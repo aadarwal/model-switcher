@@ -932,6 +932,12 @@ export type MeshRowsDeps = {
   /** A fresh reading of these accounts. Default: `pollApart`. */
   poll?: (names: string[]) => Promise<Snapshot>;
   now?: () => number;
+  /** Where the rows go (fzf reads them) and where a refusal is said. Default:
+   *  this process's stdout and stderr. A test hands in its own rather than
+   *  replacing those streams: node:test reports through the same stdout, and
+   *  a report written while the verb awaits would land in the capture. */
+  out?: (s: string) => void;
+  err?: (s: string) => void;
 };
 
 /**
@@ -993,16 +999,18 @@ export async function meshPollVerb(argv: string[]): Promise<number> {
  * exactly a picker's own is refused, exit 2, before anything is written.
  */
 export async function meshRowsVerb(argv: string[], launch: LaunchFacts, deps: MeshRowsDeps = {}): Promise<number> {
+  const out = deps.out ?? ((s: string) => { process.stdout.write(s); });
+  const err = deps.err ?? ((s: string) => { process.stderr.write(s); });
   const [provider, need, dir, ...extra] = argv;
   if ((provider !== "claude" && provider !== "codex") || (need !== "any" && need !== "fable") || !dir || extra.length
     || (provider === "codex" && need === "fable")) {
-    process.stderr.write(`${ROWS_USAGE}\n`);
+    err(`${ROWS_USAGE}\n`);
     return EXIT_USAGE;
   }
   const problem = meshDirProblem(dir);
   const keys = problem ? null : readMeshDir(dir);
   if (!keys) {
-    process.stderr.write(`ms _mesh_rows: ${dir}: ${problem ?? `no ${ROWS_FILE} a picker wrote`}\n`);
+    err(`ms _mesh_rows: ${dir}: ${problem ?? `no ${ROWS_FILE} a picker wrote`}\n`);
     return EXIT_USAGE;
   }
   const poll = deps.poll ?? pollApart;
@@ -1024,10 +1032,10 @@ export async function meshRowsVerb(argv: string[], launch: LaunchFacts, deps: Me
     now: (deps.now ?? Date.now)(),
   });
   if ("error" in view) {
-    process.stderr.write(`ms _mesh_rows: ${view.error}\n`);
+    err(`ms _mesh_rows: ${view.error}\n`);
     return EXIT_FAILED;
   }
   writeMeshDir(dir, view);
-  process.stdout.write(fzfInput(view));
+  out(fzfInput(view));
   return 0;
 }

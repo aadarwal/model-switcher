@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.13
 
 - `ms claude mesh` / `ms codex mesh` (with the launcher's usual arguments after it): choose
   the account by hand. An fzf picker — a tmux popup in a pane with fzf 0.53+ that a terminal

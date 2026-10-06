@@ -333,6 +333,16 @@ test("sessionRowHtml: BETTER rides beside the account as a QUIET chip — never 
   }
 });
 
+test("sessionRowHtml: a session pinned by hand wears a quiet `pinned` chip where `better:` would go", () => {
+  const html = sessionRowHtml({ ...SESSION, state: "running", pending: null, walled: "", better: null, pinnedAccount: "dirk" }, [], "", null, "—");
+  assert.ok(html.includes('<td>dirk <span class="ms-chip">pinned</span></td>'), html);
+  // A stale pin (the session has since left the account) is no pin: no chip,
+  // and whatever BETTER says is what shows.
+  const stale = sessionRowHtml({ ...SESSION, state: "running", pending: null, walled: "", better: "gmail", pinnedAccount: "work" }, [], "", null, "—");
+  assert.ok(stale.includes('<td>dirk <span class="ms-chip">better: gmail</span></td>'), stale);
+  assert.ok(!stale.includes(">pinned<"), stale);
+});
+
 test("sessionRowHtml: the id is short and mono, with the whole id kept in the cell's title and the row's own data-session", () => {
   const uuid = "9f1c2d3e-aaaa-bbbb-cccc-0123456789ab";
   const html = sessionRowHtml({ ...SESSION, id: uuid }, [], "", null, "—");

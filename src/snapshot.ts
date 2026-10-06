@@ -193,10 +193,29 @@ function readCache(): CacheFile | null {
  * find out. The Codex watchdog uses this to choose how often to wake up, on a
  * hook's clock and inside the tmux server — neither of which may block on the
  * network. It is deliberately NOT how anything DECIDES: `toPickInputs` and its
- * ten-minute age rule are still the only way a reading becomes a choice.
+ * ten-minute age rule are still the only way a reading becomes a choice (and
+ * `lastSnapshot`, below, is the cache in a shape fit to feed it).
  */
 export function cachedAccounts(): AccountUsage[] {
   return readCache()?.accounts ?? [];
+}
+
+/**
+ * The last snapshot on disk, as a snapshot: no lock, no registry read, no
+ * poll. For a caller whose reading was taken in another process — the mesh
+ * picker's ctrl-r (src/mesh.ts) — or could not be taken at all.
+ *
+ * A row keeps its own `stale` only when the file was written at or after
+ * `since`, by a poll the caller knows to be this moment's; every other row is
+ * marked stale, as `servedWhileBusy` marks it. An errorless row read days ago
+ * says `stale: false` as well, and `toPickInputs` would rank its numbers as
+ * current. Unlike `cachedAccounts`, this one is fit to decide on.
+ */
+export function lastSnapshot(since = Number.POSITIVE_INFINITY): Snapshot {
+  const file = readCache();
+  if (!file) return { takenAt: null, accounts: [], registryError: null };
+  const current = file.takenAt >= since;
+  return { takenAt: file.takenAt, accounts: current ? file.accounts : file.accounts.map((e) => ({ ...e, stale: true })), registryError: null };
 }
 
 function writeCache(file: CacheFile): void {
@@ -643,9 +662,10 @@ export function getSnapshot(opts: SnapshotOptions = {}): Promise<Snapshot> {
   return promise;
 }
 
-/** Rounded, human-sized, and never precise: this only ever lands in an error
- *  string a person reads. */
-function ageLabel(ms: number): string {
+/** Rounded, human-sized, and never precise: this only ever lands in text a
+ *  person reads — an error string here, the mesh picker's "usage 14s old"
+ *  (src/mesh.ts). */
+export function ageLabel(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 90) return `${s}s`;
   const m = Math.round(s / 60);

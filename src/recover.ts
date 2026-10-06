@@ -1727,10 +1727,17 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // rotation would read that id and `codex resume` a conversation this one
   // already replaced. The rollout path and its byte offset go with it — they
   // index a file that is no longer this session's.
+  //
+  // The pin goes in the same write that moves the account. A hand-picked
+  // account (`ms claude mesh`) holds against rebalance and nothing else: a
+  // wall rotates the session anyway, and `ms rotate`/`ms switch` are a human
+  // choosing again. Whichever it was, the session is no longer where the pick
+  // put it, and a pin left naming the old account would be a stale one.
   st.updateSession(id, {
     account: to,
     generation: next,
     state: "resuming",
+    pinnedAccount: null,
     ...(codex && fresh ? { cliSessionId: null, transcriptPath: null, rolloutOffset: 0 } : {}),
   });
   logLine(id, next, `respawned pane ${session.pane} on ${to} (launch ${launchId}${forced ? ", forced exit" : ""})`);

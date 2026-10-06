@@ -660,6 +660,38 @@ test("ms status: BETTER is a dash for a row the rule can NEVER move — a parked
   assert.equal("better" in live, true);
 });
 
+test("ms status: BETTER reads pinned for a session pinned by hand to the account it is on; a stale pin reads as before", async () => {
+  // sess-2 runs on gmail; unpinned, the table test above reads BETTER dirk.
+  // Pinned there by `ms claude mesh`, rebalance will not act on that opinion,
+  // so the column says why instead of naming a destination nothing will use.
+  const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
+  await seedSessions(w);
+  const { openState } = await import("../src/state.ts");
+  const pin = (account: string) => {
+    const st = openState();
+    try { st.updateSession("sess-2", { pinnedAccount: account }); } finally { st.close(); }
+  };
+
+  pin("gmail");
+  const r = run(["status"], env());
+  assert.equal(r.code, 0, r.stderr);
+  const s2 = r.stdout.split("\n").find((l) => l.startsWith("sess-2"))!;
+  assert.ok(s2, r.stdout);
+  assert.equal(cells(s2)[10], "pinned");
+
+  const j = run(["status", "--json"], env());
+  assert.equal(j.code, 0, j.stderr);
+  const row = (JSON.parse(j.stdout) as { sessions: { id: string; better: string | null; pinnedAccount: string | null }[] })
+    .sessions.find((s) => s.id === "sess-2")!;
+  assert.equal(row.pinnedAccount, "gmail", "the JSON carries the pin itself");
+  assert.equal(row.better, null, "and names no destination the rule will never act on");
+
+  // A pin naming an account the session has left is no pin at all.
+  pin("dirk");
+  const stale = run(["status"], env());
+  assert.equal(cells(stale.stdout.split("\n").find((l) => l.startsWith("sess-2"))!)[10], "dirk");
+});
+
 test("ms status --json: finding 2 — a Claude account with no launch token reads STATE no-token, never ok", async () => {
   const { home, msHome } = tempHome();
   writeFileSync(

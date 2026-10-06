@@ -121,6 +121,9 @@ export type SessionRowView = {
   /** Where the rebalance rule would put this session (src/rebalance.ts), or
    *  null when it is already there. Absent from an older /api/state. */
   better?: string | null;
+  /** The account a human pinned this session to (`ms claude mesh`), or null.
+   *  A pin counts only while it names `account`. Absent from an older /api/state. */
+  pinnedAccount?: string | null;
 };
 export type RowMessage = { text: string; error: boolean } | null;
 
@@ -433,8 +436,10 @@ export function sessionRowHtml(s: SessionRowView, others: string[], chosen: stri
   // the plain pill for this text anyway): "there is a better account" is
   // never something a human must act on — the rule acts on it, at the next
   // turn end, or they run `ms rebalance`. An amber chip on every session
-  // whose pool has shifted would be a panel of amber saying nothing.
-  var better = s.better ? ' <span class="ms-chip">better: ' + esc(s.better) + "</span>" : "";
+  // whose pool has shifted would be a panel of amber saying nothing. A
+  // session pinned by hand has no destination (`ms status` reads `pinned`),
+  // and says so in the same quiet chip.
+  var better = s.pinnedAccount && s.pinnedAccount === s.account ? ' <span class="ms-chip">pinned</span>' : s.better ? ' <span class="ms-chip">better: ' + esc(s.better) + "</span>" : "";
   var walled = s.walled ? '<small class="ms-sub"><span' + worryAttr(s.walled) + ">" + esc(s.walled) + "</span></small>" : "";
   return (
     "<tr>" +

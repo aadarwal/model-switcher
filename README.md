@@ -10,7 +10,8 @@ invocation reads its state, does one job and exits. All state is one directory, 
 ## Requirements
 
 macOS. Node ≥ 22.15 (for `process.execve` and `node:sqlite`). tmux ≥ 3.3. `claude`
-and `codex` are installed separately; `ms` needs only the ones your accounts name.
+and `codex` are installed separately; `ms` needs only the ones your accounts name. fzf is
+optional: [`mesh`](#picking-by-hand-mesh) uses it when it is on `PATH` (0.53+ for the tmux popup).
 
 ## Quick start
 
@@ -37,19 +38,26 @@ ms codex
 ### Launch
 
 ```
-ms claude [--as <account>] [--need any|fable] [--continue] [-- <claude args>]
-ms codex  [--as <account>] [--need any|fable] [--continue] [-- <codex args>]
+ms claude [mesh] [--as <account>] [--need any|fable] [--continue] [-- <claude args>]
+ms codex  [mesh] [--as <account>] [--need any|fable] [--continue] [-- <codex args>]
 ms adopt  <rollout-id|path> [--as <account>] [--continue] [-- <codex args>]
 ms attach [session]
 ```
 
 - `ms claude` / `ms codex` — pick an account with room and start that CLI in the current tmux pane under the account's credential. Everything after `--` goes to the CLI unchanged.
 - `--as <account>` — use the named account instead of choosing one. `--need fable` — also require room in the Fable window; `ms codex` rejects it, because Codex reports no such window.
+- `mesh` — choose the account yourself, in a picker showing the chooser's own ranking, and pin the session to it until its first wall. See [picking by hand](#picking-by-hand-mesh). It does not combine with `--as`; after `--` it is the CLI's own argument.
 - `--continue` — for a resume you drove yourself (`ms codex --continue -- resume <id>`, `ms claude --continue -- --resume <id>`): hand the resumed conversation the same continuation a rotation sends, as the command line's own prompt. Refused when there is nothing to continue.
 - **A launch that resumes is given no `--session-id`.** `--session-id` makes a conversation, so on a command line that already names one (`--resume <id>`, `-r <id>`, `--resume=<id>`, `--continue`/`-c`) `ms` passes your command line through untouched and records the id it names — Claude Code's own SessionStart confirms it, exactly as it does after a rotation's `--resume` relaunch. `ms claude --continue -- --resume <id>` is the path **`ms import`** resumes every Claude conversation through. Still to be checked against a live Claude Code; if that pairing misbehaves, `ms rotate` / `ms switch --continue` remain the verified way to move a Claude session `ms` already manages.
 - `ms adopt` — take over a **Codex** conversation `ms` did not start, so it can be rotated like any other. See [rescuing a pane you didn't start with ms](#rescuing-a-pane-you-didnt-start-with-ms).
 - **Where it lands.** Inside tmux, the launch replaces the pane you typed it in. Outside tmux, it goes to the **default tmux server** — the one plain `tmux` talks to, started if it is not running — in session `ms`, and attaches; the session shows in `tmux ls` like any other.
 - `ms attach [session]` — attach to a session on the default tmux server: `ms` (what a bare launch makes) when no name is given, or an import's repo-named session. Plain `tmux attach -t <session>` does the same. With no such session it says so and names the `tmux ls` to run; inside tmux it refuses rather than nest.
+
+Exit codes for `ms claude` / `ms codex`: 0 launched, 1 the account (not registered, no launch
+credential on this device, an unreadable registry), 2 the command line itself (or `mesh` with no
+terminal), 3 no account has room, 4 usage unreachable and no recent pick, 130 the `mesh` picker
+was cancelled — nothing was launched or written (128 + the signal's number when a signal ended
+it instead).
 
 ### Import
 
@@ -95,7 +103,7 @@ ms stop [<session|pane>]
 ms dashboard [--port N] [--no-open]
 ```
 
-- `ms status` — two tables: the account pool as usage sees it, and every managed session. The accounts table ends in SESS, the number of live sessions on that account, then EMAIL, the login behind the name (`-` when unknown); `--json` lists the sessions per account (`sessions`) and carries each account's `email`. The sessions table ends in BETTER — where [rebalance](#rebalance) would put that session right now, `—` when it is already there or the rule could never move it. `--watch` reprints every 5 s; `--json` prints the same rows as JSON. Sessions in state `gone` or `stopped` are hidden by default; `--all` shows them too.
+- `ms status` — two tables: the account pool as usage sees it, and every managed session. The accounts table ends in SESS, the number of live sessions on that account, then EMAIL, the login behind the name (`-` when unknown); `--json` lists the sessions per account (`sessions`) and carries each account's `email`. The sessions table ends in BETTER — where [rebalance](#rebalance) would put that session right now, `—` when it is already there or the rule could never move it, `pinned` when you picked its account by hand ([`mesh`](#picking-by-hand-mesh); `--json` carries `pinnedAccount`). `--watch` reprints every 5 s; `--json` prints the same rows as JSON. Sessions in state `gone` or `stopped` are hidden by default; `--all` shows them too.
 - `ms rotate` — move a session to the next account with room: the move a wall would have made, on demand. Always carries the unfinished work over.
 - `ms switch` — move a session to a named account. It carries the work over only when the pane reads as walled; `--continue` always carries it over.
 - `ms switch --all` — move every session of that account's provider that is not already on it, four at a time. `--timeout` bounds how long new moves are *started* (default 600 s); a move in flight is never cut off. `--provider` is needed only when the destination name is registered under both providers, same rule as `ms accounts`' own `--provider`.
@@ -326,6 +334,42 @@ An account is out if its reading failed, if it has no weekly window, or if any w
 needs is at 100 percent. The rest rank by earliest weekly reset, then most remaining, then
 solo before shared. No projections, no thresholds below 100.
 
+### Picking by hand (`mesh`)
+
+`ms claude mesh` (or `ms codex mesh`, with the launcher's usual arguments after it) shows that
+provider's accounts in an [fzf](https://github.com/junegunn/fzf) picker and launches the one
+you choose. In a tmux pane it opens as a popup (fzf 0.53 or later); anywhere else fzf takes
+the terminal — and so it does in a pane whose session no client is attached to, or one
+watched through a control-mode client (`tmux -C`, iTerm2's tmux integration), which cannot
+draw a popup.
+
+- **Rows.** One per account: `★` on the account a plain `ms claude` would pick right now
+  (when no usage can be read, that is the pick it remembers), `✗` on one it cannot use (out
+  of the ranking for want of room or a reading, or with no launch credential on this
+  device). Then STATE, the 5h, weekly and (Claude only) Fable percentages, the soonest
+  weekly reset and the number of live panes on it. The ranked accounts come first, in the
+  chooser's order, then the rest by name; the `★` always leads, so enter alone takes it.
+- **Preview.** The account's e-mail, its rank, a bar and a reset per window, whether this
+  device can launch it, the panes running on it and how old the reading is.
+- **Keys.** enter launches the highlighted account; ctrl-r takes a fresh usage reading and
+  redraws the rows, the previews and the line saying what `★` is (with fzf 0.71 or later
+  the cursor stays on its account as the rows re-rank); esc cancels.
+- **The pin.** The session is pinned to the account you chose: rebalance never moves it,
+  and `ms rebalance` and `ms status` say so. A usage wall still rotates it, so the work goes
+  on, and that rotation ends the pin; so do `ms rotate`, `ms switch` and launching that pane
+  again. A hand pick is not remembered as the chooser's last pick.
+- **No room.** An account the chooser passed over launches anyway, after one line saying
+  why, and its first wall rotates it. One with no credential on this device is refused
+  exactly as `--as` would refuse it.
+- **Cancel.** esc, or enter on a query that matches nothing, exits 130 with nothing
+  launched and nothing written. A signal while the picker is open (its pane or terminal
+  closing, a kill) cancels the same way, exiting 128 + the signal's number.
+- **Without fzf.** The same rows, numbered, and `pick 1-N [1], q to cancel:` on the
+  terminal. enter alone takes row 1 (the `★` one); `q` or ctrl-d cancels; a bad answer is
+  asked again three times, then taken as a cancel.
+
+`mesh` needs a terminal (exit 2 without one). `ms adopt` and `ms import` do not take it.
+
 ### Rebalance
 
 The chooser answers "which account is best" at launch and at a wall. In between, budgets
@@ -346,9 +390,11 @@ of two conditions holds:
 pane never with a workflow, subagent or background shell running behind the prompt
 (`background-work`) — it is re-read by the decision and again inside the transaction); no move of that session by any hand in
 the last 6 h, and no wall-driven rotation of it in the last 30 min; the destination passes
-the same preflight a rotation runs; and the session is `running` or `continuing` — never
-`parked`, `waiting`, `stopped` or a pane that is gone. At most one session moves per hook
-run. The move itself is the `ms switch` transaction with **no continuation**: the turn
+the same preflight a rotation runs; the session is `running` or `continuing` — never
+`parked`, `waiting`, `stopped` or a pane that is gone; and it is not pinned to its account
+by hand ([`mesh`](#picking-by-hand-mesh)) — `ms rebalance` reports such a session as
+`pinned to <account> by hand`, until a wall moves it and ends the pin. At most one session
+moves per hook run. The move itself is the `ms switch` transaction with **no continuation**: the turn
 ended, so there is nothing to carry over and nothing is typed into a pane its human left
 quiet. A Claude session stays Claude; there are no cross-provider moves and no projections.
 
@@ -360,9 +406,9 @@ once every 15 minutes across the whole fleet.
 **The verb.** `ms rebalance` asks the same question on demand, for every live session, and
 prints the table. Without `--dry-run` it makes the moves — one at a time, waiving only the
 6 h cooldown (an explicit run is the human deciding), never the wall guard and never the
-mid-turn refusal. The gate does not apply to it: running the verb is the asking.
+mid-turn refusal, nor a pin. The gate does not apply to it: running the verb is the asking.
 `ms status`'s BETTER column, the dashboard's `better:` chip and this table are the same
-rule seen three ways.
+rule seen three ways; a pinned session reads `pinned` in the first two.
 
 ### What the wizard changes on your machine
 

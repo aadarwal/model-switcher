@@ -3,7 +3,8 @@ import { cliVersion, compatNotices, msVersion, type Cli, type Found } from "./co
 import { updateCheck } from "./update-check.ts";
 import { claudeHook } from "./hooks/claude-hook.ts";
 import { codexHook, codexWatch } from "./hooks/codex-hook.ts";
-import { attachVerb, launchClaude, launchCodex } from "./launch.ts";
+import { attachVerb, launchClaude, launchCodex, launchCredential, readLastPick } from "./launch.ts";
+import { meshPollVerb, meshRowsVerb } from "./mesh.ts";
 import { adoptVerb } from "./adopt.ts";
 import { importVerb } from "./import.ts";
 import { dashboard } from "./dashboard.ts";
@@ -32,6 +33,16 @@ registerVerb("_pane_died", paneDied);
 registerVerb("_statusline", statuslineVerb);
 registerVerb("claude", launchClaude);
 registerVerb("codex", launchCodex);
+// The `mesh` picker's ctrl-r (src/mesh.ts): a fresh reading, the previews
+// re-rendered, the rows printed for fzf. Which accounts this device can
+// launch, and the pick a plain launch remembers, are the launch's own
+// answers, handed in. The reading itself is `_mesh_poll`, run detached, so
+// fzf killing a reload can never kill a token refresh halfway.
+registerVerb("_mesh_rows", (argv) => meshRowsVerb(argv, {
+  ready: launchCredential,
+  lastPick: (provider, need) => readLastPick(provider, need)?.name ?? null,
+}));
+registerVerb("_mesh_poll", meshPollVerb);
 registerVerb("attach", attachVerb);
 // `ms adopt`: take over a Codex conversation this tool did not start.
 registerVerb("adopt", adoptVerb);
@@ -57,7 +68,7 @@ registerVerb("dashboard", dashboard);
 
 const USAGE = `usage: ms <verb> [args]
   setup | claude | codex | adopt | import | status | calendar | accounts | rotate | switch | rebalance | stop | doctor | attach | dashboard
-  (internal: _exec _hook _codex_watch _recover _rebalance _pane_died _statusline)`;
+  (internal: _exec _hook _codex_watch _recover _rebalance _pane_died _statusline _mesh_rows _mesh_poll)`;
 
 
 /**
@@ -80,8 +91,8 @@ function quietExperimentalWarnings(): void {
  * ours stays resident, so each invocation is the moment we repair what a
  * crashed worker, a restarted tmux server or a closed pane left behind.
  *
- * Internal verbs (`_exec`, `_hook`, `_recover`, `_rebalance`, `_pane_died`) skip it — they
- * are the hot and re-entrant paths, the hook must never print or block the
+ * Internal verbs (`_exec`, `_hook`, `_recover`, `_rebalance`, `_pane_died`, `_mesh_rows`,
+ * `_mesh_poll`) skip it — they are the hot and re-entrant paths, the hook must never print or block the
  * human's turn, and a `_recover` that reconciled would be repairing itself.
  * `--version`/`--help` have already returned before this is reached.
  *

@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- `ms claude mesh` / `ms codex mesh` (with the launcher's usual arguments after it): choose
+  the account by hand. An fzf picker — a tmux popup in a pane with fzf 0.53+ that a terminal
+  client is watching, full screen otherwise (outside tmux, in a display-popup, or in a pane
+  with no client or only a control-mode one, which cannot draw a popup) — lists the
+  provider's accounts in the chooser's own ranking, `★` on what a plain launch would pick
+  (its remembered pick when usage is unreachable) and `✗` on what it cannot use, with a
+  preview per account (e-mail, rank, window bars and resets, whether this device can launch
+  it, the panes on it, the reading's age). ctrl-r takes a fresh reading and redraws the rows,
+  the previews and the status line; with fzf 0.71+ the cursor stays on its account. Without
+  fzf, a numbered menu on the terminal. A hand pick is never written as the last pick
+- ctrl-r's reading (`ms _mesh_rows`) is taken by a detached `ms _mesh_poll` of the picker's
+  own accounts: fzf kills a reload's process group when ctrl-r is pressed again or the
+  picker closes, and a token refresh cut off there would have left the account's grant spent
+- the chosen account is launched pinned (`pinnedAccount` on the session row, added to an
+  existing store when it is opened — two processes doing that at once no longer fail the
+  second): rebalance refuses the session ("pinned to <account> by hand"), `ms status`'s
+  BETTER and the dashboard's chip read `pinned`, and `--json` carries `pinnedAccount`. A wall
+  still rotates it, and every account change (a rotation, `ms rotate`, `ms switch`) ends the
+  pin
+- picking an account with no room launches it anyway after one warning line; one with no
+  credential on this device keeps the launch's usual refusal. `mesh` is refused beside `--as`,
+  twice, or without a terminal (exit 2)
+- new exit code 130 for `ms claude` / `ms codex`: the picker was cancelled, and nothing was
+  launched or written. A signal while it is open (its pane or terminal closing, a kill) is a
+  cancel too, exiting 128 + the signal's number, and still removes the picker's directory
+
 ## 0.3.12
 
 - Codex 0.160 lets one process write a conversation, and an account's background server keeps

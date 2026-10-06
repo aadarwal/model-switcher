@@ -17,7 +17,7 @@ import type { Verb } from "./cli.ts";
 import { findAccount, loadRegistry, type Registry } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import type { PickInput, Window } from "./pick.ts";
-import { decide, lastMoveAtMs, lastWallAtMs, movable, paneReading } from "./rebalance.ts";
+import { decide, isPinned, lastMoveAtMs, lastWallAtMs, movable, paneReading } from "./rebalance.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { readEvents, type Event } from "./events.ts";
@@ -155,9 +155,12 @@ export function sessionsByAccount(sessions: { id: string; provider: string; acco
   return map;
 }
 
-function computeAccount(a: AccountUsage, registry: Registry): AccountComputed {
+/** `hasToken` is read here unless the caller already knows it: the mesh
+ *  picker (src/mesh.ts) has just asked the launch's own credential check, and
+ *  reading the token a second time to learn the same fact would be one more
+ *  place a credential is read for no reason. */
+export function computeAccount(a: AccountUsage, registry: Registry, hasToken = !!readLaunchToken(a.name)): AccountComputed {
   const row = findAccount(registry, a.name, a.provider);
-  const hasToken = !!readLaunchToken(a.name);
   return { label: row?.label ?? a.name, state: accountState(a, hasToken), email: row?.email ?? null };
 }
 
@@ -253,9 +256,14 @@ export type SessionComputed = { state: string; pending: string | null; walled: W
  * this rule will NEVER move, whatever the pool does next. Naming a
  * destination for one of them would be a column telling a human where a
  * session belongs while `ms rebalance` refuses to send it there.
+ *
+ * A session pinned by hand (`ms claude mesh`) is the same case for as long as
+ * the pin holds — until its first wall — so it gets no destination either;
+ * the table says `pinned` in its place (`sessionRow`), and the JSON carries
+ * `pinnedAccount` for a reader that wants the reason.
  */
 function betterAccount(s: SessionRow, st: State, accounts: PickInput[], pane: ReturnType<typeof paneReading>): string | null {
-  if (!movable(s.state, pane)) return null;
+  if (!movable(s.state, pane) || isPinned(s)) return null;
   return decide({
     session: s,
     accounts,
@@ -302,8 +310,9 @@ function sessionRow(s: SessionRow, c: SessionComputed): string[] {
     s.wakeupAt != null ? localTimeCli(s.wakeupAt * 1000) : DASH,
     c.walled,
     // BETTER, last: every older column keeps its place, the same rule SESS
-    // followed into the accounts table.
-    c.better ?? DASH,
+    // followed into the accounts table. A pinned session has no destination
+    // (`betterAccount`), and says why rather than printing a bare dash.
+    c.better ?? (isPinned(s) ? "pinned" : DASH),
   ];
 }
 
@@ -411,7 +420,8 @@ async function render(json: boolean, all: boolean): Promise<string> {
       // providers, never within one — so a session's own credential is
       // named by both cells together, not ACCOUNT alone.
       // BETTER closes the row: where the rebalance rule would put this
-      // session right now, "—" when it is already there (src/rebalance.ts).
+      // session right now, "—" when it is already there (src/rebalance.ts),
+      // "pinned" when a human picked its account by hand (`ms claude mesh`).
       ["SESSION", "PANE", "PROVIDER", "ACCOUNT", "NEED", "STATE", "GEN", "PENDING", "WAKEUP", "WALLED?", "BETTER"],
       visible.map((r) => sessionRow(r.session, r.computed)),
     ));

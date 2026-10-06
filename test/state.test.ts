@@ -274,3 +274,75 @@ test("pane ownership: the newest row on a socket+server+pane owns it, ties broke
   assert.equal(a.state, "stopped"); assert.equal(a.desired, "stopped"); assert.equal(a.wakeupAt, null);
   st.close();
 });
+
+// --- The pin (`ms claude mesh`) --------------------------------------------
+
+test("pinnedAccount: null unless a launch pins one, writable, and cleared like any column", async () => {
+  const { st } = await fresh();
+  // Every caller that predates the pin passes nothing and gets null.
+  st.createSession({ id: "s1", ...base });
+  assert.equal(st.getSession("s1")!.pinnedAccount, null);
+  st.createSession({ id: "s2", ...base, pane: "%6", pinnedAccount: "gmail" });
+  assert.equal(st.getSession("s2")!.pinnedAccount, "gmail");
+  st.updateSession("s2", { pinnedAccount: null });
+  assert.equal(st.getSession("s2")!.pinnedAccount, null, "the recovery transaction clears it this way");
+  st.close();
+});
+
+test("a store written before the pin gains the column, at null, on its next open", async () => {
+  // The shape 0.3.12 left on disk: every column but the pin.
+  const { home, msHome } = tempHome();
+  process.env.HOME = home; process.env.MS_HOME = msHome;
+  const { DatabaseSync } = await import("node:sqlite");
+  const old = new DatabaseSync(`${msHome}/state.sqlite`);
+  old.exec(`CREATE TABLE sessions (id TEXT PRIMARY KEY, provider TEXT, cliSessionId TEXT, cwd TEXT, socket TEXT, pane TEXT,
+    serverStart TEXT, need TEXT, account TEXT, generation INTEGER, state TEXT, desired TEXT, flags TEXT, wakeupAt INTEGER, createdAt INTEGER, updatedAt INTEGER,
+    transcriptPath TEXT, rolloutOffset INTEGER NOT NULL DEFAULT 0, lastMoveAt INTEGER)`);
+  old.prepare("INSERT INTO sessions (id,provider,account,generation,state,desired,flags,createdAt,updatedAt) VALUES ('old','claude','dirk',2,'running','running','[]',1,1)").run();
+  old.close();
+
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    const s = st.getSession("old")!;
+    assert.equal(s.account, "dirk", "the row survived");
+    assert.equal(s.pinnedAccount, null, "and is not pinned to anything");
+    st.updateSession("old", { pinnedAccount: "dirk" });
+    assert.equal(st.getSession("old")!.pinnedAccount, "dirk", "the new column is writable");
+  } finally { st.close(); }
+  const again = openState();
+  try { assert.equal(again.getSession("old")!.pinnedAccount, "dirk", "a second open adds nothing twice"); } finally { again.close(); }
+});
+
+test("two opens of one old store at once: the one that finds the column already added opens anyway", async () => {
+  // Two processes (two panes' hooks, right after an upgrade) both read the
+  // old shape; the first adds the column, and the second's ALTER then finds
+  // it — `duplicate column name`, which used to fail that whole invocation.
+  // The second process's look is replayed here, from before the first's ALTER.
+  const { home, msHome } = tempHome();
+  process.env.HOME = home; process.env.MS_HOME = msHome;
+  const { DatabaseSync } = await import("node:sqlite");
+  const file = `${msHome}/state.sqlite`;
+  const old = new DatabaseSync(file);
+  old.exec(`CREATE TABLE sessions (id TEXT PRIMARY KEY, provider TEXT, cliSessionId TEXT, cwd TEXT, socket TEXT, pane TEXT,
+    serverStart TEXT, need TEXT, account TEXT, generation INTEGER, state TEXT, desired TEXT, flags TEXT, wakeupAt INTEGER, createdAt INTEGER, updatedAt INTEGER,
+    transcriptPath TEXT, rolloutOffset INTEGER NOT NULL DEFAULT 0, lastMoveAt INTEGER)`);
+  const shapeBefore = old.prepare("PRAGMA table_info(sessions)").all();
+  old.exec("ALTER TABLE sessions ADD COLUMN pinnedAccount TEXT"); // the first process, done
+  old.close();
+
+  const { State } = await import("../src/state.ts");
+  const db = new DatabaseSync(file);
+  const late = new Proxy(db, {
+    get(target, prop) {
+      if (prop === "prepare") return (sql: string) => (/table_info/.test(sql) ? { all: () => shapeBefore } : target.prepare(sql));
+      const v = Reflect.get(target, prop) as unknown;
+      return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+  const st = new State(late as unknown as InstanceType<typeof DatabaseSync>);
+  try {
+    st.createSession({ id: "s", ...base, pinnedAccount: "gmail" });
+    assert.equal(st.getSession("s")!.pinnedAccount, "gmail", "the store works, column and all");
+  } finally { st.close(); }
+});

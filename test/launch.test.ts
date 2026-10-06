@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { run, tempHome, stubDir } from "./helpers.ts";
+import { FZF_STUB } from "./fixtures/fzf-stub.ts";
 
 const SAMPLE_TOKEN = "sk-ant-oat01-AbCdEfGh12345678_-ijklmnop0123456789";
 const MS_BIN = path.resolve("bin/ms");
@@ -61,7 +62,8 @@ globalThis.fetch = async (url, init = {}) => {
 }
 
 /** tmux, as far as a launch drives it: logs every argv line, answers the
- *  identity query and the `-P -F #{pane_id}` spawns with a pane id.
+ *  identity query and the `-P -F #{pane_id}` spawns with a pane id, and says
+ *  one terminal client is attached (the `mesh` picker's popup check).
  *
  *  `list-panes` answers `MS_TMUX_PANES` (space-separated), empty by default —
  *  every launch reconciles first, and a pane the server does not list is gone.
@@ -73,6 +75,7 @@ const TMUX_STUB = `printf '%s\\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
 case "$1" in
   display-message) case "$*" in *socket_path*) echo "${DEFAULT_SOCKET}" ;; *) echo "${IDENTITY}" ;; esac ;;
+  list-clients) echo 0 ;;
   new-session|new-window) echo "%42" ;;
   list-panes) [ -z "\${MS_TMUX_PANES:-}" ] || printf '%s\\n' \${MS_TMUX_PANES} ;;
   has-session) exit "\${MS_TMUX_HAS_SESSION:-1}" ;;
@@ -1254,4 +1257,274 @@ test("codexResumeId reads the conversation a codex command line resumes, flags b
   assert.equal(codexResumeId(["resume", "my-named-thread"]), null, "a name is not a lock file");
   assert.equal(codexResumeId(["--", "resume", CONVERSATION]), null, "past `--` it is a prompt");
   assert.equal(codexResumeId(["--model", "gpt-5"]), null);
+});
+
+// --- mesh: the account, picked by hand ------------------------------------------
+//
+// `ms <cli> mesh` (src/mesh.ts) through the real verb: the stub fzf below
+// stands in for the human, in the world's own stub directory, and a plain
+// file stands in for the terminal (`MS_MESH_TTY`) — no test here has one.
+
+/** The world's env with the picker's two stand-ins in place. */
+function meshEnv(w: World, over: Record<string, string> = {}): Record<string, string> {
+  const dir = path.dirname(w.log);
+  writeFileSync(path.join(dir, "fzf"), `#!/bin/bash\n${FZF_STUB}\n`, { mode: 0o755 });
+  const tty = path.join(dir, "tty");
+  writeFileSync(tty, "");
+  return w.env({ MS_MESH_TTY: tty, MS_TEST_FZF_ARGS: path.join(dir, "fzf.args"), ...over });
+}
+const fzfArgsOf = (w: World): string[] | null => {
+  const f = path.join(path.dirname(w.log), "fzf.args");
+  return existsSync(f) ? readFileSync(f, "utf8").split("\0").slice(0, -1) : null;
+};
+/** Did the launch touch tmux beyond reading it? */
+const tmuxActed = (w: World): string[] =>
+  existsSync(w.log) ? logLines(w).filter((l) => /respawn-pane|set-option|set-hook|new-session|new-window/.test(l)) : [];
+
+test("parseLaunchArgs: `mesh` before -- is the picker, once, and never beside --as; after -- it is the CLI's", async () => {
+  const { parseLaunchArgs } = await import("../src/launch.ts");
+  assert.deepEqual(parseLaunchArgs(["mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: [] });
+  assert.deepEqual(parseLaunchArgs(["--need", "fable", "mesh", "--", "x"]), { as: null, need: "fable", continueAfter: false, mesh: true, args: ["x"] });
+  assert.deepEqual(parseLaunchArgs(["--", "mesh"]), { as: null, need: null, continueAfter: false, mesh: false, args: ["mesh"] });
+  assert.deepEqual(parseLaunchArgs(["mesh", "--", "mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: ["mesh"] });
+  assert.deepEqual(parseLaunchArgs(["--as", "mesh"]), { as: "mesh", need: null, continueAfter: false, mesh: false, args: [] }, "an account may be called mesh");
+  assert.deepEqual(parseLaunchArgs(["mesh", "--as", "work"]), { error: "mesh chooses the account; drop --as or drop mesh" });
+  assert.deepEqual(parseLaunchArgs(["--as=work", "mesh"]), { error: "mesh chooses the account; drop --as or drop mesh" });
+  assert.deepEqual(parseLaunchArgs(["mesh", "mesh"]), { error: "mesh is given twice" });
+});
+
+test("ms claude mesh: the account picked by hand is launched and pinned — and never remembered as the chooser's pick", async () => {
+  // gmail is what a plain `ms claude` takes here (its week resets first);
+  // the human takes work.
+  const w = await world();
+  const r = run(["claude", "mesh", "--", "hello"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /^ms: work \(any, pinned\) → pane %7$/m);
+
+  const st = await readState(w, launchIdOf(w));
+  assert.equal(st.sessions.length, 1);
+  const s = st.sessions[0]!;
+  assert.equal(s.account, "work");
+  assert.equal(s.pinnedAccount, "work");
+  assert.deepEqual(s.flags, ["hello"]);
+  assert.equal(st.launch!.account, "work");
+  // The row was whole — pin included — before tmux started the CLI.
+  assert.equal((await sessionsAtRespawn(w))[0]!.account, "work");
+  assert.equal(existsSync(path.join(w.msHome, "last-pick.json")), false, "a hand pick is not the chooser's answer");
+
+  // The picker saw both accounts, ★ on the chooser's, in a popup (a real
+  // pane, fzf 0.73), and its directory was gone before anything launched.
+  const args = fzfArgsOf(w)!;
+  assert.equal(args[args.indexOf("--tmux") + 1], "center,80%,60%");
+  const dir = /^cat '(.*)'\/\{1\}$/.exec(args[args.indexOf("--preview") + 1]!)![1]!;
+  assert.equal(existsSync(dir), false);
+});
+
+test("ms claude mesh, outside tmux: plain fzf, and the new pane's row is pinned too", async () => {
+  const w = await world();
+  const r = run(["claude", "mesh"], meshEnv(w, { ...OUTSIDE, MS_TEST_FZF_PICK: "work" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /^ms: work \(any, pinned\) → pane %42$/m);
+  assert.equal(fzfArgsOf(w)!.includes("--tmux"), false);
+  const s = (await readState(w)).sessions[0]!;
+  assert.equal(s.pinnedAccount, "work");
+});
+
+test("ms claude mesh: esc (130) or nothing matched (1) is exit 130, one line, and nothing written or touched", async () => {
+  for (const exit of ["130", "1"]) {
+    const w = await world();
+    const r = run(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_EXIT: exit }));
+    assert.equal(r.code, 130, r.stderr);
+    assert.equal(r.stderr, "ms claude: cancelled — nothing launched\n");
+    assert.equal((await readState(w)).sessions.length, 0, "no session row");
+    assert.deepEqual(tmuxActed(w), [], "tmux was never asked to do anything");
+    assert.equal(existsSync(path.join(w.msHome, "last-pick.json")), false);
+  }
+});
+
+test("ms claude mesh: an account with no room still launches when picked, after one line saying so", async () => {
+  const w = await world({ gmail: { body: GMAIL_OK }, work: { body: FULL } });
+  const r = run(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /^ms claude: work has no room \(session window at 100\) — launching anyway; the first wall will rotate it$/m);
+  assert.match(r.stderr, /^ms: work \(any, pinned\) → pane %7$/m);
+  const s = (await readState(w)).sessions[0]!;
+  assert.equal(s.account, "work");
+  assert.equal(s.pinnedAccount, "work");
+});
+
+test("ms claude mesh: a pick this device holds no launch token for is the launch's own refusal, and no 'launching anyway'", async () => {
+  const w = await world({ gmail: { body: GMAIL_OK }, work: { body: FULL } });
+  const { deleteLaunchToken } = await import("../src/launch-credentials.ts");
+  process.env.MS_HOME = w.msHome;
+  deleteLaunchToken("work");
+  const r = run(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, /no launch token for account 'work' \(run: ms accounts login work\)/);
+  assert.doesNotMatch(r.stderr, /launching anyway/);
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
+test("ms claude mesh: ctrl-r runs the real `ms _mesh_rows`, which re-reads usage and prints the status line and the rows fzf then shows", async () => {
+  const w = await world();
+  const rowsOut = path.join(path.dirname(w.log), "rows.out");
+  const headerOut = path.join(path.dirname(w.log), "header.out");
+  const r = run(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_RELOAD: "1", MS_TEST_FZF_ROWS: rowsOut, MS_TEST_FZF_HEADER: headerOut }));
+  assert.equal(r.code, 0, r.stderr);
+  const rows = readFileSync(rowsOut, "utf8").trimEnd().split("\n");
+  assert.equal(rows.length, 2, rows.join("\n"));
+  for (const row of rows) assert.match(row, /^[01]\t/, "then only rows: no log line");
+  assert.ok(rows.some((row) => row.includes("gmail")) && rows.some((row) => row.includes("work")));
+  // The header's status line came back with them, from the reload's reading.
+  assert.match(stripAnsi(readFileSync(headerOut, "utf8")), /^-\t★ what plain `ms claude` would pick · usage \d+s old\n$/);
+  const s = (await readState(w)).sessions[0]!;
+  assert.equal(s.account, "work", "the pick came from the reloaded rows");
+  assert.equal(s.pinnedAccount, "work");
+});
+
+const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+async function until(what: string, ok: () => boolean, ms = 30_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/** `ms <argv>` started the way a shell starts a job — a process group of its
+ *  own — so a test can hang up the whole job, as a closing terminal does, or
+ *  signal `ms` alone. */
+function startJob(argv: string[], env: Record<string, string>) {
+  const child = spawn(process.execPath, ["--import", "tsx", MS_BIN, ...argv], {
+    detached: true,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { NODE_OPTIONS: "--disable-warning=ExperimentalWarning", ...process.env, ...env },
+  });
+  let stderr = "";
+  child.stderr!.on("data", (d: Buffer) => { stderr += d.toString(); });
+  const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null; stderr: string }>((resolve) =>
+    child.on("close", (code, signal) => resolve({ code, signal, stderr })));
+  return { child, done };
+}
+
+/** The picker's directory, once the stub fzf is up and holding it. */
+async function pickerUp(w: World): Promise<string> {
+  let dir = "";
+  await until("the picker to open", () => {
+    const args = fzfArgsOf(w);
+    const m = args && args.includes("--preview") ? /^cat '(.*)'\/\{1\}$/.exec(args[args.indexOf("--preview") + 1] ?? "") : null;
+    dir = m?.[1] ?? "";
+    return !!dir && existsSync(dir);
+  });
+  return dir;
+}
+
+test("ms claude mesh: the terminal closing under the picker leaves nothing behind — no launch, no row, no directory", async () => {
+  // Measured before: a SIGHUP (the pane killed, the window closed) killed
+  // node inside spawnSync, before the `finally` that removes the directory,
+  // and every account's name, e-mail and usage stayed in $TMPDIR.
+  const w = await world();
+  const { child, done } = startJob(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_WAIT: "30" }));
+  const dir = await pickerUp(w);
+  process.kill(-child.pid!, "SIGHUP"); // the whole foreground job hangs up, fzf with it
+  const r = await done;
+  assert.equal(r.code, 129, `${r.signal ?? ""} ${r.stderr}`);
+  assert.match(r.stderr, /^ms claude: cancelled — nothing launched$/m);
+  assert.equal(existsSync(dir), false, "the picker's directory went with it");
+  assert.equal((await readState(w)).sessions.length, 0);
+  assert.deepEqual(tmuxActed(w), []);
+});
+
+test("ms claude mesh: a kill while the picker is open is a cancel, even when fzf then hands back a pick", async () => {
+  const w = await world();
+  const { child, done } = startJob(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_WAIT: "2" }));
+  const dir = await pickerUp(w);
+  process.kill(child.pid!, "SIGTERM"); // ms alone: fzf goes on, and picks work
+  const r = await done;
+  assert.equal(r.code, 143, `${r.signal ?? ""} ${r.stderr}`);
+  assert.match(r.stderr, /^ms claude: cancelled — nothing launched$/m);
+  assert.doesNotMatch(r.stderr, /^ms: work/m, "nothing launched on the far side of a kill");
+  assert.equal(existsSync(dir), false);
+  assert.equal((await readState(w)).sessions.length, 0);
+  assert.deepEqual(tmuxActed(w), []);
+});
+
+test("ms claude mesh: usage unreachable, the ★ and the first row are the remembered pick — what plain `ms claude` launches", async () => {
+  // No account's usage can be read, and a pick from a minute ago is
+  // remembered: a plain launch takes it, so the picker stars it.
+  const w = await world({ gmail: { status: 503 }, work: { status: 503 } });
+  writeFileSync(path.join(w.msHome, "last-pick.json"), JSON.stringify({ any: { name: "work", at: Date.now() - 60_000 } }), { mode: 0o600 });
+  const rowsOut = path.join(path.dirname(w.log), "rows.out");
+  const headerOut = path.join(path.dirname(w.log), "header.out");
+  const r = run(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_ROWS: rowsOut, MS_TEST_FZF_HEADER: headerOut }));
+  assert.equal(r.code, 0, r.stderr);
+  const rows = readFileSync(rowsOut, "utf8").trimEnd().split("\n").map(stripAnsi);
+  assert.match(rows[0]!, /^\d\t★ work /, rows.join("\n"));
+  assert.match(rows[1]!, /^\d\t✗ gmail /);
+  assert.match(stripAnsi(readFileSync(headerOut, "utf8")), /^-\tusage unreachable — ★ the last pick, what plain `ms claude` launches now · nothing read yet\n$/);
+  assert.match(r.stderr, /^ms: work \(any, pinned\) → pane %7$/m);
+
+  const plain = run(["claude"], w.env());
+  assert.equal(plain.code, 0, plain.stderr);
+  assert.match(plain.stderr, /^ms: work \(any\) → pane %7$/m, "plain `ms claude` takes the same account");
+});
+
+test("ms claude mesh: refused before the picker for --as, for a second mesh, and for no terminal", async () => {
+  const w = await world();
+  const env = meshEnv(w, { MS_TEST_FZF_PICK: "work" });
+  for (const [argv, why] of [
+    [["claude", "mesh", "--as", "work"], /^ms claude: mesh chooses the account; drop --as or drop mesh$/m],
+    [["claude", "--as", "work", "mesh"], /^ms claude: mesh chooses the account; drop --as or drop mesh$/m],
+    [["claude", "mesh", "mesh"], /^ms claude: mesh is given twice$/m],
+  ] as const) {
+    const r = run([...argv], env);
+    assert.equal(r.code, 2, `${argv.join(" ")}: ${r.stderr}`);
+    assert.match(r.stderr, why);
+  }
+  const noTty = run(["claude", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_MESH_TTY: path.join(w.home, "no-such-tty") }));
+  assert.equal(noTty.code, 2, noTty.stderr);
+  assert.match(noTty.stderr, /^ms claude: mesh needs a terminal$/m);
+  assert.equal(fzfArgsOf(w), null, "the picker never ran");
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
+test("ms claude -- mesh: after -- it is claude's argument, the chooser picks, and nothing is pinned", async () => {
+  const w = await world();
+  const r = run(["claude", "--", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /^ms: gmail \(any\) → pane %7$/m);
+  assert.equal(fzfArgsOf(w), null);
+  const st = await readState(w, launchIdOf(w));
+  assert.deepEqual(st.sessions[0]!.flags, ["mesh"]);
+  assert.equal(st.sessions[0]!.pinnedAccount, null);
+  assert.deepEqual(st.launch!.command, ["claude", "--session-id", st.sessions[0]!.cliSessionId, "mesh"]);
+});
+
+test("ms codex mesh: the codex accounts only, no fable column, and the pick launched pinned", async () => {
+  // home is what a plain `ms codex` takes (more room); the human takes work.
+  const w = await codexWorld([{ name: "home", weekly: 10 }, { name: "work", weekly: 80 }]);
+  const rowsOut = path.join(path.dirname(w.log), "rows.out");
+  const r = run(["codex", "mesh", "--", "--model", "gpt-5"], meshEnv(w, { MS_TEST_FZF_PICK: "work", MS_TEST_FZF_ROWS: rowsOut }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /^ms: work \(codex, pinned\) → pane %7$/m);
+  const rows = readFileSync(rowsOut, "utf8").trimEnd().split("\n");
+  assert.equal(rows.length, 2, "gmail is a claude account: not on this picker");
+  for (const row of rows) assert.doesNotMatch(row, /fable/);
+  const args = fzfArgsOf(w)!;
+  assert.equal(args[args.indexOf("--prompt") + 1], "codex account> ");
+  const st = await readState(w, launchIdOf(w));
+  const s = st.sessions[0]!;
+  assert.equal(s.provider, "codex");
+  assert.equal(s.account, "work");
+  assert.equal(s.pinnedAccount, "work");
+  assert.deepEqual(st.launch!.command, ["codex", "--model", "gpt-5"]);
+});
+
+test("ms codex mesh --need fable keeps its refusal, before any picker", async () => {
+  const w = await codexWorld([{ name: "home" }]);
+  const r = run(["codex", "mesh", "--need", "fable"], meshEnv(w, { MS_TEST_FZF_PICK: "home" }));
+  assert.equal(r.code, 2, r.stderr);
+  assert.match(r.stderr, /^ms codex: codex has no fable window$/m);
+  assert.equal(fzfArgsOf(w), null);
 });

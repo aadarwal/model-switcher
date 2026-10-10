@@ -34,6 +34,7 @@ const acct = (name: string, o: Partial<PickInput> = {}): PickInput => ({
   name,
   provider: "claude",
   shared: false,
+  reservePercent: 0,
   session: w(10, at(3)),
   weeklyAll: w(20, at(120)),
   weeklyFable: w(20, at(120)),

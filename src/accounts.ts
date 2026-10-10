@@ -123,6 +123,9 @@ const USAGE = `usage: ms accounts <command>
   token <name>                        print the launch token (claude only)
   label <name> <text> [--provider P]  name a row; a label equal to the name is
                                       the default
+  reserve <name> <percent> [--provider P]
+                                      keep 1..99% of weekly capacity for the owner;
+                                      0 clears the reserve
   ls                                  list the accounts
 
 --provider is needed only when one name is held by BOTH providers; names are
@@ -977,11 +980,12 @@ async function cmdLs(): Promise<number> {
           verified: a.identityVerified ? "yes" : "no",
         },
   );
-  // EMAIL is last on purpose: it is the widest cell and the only optional one, and every column before it
-  // keeps the position scripts and eyes already know.
-  const rows = [["NAME", "PROVIDER", "LABEL", "ORG", "POLL", "TOKEN", "VERIFIED", "EMAIL"]];
+  // Keep the legacy table byte-identical until a reserve is configured.
+  const showReserve = r.registry.accounts.some((a) => (a.reservePercent ?? 0) > 0);
+  // EMAIL stays last, with the optional RESERVE column immediately before it.
+  const rows = [["NAME", "PROVIDER", "LABEL", "ORG", "POLL", "TOKEN", "VERIFIED", ...(showReserve ? ["RESERVE"] : []), "EMAIL"]];
   r.registry.accounts.forEach((a, i) => {
-    rows.push([a.name, a.provider, a.label, a.orgId ?? "-", cells[i].poll, cells[i].token, cells[i].verified, a.email ?? "-"]);
+    rows.push([a.name, a.provider, a.label, a.orgId ?? "-", cells[i].poll, cells[i].token, cells[i].verified, ...(showReserve ? [a.reservePercent ? `${a.reservePercent}%` : "—"] : []), a.email ?? "-"]);
   });
   out(table(rows));
   return 0;
@@ -1026,6 +1030,34 @@ function cmdLabel(args: string[]): number {
   row.label = text;
   saveRegistry(r.registry, r);
   out(text === row.name ? `${row.name}: label is its name again\n` : `${row.name}: label ${JSON.stringify(text)}\n`);
+  return 0;
+}
+
+/** Reserve is registry policy only: it does not mint or alter credentials. */
+function cmdReserve(args: string[]): number {
+  let provider: Provider | null = null;
+  const words: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--provider") provider = asProvider("reserve", args[++i]);
+    else if (a.startsWith("--provider=")) provider = asProvider("reserve", a.slice("--provider=".length));
+    else if (a.startsWith("--")) throw new UsageError(`reserve: unknown option ${a}`, true);
+    else words.push(a);
+  }
+  if (words.length !== 2) throw new UsageError("reserve needs an account name and a percent (0..99)", true);
+  const [name, text] = words;
+  const percent = Number(text);
+  if (!/^\d+$/.test(text) || !Number.isInteger(percent) || percent < 0 || percent > 99) {
+    throw new UsageError("reserve percent must be an integer from 0 to 99 (0 clears)");
+  }
+  const target = resolveTarget(name, provider);
+  const r = load();
+  const row = findAccount(r.registry, target.name, target.provider);
+  if (!row) throw new UsageError(`no such ${target.provider} account: ${name}`);
+  if (percent === 0) delete row.reservePercent;
+  else row.reservePercent = percent;
+  saveRegistry(r.registry, r);
+  out(`${row.name}: ${percent ? `owner reserve ${percent}% (automation stops at ${100 - percent}% weekly)` : "reserve cleared"}\n`);
   return 0;
 }
 
@@ -1087,6 +1119,7 @@ export async function accountsVerb(args: string[]): Promise<number> {
     if (sub === "add") return cmdAdd(rest);
     if (sub === "ls") return await cmdLs();
     if (sub === "label") return cmdLabel(rest);
+    if (sub === "reserve") return cmdReserve(rest);
     if (sub && TARGET_VERBS.includes(sub)) {
       const t = parseTarget(sub, rest);
       const row = resolveTarget(t.name, t.provider);

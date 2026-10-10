@@ -30,7 +30,7 @@ const DASH = "—";
 
 // --- Accounts table ------------------------------------------------------
 
-export type AccountState = "ok" | "stale" | "auth" | "transient" | "no-grant" | "no-token" | "no room";
+export type AccountState = "ok" | "stale" | "auth" | "transient" | "no-grant" | "no-token" | "no room" | "reserved";
 
 /** `pollOne` (src/snapshot.ts) names a missing poll grant with this exact
  *  phrase for Claude ("no poll grant …") and Codex ("no credentials …");
@@ -42,9 +42,9 @@ const NO_GRANT_RE = /no poll grant|credentials missing|no credentials/i;
  * "The chooser would pass this account over", read off the same numbers the
  * chooser reads.
  *
- * `pickAccounts` (src/pick.ts) gates on a window at 100 and nothing softer —
- * no projection, no threshold below it — so this is that rule and only that
- * rule: the 5 h session window, and the weekly one. The FABLE window is
+ * Full windows gate `pickAccounts` (src/pick.ts) before the optional owner
+ * reserve. This helper checks those full windows: the 5 h session window,
+ * and the weekly one. The FABLE window is
  * deliberately not here, because the chooser only gates on it for a run that
  * asked for it (`--need fable`); an account with Fable at 100 and room in the
  * other two still runs every ordinary `ms claude`, and calling it "no room"
@@ -76,7 +76,7 @@ function noRoom(u: AccountUsage["usage"]): boolean {
  * credential outranks a slow network, which outranks a reading this round
  * merely didn't refresh.
  */
-export function accountState(a: AccountUsage, hasToken: boolean): AccountState {
+export function accountState(a: AccountUsage, hasToken: boolean, reservePercent = 0): AccountState {
   if (!hasToken && a.provider !== "codex") return "no-token";
   if (a.errorKind === "auth") return NO_GRANT_RE.test(a.error ?? "") ? "no-grant" : "auth";
   // "other" is not one of the six named states; it is folded into
@@ -89,7 +89,11 @@ export function accountState(a: AccountUsage, hasToken: boolean): AccountState {
   // fact about the numbers in it. `ok` was the one word this row could say
   // that was simply wrong — an account at 100 is not ok, it is the account
   // every launch and every rotation is about to skip.
-  return noRoom(a.usage) ? "no room" : "ok";
+  // A full window is "no room" whatever the reserve: the reserve only explains a stop BELOW 100.
+  if (noRoom(a.usage)) return "no room";
+  const weekly = a.usage?.weeklyAll?.usedPercent;
+  if (reservePercent > 0 && typeof weekly === "number" && Number.isFinite(weekly) && weekly >= 100 - reservePercent) return "reserved";
+  return "ok";
 }
 
 /** One decimal only when the value isn't integral (42, not 42.0; 42.5, not
@@ -136,7 +140,7 @@ export function localTimeCli(epochMs: number): string {
  *  one place, so `accountRow()` (the text table) and `statusJson()` (Plan 4
  *  Task 2's dashboard) compute it identically rather than one of them
  *  copying the other's logic. See review round 1 (P4-T2), findings 1 & 2. */
-export type AccountComputed = { label: string; state: AccountState; email: string | null };
+export type AccountComputed = { label: string; state: AccountState; email: string | null; reservePercent: number };
 
 /** One live session as an account card lists it. */
 export type AccountSession = { id: string; pane: string; state: string };
@@ -161,7 +165,8 @@ export function sessionsByAccount(sessions: { id: string; provider: string; acco
  *  place a credential is read for no reason. */
 export function computeAccount(a: AccountUsage, registry: Registry, hasToken = !!readLaunchToken(a.name)): AccountComputed {
   const row = findAccount(registry, a.name, a.provider);
-  return { label: row?.label ?? a.name, state: accountState(a, hasToken), email: row?.email ?? null };
+  const reservePercent = row?.reservePercent ?? 0;
+  return { label: row?.label ?? a.name, state: accountState(a, hasToken, reservePercent), email: row?.email ?? null, reservePercent };
 }
 
 function accountRow(a: AccountUsage, registry: Registry, live: number): string[] {

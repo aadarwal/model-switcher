@@ -42,7 +42,7 @@
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { ensureStore, p } from "./paths.ts";
 import { Locked, withLock } from "./lock.ts";
-import { loadRegistry, type Account, type Provider } from "./registry.ts";
+import { loadRegistry, type Account, type Provider, type Registry } from "./registry.ts";
 import { openState } from "./state.ts";
 import type { PickInput } from "./pick.ts";
 import {
@@ -691,8 +691,12 @@ export function ageLabel(ms: number): string {
  * one. An unreadable registry yields no inputs at all — `registryError` is
  * there so `ms status` can say why rather than print "no accounts".
  */
-export function toPickInputs(s: Snapshot): PickInput[] {
+export function toPickInputs(s: Snapshot, registry?: Registry): PickInput[] {
   if (s.registryError !== null) return [];
+  // Reserve policy is current registry data, not a property of a cached usage reading.
+  const current = registry ? { registry, parseError: null } : loadRegistry();
+  if (current.parseError) return [];
+  const reserves = new Map(current.registry.accounts.map((a) => [keyOf(a), a.reservePercent ?? 0]));
   const now = Date.now();
   return s.accounts.map((a): PickInput => {
     const seen = a.observedAt;
@@ -705,6 +709,7 @@ export function toPickInputs(s: Snapshot): PickInput[] {
       name: a.name,
       provider: a.provider,
       shared: a.shared,
+      reservePercent: reserves.get(keyOf(a)) ?? 0,
       session: a.usage?.session ?? null,
       weeklyAll: a.usage?.weeklyAll ?? null,
       weeklyFable: a.usage?.weeklyFable ?? null,

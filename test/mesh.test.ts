@@ -916,3 +916,16 @@ test("ms _mesh_rows and ms _mesh_poll are registered verbs, and through the real
     assert.match(p.stderr, /^usage: ms _mesh_poll <account>\.\.\.$/m);
   }
 });
+
+
+test("meshRows: the supplied registry reserve controls both ranking and displayed state", () => {
+  const p = pool();
+  p.registry.accounts.find((a) => a.name === "bravo")!.reservePercent = 30;
+  p.snapshot.accounts.find((a) => a.name === "bravo")!.usage!.weeklyAll!.usedPercent = 70;
+  const v = meshRows({ provider: "claude", need: "any", ...p, sessions: [], now: now() });
+  const row = v.rows.find((a) => a.name === "bravo")!;
+  assert.equal(row.rank, null);
+  assert.equal(row.out, "reserved: owner keeps 30% (weekly 70%)");
+  assert.equal(row.state, "reserved");
+  assert.notEqual(row.mark, "★");
+});

@@ -4,7 +4,7 @@ import { pickAccounts, parseNeed, type PickInput } from "../src/pick.ts";
 
 const w = (used: number, resets: string | null = "2026-09-20T00:00:00Z") => ({ usedPercent: used, resetsAt: resets });
 const acct = (name: string, o: Partial<PickInput> = {}): PickInput => ({
-  name, provider: "claude", shared: false, session: w(10, "2026-09-15T05:00:00Z"),
+  name, provider: "claude", shared: false, reservePercent: 0, session: w(10, "2026-09-15T05:00:00Z"),
   weeklyAll: w(50, "2026-09-18T00:00:00Z"), weeklyFable: w(50, "2026-09-18T00:00:00Z"), error: null, ...o,
 });
 
@@ -88,11 +88,42 @@ test("parseNeed", () => {
 test("a Codex account with no session window (Pro plans) is eligible on its weekly window; Claude still needs both", () => {
   const weekly = { usedPercent: 30, resetsAt: "2026-09-21T11:00:00Z" };
   const r = pickAccounts([
-    { name: "pro", provider: "codex", shared: false, session: null, weeklyAll: weekly, weeklyFable: null, error: null },
-    { name: "cl", provider: "claude", shared: false, session: null, weeklyAll: weekly, weeklyFable: weekly, error: null },
+    { name: "pro", provider: "codex", shared: false, reservePercent: 0, session: null, weeklyAll: weekly, weeklyFable: null, error: null },
+    { name: "cl", provider: "claude", shared: false, reservePercent: 0, session: null, weeklyAll: weekly, weeklyFable: weekly, error: null },
   ], "any");
   assert.deepEqual(r.picks.map((p) => p.name), ["pro"]);
   assert.deepEqual(r.out, [{ name: "cl", why: "no session window" }]);
-  const walled = pickAccounts([{ name: "pro", provider: "codex", shared: false, session: null, weeklyAll: { usedPercent: 100, resetsAt: null }, weeklyFable: null, error: null }], "any");
+  const walled = pickAccounts([{ name: "pro", provider: "codex", shared: false, reservePercent: 0, session: null, weeklyAll: { usedPercent: 100, resetsAt: null }, weeklyFable: null, error: null }], "any");
   assert.deepEqual(walled.out, [{ name: "pro", why: "weekly window at 100" }]);
+});
+
+
+for (const used of [69, 70, 71]) {
+  test(`reserve 30: weekly ${used}% is gated at 70%`, () => {
+    const r = pickAccounts([acct("owner", { provider: "codex", reservePercent: 30, weeklyAll: w(used) })], "any");
+    assert.deepEqual(r.picks.map((p) => [p.name, p.remaining]), used < 70 ? [["owner", 1]] : []);
+    assert.deepEqual(r.out, used < 70 ? [] : [{ name: "owner", why: `reserved: owner keeps 30% (weekly ${used}%)` }]);
+  });
+}
+
+test("reserve remaining uses the weekly cap, min with Fable only when requested", () => {
+  const a = acct("owner", { reservePercent: 30, weeklyAll: w(60), weeklyFable: w(95) });
+  assert.equal(pickAccounts([a], "any").picks[0]?.remaining, 10);
+  assert.equal(pickAccounts([a], "fable").picks[0]?.remaining, 5);
+  assert.equal(pickAccounts([{ ...a, weeklyFable: w(20) }], "fable").picks[0]?.remaining, 10);
+  assert.deepEqual(pickAccounts([a, acct("other", { weeklyAll: w(80) })], "any").picks.map((p) => p.name), ["other", "owner"]);
+});
+
+test("zero or absent reserve preserves the chooser result and 100% reasons retain priority", () => {
+  const a = acct("owner", { weeklyAll: w(99) });
+  const { reservePercent: _, ...legacy } = a;
+  assert.deepEqual(pickAccounts([a], "any"), pickAccounts([legacy as PickInput], "any"));
+  assert.equal(pickAccounts([a], "any").picks[0]?.remaining, 1);
+  for (const [over, why] of [
+    [{ session: w(100) }, "session window at 100"],
+    [{ weeklyAll: w(100) }, "weekly window at 100"],
+    [{ weeklyFable: w(100) }, "fable window at 100"],
+  ] as [Partial<PickInput>, string][]) {
+    assert.equal(pickAccounts([acct("owner", { reservePercent: 30, ...over })], "fable").out[0]?.why, why);
+  }
 });

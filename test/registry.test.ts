@@ -101,3 +101,34 @@ test("validateRegistry reports a non-array accounts field as a problem", async (
   assert.equal(v.problems.length, 1);
   assert.match(v.problems[0], /not an array/);
 });
+
+
+test("reserve registry round-trips valid integers and omits zero without changing legacy bytes", async () => {
+  const { home, msHome } = tempHome();
+  process.env.HOME = home; process.env.MS_HOME = msHome;
+  const { loadRegistry, saveRegistry } = await import("../src/registry.ts");
+  const r = loadRegistry();
+  const row = { name: "owner", provider: "codex" as const, label: "owner", orgId: null, shared: false, identityVerified: false };
+  r.registry.accounts.push(row);
+  const file = path.join(msHome, "accounts.json");
+  const legacy = JSON.stringify(r.registry, null, 2) + "\n";
+  for (const reservePercent of [1, 30, 99, 0]) {
+    r.registry.accounts[0] = { ...row, reservePercent };
+    saveRegistry(r.registry, r);
+    assert.equal(loadRegistry().registry.accounts[0].reservePercent, reservePercent || undefined);
+    if (!reservePercent) assert.equal(readFileSync(file, "utf8"), legacy);
+  }
+  r.registry.accounts[0] = row;
+  saveRegistry(r.registry, r);
+  assert.equal(readFileSync(file, "utf8"), legacy);
+});
+
+test("reserve registry ignores malformed optional values without dropping the account", async () => {
+  const { validateRegistry } = await import("../src/registry.ts");
+  for (const reservePercent of [undefined, 0, -1, 100, 30.5, "30", null, true, {}, NaN, Infinity]) {
+    const { registry, problems } = validateRegistry({ accounts: [{ name: "owner", provider: "codex", reservePercent }] });
+    assert.equal(registry.accounts.length, 1);
+    assert.equal(Object.hasOwn(registry.accounts[0], "reservePercent"), false);
+    assert.deepEqual(problems, []);
+  }
+});

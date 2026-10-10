@@ -921,3 +921,33 @@ test("accountState: 'no room' replaces ok and nothing else — a missing launch 
   assert.equal(accountState({ ...base, error: "timeout", errorKind: "transient", stale: false }, true), "transient");
   assert.equal(accountState({ ...base, error: null, errorKind: null, stale: true }, true), "stale");
 });
+
+
+test("accountState: reserve threshold is reserved, with reading errors still taking priority", async () => {
+  const { accountState } = await import("../src/status.ts");
+  const a = { name: "owner", provider: "codex" as const, shared: false,
+    usage: { session: null, weeklyAll: { usedPercent: 70, resetsAt: null }, weeklyFable: null },
+    error: null, errorKind: null, observedAt: Date.now(), stale: false };
+  for (const usedPercent of [69, 70, 71, 100]) {
+    assert.equal(accountState({ ...a, usage: { ...a.usage, weeklyAll: { usedPercent, resetsAt: null } } }, true, 30), usedPercent < 70 ? "ok" : usedPercent >= 100 ? "no room" : "reserved");
+  }
+  assert.equal(accountState(a, true), "ok");
+  assert.equal(accountState({ ...a, stale: true }, true, 30), "stale");
+  assert.equal(accountState({ ...a, error: "rejected", errorKind: "auth" }, true, 30), "auth");
+  assert.equal(accountState({ ...a, provider: "claude" }, false, 30), "no-token");
+});
+
+test("status text and JSON show reserved and the registry reservePercent", async () => {
+  const { env } = await world({ panes: [], screens: {} });
+  const set = run(["accounts", "reserve", "dirk", "90"], env());
+  assert.equal(set.code, 0, set.stderr);
+  const text = run(["status"], env());
+  assert.equal(text.code, 0, text.stderr);
+  assert.match(text.stdout.split("\n").find((l) => l.startsWith("dirk"))!, /reserved/);
+  const json = run(["status", "--json"], env());
+  assert.equal(json.code, 0, json.stderr);
+  const rows = JSON.parse(json.stdout).accounts;
+  assert.equal(rows.find((a: any) => a.name === "dirk").state, "reserved");
+  assert.equal(rows.find((a: any) => a.name === "dirk").reservePercent, 90);
+  assert.equal(rows.find((a: any) => a.name === "gmail").reservePercent, 0);
+});

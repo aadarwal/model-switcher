@@ -158,3 +158,24 @@ test("the Codex wall is named through the TUI's own ■ error glyph, and a gener
   assert.equal(wallKindFromText(plain("■ exceeded retry limit, last status: 429 Too Many Requests")), null);
   assert.equal(wallKindFromText(plain("■ exceeded retry limit, last status: 429 Too Many Requests, request id: req_123")), null);
 });
+
+/**
+ * Codex 0.161.0 moved the wall's link from chatgpt.com/codex/settings/usage to
+ * chatgpt.com/settings/usage, in every variant that carries one: the 0.160.0
+ * binary holds the old URL four times, the 0.162.1 binary not once. Found by
+ * the nightly canary (#39, #42). Verbatim from the 0.162.1 binary's strings.
+ */
+const CODEX_0161 = "■ You've hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again later.";
+
+test("the Codex 0.161+ wall, whose link is chatgpt.com/settings/usage, is named as well", () => {
+  assert.equal(wallKindFromText(plain(CODEX_0161)), "session");
+  // Wrapped so that the link opens a line: the URL anchor alone carries it.
+  assert.equal(wallKindFromText(plain("Visit https://chatgpt.com/settings/usage to purchase more credits or try again later.")), "session");
+  assert.equal(wallKindFromText(plain("  visit https://chatgpt.com/settings/usage to purchase more credits or try again at 10:29 PM.")), "session");
+  // A pane still on Codex 0.160 or older keeps the old link.
+  assert.equal(wallKindFromText(plain("Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later.")), "session");
+  // Only the usage page: another chatgpt.com settings link opening a line is no wall.
+  assert.equal(wallKindFromText(plain("Visit https://chatgpt.com/settings/account to change your plan.")), null);
+  // Quoted mid-line, the new link is prose like the old one.
+  assert.equal(wallKindFromText(`❯ what does codex say now\n  it says visit https://chatgpt.com/settings/usage to buy more.\n\n❯ \n`), null);
+});

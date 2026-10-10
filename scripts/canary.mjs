@@ -224,7 +224,14 @@ function codexCanary() {
     ["rollout task_complete", ["task_complete"]],
     ["rollout codex_error_info", ["codex_error_info"]],
     ["usage_limit_exceeded", ["usage_limit_exceeded"]],
-    ["wall: chatgpt.com/codex/settings/usage", ["chatgpt.com/codex/settings/usage"]],
+    // The link as the wall sentence carries it, not the bare URL: since
+    // 0.161.0 the same page is also linked from /status, which would keep a
+    // bare needle green after a change to the wall itself. Before 0.161.0
+    // the page sat under /codex/.
+    ["wall: chatgpt.com/settings/usage", [
+      "https://chatgpt.com/settings/usage to purchase more credits",
+      "https://chatgpt.com/codex/settings/usage to purchase more credits",
+    ]],
   ];
   stringChecks(report, nativeBinaries(bin), needles);
   daemonCheck(report, bin);

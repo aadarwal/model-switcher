@@ -50,7 +50,10 @@ const LEAD = String.raw`^\s*(?:[⎿■]\s*)?`;
  * plan, model and workspace limits" and a Codex reader should not have to
  * discover that its wall is covered by a clause written for Claude. The
  * settings URL is a second, independent anchor for the case where the TUI
- * wraps the sentence and the first line on screen is the URL.
+ * wraps the sentence and the first line on screen is the URL. Codex 0.161.0
+ * moved that page to https://chatgpt.com/settings/usage (the 0.162.1 binary
+ * no longer holds the old URL at all), so both are matched: a pane on an
+ * older Codex still shows the old one.
  *
  * Text still only NAMES a wall, and for Codex it does not even do that any
  * more: the trigger is the rollout record `ms _codex_watch` tails
@@ -63,7 +66,7 @@ const PATTERNS: [WallKind, RegExp][] = [
   ["fable", new RegExp(LEAD + String.raw`(?:you'?ve reached your fable limit|fable limit reached)`, "i")],
   ["weekly", new RegExp(LEAD + String.raw`(?:you'?(?:ve|\s+have) reached your weekly usage limit|weekly limit reached|you'?ve hit your (?:usage |rate )?limits? for (?:this|the) week)`, "i")],
   ["session", new RegExp(LEAD + String.raw`(?:you'?ve hit your (?:usage |session |weekly )?limit|new messages wait for your usage limit to reset|claude usage limit reached|usage limit reached)`, "i")],
-  ["session", new RegExp(LEAD + String.raw`visit https?://chatgpt\.com/codex/settings/usage`, "i")],
+  ["session", new RegExp(LEAD + String.raw`visit https?://chatgpt\.com/(?:codex/)?settings/usage`, "i")],
 ];
 
 /** A choice cursor in an option list (`❯ 1. Yes`). It wears the prompt glyph but

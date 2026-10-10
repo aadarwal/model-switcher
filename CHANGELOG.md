@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Codex 0.161.0 moved the usage page its wall links to from chatgpt.com/codex/settings/usage to
+  chatgpt.com/settings/usage. The link anchor `ms status` names a Codex wall by, when the link is
+  the first line of the wall on screen, matches both again. The nightly canary now looks for the
+  link inside the wall's own sentence, because Codex's /status card links the same page (#39,
+  #42). Rotation never depended on it: a Codex wall is read from the rollout record, not the
+  screen
+
 ## 0.3.13
 
 - `ms claude mesh` / `ms codex mesh` (with the launcher's usual arguments after it): choose

@@ -1133,3 +1133,26 @@ test("takenAt is null when nothing has ever been written, and stamped at poll en
   assert.ok(s.takenAt !== null && s.takenAt >= finishedAt,
     `takenAt (${s.takenAt}) is stamped at the end of the poll, not the start (${startedAt})`);
 });
+
+
+test("toPickInputs reads current reserves by provider even when the usage snapshot is cached", async () => {
+  const { msHome } = env([{ name: "owner", provider: "claude" }, { name: "owner", provider: "codex" }]);
+  const { toPickInputs } = await load();
+  const file = path.join(msHome, "accounts.json");
+  const registry = JSON.parse(readFileSync(file, "utf8"));
+  const snapshot = {
+    takenAt: Date.now(), registryError: null,
+    accounts: registry.accounts.map((a: any) => ({ name: a.name, provider: a.provider, shared: false,
+      usage: { session: { usedPercent: 10, resetsAt: null }, weeklyAll: { usedPercent: 70, resetsAt: null }, weeklyFable: null },
+      error: null, errorKind: null, observedAt: Date.now(), stale: false })),
+  };
+  assert.deepEqual(toPickInputs(snapshot).map((a) => a.reservePercent), [0, 0]);
+  registry.accounts[1].reservePercent = 30;
+  writeFileSync(file, JSON.stringify(registry));
+  assert.deepEqual(toPickInputs(snapshot).map((a) => a.reservePercent), [0, 30]);
+  const { pickAccounts } = await import("../src/pick.ts");
+  assert.deepEqual(pickAccounts(toPickInputs(snapshot), "any").picks.map((a) => a.name), ["owner"]);
+  delete registry.accounts[1].reservePercent;
+  writeFileSync(file, JSON.stringify(registry));
+  assert.deepEqual(toPickInputs(snapshot).map((a) => a.reservePercent), [0, 0]);
+});

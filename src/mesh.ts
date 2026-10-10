@@ -237,7 +237,7 @@ export function meshRows(input: MeshInput): MeshView {
   const { provider, need, registry, snapshot } = input;
   const wanted = new Set(input.names);
   const rows = snapshot.accounts.filter((a) => a.provider === provider && wanted.has(a.name));
-  const inputs = toPickInputs({ ...snapshot, accounts: rows });
+  const inputs = toPickInputs({ ...snapshot, accounts: rows }, registry);
   const ranking = pickAccounts(inputs, need);
   const rankOf = new Map(ranking.picks.map((p, i) => [p.name, i + 1]));
   const outOf = new Map(ranking.out.map((o) => [o.name, o.why]));

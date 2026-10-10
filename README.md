@@ -133,6 +133,7 @@ ms accounts verify <name> [--provider P]
 ms accounts remove <name> [--provider P]
 ms accounts token <name>
 ms accounts label <name> <text> [--provider P]
+ms accounts reserve <name> <percent> [--provider P]
 ms accounts ls
 ```
 
@@ -142,6 +143,26 @@ ms accounts ls
 - `verify` — re-check an account's credentials and the identity behind them. `remove` — delete the registry row and every credential it names.
 - `token` — print the Claude launch token on stdout. `ls` — one row per account: provider, label, org, poll grant, launch token, verified.
 - `--provider` is needed only when one name is registered under both. Names are unique per provider, so a Claude `work` and a Codex `work` are two accounts.
+
+#### Reserve weekly capacity for yourself
+
+```sh
+ms accounts reserve codex-1 30 --provider codex
+ms accounts reserve codex-1 0 --provider codex  # clear the reserve
+```
+
+`reserve` accepts an integer from 0 to 99; 0 clears it. A 30% reserve makes
+`codex-1` ineligible for automatic selection once its weekly usage reaches 70%.
+At 69% it has 1% left for automation. Launch, rebalance, recovery and the mesh
+ranking all use this cap; `--need fable` also respects the Fable window's remaining
+capacity. Existing sessions are not stopped by setting a reserve, and explicit
+manual account choices keep their existing override behavior.
+
+`ms status` and the dashboard show `reserved` at the threshold; status JSON
+includes `reservePercent` (0 when unset). When any account has a reserve,
+`ms accounts ls` adds RESERVE before EMAIL, showing e.g. `30%` or `—` for rows
+without one. With no reserves configured, the existing accounts table and
+registry format stay unchanged.
 
 #### Which account is which
 

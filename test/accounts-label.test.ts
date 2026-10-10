@@ -68,3 +68,42 @@ test("label: an unknown name, a name both providers hold, no text or a control c
   const work = rows(registry).filter((a) => a.name === "work");
   assert.deepEqual(work.map((a) => [a.provider, a.label]), [["claude", "work"], ["codex", "Team"]]);
 });
+
+
+test("reserve: set and clear with provider disambiguation; ls shows the reserve and unreserved rows", () => {
+  const { env, registry } = book();
+  const before = readFileSync(registry, "utf8");
+  const originalLs = run(["accounts", "ls"], env);
+  for (const percent of [1, 30, 99]) {
+    const r = run(["accounts", "reserve", "work", String(percent), "--provider=codex"], env);
+    assert.equal(r.code, 0, r.stderr);
+    const accounts = JSON.parse(readFileSync(registry, "utf8")).accounts;
+    assert.equal(accounts.find((a: any) => a.provider === "codex").reservePercent, percent);
+    assert.ok(accounts.filter((a: any) => a.provider === "claude").every((a: any) => !Object.hasOwn(a, "reservePercent")));
+    const ls = run(["accounts", "ls"], env);
+    assert.equal(ls.code, 0, ls.stderr);
+    assert.match(ls.stdout, /RESERVE/);
+    assert.match(ls.stdout.split("\n").find((l) => /work\s+codex/.test(l))!, new RegExp(`${percent}%`));
+    assert.match(ls.stdout.split("\n").find((l) => l.startsWith("claude-1"))!, /—/);
+  }
+  assert.equal(run(["accounts", "reserve", "work", "0", "--provider", "codex"], env).code, 0);
+  assert.equal(readFileSync(registry, "utf8"), before);
+  assert.equal(run(["accounts", "ls"], env).stdout, originalLs.stdout);
+  assert.equal(run(["accounts", "reserve", "claude-1", "30"], env).code, 0);
+});
+
+test("reserve: invalid invocations are usage errors and leave registry bytes untouched", () => {
+  const { env, registry } = book();
+  const before = readFileSync(registry, "utf8");
+  for (const args of [
+    ["nobody", "30"], ["work", "30"], [], ["claude-1"],
+    ...["-1", "100", "1.5", "NaN", "Infinity", "abc", "", "0x1e", "3e1"].map((n) => ["claude-1", n]),
+    ["claude-1", "30", "extra"], ["claude-1", "30", "--provider", "bad"],
+    ["claude-1", "30", "--provider"], ["claude-1", "30", "--unknown"],
+  ]) {
+    const r = run(["accounts", "reserve", ...args], env);
+    assert.equal(r.code, 2, `${JSON.stringify(args)}: ${r.stderr}`);
+    assert.equal(readFileSync(registry, "utf8"), before);
+  }
+  assert.match(run(["accounts"], env).stderr, /reserve <name> <percent>/);
+});

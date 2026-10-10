@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.14
 
 - Codex 0.161.0 moved the usage page its wall links to from chatgpt.com/codex/settings/usage to
   chatgpt.com/settings/usage. The link anchor `ms status` names a Codex wall by, when the link is

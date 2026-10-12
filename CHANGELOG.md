@@ -7,6 +7,8 @@
   0 clears the reserve. Status and the dashboard show `reserved`, status JSON
   includes `reservePercent`, and accounts with reserves enable the RESERVE column
   in `ms accounts ls`. Existing accounts without a reserve retain their chooser behavior.
+  Rebalance moves a session off an account whose week has reached its reserve (reason
+  `reserve`), and measures a destination's room up to the destination's own reserve.
 
 ## 0.3.14
 

@@ -155,8 +155,11 @@ ms accounts reserve codex-1 0 --provider codex  # clear the reserve
 `codex-1` ineligible for automatic selection once its weekly usage reaches 70%.
 At 69% it has 1% left for automation. Launch, rebalance, recovery and the mesh
 ranking all use this cap; `--need fable` also respects the Fable window's remaining
-capacity. Existing sessions are not stopped by setting a reserve, and explicit
-manual account choices keep their existing override behavior.
+capacity. Setting a reserve stops no running session. Rebalance moves a session
+that is still on the account once the week reaches the line, at its next turn end,
+to an account with at least 30% room up to that account's own reserve. A session
+pinned by hand stays. Explicit manual account choices keep their existing override
+behavior.
 
 `ms status` and the dashboard show `reserved` at the threshold; status JSON
 includes `reservePercent` (0 when unset). When any account has a reserve,

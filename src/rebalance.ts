@@ -125,7 +125,7 @@ export type DecisionInput = {
   pane: PaneReading;
 };
 
-export type MoveReason = "imminent-wall" | "better-budget";
+export type MoveReason = "imminent-wall" | "better-budget" | "reserve";
 
 /**
  * What the rule would do. `better` is present on BOTH arms and is computed
@@ -182,7 +182,11 @@ function weeklyWindows(a: PickInput, need: Need): W[] | null {
 }
 
 const mostUsed = (ws: W[]): number => Math.max(...ws.map((x) => x.usedPercent));
-const leastRoom = (ws: W[]): number => Math.min(...ws.map((x) => 100 - x.usedPercent));
+/** Room in every one of an account's gating windows, its week measured to the
+ *  owner's reserve (`ms accounts reserve`): the line the chooser itself stops
+ *  at, and how src/pick.ts measures `remaining`. */
+const leastRoom = (a: PickInput, ws: W[]): number =>
+  Math.min(...ws.map((x) => (x === a.weeklyAll ? 100 - (a.reservePercent ?? 0) : 100) - x.usedPercent));
 /** The soonest of these windows' resets, or NaN when none of them names one.
  *  NaN is the point: "I do not know when this resets" must never compare as
  *  "it resets at the end of time" and win condition 2 by default. */
@@ -191,7 +195,7 @@ const soonestReset = (ws: W[]): number => {
   return times.length ? Math.min(...times) : Number.NaN;
 };
 
-// --- The two conditions --------------------------------------------------
+// --- The three conditions ------------------------------------------------
 
 /** A window the chooser gates on is at ≥ 85 % here, and the destination has
  *  ≥ 30 % room in every one of its own. */
@@ -200,7 +204,19 @@ function imminentWall(from: PickInput, to: PickInput, need: Need): boolean {
   const there = gatingWindows(to, need);
   if (!here || !there) return false;
   return mostUsed(here) >= REBALANCE_RULES.NEAR_WALL_PERCENT
-    && leastRoom(there) >= REBALANCE_RULES.DESTINATION_ROOM_PERCENT;
+    && leastRoom(to, there) >= REBALANCE_RULES.DESTINATION_ROOM_PERCENT;
+}
+
+/** The current account's owner keeps the last `reservePercent` of its week,
+ *  and the week has reached that line. The chooser already passes the account
+ *  over there (src/pick.ts), so a session still on it is spending the owner's
+ *  share; nothing else would move it before 85 %. It goes wherever condition 1
+ *  would send it: a destination with ≥ 30 % room in every gating window. */
+function overReserve(from: PickInput, to: PickInput, need: Need): boolean {
+  const reserve = from.reservePercent ?? 0;
+  if (reserve <= 0 || !from.weeklyAll || from.weeklyAll.usedPercent < 100 - reserve) return false;
+  const there = gatingWindows(to, need);
+  return !!there && leastRoom(to, there) >= REBALANCE_RULES.DESTINATION_ROOM_PERCENT;
 }
 
 /** The destination's week resets ≥ 24 h earlier — that is the whole test.
@@ -266,6 +282,7 @@ export function decide(input: DecisionInput): Decision {
 
   if (imminentWall(from, to, need)) return { move: true, to: better, better, reason: "imminent-wall" };
   if (betterBudget(from, to, need)) return { move: true, to: better, better, reason: "better-budget" };
+  if (overReserve(from, to, need)) return { move: true, to: better, better, reason: "reserve" };
   return no("neither condition holds");
 }
 

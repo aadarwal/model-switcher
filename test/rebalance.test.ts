@@ -188,6 +188,72 @@ test("a week that resets LATER on the best account never moves anything", () => 
   assert.equal(d.better, "there", "still the better place to be — just not by enough to move for");
 });
 
+// --- Condition 3: the owner's reserve -------------------------------------
+
+test("condition 3: a session on an account whose week has reached its owner's reserve moves to one with room", () => {
+  // `here` keeps 30 % for its owner, so automation stops at 70 %. Nothing else
+  // holds: the 5 h window is low, the weekly one under 85, and `there` resets
+  // only 12 h sooner.
+  const at70 = decide(input({
+    accounts: [
+      acct("here", { reservePercent: 30, weeklyAll: w(70, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.deepEqual(at70, { move: true, to: "there", better: "there", reason: "reserve" });
+  const at69 = decide(input({
+    accounts: [
+      acct("here", { reservePercent: 30, weeklyAll: w(69, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.deepEqual(at69, { move: false, better: "there", reason: "neither condition holds" },
+    "one point under the line is still automation's to use");
+  const noReserve = decide(input({
+    accounts: [
+      acct("here", { weeklyAll: w(70, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.equal(noReserve.move, false, "the same 70 % with no reserve is no reason to move");
+});
+
+test("condition 3 asks the destination for condition 1's room, measured to the destination's own reserve", () => {
+  const to = (o: Partial<PickInput>) => decide(input({
+    accounts: [acct("here", { reservePercent: 30, weeklyAll: w(75, at(60)) }), acct("there", o)],
+  }));
+  assert.equal(to({ weeklyAll: w(70, at(48)) }).move, true, "30 % of room is enough");
+  assert.equal(to({ weeklyAll: w(71, at(48)) }).move, false, "29 % is not");
+  assert.equal(to({ reservePercent: 20, weeklyAll: w(50, at(48)) }).move, true,
+    "a destination with a reserve of its own has room up to its cap: 80 − 50 = 30");
+  assert.equal(to({ reservePercent: 20, weeklyAll: w(51, at(48)) }).move, false, "…and 29 is still not enough");
+});
+
+test("condition 1 measures the destination's room to its own reserve too", () => {
+  // `there` resets only 12 h sooner, so condition 2 stays out of it.
+  const to = (o: Partial<PickInput>) => decide(input({
+    accounts: [
+      acct("here", { session: w(85, at(3)), weeklyAll: w(20, at(60)) }),
+      acct("there", { weeklyAll: w(30, at(48)), ...o }),
+    ],
+  }));
+  assert.equal(to({}).reason, "imminent-wall", "70 % of room, no reserve: it moves");
+  assert.equal(to({ reservePercent: 40 }).reason, "imminent-wall", "a 40 % reserve leaves exactly 30");
+  assert.equal(to({ reservePercent: 41 }).move, false, "…and a 41 % reserve leaves 29");
+});
+
+test("a session pinned by hand to a reserved account stays: the human's pick outranks the reserve", () => {
+  const d = decide(input({
+    session: sess({ pinnedAccount: "here" }),
+    accounts: [
+      acct("here", { reservePercent: 30, weeklyAll: w(90, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.equal(d.move, false);
+  assert.match(d.reason, /pinned to here by hand/);
+});
+
 // --- `better` is computed whatever the guards say ------------------------
 
 test("`better` is computed even when nothing moves", () => {

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.15
 
 - Add `ms accounts reserve <name> <percent> [--provider P]` to keep weekly capacity
   for an account owner. Automatic selection stops at `100 - percent` weekly usage;

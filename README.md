@@ -154,12 +154,21 @@ ms accounts reserve codex-1 0 --provider codex  # clear the reserve
 `reserve` accepts an integer from 0 to 99; 0 clears it. A 30% reserve makes
 `codex-1` ineligible for automatic selection once its weekly usage reaches 70%.
 At 69% it has 1% left for automation. Launch, rebalance, recovery and the mesh
-ranking all use this cap; `--need fable` also respects the Fable window's remaining
-capacity. Setting a reserve stops no running session. Rebalance moves a session
-that is still on the account once the week reaches the line, at its next turn end,
-to an account with at least 30% room up to that account's own reserve. A session
-pinned by hand stays. Explicit manual account choices keep their existing override
-behavior.
+ranking all use this cap. The reserve is on the weekly window that every model
+counts against (a Codex account's only weekly window). A Claude account's Fable
+window has no reserve of its own, and `--need fable` stops only when that window
+is full.
+
+Setting a reserve stops no running session. Rebalance moves a session that is
+still on the account at its next turn end once the week reaches the line, even
+within six hours of its last move. It goes to the first ranked account with at
+least 30% room up to that account's own reserve, and never moves a session onto
+a reserved account short of that room. A session pinned by hand stays. A walled session
+that finds every account full or reserved waits until the first of them comes
+back, a reserved one when its week resets. Explicit manual account choices keep
+their existing override behavior. A `reservePercent` in `accounts.json` that is
+not a whole percent from 1 to 99 is reported by `ms doctor` and `ms accounts`,
+and that account has no reserve until it is fixed.
 
 `ms status` and the dashboard show `reserved` at the threshold; status JSON
 includes `reservePercent` (0 when unset). When any account has a reserve,

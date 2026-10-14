@@ -1135,24 +1135,45 @@ test("takenAt is null when nothing has ever been written, and stamped at poll en
 });
 
 
-test("toPickInputs reads current reserves by provider even when the usage snapshot is cached", async () => {
-  const { msHome } = env([{ name: "owner", provider: "claude" }, { name: "owner", provider: "codex" }]);
-  const { toPickInputs } = await load();
+test("every getSnapshot() row carries its account's current reserve, by provider, even one served from the cache", async () => {
+  // The reserve is registry policy, not part of a reading: getSnapshot lays the
+  // current one over each row, as it does `shared`, so a reserve set after the
+  // reading applies at once, with no poll.
+  const { msHome, snapshot } = env([{ name: "owner", provider: "claude" }, { name: "owner", provider: "codex" }]);
   const file = path.join(msHome, "accounts.json");
   const registry = JSON.parse(readFileSync(file, "utf8"));
-  const snapshot = {
-    takenAt: Date.now(), registryError: null,
-    accounts: registry.accounts.map((a: any) => ({ name: a.name, provider: a.provider, shared: false,
-      usage: { session: { usedPercent: 10, resetsAt: null }, weeklyAll: { usedPercent: 70, resetsAt: null }, weeklyFable: null },
+  const reading = { session: { usedPercent: 10, resetsAt: null }, weeklyAll: { usedPercent: 70, resetsAt: null }, weeklyFable: null };
+  writeFileSync(snapshot, JSON.stringify({
+    takenAt: Date.now(), backoff: {},
+    accounts: registry.accounts.map((a: any) => ({ name: a.name, provider: a.provider, shared: false, usage: reading,
       error: null, errorKind: null, observedAt: Date.now(), stale: false })),
-  };
-  assert.deepEqual(toPickInputs(snapshot).map((a) => a.reservePercent), [0, 0]);
+  }));
+  const calls = stubFetch(() => ok());
+  const { getSnapshot, toPickInputs } = await load();
+  const reserves = async () => toPickInputs(await getSnapshot()).map((a) => a.reservePercent);
+  assert.deepEqual(await reserves(), [0, 0]);
   registry.accounts[1].reservePercent = 30;
   writeFileSync(file, JSON.stringify(registry));
-  assert.deepEqual(toPickInputs(snapshot).map((a) => a.reservePercent), [0, 30]);
+  assert.deepEqual(await reserves(), [0, 30], "the codex owner's reserve, not the claude owner's");
   const { pickAccounts } = await import("../src/pick.ts");
-  assert.deepEqual(pickAccounts(toPickInputs(snapshot), "any").picks.map((a) => a.name), ["owner"]);
+  assert.deepEqual(pickAccounts(toPickInputs(await getSnapshot()), "any").picks.map((a) => a.name), ["owner"]);
   delete registry.accounts[1].reservePercent;
   writeFileSync(file, JSON.stringify(registry));
-  assert.deepEqual(toPickInputs(snapshot).map((a) => a.reservePercent), [0, 0]);
+  assert.deepEqual(await reserves(), [0, 0]);
+  assert.equal(calls.length, 0, "all of it from the cached reading");
+});
+
+test("toPickInputs reads no file: a registry broken after the snapshot was taken does not empty the pool", async () => {
+  // It once re-read accounts.json for the reserve. A file half-written in that
+  // gap made it return no inputs while the snapshot's own registryError stayed
+  // null, and launch reported a full fleet ("no account has room") instead of
+  // the broken registry.
+  const { msHome } = env([{ name: "one", provider: "claude" }]);
+  const { toPickInputs } = await load();
+  writeFileSync(path.join(msHome, "accounts.json"), '{"version": 1, "accou');
+  const row = { name: "one", provider: "claude" as const, shared: false, reservePercent: 30,
+    usage: { session: { usedPercent: 10, resetsAt: null }, weeklyAll: { usedPercent: 50, resetsAt: null }, weeklyFable: null },
+    error: null, errorKind: null, observedAt: Date.now(), stale: false };
+  const inputs = toPickInputs({ takenAt: Date.now(), registryError: null, accounts: [row] });
+  assert.deepEqual(inputs.map((a) => [a.name, a.reservePercent]), [["one", 30]]);
 });

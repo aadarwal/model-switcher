@@ -71,6 +71,10 @@ export type AccountUsage = {
   name: string;
   provider: Provider;
   shared: boolean;
+  /** The owner's reserve (`ms accounts reserve`): registry policy, not part of
+   *  the reading. Every row getSnapshot returns carries the current one; a row
+   *  read straight from the cache file (`lastSnapshot`) does not. */
+  reservePercent?: number;
   usage: Usage | null;
   error: string | null;
   errorKind: ErrorKind | null;
@@ -126,7 +130,7 @@ const keyOf = (a: { provider: Provider; name: string }): string => `${a.provider
 /** The credential lock's name. `-` not `:`, because src/lock.ts's name pattern
  *  admits only `[A-Za-z0-9_-]` — a name it rejects would throw, not lock. */
 const lockOf = (a: { provider: Provider; name: string }): string => `account-${a.provider}-${a.name}`;
-const whoOf = (a: Account) => ({ name: a.name, provider: a.provider, shared: a.shared });
+const whoOf = (a: Account) => ({ name: a.name, provider: a.provider, shared: a.shared, reservePercent: a.reservePercent ?? 0 });
 
 // --- The cache file ----------------------------------------------------
 
@@ -693,10 +697,11 @@ export function ageLabel(ms: number): string {
  */
 export function toPickInputs(s: Snapshot, registry?: Registry): PickInput[] {
   if (s.registryError !== null) return [];
-  // Reserve policy is current registry data, not a property of a cached usage reading.
-  const current = registry ? { registry, parseError: null } : loadRegistry();
-  if (current.parseError) return [];
-  const reserves = new Map(current.registry.accounts.map((a) => [keyOf(a), a.reservePercent ?? 0]));
+  // The owner's reserve comes with each row: getSnapshot lays the registry's
+  // current one over every row it returns (whoOf), so nothing here reads a
+  // file. A snapshot that never went through it (`lastSnapshot`, mesh's
+  // reload) comes with the caller's registry instead.
+  const reserves = registry ? new Map(registry.accounts.map((a) => [keyOf(a), a.reservePercent ?? 0])) : null;
   const now = Date.now();
   return s.accounts.map((a): PickInput => {
     const seen = a.observedAt;
@@ -709,7 +714,7 @@ export function toPickInputs(s: Snapshot, registry?: Registry): PickInput[] {
       name: a.name,
       provider: a.provider,
       shared: a.shared,
-      reservePercent: reserves.get(keyOf(a)) ?? 0,
+      reservePercent: reserves ? reserves.get(keyOf(a)) ?? 0 : a.reservePercent ?? 0,
       session: a.usage?.session ?? null,
       weeklyAll: a.usage?.weeklyAll ?? null,
       weeklyFable: a.usage?.weeklyFable ?? null,

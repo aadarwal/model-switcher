@@ -29,7 +29,7 @@
 import { rebalanceEnabled } from "./autorotate.ts";
 import { appendEvent, lastEvent } from "./events.ts";
 import { msBinary } from "./paths.ts";
-import { pickAccounts, type Need, type PickInput } from "./pick.ts";
+import { pickAccounts, reserveReached, type Need, type PickInput } from "./pick.ts";
 import { backgroundWork, isBusy, safeCapture } from "./recover.ts";
 import type { Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type Snapshot, type SnapshotOptions } from "./snapshot.ts";
@@ -195,28 +195,20 @@ const soonestReset = (ws: W[]): number => {
   return times.length ? Math.min(...times) : Number.NaN;
 };
 
-// --- The three conditions ------------------------------------------------
+// --- The conditions ------------------------------------------------------
 
 /** A window the chooser gates on is at ≥ 85 % here, and the destination has
  *  ≥ 30 % room in every one of its own. */
 function imminentWall(from: PickInput, to: PickInput, need: Need): boolean {
   const here = gatingWindows(from, need);
-  const there = gatingWindows(to, need);
-  if (!here || !there) return false;
-  return mostUsed(here) >= REBALANCE_RULES.NEAR_WALL_PERCENT
-    && leastRoom(to, there) >= REBALANCE_RULES.DESTINATION_ROOM_PERCENT;
+  return !!here && mostUsed(here) >= REBALANCE_RULES.NEAR_WALL_PERCENT && hasRoom(to, need);
 }
 
-/** The current account's owner keeps the last `reservePercent` of its week,
- *  and the week has reached that line. The chooser already passes the account
- *  over there (src/pick.ts), so a session still on it is spending the owner's
- *  share; nothing else would move it before 85 %. It goes wherever condition 1
- *  would send it: a destination with ≥ 30 % room in every gating window. */
-function overReserve(from: PickInput, to: PickInput, need: Need): boolean {
-  const reserve = from.reservePercent ?? 0;
-  if (reserve <= 0 || !from.weeklyAll || from.weeklyAll.usedPercent < 100 - reserve) return false;
-  const there = gatingWindows(to, need);
-  return !!there && leastRoom(to, there) >= REBALANCE_RULES.DESTINATION_ROOM_PERCENT;
+/** Condition 1's destination test on its own: ≥ 30 % room in every gating
+ *  window, the week measured up to the account's own reserve. */
+function hasRoom(a: PickInput, need: Need): boolean {
+  const ws = gatingWindows(a, need);
+  return !!ws && leastRoom(a, ws) >= REBALANCE_RULES.DESTINATION_ROOM_PERCENT;
 }
 
 /** The destination's week resets ≥ 24 h earlier — that is the whole test.
@@ -227,6 +219,10 @@ function betterBudget(from: PickInput, to: PickInput, need: Need): boolean {
   const here = weeklyWindows(from, need);
   const there = weeklyWindows(to, need);
   if (!here || !there) return false;
+  // …except onto an account whose owner keeps a reserve and that is short of
+  // condition 1's room before it: the move would only spend the owner's share,
+  // and condition 3 would take the session straight back off.
+  if ((to.reservePercent ?? 0) > 0 && !hasRoom(to, need)) return false;
   const hereReset = soonestReset(here);
   const thereReset = soonestReset(there);
   if (!Number.isFinite(hereReset) || !Number.isFinite(thereReset)) return false;
@@ -252,7 +248,8 @@ export function decide(input: DecisionInput): Decision {
   const { session, now } = input;
   const need: Need = session.need;
   const mine = input.accounts.filter((a) => a.provider === session.provider);
-  const best = pickAccounts(mine, need).picks[0] ?? null;
+  const ranked = pickAccounts(mine, need).picks;
+  const best = ranked[0] ?? null;
   const better = best && best.name !== session.account ? best.name : null;
   const no = (reason: string): Decision => ({ move: false, better, reason });
 
@@ -266,7 +263,13 @@ export function decide(input: DecisionInput): Decision {
   if (input.pane === "gone") return no("the pane is gone");
   if (input.pane === "busy") return no("the pane is mid-turn");
   if (input.pane === "background") return no(BACKGROUND_WORK);
-  if (input.lastMoveAt !== null && now - input.lastMoveAt < REBALANCE_RULES.MOVE_COOLDOWN_MS) {
+  // Past its owner's reserve (`ms accounts reserve`), the account is a line
+  // automation must not keep crossing, so the move cooldown does not hold the
+  // session there. Nothing can move it back: the chooser passes over an
+  // account past its reserve, and every rule moves only to the chooser's picks.
+  const from = mine.find((a) => a.name === session.account);
+  const pastReserve = !!from && reserveReached(from.reservePercent, from.weeklyAll);
+  if (!pastReserve && input.lastMoveAt !== null && now - input.lastMoveAt < REBALANCE_RULES.MOVE_COOLDOWN_MS) {
     return no("it moved within the last 6h");
   }
   if (input.lastWallAt !== null && now - input.lastWallAt < REBALANCE_RULES.WALL_COOLDOWN_MS) {
@@ -275,14 +278,20 @@ export function decide(input: DecisionInput): Decision {
   if (!best) return no("no account has room");
   if (!better) return no("already on the best account");
 
-  const from = mine.find((a) => a.name === session.account);
   if (!from) return no("the current account is not in the snapshot");
   if (!gatingWindows(from, need)) return no("the current account has no usable reading");
   const to = mine.find((a) => a.name === better)!;
 
   if (imminentWall(from, to, need)) return { move: true, to: better, better, reason: "imminent-wall" };
   if (betterBudget(from, to, need)) return { move: true, to: better, better, reason: "better-budget" };
-  if (overReserve(from, to, need)) return { move: true, to: better, better, reason: "reserve" };
+  // Condition 3: past the owner's reserve, the session goes to the first
+  // ranked account with condition 1's room. Ranked by the soonest reset, the
+  // chooser's first pick can be nearly spent while a later one is fresh, and
+  // the owner's share is not left to drain for that.
+  if (pastReserve) {
+    const dest = ranked.find((p) => p.name !== session.account && hasRoom(mine.find((a) => a.name === p.name)!, need));
+    if (dest) return { move: true, to: dest.name, better, reason: "reserve" };
+  }
   return no("neither condition holds");
 }
 

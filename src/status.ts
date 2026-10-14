@@ -16,7 +16,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { findAccount, loadRegistry, type Registry } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
-import type { PickInput, Window } from "./pick.ts";
+import { reserveReached, type PickInput, type Window } from "./pick.ts";
 import { decide, isPinned, lastMoveAtMs, lastWallAtMs, movable, paneReading } from "./rebalance.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
@@ -91,8 +91,7 @@ export function accountState(a: AccountUsage, hasToken: boolean, reservePercent 
   // every launch and every rotation is about to skip.
   // A full window is "no room" whatever the reserve: the reserve only explains a stop BELOW 100.
   if (noRoom(a.usage)) return "no room";
-  const weekly = a.usage?.weeklyAll?.usedPercent;
-  if (reservePercent > 0 && typeof weekly === "number" && Number.isFinite(weekly) && weekly >= 100 - reservePercent) return "reserved";
+  if (reserveReached(reservePercent, a.usage?.weeklyAll)) return "reserved";
   return "ok";
 }
 

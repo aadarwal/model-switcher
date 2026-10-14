@@ -12,6 +12,14 @@ export function parseNeed(s: string | undefined): Need | null {
 
 const ms = (iso: string | null) => (iso ? Date.parse(iso) : Number.POSITIVE_INFINITY);
 
+/** Has this account's week reached its owner's reserve (`ms accounts reserve`)?
+ *  Automation stops using it at 100 − reserve of the weekly window: the one
+ *  rule the chooser below, `ms status` and rebalance all read. */
+export function reserveReached(reservePercent: number | undefined, weeklyAll: Window | null | undefined): boolean {
+  const reserve = reservePercent ?? 0;
+  return reserve > 0 && !!weeklyAll && Number.isFinite(weeklyAll.usedPercent) && weeklyAll.usedPercent >= 100 - reserve;
+}
+
 export function pickAccounts(inputs: PickInput[], need: Need, exclude: string[] = []): PickResult {
   const out: PickResult["out"] = [];
   const eligible: { name: string; resetsAt: string | null; remaining: number; shared: boolean; resetMs: number }[] = [];
@@ -30,7 +38,7 @@ export function pickAccounts(inputs: PickInput[], need: Need, exclude: string[] 
     if (a.weeklyAll.usedPercent >= 100) { out.push({ name: a.name, why: "weekly window at 100" }); continue; }
     if (need === "fable" && a.weeklyFable!.usedPercent >= 100) { out.push({ name: a.name, why: "fable window at 100" }); continue; }
     const reserve = a.reservePercent ?? 0;
-    if (reserve > 0 && a.weeklyAll.usedPercent >= 100 - reserve) {
+    if (reserveReached(reserve, a.weeklyAll)) {
       out.push({ name: a.name, why: `reserved: owner keeps ${reserve}% (weekly ${a.weeklyAll.usedPercent}%)` });
       continue;
     }

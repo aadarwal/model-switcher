@@ -254,6 +254,58 @@ test("a session pinned by hand to a reserved account stays: the human's pick out
   assert.match(d.reason, /pinned to here by hand/);
 });
 
+test("condition 3 looks past the chooser's first pick for a destination with room", () => {
+  // The chooser ranks by the soonest reset, so its first pick can be nearly
+  // spent while a later one is fresh: the owner's reserve is not left to
+  // drain because the soonest account happens to be short of room.
+  const d = (roomy: number) => decide(input({
+    accounts: [
+      acct("here", { reservePercent: 30, weeklyAll: w(80, at(20)) }),
+      acct("near", { weeklyAll: w(75, at(40)) }),
+      acct("roomy", { weeklyAll: w(roomy, at(150)) }),
+    ],
+  }));
+  assert.deepEqual(d(10), { move: true, to: "roomy", better: "near", reason: "reserve" },
+    "past the reserve, it goes to the first ranked account with 30 % of room, and `better` still names the chooser's pick");
+  assert.deepEqual(d(71), { move: false, better: "near", reason: "neither condition holds" },
+    "when no ranked account has 30 % of room, it stays");
+});
+
+test("the 6 h move cooldown does not hold a session on an account past its owner's reserve", () => {
+  // A wall rotation or a rebalance move can land a session on a reserved
+  // account just under its line; the next turns cross it. The cooldown is
+  // there against moving back and forth, and nothing moves back onto an
+  // account past its reserve (the chooser passes it over).
+  const after = (used: number, reserve: number) => decide(input({
+    lastMoveAt: NOW - HOUR,
+    accounts: [
+      acct("here", { reservePercent: reserve, weeklyAll: w(used, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.deepEqual(after(75, 30), { move: true, to: "there", better: "there", reason: "reserve" });
+  assert.equal(after(69, 30).reason, "it moved within the last 6h", "one point under the line, the cooldown holds");
+  assert.equal(after(90, 0).reason, "it moved within the last 6h", "an account with no reserve keeps the cooldown, however full");
+  const wall = decide(input({
+    lastWallAt: NOW - MINUTE,
+    accounts: [acct("here", { reservePercent: 30, weeklyAll: w(75, at(60)) }), acct("there", { weeklyAll: w(20, at(48)) })],
+  }));
+  assert.equal(wall.reason, "it rotated off a wall within the last 30m", "the 30 min wall cooldown still holds");
+});
+
+test("condition 2 never moves a session onto an account short of room before its owner's reserve", () => {
+  // `there` resets 70 h sooner: condition 2's case. With a 30 % reserve at
+  // 69 % it has 1 point left for automation, and moving there would only
+  // spend the owner's share (or be moved straight back off).
+  const onto = (o: Partial<PickInput>) => decide(input({
+    accounts: [acct("here", { weeklyAll: w(20, at(100)) }), acct("there", { weeklyAll: w(69, at(30)), ...o })],
+  }));
+  assert.deepEqual(onto({ reservePercent: 30 }), { move: false, better: "there", reason: "neither condition holds" });
+  assert.equal(onto({ reservePercent: 30, weeklyAll: w(40, at(30)) }).reason, "better-budget", "30 points short of the line is room enough");
+  assert.equal(onto({ reservePercent: 30, weeklyAll: w(41, at(30)) }).move, false, "…and 29 is not");
+  assert.equal(onto({}).reason, "better-budget", "an account with no reserve moves as before");
+});
+
 // --- `better` is computed whatever the guards say ------------------------
 
 test("`better` is computed even when nothing moves", () => {

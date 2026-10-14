@@ -8,8 +8,8 @@
   includes `reservePercent`, and accounts with reserves enable the RESERVE column
   in `ms accounts ls`. Existing accounts without a reserve retain their chooser behavior.
   Rebalance moves a session off an account whose week has reached its reserve (reason
-  `reserve`), to the first ranked account with 30% room, even within the 6 h move
-  cooldown. It measures a destination's room up to the destination's own reserve,
+  `reserve`), to the first ranked account with 30% room, once the 6 h move cooldown
+  allows. It measures a destination's room up to the destination's own reserve,
   and never moves a session onto a reserved account short of it. Recovery waits for a
   reserved account's weekly reset. A launch whose usage is unreachable does not
   reuse a remembered pick that is past its reserve. An invalid `reservePercent`

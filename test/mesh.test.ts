@@ -351,6 +351,14 @@ test("meshRows: usage unreachable, the ★ is the remembered pick a plain launch
     assert.ok(w.rows.every((r) => r.mark === "✗"));
     assert.match(plain(meshHeader(w)[1]), /^usage unreachable — no account could be read just now · newest reading 20m old$/);
   }
+  // A remembered pick whose last reading is past its owner's reserve: a plain
+  // launch refuses it (exit 4), so no ★ either. Under the line it is the ★.
+  const held = (reservePercent: number): Registry => ({ ...p.registry, accounts: p.registry.accounts.map((a) => (a.name === "bravo" ? { ...a, reservePercent } : a)) });
+  const past = meshRows({ provider: "claude", need: "any", names: p.names, registry: held(30), snapshot: p.snapshot, ready: () => null, lastPick: "bravo", sessions: [], now: now() });
+  assert.equal(past.starredBy, null, "bravo's last reading, 75 %, is past a 30 % reserve");
+  const under = meshRows({ provider: "claude", need: "any", names: p.names, registry: held(20), snapshot: p.snapshot, ready: () => null, lastPick: "bravo", sessions: [], now: now() });
+  assert.equal(under.starredBy, "last pick", "…and under a 20 % one");
+  assert.equal(under.rows[0]!.name, "bravo");
   // With room somewhere, the ranking's ★ stands and the remembered pick is
   // nobody's business.
   const q = pool();

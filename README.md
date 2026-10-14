@@ -160,10 +160,12 @@ window has no reserve of its own, and `--need fable` stops only when that window
 is full.
 
 Setting a reserve stops no running session. Rebalance moves a session that is
-still on the account at its next turn end once the week reaches the line, even
-within six hours of its last move. It goes to the first ranked account with at
-least 30% room up to that account's own reserve, and never moves a session onto
-a reserved account short of that room. A session pinned by hand stays. A walled session
+still on the account at its next turn end once the week reaches the line. It goes
+to the first ranked account with at least 30% room up to that account's own
+reserve, and never moves a session onto a reserved account short of that room.
+Like every rebalance move, it waits out the six hours after the session's last
+account change. That change might be your own `ms switch`, a wall's rotation, or
+a move that was refused. A session pinned by hand stays. A walled session
 that finds every account full or reserved waits until the first of them comes
 back, a reserved one when its week resets. Explicit manual account choices keep
 their existing override behavior. A `reservePercent` in `accounts.json` that is

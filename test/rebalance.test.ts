@@ -265,32 +265,26 @@ test("condition 3 looks past the chooser's first pick for a destination with roo
       acct("roomy", { weeklyAll: w(roomy, at(150)) }),
     ],
   }));
-  assert.deepEqual(d(10), { move: true, to: "roomy", better: "near", reason: "reserve" },
-    "past the reserve, it goes to the first ranked account with 30 % of room, and `better` still names the chooser's pick");
+  assert.deepEqual(d(10), { move: true, to: "roomy", better: "roomy", reason: "reserve" },
+    "past the reserve, it goes to the first ranked account with 30 % of room, and says so as `better` (what the dry run and the dashboard show)");
   assert.deepEqual(d(71), { move: false, better: "near", reason: "neither condition holds" },
     "when no ranked account has 30 % of room, it stays");
 });
 
-test("the 6 h move cooldown does not hold a session on an account past its owner's reserve", () => {
-  // A wall rotation or a rebalance move can land a session on a reserved
-  // account just under its line; the next turns cross it. The cooldown is
-  // there against moving back and forth, and nothing moves back onto an
-  // account past its reserve (the chooser passes it over).
-  const after = (used: number, reserve: number) => decide(input({
-    lastMoveAt: NOW - HOUR,
+test("the 6 h move cooldown holds a reserve move like any other, and the move comes when it is up", () => {
+  // The cooldown counts every account change: a human's `ms switch` onto this
+  // account (which a rule must not undo at the next turn end) and this rule's
+  // own move that the switch then refused (which must not be retried at every
+  // turn end). So a session moved within the six hours stays until they are up.
+  const after = (ago: number) => decide(input({
+    lastMoveAt: NOW - ago,
     accounts: [
-      acct("here", { reservePercent: reserve, weeklyAll: w(used, at(60)) }),
+      acct("here", { reservePercent: 30, weeklyAll: w(75, at(60)) }),
       acct("there", { weeklyAll: w(20, at(48)) }),
     ],
   }));
-  assert.deepEqual(after(75, 30), { move: true, to: "there", better: "there", reason: "reserve" });
-  assert.equal(after(69, 30).reason, "it moved within the last 6h", "one point under the line, the cooldown holds");
-  assert.equal(after(90, 0).reason, "it moved within the last 6h", "an account with no reserve keeps the cooldown, however full");
-  const wall = decide(input({
-    lastWallAt: NOW - MINUTE,
-    accounts: [acct("here", { reservePercent: 30, weeklyAll: w(75, at(60)) }), acct("there", { weeklyAll: w(20, at(48)) })],
-  }));
-  assert.equal(wall.reason, "it rotated off a wall within the last 30m", "the 30 min wall cooldown still holds");
+  assert.equal(after(HOUR).reason, "it moved within the last 6h");
+  assert.deepEqual(after(REBALANCE_RULES.MOVE_COOLDOWN_MS), { move: true, to: "there", better: "there", reason: "reserve" });
 });
 
 test("condition 2 never moves a session onto an account short of room before its owner's reserve", () => {
@@ -304,6 +298,8 @@ test("condition 2 never moves a session onto an account short of room before its
   assert.equal(onto({ reservePercent: 30, weeklyAll: w(40, at(30)) }).reason, "better-budget", "30 points short of the line is room enough");
   assert.equal(onto({ reservePercent: 30, weeklyAll: w(41, at(30)) }).move, false, "…and 29 is not");
   assert.equal(onto({}).reason, "better-budget", "an account with no reserve moves as before");
+  assert.equal(onto({ reservePercent: 10, session: w(75, at(3)), weeklyAll: w(10, at(30)) }).reason, "better-budget",
+    "only the week counts against the reserve: a busy 5 h window is no reason to refuse it");
 });
 
 // --- `better` is computed whatever the guards say ------------------------

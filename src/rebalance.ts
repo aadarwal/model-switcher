@@ -219,10 +219,12 @@ function betterBudget(from: PickInput, to: PickInput, need: Need): boolean {
   const here = weeklyWindows(from, need);
   const there = weeklyWindows(to, need);
   if (!here || !there) return false;
-  // …except onto an account whose owner keeps a reserve and that is short of
-  // condition 1's room before it: the move would only spend the owner's share,
-  // and condition 3 would take the session straight back off.
-  if ((to.reservePercent ?? 0) > 0 && !hasRoom(to, need)) return false;
+  // …except onto an account whose owner keeps a reserve, with less than
+  // condition 1's room left in its week before that line: the move would only
+  // spend the owner's share. Only the week: the reserve has no say over the
+  // 5 h or Fable windows, and without a reserve nothing changes.
+  const reserve = to.reservePercent ?? 0;
+  if (reserve > 0 && 100 - reserve - to.weeklyAll!.usedPercent < REBALANCE_RULES.DESTINATION_ROOM_PERCENT) return false;
   const hereReset = soonestReset(here);
   const thereReset = soonestReset(there);
   if (!Number.isFinite(hereReset) || !Number.isFinite(thereReset)) return false;
@@ -263,13 +265,7 @@ export function decide(input: DecisionInput): Decision {
   if (input.pane === "gone") return no("the pane is gone");
   if (input.pane === "busy") return no("the pane is mid-turn");
   if (input.pane === "background") return no(BACKGROUND_WORK);
-  // Past its owner's reserve (`ms accounts reserve`), the account is a line
-  // automation must not keep crossing, so the move cooldown does not hold the
-  // session there. Nothing can move it back: the chooser passes over an
-  // account past its reserve, and every rule moves only to the chooser's picks.
-  const from = mine.find((a) => a.name === session.account);
-  const pastReserve = !!from && reserveReached(from.reservePercent, from.weeklyAll);
-  if (!pastReserve && input.lastMoveAt !== null && now - input.lastMoveAt < REBALANCE_RULES.MOVE_COOLDOWN_MS) {
+  if (input.lastMoveAt !== null && now - input.lastMoveAt < REBALANCE_RULES.MOVE_COOLDOWN_MS) {
     return no("it moved within the last 6h");
   }
   if (input.lastWallAt !== null && now - input.lastWallAt < REBALANCE_RULES.WALL_COOLDOWN_MS) {
@@ -278,6 +274,7 @@ export function decide(input: DecisionInput): Decision {
   if (!best) return no("no account has room");
   if (!better) return no("already on the best account");
 
+  const from = mine.find((a) => a.name === session.account);
   if (!from) return no("the current account is not in the snapshot");
   if (!gatingWindows(from, need)) return no("the current account has no usable reading");
   const to = mine.find((a) => a.name === better)!;
@@ -287,10 +284,12 @@ export function decide(input: DecisionInput): Decision {
   // Condition 3: past the owner's reserve, the session goes to the first
   // ranked account with condition 1's room. Ranked by the soonest reset, the
   // chooser's first pick can be nearly spent while a later one is fresh, and
-  // the owner's share is not left to drain for that.
-  if (pastReserve) {
+  // the owner's share is not left to drain for that. The destination is what
+  // the move reports as `better` too: the dry run, `ms status` and the
+  // dashboard's confirm all show `better`, and must name where it goes.
+  if (reserveReached(from.reservePercent, from.weeklyAll)) {
     const dest = ranked.find((p) => p.name !== session.account && hasRoom(mine.find((a) => a.name === p.name)!, need));
-    if (dest) return { move: true, to: dest.name, better, reason: "reserve" };
+    if (dest) return { move: true, to: dest.name, better: dest.name, reason: "reserve" };
   }
   return no("neither condition holds");
 }

@@ -34,6 +34,7 @@ const acct = (name: string, o: Partial<PickInput> = {}): PickInput => ({
   name,
   provider: "claude",
   shared: false,
+  reservePercent: 0,
   session: w(10, at(3)),
   weeklyAll: w(20, at(120)),
   weeklyFable: w(20, at(120)),
@@ -185,6 +186,120 @@ test("a week that resets LATER on the best account never moves anything", () => 
   }));
   assert.equal(d.move, false);
   assert.equal(d.better, "there", "still the better place to be — just not by enough to move for");
+});
+
+// --- Condition 3: the owner's reserve -------------------------------------
+
+test("condition 3: a session on an account whose week has reached its owner's reserve moves to one with room", () => {
+  // `here` keeps 30 % for its owner, so automation stops at 70 %. Nothing else
+  // holds: the 5 h window is low, the weekly one under 85, and `there` resets
+  // only 12 h sooner.
+  const at70 = decide(input({
+    accounts: [
+      acct("here", { reservePercent: 30, weeklyAll: w(70, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.deepEqual(at70, { move: true, to: "there", better: "there", reason: "reserve" });
+  const at69 = decide(input({
+    accounts: [
+      acct("here", { reservePercent: 30, weeklyAll: w(69, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.deepEqual(at69, { move: false, better: "there", reason: "neither condition holds" },
+    "one point under the line is still automation's to use");
+  const noReserve = decide(input({
+    accounts: [
+      acct("here", { weeklyAll: w(70, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.equal(noReserve.move, false, "the same 70 % with no reserve is no reason to move");
+});
+
+test("condition 3 asks the destination for condition 1's room, measured to the destination's own reserve", () => {
+  const to = (o: Partial<PickInput>) => decide(input({
+    accounts: [acct("here", { reservePercent: 30, weeklyAll: w(75, at(60)) }), acct("there", o)],
+  }));
+  assert.equal(to({ weeklyAll: w(70, at(48)) }).move, true, "30 % of room is enough");
+  assert.equal(to({ weeklyAll: w(71, at(48)) }).move, false, "29 % is not");
+  assert.equal(to({ reservePercent: 20, weeklyAll: w(50, at(48)) }).move, true,
+    "a destination with a reserve of its own has room up to its cap: 80 − 50 = 30");
+  assert.equal(to({ reservePercent: 20, weeklyAll: w(51, at(48)) }).move, false, "…and 29 is still not enough");
+});
+
+test("condition 1 measures the destination's room to its own reserve too", () => {
+  // `there` resets only 12 h sooner, so condition 2 stays out of it.
+  const to = (o: Partial<PickInput>) => decide(input({
+    accounts: [
+      acct("here", { session: w(85, at(3)), weeklyAll: w(20, at(60)) }),
+      acct("there", { weeklyAll: w(30, at(48)), ...o }),
+    ],
+  }));
+  assert.equal(to({}).reason, "imminent-wall", "70 % of room, no reserve: it moves");
+  assert.equal(to({ reservePercent: 40 }).reason, "imminent-wall", "a 40 % reserve leaves exactly 30");
+  assert.equal(to({ reservePercent: 41 }).move, false, "…and a 41 % reserve leaves 29");
+});
+
+test("a session pinned by hand to a reserved account stays: the human's pick outranks the reserve", () => {
+  const d = decide(input({
+    session: sess({ pinnedAccount: "here" }),
+    accounts: [
+      acct("here", { reservePercent: 30, weeklyAll: w(90, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.equal(d.move, false);
+  assert.match(d.reason, /pinned to here by hand/);
+});
+
+test("condition 3 looks past the chooser's first pick for a destination with room", () => {
+  // The chooser ranks by the soonest reset, so its first pick can be nearly
+  // spent while a later one is fresh: the owner's reserve is not left to
+  // drain because the soonest account happens to be short of room.
+  const d = (roomy: number) => decide(input({
+    accounts: [
+      acct("here", { reservePercent: 30, weeklyAll: w(80, at(20)) }),
+      acct("near", { weeklyAll: w(75, at(40)) }),
+      acct("roomy", { weeklyAll: w(roomy, at(150)) }),
+    ],
+  }));
+  assert.deepEqual(d(10), { move: true, to: "roomy", better: "roomy", reason: "reserve" },
+    "past the reserve, it goes to the first ranked account with 30 % of room, and says so as `better` (what the dry run and the dashboard show)");
+  assert.deepEqual(d(71), { move: false, better: "near", reason: "neither condition holds" },
+    "when no ranked account has 30 % of room, it stays");
+});
+
+test("the 6 h move cooldown holds a reserve move like any other, and the move comes when it is up", () => {
+  // The cooldown counts every account change: a human's `ms switch` onto this
+  // account (which a rule must not undo at the next turn end) and this rule's
+  // own move that the switch then refused (which must not be retried at every
+  // turn end). So a session moved within the six hours stays until they are up.
+  const after = (ago: number) => decide(input({
+    lastMoveAt: NOW - ago,
+    accounts: [
+      acct("here", { reservePercent: 30, weeklyAll: w(75, at(60)) }),
+      acct("there", { weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.equal(after(HOUR).reason, "it moved within the last 6h");
+  assert.deepEqual(after(REBALANCE_RULES.MOVE_COOLDOWN_MS), { move: true, to: "there", better: "there", reason: "reserve" });
+});
+
+test("condition 2 never moves a session onto an account short of room before its owner's reserve", () => {
+  // `there` resets 70 h sooner: condition 2's case. With a 30 % reserve at
+  // 69 % it has 1 point left for automation, and moving there would only
+  // spend the owner's share (or be moved straight back off).
+  const onto = (o: Partial<PickInput>) => decide(input({
+    accounts: [acct("here", { weeklyAll: w(20, at(100)) }), acct("there", { weeklyAll: w(69, at(30)), ...o })],
+  }));
+  assert.deepEqual(onto({ reservePercent: 30 }), { move: false, better: "there", reason: "neither condition holds" });
+  assert.equal(onto({ reservePercent: 30, weeklyAll: w(40, at(30)) }).reason, "better-budget", "30 points short of the line is room enough");
+  assert.equal(onto({ reservePercent: 30, weeklyAll: w(41, at(30)) }).move, false, "…and 29 is not");
+  assert.equal(onto({}).reason, "better-budget", "an account with no reserve moves as before");
+  assert.equal(onto({ reservePercent: 10, session: w(75, at(3)), weeklyAll: w(10, at(30)) }).reason, "better-budget",
+    "only the week counts against the reserve: a busy 5 h window is no reason to refuse it");
 });
 
 // --- `better` is computed whatever the guards say ------------------------

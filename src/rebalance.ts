@@ -29,7 +29,7 @@
 import { rebalanceEnabled } from "./autorotate.ts";
 import { appendEvent, lastEvent } from "./events.ts";
 import { msBinary } from "./paths.ts";
-import { pickAccounts, type Need, type PickInput } from "./pick.ts";
+import { pickAccounts, reserveReached, type Need, type PickInput } from "./pick.ts";
 import { backgroundWork, isBusy, safeCapture } from "./recover.ts";
 import type { Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type Snapshot, type SnapshotOptions } from "./snapshot.ts";
@@ -125,7 +125,7 @@ export type DecisionInput = {
   pane: PaneReading;
 };
 
-export type MoveReason = "imminent-wall" | "better-budget";
+export type MoveReason = "imminent-wall" | "better-budget" | "reserve";
 
 /**
  * What the rule would do. `better` is present on BOTH arms and is computed
@@ -182,7 +182,11 @@ function weeklyWindows(a: PickInput, need: Need): W[] | null {
 }
 
 const mostUsed = (ws: W[]): number => Math.max(...ws.map((x) => x.usedPercent));
-const leastRoom = (ws: W[]): number => Math.min(...ws.map((x) => 100 - x.usedPercent));
+/** Room in every one of an account's gating windows, its week measured to the
+ *  owner's reserve (`ms accounts reserve`): the line the chooser itself stops
+ *  at, and how src/pick.ts measures `remaining`. */
+const leastRoom = (a: PickInput, ws: W[]): number =>
+  Math.min(...ws.map((x) => (x === a.weeklyAll ? 100 - (a.reservePercent ?? 0) : 100) - x.usedPercent));
 /** The soonest of these windows' resets, or NaN when none of them names one.
  *  NaN is the point: "I do not know when this resets" must never compare as
  *  "it resets at the end of time" and win condition 2 by default. */
@@ -191,16 +195,20 @@ const soonestReset = (ws: W[]): number => {
   return times.length ? Math.min(...times) : Number.NaN;
 };
 
-// --- The two conditions --------------------------------------------------
+// --- The conditions ------------------------------------------------------
 
 /** A window the chooser gates on is at ≥ 85 % here, and the destination has
  *  ≥ 30 % room in every one of its own. */
 function imminentWall(from: PickInput, to: PickInput, need: Need): boolean {
   const here = gatingWindows(from, need);
-  const there = gatingWindows(to, need);
-  if (!here || !there) return false;
-  return mostUsed(here) >= REBALANCE_RULES.NEAR_WALL_PERCENT
-    && leastRoom(there) >= REBALANCE_RULES.DESTINATION_ROOM_PERCENT;
+  return !!here && mostUsed(here) >= REBALANCE_RULES.NEAR_WALL_PERCENT && hasRoom(to, need);
+}
+
+/** Condition 1's destination test on its own: ≥ 30 % room in every gating
+ *  window, the week measured up to the account's own reserve. */
+function hasRoom(a: PickInput, need: Need): boolean {
+  const ws = gatingWindows(a, need);
+  return !!ws && leastRoom(a, ws) >= REBALANCE_RULES.DESTINATION_ROOM_PERCENT;
 }
 
 /** The destination's week resets ≥ 24 h earlier — that is the whole test.
@@ -211,6 +219,12 @@ function betterBudget(from: PickInput, to: PickInput, need: Need): boolean {
   const here = weeklyWindows(from, need);
   const there = weeklyWindows(to, need);
   if (!here || !there) return false;
+  // …except onto an account whose owner keeps a reserve, with less than
+  // condition 1's room left in its week before that line: the move would only
+  // spend the owner's share. Only the week: the reserve has no say over the
+  // 5 h or Fable windows, and without a reserve nothing changes.
+  const reserve = to.reservePercent ?? 0;
+  if (reserve > 0 && 100 - reserve - to.weeklyAll!.usedPercent < REBALANCE_RULES.DESTINATION_ROOM_PERCENT) return false;
   const hereReset = soonestReset(here);
   const thereReset = soonestReset(there);
   if (!Number.isFinite(hereReset) || !Number.isFinite(thereReset)) return false;
@@ -236,7 +250,8 @@ export function decide(input: DecisionInput): Decision {
   const { session, now } = input;
   const need: Need = session.need;
   const mine = input.accounts.filter((a) => a.provider === session.provider);
-  const best = pickAccounts(mine, need).picks[0] ?? null;
+  const ranked = pickAccounts(mine, need).picks;
+  const best = ranked[0] ?? null;
   const better = best && best.name !== session.account ? best.name : null;
   const no = (reason: string): Decision => ({ move: false, better, reason });
 
@@ -266,6 +281,16 @@ export function decide(input: DecisionInput): Decision {
 
   if (imminentWall(from, to, need)) return { move: true, to: better, better, reason: "imminent-wall" };
   if (betterBudget(from, to, need)) return { move: true, to: better, better, reason: "better-budget" };
+  // Condition 3: past the owner's reserve, the session goes to the first
+  // ranked account with condition 1's room. Ranked by the soonest reset, the
+  // chooser's first pick can be nearly spent while a later one is fresh, and
+  // the owner's share is not left to drain for that. The destination is what
+  // the move reports as `better` too: the dry run, `ms status` and the
+  // dashboard's confirm all show `better`, and must name where it goes.
+  if (reserveReached(from.reservePercent, from.weeklyAll)) {
+    const dest = ranked.find((p) => p.name !== session.account && hasRoom(mine.find((a) => a.name === p.name)!, need));
+    if (dest) return { move: true, to: dest.name, better: dest.name, reason: "reserve" };
+  }
   return no("neither condition holds");
 }
 

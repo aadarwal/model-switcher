@@ -19,7 +19,7 @@ export type EventKind = "started" | "resumed" | "cleared" | "compacted" | "activ
  * a turn recognise that very turn's ending, rather than any later one.
  *
  * `from`/`to` are a `rebalance`'s two accounts, and its `kindDetail` is the
- * condition that moved it (`imminent-wall` | `better-budget`) — the same
+ * condition that moved it (`imminent-wall` | `better-budget` | `reserve`) — the same
  * place a `rate_limited` records which window walled. Naming the accounts
  * rather than only the destination is what makes the log answer "where was
  * this session before the rule touched it" without a join. */

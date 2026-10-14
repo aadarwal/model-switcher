@@ -44,7 +44,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { resolveOnPath } from "./exec.ts";
 import { msBinary } from "./paths.ts";
-import { pickAccounts, type Need, type Window } from "./pick.ts";
+import { pickAccounts, reserveReached, type Need, type Window } from "./pick.ts";
 import { NAME_PATTERN, findAccount, loadRegistry, type Provider, type Registry } from "./registry.ts";
 import { DEFAULT_MAX_AGE_MS, ageLabel, getSnapshot, lastSnapshot, toPickInputs, type AccountUsage, type Snapshot } from "./snapshot.ts";
 import { openState, type SessionRow } from "./state.ts";
@@ -237,7 +237,7 @@ export function meshRows(input: MeshInput): MeshView {
   const { provider, need, registry, snapshot } = input;
   const wanted = new Set(input.names);
   const rows = snapshot.accounts.filter((a) => a.provider === provider && wanted.has(a.name));
-  const inputs = toPickInputs({ ...snapshot, accounts: rows });
+  const inputs = toPickInputs({ ...snapshot, accounts: rows }, registry);
   const ranking = pickAccounts(inputs, need);
   const rankOf = new Map(ranking.picks.map((p, i) => [p.name, i + 1]));
   const outOf = new Map(ranking.out.map((o) => [o.name, o.why]));
@@ -246,9 +246,13 @@ export function meshRows(input: MeshInput): MeshView {
   // passing, and none of them is recent enough to stand in for one.
   const unreachable = rows.length > 0 && rows.every((a) => a.errorKind === "transient") && inputs.every((i) => i.error !== null);
   // And the launch's own answer to it: the remembered pick, while it is still
-  // registered (`launchWith`, src/launch.ts).
+  // registered and its last reading is not past its owner's reserve
+  // (`launchWith`, src/launch.ts, refuses it then). The reserve is the
+  // registry's: rows from `lastSnapshot` carry none of their own.
   const last = input.lastPick ?? null;
-  const remembered = !ranking.picks.length && unreachable && last !== null && wanted.has(last) && findAccount(registry, last, provider) ? last : null;
+  const lastAccount = last !== null ? findAccount(registry, last, provider) : null;
+  const heldBack = last !== null && reserveReached(lastAccount?.reservePercent, usageOf.get(last)?.usage?.weeklyAll);
+  const remembered = !ranking.picks.length && unreachable && last !== null && wanted.has(last) && lastAccount && !heldBack ? last : null;
   const star = ranking.picks[0]?.name ?? remembered;
   const seen = rows.map((a) => a.observedAt).filter((t): t is number => t !== null);
   const live = sessionsByAccount(input.sessions);

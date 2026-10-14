@@ -22,6 +22,8 @@ export type Account = {
   label: string;
   orgId: string | null;
   shared: boolean;
+  /** Weekly capacity kept for the owner; absent/zero means no reserve. */
+  reservePercent?: number;
   identityVerified: boolean;
   identityMethod?: string;
   /** The login behind this name, as the provider's own profile reported it at sign-in or verify. Display only:
@@ -44,6 +46,13 @@ function topShapeProblem(raw: unknown): string | null {
   return null;
 }
 
+/** How a problem with one optional field reads: the row still loads, without
+ *  that value (accounts.ts words it apart from a row that is skipped). */
+export const FIELD_IGNORED = "so it is ignored";
+
+/** A reserve the registry keeps: a whole percent from 1 to 99. */
+const reserveOk = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 99;
+
 export function validateRegistry(raw: unknown): { registry: Registry; problems: string[] } {
   const problems: string[] = [];
   const out: Account[] = [];
@@ -63,10 +72,22 @@ export function validateRegistry(raw: unknown): { registry: Registry; problems: 
     const key = `${a.provider}:${a.name}`;
     if (seen.has(key)) { problems.push(`${at}: duplicate name ${a.name} for ${a.provider}`); return; }
     seen.add(key);
+    // The CLI only ever writes 1..99, so anything else was a hand edit. It is
+    // said out loud rather than read as "no reserve" in silence: the reserve
+    // only exists to protect the owner, and silence fails open.
+    const reserve = a.reservePercent;
+    if (reserve !== undefined && reserve !== null && reserve !== 0 && !reserveOk(reserve)) {
+      problems.push(
+        `${at}: reservePercent ${JSON.stringify(reserve) ?? String(reserve)} is not a whole percent from 1 to 99, ` +
+        `${FIELD_IGNORED} and ${a.name} has no reserve — it will be dropped if the file is rewritten ` +
+        `(set one with: ms accounts reserve ${a.name} <percent>)`,
+      );
+    }
     out.push({
       name: a.name, provider: a.provider, label: typeof a.label === "string" ? a.label : a.name,
       orgId: typeof a.orgId === "string" ? a.orgId : null,
       shared: a.shared === true, identityVerified: a.identityVerified === true,
+      ...(reserveOk(a.reservePercent) ? { reservePercent: a.reservePercent } : {}),
       ...(typeof a.identityMethod === "string" ? { identityMethod: a.identityMethod } : {}),
       ...(typeof a.email === "string" && a.email.length <= 254 && !/[\x00-\x1f\x7f]/.test(a.email) && /^[^\s@]+@[^\s@]+$/.test(a.email)
         ? { email: a.email }
@@ -93,7 +114,7 @@ export function saveRegistry(r: Registry, prev: { parseError: string | null }): 
   ensureStore();
   const tmp = `${p.registry}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify(r, null, 2) + "\n", { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify(r, (key, value) => key === "reservePercent" && value === 0 ? undefined : value, 2) + "\n", { mode: 0o600 });
     renameSync(tmp, p.registry);
   } catch (e) { rmSync(tmp, { force: true }); throw e; }
 }

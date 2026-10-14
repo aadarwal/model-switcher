@@ -1,6 +1,6 @@
 export type Need = "any" | "fable";
 export type Window = { usedPercent: number; resetsAt: string | null };
-export type PickInput = { name: string; provider: "claude" | "codex"; shared: boolean;
+export type PickInput = { name: string; provider: "claude" | "codex"; shared: boolean; reservePercent: number;
   session: Window | null; weeklyAll: Window | null; weeklyFable: Window | null; error: string | null };
 export type PickResult = { picks: { name: string; resetsAt: string | null; remaining: number }[]; out: { name: string; why: string }[] };
 
@@ -11,6 +11,14 @@ export function parseNeed(s: string | undefined): Need | null {
 }
 
 const ms = (iso: string | null) => (iso ? Date.parse(iso) : Number.POSITIVE_INFINITY);
+
+/** Has this account's week reached its owner's reserve (`ms accounts reserve`)?
+ *  Automation stops using it at 100 − reserve of the weekly window: the one
+ *  rule the chooser below, `ms status` and rebalance all read. */
+export function reserveReached(reservePercent: number | undefined, weeklyAll: Window | null | undefined): boolean {
+  const reserve = reservePercent ?? 0;
+  return reserve > 0 && !!weeklyAll && Number.isFinite(weeklyAll.usedPercent) && weeklyAll.usedPercent >= 100 - reserve;
+}
 
 export function pickAccounts(inputs: PickInput[], need: Need, exclude: string[] = []): PickResult {
   const out: PickResult["out"] = [];
@@ -29,8 +37,14 @@ export function pickAccounts(inputs: PickInput[], need: Need, exclude: string[] 
     if (a.session && a.session.usedPercent >= 100) { out.push({ name: a.name, why: "session window at 100" }); continue; }
     if (a.weeklyAll.usedPercent >= 100) { out.push({ name: a.name, why: "weekly window at 100" }); continue; }
     if (need === "fable" && a.weeklyFable!.usedPercent >= 100) { out.push({ name: a.name, why: "fable window at 100" }); continue; }
+    const reserve = a.reservePercent ?? 0;
+    if (reserveReached(reserve, a.weeklyAll)) {
+      out.push({ name: a.name, why: `reserved: owner keeps ${reserve}% (weekly ${a.weeklyAll.usedPercent}%)` });
+      continue;
+    }
     const windows = need === "fable" ? [a.weeklyAll, a.weeklyFable!] : [a.weeklyAll];
-    const remaining = Math.min(...windows.map((x) => 100 - x.usedPercent));
+    const weeklyRemaining = (100 - reserve) - a.weeklyAll.usedPercent;
+    const remaining = need === "fable" ? Math.min(weeklyRemaining, 100 - a.weeklyFable!.usedPercent) : weeklyRemaining;
     const resetMs = Math.min(...windows.map((x) => ms(x.resetsAt)));
     const resetsAt = windows.map((x) => x.resetsAt).filter((x): x is string => !!x).sort((x, y) => ms(x) - ms(y))[0] ?? null;
     eligible.push({ name: a.name, resetsAt, remaining, shared: a.shared, resetMs });

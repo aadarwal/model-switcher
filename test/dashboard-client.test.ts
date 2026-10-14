@@ -1026,3 +1026,9 @@ test("calendarHtml: nothing upcoming reads as a sentence, never as an empty pane
   const { calendarHtml } = await import("../src/dashboard/client-logic.ts");
   assert.match(calendarHtml([], "—"), /No limit resets/);
 });
+
+
+test("account cards render the status API's reserved state", () => {
+  const html = accountRowHtml({ name: "codex-1", provider: "codex", label: "Owner", state: "reserved" }, "—");
+  assert.match(html, />reserved<\/span>/);
+});

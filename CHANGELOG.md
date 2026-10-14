@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Add `ms accounts reserve <name> <percent> [--provider P]` to keep weekly capacity
+  for an account owner. Automatic selection stops at `100 - percent` weekly usage;
+  0 clears the reserve. Status and the dashboard show `reserved`, status JSON
+  includes `reservePercent`, and accounts with reserves enable the RESERVE column
+  in `ms accounts ls`. Existing accounts without a reserve retain their chooser behavior.
+  Rebalance moves a session off an account whose week has reached its reserve (reason
+  `reserve`), to the first ranked account with 30% room, once the 6 h move cooldown
+  allows. It measures a destination's room up to the destination's own reserve,
+  and never moves a session onto a reserved account short of it. Recovery waits for a
+  reserved account's weekly reset. A launch whose usage is unreachable does not
+  reuse a remembered pick that is past its reserve. An invalid `reservePercent`
+  in `accounts.json` is reported rather than ignored.
+
 ## 0.3.14
 
 - Codex 0.161.0 moved the usage page its wall links to from chatgpt.com/codex/settings/usage to

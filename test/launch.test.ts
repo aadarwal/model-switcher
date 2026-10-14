@@ -398,6 +398,35 @@ test("usage unreachable but a pick under 10 minutes old: launch on it", async ()
   assert.equal(st.sessions[0]!.account, "work");
 });
 
+test("usage unreachable: a remembered pick whose last reading is past its owner's reserve is not launched on", async () => {
+  // `work` was remembered before `ms accounts reserve work 30`. Nothing is fresh
+  // enough to gate on, but the reserve is policy rather than usage, and work's
+  // last reading (85 %) is already past the line its owner has since drawn.
+  const w = await world({ gmail: { status: 503 }, work: { status: 503 } });
+  const file = path.join(w.msHome, "accounts.json");
+  const reg = JSON.parse(readFileSync(file, "utf8"));
+  reg.accounts[1].reservePercent = 30;
+  writeFileSync(file, JSON.stringify(reg), { mode: 0o600 });
+  const old = Date.now() - 20 * 60_000;
+  const reading = (weekly: number) => ({ session: { usedPercent: 10, resetsAt: null }, weeklyAll: { usedPercent: weekly, resetsAt: null }, weeklyFable: null });
+  const lastReadings = (work: number) => writeFileSync(path.join(w.msHome, "snapshot.json"), JSON.stringify({ takenAt: old, backoff: {}, accounts: [
+    { name: "gmail", provider: "claude", shared: false, usage: reading(100), error: null, errorKind: null, observedAt: old, stale: false },
+    { name: "work", provider: "claude", shared: false, usage: reading(work), error: null, errorKind: null, observedAt: old, stale: false },
+  ] }), { mode: 0o600 });
+  const remember = () => writeFileSync(path.join(w.msHome, "last-pick.json"), JSON.stringify({ any: { name: "work", at: Date.now() - 60_000 } }), { mode: 0o600 });
+
+  lastReadings(85); remember();
+  const r = run(["claude"], w.env());
+  assert.equal(r.code, 4, r.stderr);
+  assert.match(r.stderr, /usage unreachable, and the last pick 'work' is held back by its owner's reserve \(30%; its last reading had the week at 85%\)/);
+  assert.equal((await readState(w)).sessions.length, 0);
+
+  lastReadings(60); remember();
+  const under = run(["claude"], w.env());
+  assert.equal(under.code, 0, under.stderr);
+  assert.match(under.stderr, /^ms: work \(any\) → pane %7$/m, "under the line, the remembered pick still launches");
+});
+
 test("a pick older than 10 minutes is not a pick: exit 4", async () => {
   const w = await world({ gmail: { status: 503 }, work: { status: 503 } });
   writeFileSync(path.join(w.msHome, "last-pick.json"), JSON.stringify({ any: { name: "work", at: Date.now() - 11 * 60_000 } }), { mode: 0o600 });

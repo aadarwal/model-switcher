@@ -625,6 +625,31 @@ test("nothing has room: the session waits, a wake-up is scheduled and the recove
   assert.match(recoverLog(w), /nothing has room/);
 });
 
+test("an account held back by its owner's reserve is waited for until its week resets", async (t) => {
+  // `ms accounts reserve`: gmail is out of the pick at 75 % because its owner
+  // keeps 30 %, and that lifts when its week resets, a day from now. Waiting
+  // only for windows "at 100" slept until dirk's own week, five days out.
+  const weeklyReset = new Date(Date.now() + 24 * HOUR).toISOString();
+  const w = await world(t, {
+    registry: JSON.stringify({ version: 1, accounts: [
+      { name: "dirk", provider: "claude", label: "dirk", shared: false },
+      { name: "gmail", provider: "claude", label: "gmail", shared: false, reservePercent: 30 },
+    ] }),
+    usage: {
+      dirk: { session: 50, weekly: 100, weeklyReset: new Date(Date.now() + 120 * HOUR).toISOString() },
+      gmail: { session: 10, weekly: 75, weeklyReset },
+    },
+  });
+
+  assert.equal(await recoverSession("s1"), 2);
+
+  const s = session(w);
+  assert.equal(s.state, "waiting");
+  const at = Math.floor(Date.parse(weeklyReset) / 1000);
+  assert.ok(Math.abs(s.wakeupAt! - at) < 5, `wakeup ${s.wakeupAt} is not gmail's weekly reset (${at})`);
+  assert.match(recoverLog(w), /gmail: reserved: owner keeps 30% \(weekly 75%\)/);
+});
+
 test("a deadline that already has a timer does not get a second one", async (t) => {
   // The session came back round to the same wake-up — a re-dispatch, or a
   // timer reconciliation fired after a tmux restart. Arming another

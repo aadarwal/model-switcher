@@ -989,8 +989,9 @@ function heldElsewhere(threadId: string, id: string, where: string): string {
 
 /**
  * When to look again, given that every account was passed over. A window that
- * is at 100 says when it resets; the earliest of those is the first moment the
- * fleet can have room. Nothing else is a schedule — an account with a dead
+ * is at 100 says when it resets, and so does a week that has reached its
+ * owner's reserve; the earliest of those is the first moment the fleet can
+ * have room. Nothing else is a schedule — an account with a dead
  * grant will still be dead in ten minutes, but ten minutes is the honest
  * "check again" rather than a guess at a fix.
  */
@@ -1002,9 +1003,12 @@ function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[]
     if (Number.isFinite(at)) times.push(Math.floor(at / 1000));
   };
   for (const o of out) {
-    if (!/ at 100$/.test(o.why)) continue;
     const input = by.get(o.name);
     if (!input) continue;
+    // An account its owner holds back (`ms accounts reserve`, src/pick.ts)
+    // comes back when its week resets, though that window is not at 100.
+    if (o.why.startsWith("reserved:")) { consider(input.weeklyAll); continue; }
+    if (!/ at 100$/.test(o.why)) continue;
     consider(o.why.startsWith("session") ? input.session : o.why.startsWith("fable") ? input.weeklyFable : input.weeklyAll);
   }
   // The account this session is LEAVING counts here too. It is excluded from

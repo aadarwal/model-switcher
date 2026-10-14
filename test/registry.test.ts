@@ -123,12 +123,22 @@ test("reserve registry round-trips valid integers and omits zero without changin
   assert.equal(readFileSync(file, "utf8"), legacy);
 });
 
-test("reserve registry ignores malformed optional values without dropping the account", async () => {
+test("reserve registry keeps the account whatever its reservePercent, and reports a value that is not a whole percent", async () => {
+  // The CLI only writes 1..99, so anything else came from a hand edit. Ignoring
+  // it silently left the account with no reserve at all (a policy that only
+  // protects the owner, failing open) with `ms doctor` saying ✓.
   const { validateRegistry } = await import("../src/registry.ts");
-  for (const reservePercent of [undefined, 0, -1, 100, 30.5, "30", null, true, {}, NaN, Infinity]) {
+  for (const reservePercent of [undefined, 0, null]) {
     const { registry, problems } = validateRegistry({ accounts: [{ name: "owner", provider: "codex", reservePercent }] });
     assert.equal(registry.accounts.length, 1);
     assert.equal(Object.hasOwn(registry.accounts[0], "reservePercent"), false);
-    assert.deepEqual(problems, []);
+    assert.deepEqual(problems, [], `${JSON.stringify(reservePercent)} is no reserve, said plainly`);
+  }
+  for (const reservePercent of [-1, 100, 30.5, "30", true, {}, NaN, Infinity]) {
+    const { registry, problems } = validateRegistry({ accounts: [{ name: "owner", provider: "codex", reservePercent }] });
+    assert.equal(registry.accounts.length, 1, "the account itself still loads");
+    assert.equal(Object.hasOwn(registry.accounts[0], "reservePercent"), false);
+    assert.equal(problems.length, 1, `${String(reservePercent)} is reported`);
+    assert.match(problems[0], /^accounts\[0\]: reservePercent .+ is not a whole percent from 1 to 99, so it is ignored and owner has no reserve/);
   }
 });

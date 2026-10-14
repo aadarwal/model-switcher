@@ -41,6 +41,7 @@ import { withLock } from "./lock.ts";
 import { ensureStore, p } from "./paths.ts";
 import {
   type Account,
+  FIELD_IGNORED,
   findAccount,
   loadRegistry,
   NAME_PATTERN,
@@ -192,7 +193,9 @@ function noteProblems(problems: string[]): void {
   if (problemsWarned) return;
   problemsWarned = true;
   for (const problem of problems) {
-    warn(`warning: accounts.json ${problem} — that row is skipped, and will be dropped if the file is rewritten`);
+    // A problem with one field (FIELD_IGNORED) already says what it leaves;
+    // every other one skips its whole row.
+    warn(`warning: accounts.json ${problem}${problem.includes(FIELD_IGNORED) ? "" : " — that row is skipped, and will be dropped if the file is rewritten"}`);
   }
 }
 
@@ -1041,7 +1044,10 @@ function cmdReserve(args: string[]): number {
     const a = args[i];
     if (a === "--provider") provider = asProvider("reserve", args[++i]);
     else if (a.startsWith("--provider=")) provider = asProvider("reserve", a.slice("--provider=".length));
-    else if (a.startsWith("--")) throw new UsageError(`reserve: unknown option ${a}`, true);
+    // An option-looking word where the name goes is an option no name can be
+    // (names never start with "-"); where the percent goes, "-1" is the
+    // percent's own error, below.
+    else if (a.startsWith("--") || (a.startsWith("-") && words.length === 0)) throw new UsageError(`reserve: unknown option ${a}`, true);
     else words.push(a);
   }
   if (words.length !== 2) throw new UsageError("reserve needs an account name and a percent (0..99)", true);

@@ -92,6 +92,29 @@ test("reserve: set and clear with provider disambiguation; ls shows the reserve 
   assert.equal(run(["accounts", "reserve", "claude-1", "30"], env).code, 0);
 });
 
+test("reserve: a hand-edited reservePercent that is not a whole percent is reported, and the account is still listed", () => {
+  const { env, registry } = book();
+  const reg = JSON.parse(readFileSync(registry, "utf8"));
+  reg.accounts.find((a: any) => a.provider === "codex").reservePercent = "30";
+  writeFileSync(registry, JSON.stringify(reg));
+  const ls = run(["accounts", "ls"], env);
+  assert.equal(ls.code, 0, ls.stderr);
+  assert.match(ls.stderr, /warning: accounts\.json accounts\[\d\]: reservePercent "30" is not a whole percent from 1 to 99, so it is ignored and work has no reserve/);
+  assert.doesNotMatch(ls.stderr, /that row is skipped/, "the row is not skipped: only the value is");
+  assert.match(ls.stdout, /work\s+codex/);
+});
+
+test("reserve: an option-looking name is an unknown option, and a negative percent is the percent's error", () => {
+  const { env } = book();
+  const dash = run(["accounts", "reserve", "-x", "30"], env);
+  assert.equal(dash.code, 2);
+  assert.match(dash.stderr, /reserve: unknown option -x/);
+  assert.doesNotMatch(dash.stderr, /no such account/);
+  const negative = run(["accounts", "reserve", "claude-1", "-1"], env);
+  assert.equal(negative.code, 2);
+  assert.match(negative.stderr, /reserve percent must be an integer from 0 to 99/);
+});
+
 test("reserve: invalid invocations are usage errors and leave registry bytes untouched", () => {
   const { env, registry } = book();
   const before = readFileSync(registry, "utf8");

@@ -34,7 +34,7 @@ import type { Verb } from "./cli.ts";
 import { codexBaseDir, ensureStore, msBinary, p } from "./paths.ts";
 import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
-import { parseNeed, pickAccounts, type Need, type PickInput } from "./pick.ts";
+import { parseNeed, pickAccounts, reserveReached, type Need, type PickInput } from "./pick.ts";
 import { syncCodexAutorotate, syncRebalance } from "./autorotate.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
@@ -613,6 +613,15 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
       if (!last) { say("usage unreachable", reasons); return EXIT_UNREACHABLE; }
       if (!findAccount(registry, last.name, provider)) {
         say(`usage unreachable, and the last pick '${last.name}' is no longer registered`, reasons);
+        return EXIT_UNREACHABLE;
+      }
+      // Nothing is fresh enough to gate on, but the owner's reserve (`ms
+      // accounts reserve`) is policy, not usage: a pick remembered before the
+      // reserve was drawn is not launched on if its last reading is past it.
+      const lastRow = rows.find((a) => a.name === last.name);
+      const lastWeek = lastRow?.usage?.weeklyAll;
+      if (lastRow && lastWeek && reserveReached(lastRow.reservePercent, lastWeek)) {
+        say(`usage unreachable, and the last pick '${last.name}' is held back by its owner's reserve (${lastRow.reservePercent}%; its last reading had the week at ${lastWeek.usedPercent}%)`, reasons);
         return EXIT_UNREACHABLE;
       }
       account = last.name;

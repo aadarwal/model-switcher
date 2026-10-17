@@ -270,8 +270,9 @@ export function providerMark(provider: string): string {
   return '<svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="' + d + '"></path></svg>';
 }
 
-/** "resets Tue 20:00" — local wall clock, the weekday named because every
- *  weekly window resets days out and "20:00" alone would read as tonight.
+/** "resets Tue 20 Oct 20:00" — local wall clock, the weekday and the date
+ *  named because every weekly window resets days out: "20:00" alone would
+ *  read as tonight, and "Tue" alone is ambiguous a week ahead.
  *  A window with no reset says nothing rather than guessing one. */
 export function resetNote(iso: string | null | undefined): string {
   if (!iso) return "";
@@ -279,7 +280,8 @@ export function resetNote(iso: string | null | undefined): string {
   if (!isFinite(t)) return "";
   var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   var d = new Date(t);
-  return "resets " + days[d.getDay()] + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return "resets " + days[d.getDay()] + " " + d.getDate() + " " + months[d.getMonth()] + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
 }
 
 /**

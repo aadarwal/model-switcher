@@ -167,11 +167,16 @@ const clockAt = (ms: number): string => {
   const d = new Date(ms);
   return `${two(d.getHours())}:${two(d.getMinutes())}`;
 };
-/** `%a %H:%M`, local. */
-const weekdayAt = (ms: number): string => `${WEEKDAYS[new Date(ms).getDay()]} ${clockAt(ms)}`;
-/** Today's reset is a clock time; any other day's carries its weekday. */
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+/** `%a %-d %b %H:%M`, local: the weekday AND the date, because a weekly
+ *  window resets days out and the weekday alone is ambiguous a week ahead. */
+const dateAt = (ms: number): string => {
+  const d = new Date(ms);
+  return `${WEEKDAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]} ${clockAt(ms)}`;
+};
+/** Today's reset is a clock time; any other day's carries its date. */
 function resetClock(ms: number, now: number): string {
-  return new Date(ms).toDateString() === new Date(now).toDateString() ? clockAt(ms) : weekdayAt(ms);
+  return new Date(ms).toDateString() === new Date(now).toDateString() ? clockAt(ms) : dateAt(ms);
 }
 function untilText(ms: number, now: number): string {
   const minutes = Math.floor((ms - now) / 60_000);
@@ -342,7 +347,7 @@ export function renderRow(row: MeshRow, view: Pick<MeshView, "provider" | "need"
     // Codex reports no Fable-scoped window at all (src/providers/codex-usage.ts).
     ...(view.provider === "claude" ? ["  ", percent("fable", row.usage?.weeklyFable)] : []),
     "  ",
-    cell(reset === null ? DASH : weekdayAt(reset), 9, null),
+    cell(reset === null ? DASH : dateAt(reset), 16, null),
     ...(row.panes.length ? ["  ", paint(`${row.panes.length} pane${row.panes.length === 1 ? "" : "s"}`, tone(null))] : []),
   ];
   return parts.join("").trimEnd();
@@ -466,9 +471,21 @@ export function meshHeader(view: MeshView): [string, string] {
       : `usage unreachable — no account could be read just now · ${newest}`];
   }
   const reading = age === null ? "no usage reading yet" : `usage ${age} old`;
-  return [HEADER_KEYS, view.starredBy !== null
-    ? `${star} what plain \`${cmd}\` would pick · ${reading}`
-    : `no account has room — plain \`${cmd}\` would refuse · ${reading}`];
+  if (view.starredBy !== null) return [HEADER_KEYS, `${star} what plain \`${cmd}\` would pick · ${reading}`];
+  const next = nextRoom(view);
+  const when = next === null ? "" : `next room: ${next.name} ${dateAt(next.at)} (${untilText(next.at, view.now)}) · `;
+  return [HEADER_KEYS, `no account has room — ${when}plain \`${cmd}\` would refuse · ${reading}`];
+}
+
+/** With nothing ranked, the account whose ranking window resets soonest: the
+ *  first that comes back, and when. Null when no row reports a reset. */
+function nextRoom(view: MeshView): { name: string; at: number } | null {
+  let best: { name: string; at: number } | null = null;
+  for (const row of view.rows) {
+    const at = rankingReset(row, view.need);
+    if (at !== null && at > view.now && (best === null || at < best.at)) best = { name: row.name, at };
+  }
+  return best;
 }
 
 // --- fzf -------------------------------------------------------------------

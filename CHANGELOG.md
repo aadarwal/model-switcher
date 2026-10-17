@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Reset times carry the date, not only the weekday: the picker's resets column, its preview
+  and the dashboard now read `Tue 20 Oct 20:00` (was `Tue 20:00`). A weekly window resets days
+  out, and a weekday alone is ambiguous a week ahead. A reset later today is still just `20:00`.
+- When no account has room, the picker header names the account that comes back first and
+  when: `no account has room — next room: claude-6 Sun 18 Oct 14:59 (in 16h 9m) · …`.
+
 ## 0.3.15
 
 - Add `ms accounts reserve <name> <percent> [--provider P]` to keep weekly capacity

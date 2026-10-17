@@ -182,11 +182,29 @@ test("meshRows: nothing with room means no ★, and every row is crossed out", (
   assert.match(meshHeader(v)[1], /no account has room/);
 });
 
+test("meshHeader: with no room, it names the soonest reset that brings an account back, with its date", () => {
+  const p = pool();
+  const hours = [30, 7, 52];
+  const full = { ...p.snapshot, accounts: p.snapshot.accounts.map((a, i) => (a.usage ? { ...a, usage: { ...a.usage, weeklyAll: { usedPercent: 100, resetsAt: inHours(hours[i % hours.length]!) } } } : a)) };
+  const v = meshRows({ provider: "claude", need: "any", names: p.names, registry: p.registry, snapshot: full, ready: () => null, sessions: [], now: now() });
+  const soonest = v.rows.map((r) => ({ name: r.name, at: Date.parse(r.usage?.weeklyAll?.resetsAt ?? "") })).filter((x) => Number.isFinite(x.at)).sort((a, b) => a.at - b.at)[0]!;
+  const d = new Date(soonest.at);
+  const label = `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()]} ${d.getDate()} ${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getMonth()]}`;
+  const status = plain(meshHeader(v)[1]);
+  assert.match(status, /^no account has room — next room: /);
+  assert.ok(status.includes(`next room: ${soonest.name} ${label} `), status);
+  assert.match(status, /\(in \d+h \d+m\)/);
+});
+
+test("meshHeader: with room, there is no next-room note", () => {
+  assert.doesNotMatch(plain(meshHeader(view())[1]), /next room/);
+});
+
 test("renderRow: columns line up, and Codex has no fable column", () => {
   const v = view();
   const lines = renderRows(v).map(plain);
   // name padded to the widest (charlie), state to the widest (transient).
-  assert.match(lines[0]!, /^★ bravo {4}ok {9}5h {2}95% {2}wk {2}75% {2}fable {2}20% {2}\w{3} \d\d:\d\d$/);
+  assert.match(lines[0]!, /^★ bravo {4}ok {9}5h {2}95% {2}wk {2}75% {2}fable {2}20% {2}\w{3} \d{1,2} \w{3} \d\d:\d\d$/);
   // Every row puts its 5h column in the same place.
   const at = lines.map((l) => l.indexOf(" 5h "));
   assert.ok(at.every((i) => i === at[0]), lines.join("\n"));
@@ -224,7 +242,9 @@ test("renderRow: the resets column is the soonest reset among the windows the ra
   const reset = new Date(Date.parse(inHours(24)!));
   const day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][reset.getDay()];
   // The weekly reset (24 h), not the 5 h window's (2 h): the ranking reads the week.
-  assert.ok(bravo.includes(`${day} ${String(reset.getHours()).padStart(2, "0")}:`), bravo);
+  const mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][reset.getMonth()];
+  // The date, not only the weekday: a weekly reset is days out.
+  assert.ok(bravo.includes(`${day} ${reset.getDate()} ${mon} ${String(reset.getHours()).padStart(2, "0")}:`), bravo);
   assert.ok(bravo.endsWith("2 panes"), bravo);
   const alpha = plain(renderRow(v.rows[1]!, v, rowWidths(v.rows)));
   assert.doesNotMatch(alpha, /pane/, "no panes, no column");
@@ -239,8 +259,8 @@ test("renderPreview: who it is, where it stands, the bars, the resets, what is h
   assert.match(text, /^ Status {4}ok — ★ what `ms claude` would pick now$/m);
   assert.match(text, /^ Rank {6}1 of 3 with room \(need: any\)$/m);
   // The reading was stamped a moment ago, maybe in this same millisecond.
-  assert.match(text, /^ 5h {8}\[█{11}░\] {2}95% {2}resets (\w{3} )?\d\d:\d\d \(in (1h 59m|2h 0m)\)$/m);
-  assert.match(text, /^ Week {6}\[█{9}░{3}\] {2}75% {2}resets \w{3} \d\d:\d\d \(in (23h 59m|1d 0h)\)$/m);
+  assert.match(text, /^ 5h {8}\[█{11}░\] {2}95% {2}resets (\w{3} \d{1,2} \w{3} )?\d\d:\d\d \(in (1h 59m|2h 0m)\)$/m);
+  assert.match(text, /^ Week {6}\[█{9}░{3}\] {2}75% {2}resets \w{3} \d{1,2} \w{3} \d\d:\d\d \(in (23h 59m|1d 0h)\)$/m);
   assert.match(text, /^ Fable {5}\[█{2}░{10}\] {2}20% {2}resets /m);
   assert.match(text, /^ Here {6}launch token on this device ✓$/m);
   assert.match(text, /^ Panes {5}%12 running (~|\/nohome)\/src\/foo$/m);

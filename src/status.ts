@@ -17,6 +17,7 @@ import type { Verb } from "./cli.ts";
 import { findAccount, loadRegistry, type Registry } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import { reserveReached, type PickInput, type Window } from "./pick.ts";
+import { poolSummaries, poolSummaryText, type PoolSummaries } from "./pool-summary.ts";
 import { decide, isPinned, lastMoveAtMs, lastWallAtMs, movable, paneReading } from "./rebalance.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
@@ -84,6 +85,15 @@ export function accountState(a: AccountUsage, hasToken: boolean, reservePercent 
   // later.
   if (a.errorKind === "transient" || a.errorKind === "other") return "transient";
   if (a.stale) return "stale";
+  // A successful HTTP response can still omit a required window or report
+  // a nonfinite percentage. The chooser rejects that reading, so it cannot
+  // be an `ok` row or inflate the pool's count of accounts with room.
+  // Codex Pro legitimately omits the session window; when present, it must
+  // be finite for both providers, just as pickAccounts requires.
+  const u = a.usage;
+  if (!u?.weeklyAll || !Number.isFinite(u.weeklyAll.usedPercent)
+    || (!u.session && a.provider !== "codex")
+    || (u.session && !Number.isFinite(u.session.usedPercent))) return "transient";
   // Last, and only ever in place of `ok`: everything above describes the
   // READING (missing, refused, old), and a fact about the reading outranks a
   // fact about the numbers in it. `ok` was the one word this row could say
@@ -168,8 +178,7 @@ export function computeAccount(a: AccountUsage, registry: Registry, hasToken = !
   return { label: row?.label ?? a.name, state: accountState(a, hasToken, reservePercent), email: row?.email ?? null, reservePercent };
 }
 
-function accountRow(a: AccountUsage, registry: Registry, live: number): string[] {
-  const c = computeAccount(a, registry);
+function accountRow(a: AccountUsage, c: AccountComputed, live: number): string[] {
   const reset = earliestWeeklyResetCli(a.usage);
   return [
     a.name,
@@ -354,7 +363,7 @@ function table(headers: string[], rows: string[][]): string[] {
  *  (fix-C-report.md item 1 / fix-R). */
 export type StatusAccountRow = AccountUsage & AccountComputed & { sessions: AccountSession[] };
 export type StatusSessionRow = Omit<SessionRow, "state"> & { state: string; pending: string | null; walled: Walled; better: string | null };
-export type StatusJson = { accounts: StatusAccountRow[]; sessions: StatusSessionRow[]; takenAt: number | null };
+export type StatusJson = { accounts: StatusAccountRow[]; sessions: StatusSessionRow[]; takenAt: number | null; pools: PoolSummaries };
 
 /**
  * The `--json` shape below, isolated so another caller (the dashboard API,
@@ -380,7 +389,7 @@ export async function statusJson(): Promise<StatusJson> {
     });
     const on = sessionsByAccount(sessions);
     const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry), sessions: on.get(`${a.provider}:${a.name}`) ?? [] }));
-    return { accounts, sessions, takenAt: snapshot.takenAt };
+    return { accounts, sessions, takenAt: snapshot.takenAt, pools: poolSummaries(accounts, Date.now()) };
   } finally {
     st.close();
   }
@@ -401,11 +410,18 @@ async function render(json: boolean, all: boolean): Promise<string> {
     const sessions = st.listSessions().map((s) => ({ session: s, computed: computeSession(s, st, pool) }));
     const visible = all ? sessions : sessions.filter((r) => !isFinishedState(r.computed.state));
     const on = sessionsByAccount(sessions.map((r) => ({ ...r.session, state: r.computed.state })));
+    const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry) }));
+    const now = Date.now();
+    const summaries = poolSummaries(accounts, now);
     const lines: string[] = [];
     // A registry the loader could not read is not silently a pool of zero
     // accounts — say so, first, before either table (which may still show
     // the last known readings, carried forward by src/snapshot.ts).
     if (parseError) lines.push(parseError);
+    for (const provider of ["claude", "codex"] as const) {
+      const summary = summaries[provider];
+      if (summary) lines.push(poolSummaryText(provider, summary, now));
+    }
     lines.push(...table(
       // PROVIDER sits next to NAME for the same reason it sits next to
       // ACCOUNT in the sessions table below: identity in this tool is
@@ -415,7 +431,7 @@ async function render(json: boolean, all: boolean): Promise<string> {
       // means reading the sessions table below sideways. EMAIL (0.3.7) closes the row: the login
       // behind the name, so `claude-1`…`claude-5` can be told apart. Every older column keeps its place.
       ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE", "SESS", "EMAIL"],
-      snapshot.accounts.map((a) => accountRow(a, registry, (on.get(`${a.provider}:${a.name}`) ?? []).length)),
+      accounts.map((a) => accountRow(a, a, (on.get(`${a.provider}:${a.name}`) ?? []).length)),
     ));
     lines.push("");
     lines.push(...table(

@@ -335,7 +335,7 @@ test("two turns in a row arm exactly one timer", async () => {
   // otherwise mean ten timers waking to read the same rows.
   const { run } = await import("./helpers.ts");
   const w = await world({ rollouts: { s1: [] }, events: { s1: [] } });
-  const env = { HOME: w.home, MS_HOME: process.env.MS_HOME!, PATH: process.env.PATH!, MS_BIN, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: SOCKET, MS_PANE: "%7" };
+  const env = { HOME: w.home, MS_HOME: process.env.MS_HOME!, PATH: process.env.PATH!, MS_BIN, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: SOCKET, MS_PANE: "%7", MS_CLI_PID: String(process.pid), MS_CLI_PROVIDER: "codex" };
   for (const turn of ["t-1", "t-2", "t-3"]) {
     assert.equal(run(["_hook", "codex"], env, JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "cx-s1", turn_id: turn, transcript_path: w.rollout("s1") })).code, 0);
   }
@@ -787,7 +787,7 @@ test("a prompt arriving DURING a turn end still arms its watch: the pass holds n
   const prompt = path.join(w.home, "prompt.sh");
   writeFileSync(prompt, `#!/bin/bash
 printf '%s' '{"hook_event_name":"UserPromptSubmit","session_id":"cx-s9","turn_id":"t-9"}' \\
-  | MS_SESSION=s9 MS_GENERATION=2 MS_SOCKET='${SOCKET}' MS_PANE=%9 \\
+  | MS_SESSION=s9 MS_GENERATION=2 MS_SOCKET='${SOCKET}' MS_PANE=%9 MS_CLI_PID=$$ MS_CLI_PROVIDER=codex \\
     '${process.execPath}' --import tsx '${path.resolve("bin/ms")}' _hook codex >/dev/null 2>&1
 `, { mode: 0o755 });
   process.env.MS_TEST_ON_CAPTURE = prompt;

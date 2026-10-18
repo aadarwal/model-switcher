@@ -440,12 +440,15 @@ function probe(session: string, provider: Provider, cmd: string, args: string[],
     // probe sets for itself can never be scrubbed.
     const childEnv: NodeJS.ProcessEnv = { ...process.env };
     scrubProviderEnv(childEnv, provider);
-    const r = spawnSync(cmd, args, {
+    // The probe has no tmux pane. Pin the CLI itself before replacing this
+    // shell, just as `_exec` pins its PID before execve. Arguments remain
+    // structured and credentials stay exclusively in the environment.
+    const r = spawnSync("/bin/sh", ["-c", 'export MS_CLI_PID=$$; exec "$@"', "ms-hook-probe", cmd, ...args], {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf8",
       timeout: PROBE_TIMEOUT_MS,
-      env: { ...childEnv, ...env, ...probeEnv(session) },
+      env: { ...childEnv, ...env, ...probeEnv(session), MS_CLI_PROVIDER: provider },
     });
     if (r.error) throw new Error(`${cmd} could not be run (${r.error.message})`);
     if (!readEvents(session).some((e) => e.kind === "started")) {

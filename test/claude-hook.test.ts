@@ -8,7 +8,7 @@ function setup() {
   const { home, msHome } = tempHome(); const { dir, stub } = stubDir();
   const tlog = path.join(home, "tmux.log");
   stub("tmux", `printf '%s\\n' "$*" >> "${tlog}"; case "$*" in *capture-pane*) printf '❯ do it\\n  ⎿  You'"'"'ve reached your Fable limit. Run /usage-credits to continue or switch models with /model.\\n\\n❯ \\n' ;; esac; exit 0`);
-  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7" };
+  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7", MS_CLI_PID: String(process.pid), MS_CLI_PROVIDER: "claude" };
   return { home, msHome, env, tlog };
 }
 
@@ -74,6 +74,57 @@ test("a /clear moves the row onto the new CLI session id, and the event records 
     assert.equal(st.getSession("s1")!.cliSessionId, "c-99", "the row follows the conversation the human is in");
   } finally {
     st.close();
+  }
+});
+
+test("SessionStart follows Claude's transcript and never carries an old conversation's path across /clear or /resume", async () => {
+  for (const source of ["startup", "clear", "resume"]) {
+    const { env } = setup();
+    const openState = await seedSession(env);
+    const seeded = openState();
+    seeded.updateSession("s1", { transcriptPath: "/tmp/old-conversation.jsonl" });
+    seeded.close();
+    for (const transcript of ["/tmp/current-conversation.jsonl", undefined, " "]) {
+      const sessionId = `c-${source}-${String(transcript)}`;
+      assert.equal(run(["_hook", "claude"], env, JSON.stringify({ hook_event_name: "SessionStart", source, session_id: sessionId, transcript_path: transcript })).code, 0);
+      const st = openState();
+      try {
+        assert.equal(st.getSession("s1")!.transcriptPath, transcript?.trim() ? transcript : null);
+      } finally { st.close(); }
+    }
+  }
+});
+
+test("a same-conversation report without a transcript preserves the known path; an old generation cannot replace it", async () => {
+  const { env } = setup();
+  const openState = await seedSession(env);
+  const seeded = openState();
+  seeded.updateSession("s1", { transcriptPath: "/tmp/current.jsonl" });
+  seeded.close();
+  for (const extra of [
+    { MS_GENERATION: "2", session_id: "c-42" },
+    { MS_GENERATION: "1", session_id: "c-older", transcript_path: "/tmp/older.jsonl" },
+  ]) {
+    assert.equal(run(["_hook", "claude"], { ...env, MS_GENERATION: extra.MS_GENERATION }, JSON.stringify({ hook_event_name: "SessionStart", source: "resume", ...extra })).code, 0);
+    const st = openState();
+    try { assert.equal(st.getSession("s1")!.transcriptPath, "/tmp/current.jsonl"); } finally { st.close(); }
+  }
+});
+
+test("an existing Claude pane learns its transcript on its next prompt, only for its current conversation", async () => {
+  const { env } = setup();
+  const openState = await seedSession(env);
+  for (const [sessionId, transcript, expected] of [
+    ["c-42", "/tmp/current.jsonl", "/tmp/current.jsonl"],
+    ["different-conversation", "/tmp/other.jsonl", "/tmp/current.jsonl"],
+    ["c-42", undefined, "/tmp/current.jsonl"],
+  ]) {
+    assert.equal(run(["_hook", "claude"], env, JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: sessionId, transcript_path: transcript })).code, 0);
+    const st = openState();
+    try {
+      assert.equal(st.getSession("s1")!.transcriptPath, expected);
+      assert.equal(st.getSession("s1")!.cliSessionId, "c-42");
+    } finally { st.close(); }
   }
 });
 
@@ -349,7 +400,7 @@ case "$*" in
   *capture-pane*) printf '> done\\n\\n> \\n' ;;
 esac
 exit 0`);
-  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7" };
+  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7", MS_CLI_PID: String(process.pid), MS_CLI_PROVIDER: "claude" };
   return { home, msHome, env, tlog };
 }
 

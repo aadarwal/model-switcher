@@ -8,7 +8,7 @@ function setup() {
   const { home, msHome } = tempHome(); const { dir, stub } = stubDir();
   const tlog = path.join(home, "tmux.log");
   stub("tmux", `printf '%s\\n' "$*" >> "${tlog}"; exit 0`);
-  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7" };
+  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7", MS_CLI_PID: String(process.pid), MS_CLI_PROVIDER: "codex" };
   return { home, msHome, env, tlog };
 }
 
@@ -380,7 +380,7 @@ case "$*" in
   *capture-pane*) printf '> done\\n\\n> \\n' ;;
 esac
 exit 0`);
-  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7" };
+  const env = { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}`, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: "/private/tmp/tmux-501/default", MS_PANE: "%7", MS_CLI_PID: String(process.pid), MS_CLI_PROVIDER: "codex" };
   return { home, msHome, env, tlog };
 }
 

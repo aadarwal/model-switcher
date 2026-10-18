@@ -441,7 +441,7 @@ test("a wall after a /clear resumes the conversation the human is actually in", 
   const { run } = await import("./helpers.ts");
   const hook = run(
     ["_hook", "claude"],
-    { HOME: w.home, MS_HOME: w.msHome, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: SOCKET, MS_PANE: PANE },
+    { HOME: w.home, MS_HOME: w.msHome, MS_SESSION: "s1", MS_GENERATION: "2", MS_SOCKET: SOCKET, MS_PANE: PANE, MS_CLI_PID: String(process.pid), MS_CLI_PROVIDER: "claude" },
     JSON.stringify({ hook_event_name: "SessionStart", source: "clear", session_id: "c-2" }),
   );
   assert.equal(hook.code, 0);

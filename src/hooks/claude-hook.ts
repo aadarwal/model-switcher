@@ -5,6 +5,7 @@ import { msBinary } from "../paths.ts";
 import type { SessionRow, State, WallKind as RecoveryWallKind } from "../state.ts";
 import { Tmux } from "../tmux.ts";
 import { wallKindFromText } from "../wall.ts";
+import { hookOwnedByLaunch } from "./owner.ts";
 
 /** Total budget for the whole hook. Claude waits on us, so nothing here is
  * unbounded: stdin is capped, and every tmux call is a bounded subprocess. */
@@ -21,7 +22,9 @@ const SOURCE_KIND: Record<string, EventKind> = { startup: "started", resume: "re
  * session's log. It never prints (Claude would render it), never blocks, and
  * never acts for a pane the tool did not launch: `MS_SESSION`/`MS_GENERATION`/
  * `MS_SOCKET`/`MS_PANE` are inherited from `ms _exec`, so a pane launched by
- * hand simply has none of them and the hook exits 0.
+ * hand simply has none of them and the hook exits 0. The inherited identity
+ * alone is insufficient: a headless child carries it too, so its actual
+ * process ancestry must also identify the launched CLI.
  *
  * The generation is the INHERITED one, never the store's latest: a late event
  * from a replaced generation must stay attributable to the process that sent it.
@@ -35,6 +38,7 @@ export async function claudeHook(): Promise<number> {
     // A generation is a positive counter. `Number("")` is 0 and `Number(" ")`
     // is 0 too, so "finite" is not enough to tell a real one from a blank.
     if (!session || !Number.isInteger(gen) || gen <= 0 || !socket || !pane) return 0;
+    if (!await hookOwnedByLaunch("claude", session, gen, socket, pane)) return 0;
 
     // The rebalance gate, carried from the human's own shell into the store
     // the dispatched processes can actually read. Only when the variable is
@@ -49,18 +53,19 @@ export async function claudeHook(): Promise<number> {
 
     const name = String(input.hook_event_name ?? "");
     const cliSessionId = typeof input.session_id === "string" ? input.session_id : null;
+    const transcript = typeof input.transcript_path === "string" && input.transcript_path.trim() ? input.transcript_path : null;
     const t = Math.floor(Date.now() / 1000);
 
     if (name === "SessionStart") {
       const kind = SOURCE_KIND[String(input.source ?? "startup")] ?? "started";
       // The store first, so the event can record BOTH ids when the id moved.
-      const prev = await noteSessionStart(session, gen, kind, cliSessionId);
+      const prev = await noteSessionStart(session, gen, kind, cliSessionId, transcript);
       appendEvent({ t, kind, session, generation: gen, cliSessionId, ...(prev !== undefined ? { prevCliSessionId: prev } : {}) });
     } else if (name === "UserPromptSubmit") {
       // The event first: it is what makes an earlier failure obsolete, and the
       // state move below is only bookkeeping on top of it.
       appendEvent({ t, kind: "activity", session, generation: gen, cliSessionId });
-      await noteActivity(session, gen);
+      await noteActivity(session, gen, cliSessionId, transcript);
     } else if (name === "Stop") {
       // The turn ENDED, successfully. Nothing is written down for it: unlike
       // Codex, whose wall is a turn that never ends and whose watchdog needs
@@ -178,7 +183,7 @@ async function onRow<T>(session: string, gen: number, fn: (st: State, s: Session
  * Returns the id the row USED to carry when it changed, `undefined` when it
  * did not.
  */
-async function noteSessionStart(session: string, gen: number, kind: EventKind, cliSessionId: string | null): Promise<string | null | undefined> {
+async function noteSessionStart(session: string, gen: number, kind: EventKind, cliSessionId: string | null, transcript: string | null): Promise<string | null | undefined> {
   if (kind === "compacted") return undefined;
   return await onRow(session, gen, (st, s) => {
     const patch: Partial<SessionRow> = {};
@@ -186,7 +191,10 @@ async function noteSessionStart(session: string, gen: number, kind: EventKind, c
     if (cliSessionId && cliSessionId !== s.cliSessionId) {
       patch.cliSessionId = cliSessionId;
       prev = s.cliSessionId;
+      // An old conversation's transcript must never describe the new one.
+      patch.transcriptPath = transcript;
     }
+    if (transcript && transcript !== s.transcriptPath) patch.transcriptPath = transcript;
     // A launch is `running` only once the CLI reports itself under this
     // generation (spec §7 step 5); until then it is `launching`.
     //
@@ -231,9 +239,14 @@ async function noteSessionStart(session: string, gen: number, kind: EventKind, c
  * continuation and has not been seen acting on it yet; this is that. Any other
  * state belongs to somebody else — the worker, a stop, reconciliation.
  */
-async function noteActivity(session: string, gen: number): Promise<void> {
+async function noteActivity(session: string, gen: number, cliSessionId: string | null, transcript: string | null): Promise<void> {
   await onRow(session, gen, (st, s) => {
-    if (s.state === "continuing") st.updateSession(session, { state: "running" });
+    const patch: Partial<SessionRow> = {};
+    if (s.state === "continuing") patch.state = "running";
+    // Existing panes learn their transcript on the next turn after an
+    // upgrade. Only SessionStart may move the conversation's identity.
+    if (transcript && cliSessionId && cliSessionId === s.cliSessionId && transcript !== s.transcriptPath) patch.transcriptPath = transcript;
+    if (Object.keys(patch).length) st.updateSession(session, patch);
   });
 }
 

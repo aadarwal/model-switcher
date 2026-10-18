@@ -45,6 +45,9 @@ echo "MS_SOCKET=$MS_SOCKET"
 echo "MS_PANE=$MS_PANE"
 echo "MS_ACCOUNT=$MS_ACCOUNT"
 echo "MS_BIN=$MS_BIN"
+echo "MS_CLI_PID=$MS_CLI_PID"
+echo "MS_CLI_PROVIDER=$MS_CLI_PROVIDER"
+echo "PID=$$"
 echo "FOO=$FOO"`;
 
 test("_exec sets the environment and execs the CLI in place, with the token never on argv", async () => {
@@ -67,6 +70,8 @@ test("_exec sets the environment and execs the CLI in place, with the token neve
   assert.equal(lines.MS_SOCKET, SESSION_BASE.socket);
   assert.equal(lines.MS_PANE, SESSION_BASE.pane);
   assert.equal(lines.MS_ACCOUNT, "gmail");
+  assert.equal(lines.MS_CLI_PID, lines.PID, "execve preserves the pinned CLI pid");
+  assert.equal(lines.MS_CLI_PROVIDER, "claude");
   assert.equal(lines.ARGS, "--resume c-1 hello");
   assert.equal(lines.FOO, "bar");
   assert.match(lines.MS_BIN, /bin\/ms$/);
@@ -82,7 +87,7 @@ test("_exec sets the environment and execs the CLI in place, with the token neve
 test("launch.env cannot shadow the token or MS_* identity variables", async () => {
   const { home, msHome } = tempHome();
   const { dir, stub } = stubDir();
-  await seedLaunch({ home, msHome, env: { MS_ACCOUNT: "evil", CLAUDE_CODE_OAUTH_TOKEN: "evil-token", MS_SESSION: "evil-session" } });
+  await seedLaunch({ home, msHome, env: { MS_ACCOUNT: "evil", CLAUDE_CODE_OAUTH_TOKEN: "evil-token", MS_SESSION: "evil-session", MS_CLI_PID: "1", MS_CLI_PROVIDER: "codex" } });
   const { saveLaunchToken } = await import("../src/launch-credentials.ts");
   saveLaunchToken("gmail", SAMPLE_TOKEN);
   stub("claude", STUB_SCRIPT);
@@ -97,6 +102,8 @@ test("launch.env cannot shadow the token or MS_* identity variables", async () =
   assert.equal(lines.MS_ACCOUNT, "gmail");
   assert.equal(lines.TOKEN, SAMPLE_TOKEN);
   assert.equal(lines.MS_SESSION, "s1");
+  assert.equal(lines.MS_CLI_PID, lines.PID);
+  assert.equal(lines.MS_CLI_PROVIDER, "claude");
 });
 
 test("a missing launch token exits 3 and stderr names only the account", async () => {

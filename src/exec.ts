@@ -151,6 +151,8 @@ export const execLaunch: Verb = async (args) => {
   env.MS_PANE = session.pane;
   env.MS_ACCOUNT = launch.account;
   env.MS_BIN = msBinary();
+  env.MS_CLI_PID = String(process.pid);
+  env.MS_CLI_PROVIDER = provider;
 
   // A Codex pane runs its conversation in its own process when the CLI can
   // (`withNoDaemon` says why): decided against the binary about to run.

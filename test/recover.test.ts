@@ -51,6 +51,10 @@ case "$1" in
   list-panes) get panes ;;
   display-message)
     case "$*" in
+      *'#{pid}:#{start_time}'*)
+        if [ -n "$MS_TMUX_SERVER_ERROR" ]; then printf '%s\n' "$MS_TMUX_SERVER_ERROR" >&2; exit 1; fi
+        identity=$(get server_identity); [ -n "$identity" ] || identity="$MS_TMUX_IDENTITY"
+        printf '%s\n' "$identity" ;;
       *pane_pid*) printf '%s\t%s\t%s\t%s\n' "$(get pane_pid)" "$(get command)" "$(get pane_dead)" "$(get cwd)" ;;
       *pane_dead_status*) get pane_dead_status ;;
       *) get pane_dead ;;
@@ -206,6 +210,8 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   process.env.MS_TMUX_STATE = state;
   process.env.MS_TMUX_SCREEN = screen;
   process.env.MS_TMUX_FAIL = opts.failOn ?? "";
+  process.env.MS_TMUX_IDENTITY = "1:2";
+  process.env.MS_TMUX_SERVER_ERROR = "";
   // What the pane looks like after `respawn-pane`: alive, unless the test is
   // about a launch that died on arrival.
   process.env.MS_TMUX_RESPAWN_DEAD = opts.respawnDead === undefined ? "0" : "1";
@@ -361,6 +367,117 @@ function reportOnRespawn(w: World, event: { generation: number; cliSessionId: st
   }, 10);
   return () => clearInterval(timer);
 }
+
+test("a queued recovery never inspects or changes a reused pane on a restarted or missing server", async (t) => {
+  for (const gone of [false, true]) {
+    const w = await world(t);
+    const st = openState(); st.setWakeup("s1", nowSeconds() + 600); st.close();
+    if (gone) process.env.MS_TMUX_SERVER_ERROR = `no server running on ${SOCKET}`;
+    else process.env.MS_TMUX_IDENTITY = "9:9";
+
+    assert.equal(await recoverSession("s1"), 1);
+
+    const row = session(w);
+    assert.deepEqual([row.state, row.desired, row.wakeupAt, row.generation, row.account], ["stopped", "stopped", null, 2, "dirk"]);
+    assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+    assert.deepEqual(rows(w, "attempts"), []);
+    assert.ok(logLines(w).every((line) => line.includes("display-message -p #{pid}:#{start_time}")), "server identity is the only tmux question");
+    assert.doesNotThrow(() => process.kill(w.pid, 0), "the unrelated pane's process remains alive");
+    assert.match(recoverLog(w), gone ? /tmux server is gone/ : /tmux server restarted/);
+  }
+});
+
+test("an unreadable server refuses recovery without retiring the session or claiming its pending recovery", async (t) => {
+  for (const permissionDenied of [false, true]) {
+    const w = await world(t);
+    const wakeup = nowSeconds() + 600;
+    const st = openState(); st.setWakeup("s1", wakeup); st.close();
+    if (permissionDenied) process.env.MS_TMUX_SERVER_ERROR = `error connecting to ${SOCKET} (Permission denied)`;
+    else process.env.MS_TMUX_IDENTITY = "";
+
+    assert.equal(await recoverSession("s1"), 1);
+
+    const row = session(w);
+    assert.deepEqual([row.state, row.desired, row.wakeupAt, row.generation, row.account], ["walled", "running", wakeup, 2, "dirk"]);
+    assert.equal(rows(w, "recoveries")[0].status, "pending");
+    assert.equal(rows(w, "recoveries")[0].owner, null);
+    assert.deepEqual(rows(w, "attempts"), []);
+    assert.ok(logLines(w).every((line) => line.includes("display-message -p #{pid}:#{start_time}")));
+    assert.doesNotThrow(() => process.kill(w.pid, 0));
+    assert.match(recoverLog(w), /could not confirm the tmux server identity/);
+  }
+});
+
+test("a server restart after claiming the recovery is rechecked before any pane mutation", async (t) => {
+  const w = await world(t);
+  process.env.MS_TMUX_ON_MATCH = "list-panes";
+  process.env.MS_TMUX_ON = 'printf "server_identity=9:9\\n" >> "$MS_TMUX_STATE"';
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  assert.equal(session(w).state, "stopped");
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  assert.doesNotMatch(logLines(w).join("\n"), /set-option|send-keys|respawn-pane|capture-pane/);
+  assert.doesNotThrow(() => process.kill(w.pid, 0));
+});
+
+test("a server restart while the CLI exits is rechecked before the respawn", async (t) => {
+  const w = await world(t);
+  process.env.MS_TMUX_ON_MATCH = "/exit Enter";
+  process.env.MS_TMUX_ON = 'printf "server_identity=9:9\\n" >> "$MS_TMUX_STATE"';
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  assert.equal(session(w).state, "stopped");
+  assert.equal(session(w).generation, 2);
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  assert.match(logLines(w).join("\n"), /send-keys.*\/exit Enter/);
+  assert.doesNotMatch(logLines(w).join("\n"), /respawn-pane|set-option -pu/);
+  assert.doesNotThrow(() => process.kill(w.pid, 0));
+});
+
+test("a server restart after Escape sends no /exit or signals to the replacement pane", async (t) => {
+  const w = await world(t);
+  const replacement = liveProcess(t);
+  process.env.MS_TMUX_ON_MATCH = "send-keys -t %7 Escape";
+  process.env.MS_TMUX_ON = `printf 'server_identity=9:9\\npane_pid=${replacement}\\n' >> "$MS_TMUX_STATE"`;
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  assert.equal(session(w).state, "stopped");
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  assert.match(logLines(w).join("\n"), /send-keys -t %7 Escape/);
+  assert.doesNotMatch(logLines(w).join("\n"), /\/exit|respawn-pane|set-option -pu/);
+  assert.doesNotMatch(recoverLog(w), /sent SIGTERM|sent SIGKILL/);
+  assert.doesNotThrow(() => process.kill(replacement, 0), "the replacement process is still alive");
+});
+
+test("a server restart during the exit wait never signals a replacement server's PID", async (t) => {
+  const w = await world(t, { screen: MODAL_SCREEN });
+  const replacement = liveProcess(t);
+  // The modal skips keys and takes the signal path. Let SIGTERM target the
+  // original CLI, then replace the server on the following paneInfo read.
+  const stop = onFirst(w, "#{pane_pid}", () => {
+    process.env.MS_TMUX_ON_MATCH = "#{pane_pid}";
+    process.env.MS_TMUX_ON = `printf 'server_identity=9:9\\npane_pid=${replacement}\\n' >> "$MS_TMUX_STATE"`;
+  });
+  t.after(stop);
+  // Keep the original process alive through SIGTERM, so waitForExit reaches
+  // a second poll and the injection above happens inside that wait.
+  const stubborn = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], { stdio: "ignore" });
+  t.after(() => { stubborn.kill("SIGKILL"); });
+  await sleep(100);
+  appendFileSync(w.state, `pane_pid=${stubborn.pid}\n`);
+
+  assert.equal(await recoverSession("s1"), 1);
+
+  assert.equal(session(w).state, "stopped");
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  assert.match(recoverLog(w), /sent SIGTERM/);
+  assert.doesNotMatch(recoverLog(w), /sent SIGKILL/);
+  assert.doesNotMatch(logLines(w).join("\n"), /send-keys|respawn-pane|set-option -pu/);
+  assert.doesNotThrow(() => process.kill(replacement, 0));
+});
 
 test("the happy path: dirk hands off to gmail and the resumed session continues", async (t) => {
   const w = await world(t);
@@ -1667,6 +1784,8 @@ async function codexWorld(t: TestContext, opts: CodexWorldOptions = {}): Promise
   process.env.MS_TMUX_SCREEN = screen;
   process.env.MS_TMUX_SNAPSHOT = atRespawn;
   process.env.MS_TMUX_FAIL = "";
+  process.env.MS_TMUX_IDENTITY = "1:2";
+  process.env.MS_TMUX_SERVER_ERROR = "";
   process.env.MS_TMUX_RESPAWN_DEAD = "0";
   process.env.MS_TMUX_DEAD_STATUS = "0";
   process.env.MS_TMUX_ON_MATCH = "";

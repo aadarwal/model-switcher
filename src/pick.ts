@@ -20,6 +20,30 @@ export function reserveReached(reservePercent: number | undefined, weeklyAll: Wi
   return reserve > 0 && !!weeklyAll && Number.isFinite(weeklyAll.usedPercent) && weeklyAll.usedPercent >= 100 - reserve;
 }
 
+/** A reset can restore room only after ALL exhausted required windows clear.
+ *  The ranking's next weekly reset is a different question: an unblocked
+ *  week says nothing about a full session or Fable window. Validate the
+ *  projected reading with the chooser so missing/malformed windows and
+ *  unreadable accounts cannot acquire a capacity promise. */
+export function roomAfterReset(input: PickInput | undefined, need: Need, now: number): number | null {
+  if (!input || input.error) return null;
+  const blocked: ("session" | "weeklyAll" | "weeklyFable")[] = [];
+  if (input.session && Number.isFinite(input.session.usedPercent) && input.session.usedPercent >= 100) blocked.push("session");
+  if (input.weeklyAll && Number.isFinite(input.weeklyAll.usedPercent) && (input.weeklyAll.usedPercent >= 100 || reserveReached(input.reservePercent, input.weeklyAll))) blocked.push("weeklyAll");
+  if (need === "fable" && input.weeklyFable && Number.isFinite(input.weeklyFable.usedPercent) && input.weeklyFable.usedPercent >= 100) blocked.push("weeklyFable");
+  if (!blocked.length) return null;
+  const projected = { ...input };
+  let at = now;
+  for (const key of blocked) {
+    const w = input[key]!;
+    const reset = w.resetsAt ? Date.parse(w.resetsAt) : Number.NaN;
+    if (!Number.isFinite(reset) || reset <= now) return null;
+    at = Math.max(at, reset);
+    projected[key] = { ...w, usedPercent: 0 };
+  }
+  return pickAccounts([projected], need).picks.length ? at : null;
+}
+
 export function pickAccounts(inputs: PickInput[], need: Need, exclude: string[] = []): PickResult {
   const out: PickResult["out"] = [];
   const eligible: { name: string; resetsAt: string | null; remaining: number; shared: boolean; resetMs: number }[] = [];

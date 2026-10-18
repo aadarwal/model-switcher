@@ -200,6 +200,69 @@ test("meshHeader: with room, there is no next-room note", () => {
   assert.doesNotMatch(plain(meshHeader(view())[1]), /next room/);
 });
 
+for (const scenario of [
+  { title: "a full session waits for its 5h reset", usage: { session: { used: 100, resetIn: 2 } }, need: "any", expected: "alpha", wait: "2h 0m" },
+  { title: "a full session and week both have to reset", usage: { session: { used: 100, resetIn: 52 }, weekly: { used: 100, resetIn: 7 } }, need: "any", expected: "bravo", wait: "1d 12h" },
+  { title: "a full Fable window cannot be cleared by an unblocked week's reset", usage: { weekly: { used: 20, resetIn: 7 }, fable: { used: 100, resetIn: 52 } }, need: "fable", expected: "bravo", wait: "1d 12h" },
+  { title: "a full week and Fable window both have to reset", usage: { weekly: { used: 100, resetIn: 30 }, fable: { used: 100, resetIn: 52 } }, need: "fable", expected: "bravo", wait: "1d 12h" },
+  { title: "an unblocked Fable reset does not clear a full week", usage: { weekly: { used: 100, resetIn: 30 }, fable: { used: 20, resetIn: 7 } }, need: "fable", expected: "alpha", wait: "1d 6h" },
+  { title: "the owner's reserve waits for the week as well as a full Fable window", usage: { weekly: { used: 75, resetIn: 30 }, fable: { used: 100, resetIn: 7 } }, reserve: 30, need: "fable", expected: "alpha", wait: "1d 6h" },
+  { title: "an ordinary run does not wait for a full Fable window", usage: { session: { used: 100, resetIn: 2 }, fable: { used: 100, resetIn: 52 } }, need: "any", expected: "alpha", wait: "2h 0m" },
+] as const) {
+  test(`meshHeader: next room — ${scenario.title}`, () => {
+    const current = now();
+    const registry: Registry = { version: 1, accounts: [account("alpha", { reservePercent: "reserve" in scenario ? scenario.reserve : 0 }), account("bravo")] };
+    const snapshot: Snapshot = {
+      takenAt: current, registryError: null,
+      accounts: [reading("alpha", scenario.usage), reading("bravo", { weekly: { used: 100, resetIn: 36 } })],
+    };
+    const v = meshRows({ provider: "claude", need: scenario.need, names: ["alpha", "bravo"], registry, snapshot, ready: () => null, sessions: [], now: current });
+    const status = plain(meshHeader(v)[1]);
+    assert.ok(status.includes(`next room: ${scenario.expected} `), status);
+    assert.ok(status.includes(`(in ${scenario.wait})`), status);
+  });
+}
+
+for (const scenario of [
+  { title: "missing launch credentials", usage: {}, unready: true },
+  { title: "a rejected usage credential", usage: { error: "unauthorized", errorKind: "auth" } },
+  { title: "a reading too stale for the chooser", usage: { stale: true, observedAt: now() - 20 * 60_000 } },
+  { title: "a missing required session window", usage: { session: null } },
+  { title: "a malformed required Fable window", usage: { fable: { used: Number.NaN, resetIn: 1 } } },
+  { title: "an infinite session percentage", usage: { session: { used: Number.POSITIVE_INFINITY, resetIn: 1 } } },
+  { title: "a full window with no reset", usage: { session: { used: 100, resetIn: null } } },
+  { title: "a full window whose reset is already past", usage: { session: { used: 100, resetIn: -1 } } },
+] as const) {
+  test(`meshHeader: next room excludes ${scenario.title}`, () => {
+    const registry: Registry = { version: 1, accounts: [account("alpha"), account("bravo")] };
+    const snapshot: Snapshot = {
+      takenAt: now(), registryError: null,
+      accounts: [reading("alpha", { weekly: { used: 100, resetIn: 1 }, ...scenario.usage }), reading("bravo", { weekly: { used: 100, resetIn: 36 } })],
+    };
+    const ready: Ready = (name) => name === "alpha" && "unready" in scenario ? { error: "no launch token" } : null;
+    const v = meshRows({ provider: "claude", need: "fable", names: ["alpha", "bravo"], registry, snapshot, ready, sessions: [], now: now() });
+    const status = plain(meshHeader(v)[1]);
+    assert.ok(status.includes("next room: bravo "), status);
+  });
+}
+
+test("meshHeader: no next-room promise when a blocked window has no known future reset", () => {
+  const registry: Registry = { version: 1, accounts: [account("alpha")] };
+  const snapshot: Snapshot = { takenAt: now(), registryError: null, accounts: [reading("alpha", { session: { used: 100, resetIn: null } })] };
+  const v = meshRows({ provider: "claude", need: "any", names: ["alpha"], registry, snapshot, ready: () => null, sessions: [], now: now() });
+  assert.doesNotMatch(plain(meshHeader(v)[1]), /next room/);
+});
+
+test("meshHeader: Codex capacity can return without a reported session window", () => {
+  const current = now();
+  const registry: Registry = { version: 1, accounts: [account("pro", { provider: "codex" })] };
+  const snapshot: Snapshot = { takenAt: current, registryError: null, accounts: [reading("pro", { provider: "codex", session: null, weekly: { used: 100, resetIn: 2 } })] };
+  const v = meshRows({ provider: "codex", need: "any", names: ["pro"], registry, snapshot, ready: () => null, sessions: [], now: current });
+  const status = plain(meshHeader(v)[1]);
+  assert.ok(status.includes("next room: pro "), status);
+  assert.ok(status.includes("(in 2h 0m)"), status);
+});
+
 test("renderRow: columns line up, and Codex has no fable column", () => {
   const v = view();
   const lines = renderRows(v).map(plain);

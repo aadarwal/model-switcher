@@ -44,7 +44,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { resolveOnPath } from "./exec.ts";
 import { msBinary } from "./paths.ts";
-import { pickAccounts, reserveReached, type Need, type Window } from "./pick.ts";
+import { pickAccounts, reserveReached, roomAfterReset, type Need, type Window } from "./pick.ts";
 import { NAME_PATTERN, findAccount, loadRegistry, type Provider, type Registry } from "./registry.ts";
 import { DEFAULT_MAX_AGE_MS, ageLabel, getSnapshot, lastSnapshot, toPickInputs, type AccountUsage, type Snapshot } from "./snapshot.ts";
 import { openState, type SessionRow } from "./state.ts";
@@ -81,6 +81,8 @@ export type MeshRow = {
   out: string | null;
   /** Why this device cannot launch it, or null when it can. */
   unready: string | null;
+  /** When every capacity gate clears, or null when resets cannot establish it. */
+  roomAt: number | null;
   usage: AccountUsage["usage"];
   observedAt: number | null;
   stale: boolean;
@@ -243,6 +245,7 @@ export function meshRows(input: MeshInput): MeshView {
   const wanted = new Set(input.names);
   const rows = snapshot.accounts.filter((a) => a.provider === provider && wanted.has(a.name));
   const inputs = toPickInputs({ ...snapshot, accounts: rows }, registry);
+  const inputOf = new Map(inputs.map((a) => [a.name, a]));
   const ranking = pickAccounts(inputs, need);
   const rankOf = new Map(ranking.picks.map((p, i) => [p.name, i + 1]));
   const outOf = new Map(ranking.out.map((o) => [o.name, o.why]));
@@ -286,6 +289,7 @@ export function meshRows(input: MeshInput): MeshView {
       rank,
       out: out === null ? null : clean(out),
       unready: unready === null ? null : clean(unready),
+      roomAt: unready === null ? roomAfterReset(inputOf.get(name), need, input.now) : null,
       usage: a.usage,
       observedAt: a.observedAt,
       stale: a.stale,
@@ -477,12 +481,12 @@ export function meshHeader(view: MeshView): [string, string] {
   return [HEADER_KEYS, `no account has room — ${when}plain \`${cmd}\` would refuse · ${reading}`];
 }
 
-/** With nothing ranked, the account whose ranking window resets soonest: the
- *  first that comes back, and when. Null when no row reports a reset. */
+/** The first launchable account whose exhausted windows will all have reset.
+ *  Null when no reading establishes when capacity returns. */
 function nextRoom(view: MeshView): { name: string; at: number } | null {
   let best: { name: string; at: number } | null = null;
   for (const row of view.rows) {
-    const at = rankingReset(row, view.need);
+    const at = row.roomAt;
     if (at !== null && at > view.now && (best === null || at < best.at)) best = { name: row.name, at };
   }
   return best;

@@ -6,6 +6,7 @@ import { stubDir, tempHome } from "./helpers.ts";
 import {
   COMPAT,
   cliVersion,
+  cliSupportsFlag,
   compareVersions,
   compatNotices,
   parseVersion,
@@ -121,6 +122,24 @@ test("cliVersion: an upgrade in place (same path, new file) is probed again", (t
   cli.rewrite("0.162.0");
   assert.equal(cliVersion(cli.bin), "0.162.0");
   assert.equal(cli.calls(), 2);
+});
+
+test("cliSupportsFlag probes help once per binary and invalidates on upgrade", () => {
+  const { home } = tempHome();
+  const { dir, stub } = stubDir();
+  const bin = path.join(dir, "claude");
+  const cache = path.join(home, "flags.json");
+  const count = path.join(home, "calls");
+  stub("claude", `echo x >> '${count}'\necho '  --effort <level>  Effort for this session'`);
+  assert.equal(cliSupportsFlag(bin, "--effort", cache), true);
+  assert.equal(cliSupportsFlag(bin, "--effort", cache), true);
+  assert.equal(readFileSync(count, "utf8"), "x\n");
+  stub("claude", "echo '  --model <model>  No effort flag in this older build'");
+  assert.equal(cliSupportsFlag(bin, "--effort", cache), false);
+  stub("claude", "echo '  --effortless <value>'");
+  assert.equal(cliSupportsFlag(bin, "--effort", cache), false);
+  stub("claude", "echo ' --effort <level>'; exit 1");
+  assert.equal(cliSupportsFlag(bin, "--effort", cache), false);
 });
 
 test("cliVersion: a CLI that fails --version is cached as unknown, not re-spawned on every launch", (t) => {

@@ -41,6 +41,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { codexAutorotateEnabled } from "./autorotate.ts";
 import { readEvents } from "./events.ts";
+import { cliSupportsFlag } from "./compat.ts";
+import { resolveOnPath } from "./exec.ts";
+import { flagsWithLiveSettings, readLiveSettings } from "./live-settings.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
@@ -1558,6 +1561,17 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   const from = session.account;
   const manual = opts.manual;
 
+  // Use one runtime-settings reading for BOTH the chooser and the relaunch.
+  // A /model change can require the scoped window even when the original
+  // launch did not. Tighten that need before choosing; an explicit scoped
+  // need is never relaxed by metadata from a different model name.
+  const liveAtPick = readLiveSettings(session.provider, session.transcriptPath, session.cliSessionId);
+  if (session.provider === "claude" && liveAtPick.model && /fable/i.test(liveAtPick.model) && session.need !== "fable") {
+    session = { ...session, need: "fable" };
+    st.updateSession(id, { need: "fable" });
+    logLine(id, g, `the live model ${liveAtPick.model} needs Fable room; choosing with the current model's need`);
+  }
+
   // 3. Candidates: never the account we are leaving, never one this recovery
   // has already tried.
   const tried = st.attempts(rec.id).map((a) => a.account);
@@ -1677,6 +1691,11 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     );
   }
 
+  // Probe optional flags before the final intent checks: a help probe can
+  // take seconds, during which a human's stop must still win.
+  const claudeBin = session.provider === "claude" && liveAtPick.effort ? resolveOnPath("claude") : null;
+  const effortSupported = session.provider === "codex" || !!(claudeBin && cliSupportsFlag(claudeBin, "--effort"));
+
   const beforeExit = guardServer(st, session, tmux, g, rec);
   if (beforeExit !== null) return beforeExit;
 
@@ -1751,7 +1770,11 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // The same flag treatment for both CLIs, and for the same reason: the
   // launch's own positional prompt is not re-submitted beside the
   // continuation, and never re-submitted at all (see `flagsForResume`).
-  const flags = flagsForResume(session.flags);
+  const live = fresh ? { model: null, effort: null } : liveAtPick;
+  const flags = flagsWithLiveSettings(session.provider, flagsForResume(session.flags), live, effortSupported);
+  logLine(id, next, live.model
+    ? `resuming on ${to} with model ${live.model}, effort ${effortSupported && live.effort ? live.effort : "from launch flags/default"} (from ${codex ? "rollout" : "transcript"}${!effortSupported && live.effort ? "; --effort unavailable, keeping launch effort" : ""})`
+    : "model/effort fallback: no usable current-conversation transcript metadata; keeping launch flags");
   const command = codex
     ? fresh
       ? codexLaunchCommand(flags)

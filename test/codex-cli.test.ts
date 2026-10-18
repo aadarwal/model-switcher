@@ -303,6 +303,103 @@ test("a new conversation runs in-process too: --no-daemon at the top level", () 
   assert.deepEqual(withNoDaemon(["codex", "--", "resume"], "0.160.0"), ["codex", "--no-daemon", "--", "resume"]);
 });
 
+test("resume and fork session names and prompts are not subcommands", () => {
+  for (const sub of ["resume", "fork"]) {
+    for (const prompt of ["review", "exec", "help", "app"]) {
+      assert.deepEqual(
+        withNoDaemon(["codex", sub, ID, prompt], "0.160.0"),
+        ["codex", sub, "--no-daemon", ID, prompt],
+      );
+    }
+    assert.deepEqual(
+      withNoDaemon(["codex", sub, "review"], "0.160.0"),
+      ["codex", sub, "--no-daemon", "review"],
+    );
+  }
+});
+
+test("option values do not select a subcommand or suppress in-process launches", () => {
+  for (const args of [
+    ["--profile", "review"], ["--cd", "app"], ["--model", "resume"],
+    ["--enable", "exec"], ["--disable", "help"], ["--add-dir", "review"],
+    ["-p", "review"], ["-C", "app"], ["-m", "resume"],
+    ["--profile=review"], ["--model=resume"], ["-preview"], ["-mresume"],
+  ]) {
+    assert.deepEqual(
+      withNoDaemon(["codex", ...args], "0.160.0"),
+      ["codex", "--no-daemon", ...args],
+    );
+    assert.deepEqual(
+      withNoDaemon(["codex", ...args, "resume", ID], "0.160.0"),
+      ["codex", ...args, "resume", "--no-daemon", ID],
+    );
+    // A real non-interactive command is still left alone after options.
+    const exec = ["codex", ...args, "exec", "hello"];
+    assert.deepEqual(withNoDaemon(exec, "0.160.0"), exec);
+  }
+});
+
+test("image values follow Codex's variable arity without becoming subcommands", () => {
+  assert.deepEqual(
+    withNoDaemon(["codex", "--image", "review", "resume"], "0.160.0"),
+    ["codex", "--no-daemon", "--image", "review", "resume"],
+  );
+  assert.deepEqual(
+    withNoDaemon(["codex", "-i", "review", "--model", "gpt-5", "resume", ID], "0.160.0"),
+    ["codex", "-i", "review", "--model", "gpt-5", "resume", "--no-daemon", ID],
+  );
+  for (const image of ["--image=review", "-ireview"]) {
+    assert.deepEqual(
+      withNoDaemon(["codex", image, "resume", ID], "0.160.0"),
+      ["codex", image, "resume", "--no-daemon", ID],
+    );
+  }
+});
+
+test("only an explicit flag before -- suppresses the added --no-daemon", () => {
+  assert.deepEqual(
+    withNoDaemon(["codex", "resume", "--", ID, "--no-daemon"], "0.160.0"),
+    ["codex", "resume", "--no-daemon", "--", ID, "--no-daemon"],
+  );
+  for (const option of ["--profile=--no-daemon", "--image=--no-daemon", "-i--no-daemon"]) {
+    assert.deepEqual(withNoDaemon(["codex", option], "0.160.0"), ["codex", "--no-daemon", option]);
+  }
+  const explicit = ["codex", "--image", "review", "--no-daemon", "resume", ID];
+  assert.deepEqual(withNoDaemon(explicit, "0.160.0"), explicit, "an explicit flag ends the variadic image values");
+});
+
+test("a lone dash is an image value, so later paths named like subcommands stay image values", () => {
+  // Both Codex 0.157.0 and 0.162.1 show root TUI help for these shapes.
+  for (const option of ["--image", "-i"]) {
+    for (const images of [["-", "review"], ["-", "resume", ID]]) {
+      const args = [option, ...images, "--help"];
+      assert.deepEqual(withNoDaemon(["codex", ...args], "0.160.0"), ["codex", "--no-daemon", ...args]);
+    }
+  }
+});
+
+test("noninteractive aliases and internal subcommands are left alone from the oldest supported daemon version", () => {
+  // These help routes exist in installed Codex 0.157.0 and 0.162.1, and in
+  // rust-v0.160.0's CLI enum. They must never acquire a TUI-only flag.
+  for (const version of ["0.157.0", "0.160.0", "0.162.1"]) {
+    for (const sub of ["cloud-tasks", "tcp-tunnel", "execpolicy", "responses-api-proxy", "stdio-to-uds"]) {
+      const command = ["codex", "--profile", "review", sub, "--help"];
+      assert.deepEqual(withNoDaemon(command, version), command, `${version}: ${sub}`);
+    }
+  }
+});
+
+test("a former command name remains a prompt, and the desktop app is a command only where Codex compiles it", () => {
+  for (const version of ["0.157.0", "0.160.0", "0.162.1"]) {
+    assert.deepEqual(withNoDaemon(["codex", "mcp-server"], version), ["codex", "--no-daemon", "mcp-server"]);
+    assert.deepEqual(withNoDaemon(["codex", "app"], version, "linux"), ["codex", "--no-daemon", "app"]);
+    for (const platform of ["darwin", "win32"] as const) {
+      const command = ["codex", "app", "--help"];
+      assert.deepEqual(withNoDaemon(command, version, platform), command);
+    }
+  }
+});
+
 test("--no-daemon is never added twice, never to a CLI without it, and never to a non-interactive subcommand", () => {
   // Codex refuses the flag given twice ("cannot be used multiple times").
   const own = ["codex", "resume", ID, "--no-daemon"];

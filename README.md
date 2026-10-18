@@ -256,6 +256,17 @@ holding a socket, stays each account's own — shared, every account would run a
 one that daemon holds — and a link to the base's copy is removed (never its target).
 `MS_CODEX_BASE_DIR` puts the base somewhere other than `~/.codex`.
 
+Managed interactive Codex launches and resumes use `--no-daemon` on Codex 0.157+
+so each pane runs its own conversation and hooks. This lets a rotation release the
+conversation's writer lock when the pane exits and keeps hooks tied to that pane's
+`MS_SESSION` and generation. Option values and resume/fork prompts such as `review`
+keep this behavior. Codex launches that bypass `ms` can show
+"Background server has incompatible feature settings" when its settings differ from
+the running shared server. For a managed session, use `ms codex`; for a direct launch
+that bypasses the server, pass `--no-daemon` or choose "Run without daemon this
+time" in that prompt. Restarting the shared server changes its persisted settings
+and can interrupt other clients.
+
 ### Credentials are per device
 
 The token endpoints rotate refresh tokens, so the first refresh on either machine

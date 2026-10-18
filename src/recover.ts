@@ -548,7 +548,7 @@ function guardServer(st: State, session: SessionRow, tmux: Tmux, generation = se
   return fail(session.id, generation, problem.why);
 }
 
-class ServerOwnershipLost extends Error {
+export class ServerOwnershipLost extends Error {
   constructor(readonly generation: number, why: string) { super(why); }
 }
 
@@ -556,7 +556,7 @@ class ServerOwnershipLost extends Error {
  * check cannot vouch for a server after one of those waits. Throwing (rather
  * than treating this as a failed keypress) prevents the signal fallback from
  * targeting a replacement server's pane, including in `ms stop`. */
-function assertServer(tmux: Tmux, session: SessionRow, generation: number): void {
+export function assertServer(tmux: Tmux, session: SessionRow, generation: number): void {
   const problem = serverProblem(session, tmux);
   if (!problem) return;
   if (problem.obsolete) {

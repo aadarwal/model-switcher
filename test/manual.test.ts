@@ -58,7 +58,13 @@ case "$1" in
           n=$(get dm)
           if [ -z "$n" ]; then n=0; fi
           n=$(( n + 1 )); put dm "$n"
-          if [ "$n" -ge 2 ]; then put pane_dead 0; put pane_pid "$MS_TMUX_REVIVE"; fi
+          if [ "$n" -ge 2 ]; then
+            put pane_dead 0; put pane_pid "$MS_TMUX_REVIVE"
+            if [ -n "$MS_TMUX_RESTART_ON_REVIVE" ]; then
+              put identity 9:9
+              if [ "$MS_TMUX_RESTART_ON_REVIVE" = "dead" ]; then put pane_dead 1; fi
+            fi
+          fi
         fi
         printf '%s\t%s\t%s\t%s\n' "$(get pane_pid)" "$(get command)" "$(get pane_dead)" "$(get cwd)" ;;
       *pane_dead_status*) get pane_dead_status ;;
@@ -219,6 +225,7 @@ async function world(t: TestContext, opts: WorldOptions = {}): Promise<World> {
   process.env.MS_TMUX_SCREEN = screen;
   process.env.MS_TMUX_SNAP = opts.snapshot ? snap : "";
   process.env.MS_TMUX_REVIVE = opts.revivePid ? String(opts.revivePid) : "";
+  process.env.MS_TMUX_RESTART_ON_REVIVE = "";
   process.env.MS_TMUX_FAIL = opts.failOn ?? "";
   process.env.MS_POLL_MS = "20";
   process.env.MS_READY_MS = "10000";
@@ -723,6 +730,23 @@ test("stop does not respawn a pane something else already brought back", async (
     logLines(w).some((l) => l.includes("remain-on-exit off")),
     "the pane stayed the tool's: exiting that shell would leave a dead pane and re-fire the pane-died hook",
   );
+});
+
+test("stop never hands back or releases a replacement pane when tmux restarts during its final settle", async (t) => {
+  const say = stderr(t);
+  for (const state of ["dead", "live"]) {
+    const replacement = liveProcess(t);
+    const w = await world(t, { screen: IDLE_SCREEN, revivePid: replacement });
+    process.env.MS_TMUX_RESTART_ON_REVIVE = state;
+
+    assert.equal(await stopVerb(["s1"]), 1);
+
+    assert.deepEqual([session(w).state, session(w).desired, session(w).wakeupAt], ["stopped", "stopped", null]);
+    assert.ok(!respawnLine(w), `${state}: no login shell is respawned over the replacement`);
+    assert.ok(!logLines(w).some((line) => line.includes("remain-on-exit off")), `${state}: the replacement pane's options are left alone`);
+    assert.doesNotThrow(() => process.kill(replacement, 0));
+    assert.match(say(), /tmux server restarted; the pane id is stale/);
+  }
 });
 
 test("a pane that will not die is not recorded as stopped", async (t) => {

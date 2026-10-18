@@ -175,6 +175,28 @@ export function cliVersion(bin: string, cacheFile = probeCachePath()): string | 
   return version;
 }
 
+/** Probe an optional CLI flag instead of guessing its introduction version.
+ * The same binary identity as the version cache invalidates this after an
+ * upgrade. Failed probes are conservative and bounded, and cached too. */
+export function cliSupportsFlag(bin: string, flag: string, cacheFile = path.join(msHome(), "cli-flags.json")): boolean {
+  let real: string;
+  try { real = realpathSync(bin); } catch { return false; }
+  const key = fileKey(real);
+  if (!key) return false;
+  type Entry = { key: string; supported: boolean; at: number };
+  const raw = readJson(cacheFile);
+  const cache = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, Entry> : {};
+  const name = `${real}:${flag}`;
+  const hit = cache[name];
+  if (hit?.key === key && typeof hit.supported === "boolean") return hit.supported;
+  const r = spawnSync(bin, ["--help"], { encoding: "utf8", timeout: PROBE_TIMEOUT_MS, maxBuffer: 1 << 20, stdio: ["ignore", "pipe", "ignore"] });
+  const supported = !r.error && r.status === 0 && (r.stdout ?? "").split(/\s+/).includes(flag);
+  cache[name] = { key, supported, at: Date.now() };
+  const kept = Object.entries(cache).sort(([, a], [, b]) => (b?.at ?? 0) - (a?.at ?? 0)).slice(0, PROBE_CACHE_MAX);
+  writeSmallJson(cacheFile, Object.fromEntries(kept));
+  return supported;
+}
+
 // --- The line a human sees --------------------------------------------------
 
 /** How to get a newer `ms`: the formula's name when this is the Homebrew

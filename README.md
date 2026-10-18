@@ -279,6 +279,14 @@ the *same* pane on the new account running `claude --resume <id> "<continuation>
 `codex resume <id>`). The continuation is an argument to that invocation, never keystrokes
 typed into a shell. Four handoffs run at a time across the whole tmux server.
 
+Handoffs carry the last recorded model and reasoning effort from Claude's transcript
+or Codex's rollout, replacing older launch-time model/effort flags. Claude's `--effort`
+is added only when the installed CLI advertises it. Missing or unreadable metadata
+keeps the original launch flags; the session's `recover.log` records the source and
+any fallback. This reflects the last recorded turn: a picker change made before the
+next turn may not yet be on disk. Account rotation does not enforce a provider's
+internal fallback policy or a formal model floor.
+
 Automatic recovery for Codex is **on**: the wall record was checked against 85 real walled
 rollouts and the whole handoff was watched end to end, so `ms` moves a walled Codex session
 the way it moves a Claude one — bounded by the caps that make an unattended rotation safe:

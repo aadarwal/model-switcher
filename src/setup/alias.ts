@@ -1,7 +1,7 @@
 // src/setup/alias.ts
 //
-// The shell alias opt-in (Plan 3 Task 3): `alias claude='<msBin> claude'`
-// and `alias codex='<msBin> codex'` in the human's rc file, so plain
+// The shell alias opt-in: `alias claude='<msBin> claude --'`
+// and `alias codex='<msBin> codex --'` in the human's rc file, so plain
 // `claude`/`codex` on the command line go through this tool without the
 // human having to remember to type `ms`.
 //
@@ -9,9 +9,8 @@
 // of their own exports, prompts and other aliases. So — same discipline as
 // `hooks/codex-install.ts`'s `config.toml` writer — this owns exactly one
 // block, delimited by marker comments, and copies every other byte through
-// unchanged. Unlike that installer there is nothing here to parse or trust:
-// two `alias` lines are the whole of it, so install/remove is a straight
-// block splice rather than a scan for pre-existing tables.
+// unchanged. Installation also refuses visible shell functions or aliases
+// with these names rather than shadowing the human's own wrappers.
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -25,21 +24,21 @@ const BEGIN_RE = /^\s*# ms-alias-begin\b/;
 const END_RE = /^\s*# ms-alias-end\b/;
 
 /** The block this tool owns, markers included, for a given binary. Each
- * alias's VALUE is the whole command (`<bin> claude`), quoted as ONE shell
+ * alias's VALUE is the whole command (`<bin> claude --`), quoted as ONE shell
  * word — so a `'` inside the path is escaped rather than ending the quoted
  * run and turning the rest of the rc file into a syntax error. That outer
  * quoting protects the RC FILE'S parse of the `alias` statement, but a
  * shell re-parses an alias's own body every time the alias is USED — by
  * then the outer quotes are long gone, so `msBin` must ALSO be quoted as
  * its own shell word inside the value (`shellQuote(msBin)`) before the
- * whole `<quoted-bin> claude` command is quoted again for the rc file. For
+ * whole `<quoted-bin> claude --` command is quoted again for the rc file. For
  * a path with neither quote nor oddity this still round-trips to the same
  * command, just wrapped twice. */
 function block(msBin: string): string {
   return [
     BEGIN,
-    `alias claude=${shellQuote(`${shellQuote(msBin)} claude`)}`,
-    `alias codex=${shellQuote(`${shellQuote(msBin)} codex`)}`,
+    `alias claude=${shellQuote(`${shellQuote(msBin)} claude --`)}`,
+    `alias codex=${shellQuote(`${shellQuote(msBin)} codex --`)}`,
     END,
   ].join("\n");
 }
@@ -56,19 +55,21 @@ function escapeRegExp(s: string): string {
  * so the outer `shellQuote` always turns the inner wrapper's own leading and
  * trailing `'` into the same fixed 5-char open (`''\''`) and 4-char close
  * (`'\''`) — whatever `bin` itself contains — with the escaped `<bin>` and
- * literal ` claude`/` codex` suffix in between. The captures strip those
+ * literal ` claude --`/` codex --` suffix in between. The captures strip those
  * fixed markers to get at the escaped `<bin>` itself — that is what the
  * caller compares between the two lines, not the raw line text (which is
  * never equal between the two lines even when the block is exactly what
- * `installAlias` writes, since one ends in `claude` and the other `codex`). */
+ * `installAlias` writes, since the provider suffix differs between them). */
 const QUOTE_OPEN = "''\\''"; // outer shellQuote's escape of the inner wrapper's OPENING '
 const QUOTE_CLOSE = "'\\''"; // outer shellQuote's escape of the inner wrapper's CLOSING '
-const EXPECTED_BLOCK_RE = new RegExp(
+// Recognize the old boundary-less block too, so an upgrade can replace it
+// and an uninstall can still remove it. Both lines must have the SAME shape.
+const EXPECTED_BLOCK_RES = ["", " --"].map((boundary) => new RegExp(
   `^${escapeRegExp(BEGIN)}` +
-    `\\nalias claude=${escapeRegExp(QUOTE_OPEN)}(.*)${escapeRegExp(QUOTE_CLOSE)} claude'` +
-    `\\nalias codex=${escapeRegExp(QUOTE_OPEN)}(.*)${escapeRegExp(QUOTE_CLOSE)} codex'` +
+    `\\nalias claude=${escapeRegExp(QUOTE_OPEN)}(.*)${escapeRegExp(QUOTE_CLOSE)} claude${boundary}'` +
+    `\\nalias codex=${escapeRegExp(QUOTE_OPEN)}(.*)${escapeRegExp(QUOTE_CLOSE)} codex${boundary}'` +
     `\\n${escapeRegExp(END)}$`,
-);
+));
 
 /**
  * Finds the marker block using LINE boundaries only (never trimmed), so
@@ -127,12 +128,34 @@ function locate(rcPath: string, text: string): LocateResult {
  * surely as a removal would have. `m[1] !== m[2]` catches the two alias lines
  * naming DIFFERENT binaries — a block no single re-point could have produced. */
 function isOurBlock(blockText: string): boolean {
-  const m = EXPECTED_BLOCK_RE.exec(blockText);
-  return !!m && m[1] === m[2];
+  return EXPECTED_BLOCK_RES.some((re) => {
+    const m = re.exec(blockText);
+    return !!m && m[1] === m[2];
+  });
 }
 
 function handEdited(rcPath: string): string {
   return `${rcPath}: the '${BEGIN}' … '${END}' block does not match what this tool writes (hand-edited?); remove it by hand, refusing to guess`;
+}
+
+/** A static check of ordinary bash/zsh declarations, never an execution of
+ * the rc file. Sourced files and dynamically generated definitions cannot
+ * be discovered here. Quoted alias values are kept together, so an unrelated
+ * alias whose value merely mentions `claude=...` is not a conflict. */
+function conflictingDeclaration(rcPath: string, text: string): string | undefined {
+  for (const [i, line] of text.split("\n").entries()) {
+    const fn = /^\s*(?:function\s+(claude|codex)(?=[\s({]|$)|(claude|codex)\s*\(\s*\))/.exec(line);
+    if (fn) return `${rcPath}:${i + 1}: existing ${fn[1] ?? fn[2]} function; refusing to shadow it with an alias (use ms claude or ms codex explicitly)`;
+    const alias = /^\s*(?:(?:builtin|command)\s+)?alias\s+(.+)$/.exec(line);
+    if (!alias) continue;
+    const words = alias[1]!.match(/(?:[^\s"'\\]+|\\.|"(?:[^"\\]|\\.)*"|'[^']*')+/g) ?? [];
+    for (const word of words) {
+      if (word.startsWith("#")) break;
+      const name = /^(?:["']?)(claude|codex)(?:["']?)=/.exec(word)?.[1];
+      if (name) return `${rcPath}:${i + 1}: existing ${name} alias; refusing to overwrite it (use ms claude or ms codex explicitly)`;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -170,8 +193,9 @@ function spliceIn(pre: string, blockText: string, post: string): string {
  *
  * The file is backed up (`<rc>.bak-ms-<unix seconds>`) before the first
  * change and created (0644, parents included) when missing. A second call
- * for the SAME binary is a no-op: `changed: false`, no backup, file
- * untouched. A begin marker with no matching end is refused rather than
+ * for the SAME binary and block version is a no-op: `changed: false`, no
+ * backup, file untouched. A legacy block is upgraded even for the same
+ * binary. A begin marker with no matching end is refused rather than
  * risking the human's own configuration below it.
  */
 export function installAlias(rcPath: string, msBin: string): AliasResult {
@@ -182,6 +206,10 @@ export function installAlias(rcPath: string, msBin: string): AliasResult {
   if (located.kind === "one" && !isOurBlock(located.at.blockText)) {
     return { changed: false, backup: null, problem: handEdited(rcPath) };
   }
+  // Keep line numbers intact while excluding the only declarations we own.
+  const humanText = located.kind === "none" ? text : located.at.rawBefore + located.at.blockText.replace(/[^\n]/g, "") + located.at.rawAfter;
+  const conflict = conflictingDeclaration(rcPath, humanText);
+  if (conflict) return { changed: false, backup: null, problem: conflict };
   // No block yet: the whole file is "pre", appended to as is — nothing to
   // strip a separator from, because no separator has ever been added. A
   // block already there (validated as ours just above) recovers the true
@@ -200,6 +228,14 @@ export function installAlias(rcPath: string, msBin: string): AliasResult {
   }
   writeAtomicThroughLink(rcPath, next, { defaultMode: 0o644 });
   return { changed: true, backup };
+}
+
+/** Refresh an already opted-in block, including the old aliases without
+ * `--`. Repair must never opt a human into aliases they did not install. */
+export function repairAlias(rcPath: string, msBin: string): AliasResult {
+  if (!existsSync(rcPath)) return { changed: false, backup: null };
+  if (locate(rcPath, readFileSync(rcPath, "utf8")).kind === "none") return { changed: false, backup: null };
+  return installAlias(rcPath, msBin);
 }
 
 /**

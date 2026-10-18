@@ -22,7 +22,8 @@
 // Two paths are NOT the seven steps, and this file owns them too because
 // they are the other half of "the wizard edited my machine":
 //
-//   * `--repair` re-runs the hooks and the final check against the accounts
+//   * `--repair` re-runs the hooks, refreshes existing managed aliases, and
+//     runs the final check against the accounts
 //     that are already registered, with no login and no questions about
 //     counts. `--resume` cannot do this — it SKIPS every step already in
 //     `done`, which after a finished run is all of them — and `--reset` would
@@ -40,8 +41,8 @@
 
 import { homedir } from "node:os";
 import type { Verb } from "./cli.ts";
-import { claudeSettingsPath } from "./paths.ts";
-import { rcPathFor, removeAlias } from "./setup/alias.ts";
+import { claudeSettingsPath, msBinary } from "./paths.ts";
+import { rcPathFor, removeAlias, repairAlias } from "./setup/alias.ts";
 import { readlinePrompter, type Prompter } from "./setup/prompt.ts";
 import { loadSetup, markDone, resetSetup, saveSetup } from "./setup/state.ts";
 import { removeStatusline } from "./setup/statusline.ts";
@@ -51,7 +52,7 @@ const USAGE = `usage: ms setup [--resume] [--reset] [--yes] [--repair] [--remove
   --resume            continue at the first step not finished (the default when there is one)
   --reset             forget how far setup got, keeping every account and credential
   --yes               accept every default and ask nothing (installs no opt-ins)
-  --repair            re-install the hooks for the accounts already registered, without logging in again
+  --repair            re-install hooks and refresh existing ms aliases, without logging in again
   --remove <what>     undo an opt-in: 'statusline' or 'alias' (both may be given)`;
 
 export type RemovableOptIn = "statusline" | "alias";
@@ -96,15 +97,14 @@ export async function runSetup(prompter: Prompter, opts: SetupOpts): Promise<num
 }
 
 /**
- * `--repair`: the hooks and the final check, over the accounts that are
- * already there.
+ * `--repair`: the hooks, existing aliases and the final check, over the
+ * accounts that are already there.
  *
  * It reads the accounts from the REGISTRY, never from `setup.json`'s memory
  * of some past run — the rows with credentials are the durable fact, and a
  * human repairing an install months later may be running a wizard that never
  * met them. Nothing here logs in, asks for a count, or asks about an opt-in:
- * the two steps it runs are the ones a CLI upgrade, a dotfiles restore or a
- * hand edit breaks.
+ * these are the steps a CLI upgrade, a dotfiles restore or a hand edit breaks.
  *
  * `setup.json` is only READ (for the opt-in record and the timestamps) and
  * is not advanced: repair is not progress through the wizard, and a machine
@@ -131,6 +131,13 @@ export async function runRepair(prompter: Prompter, opts: { yes: boolean }): Pro
 
   try {
     await STEP_RUNNERS.hooks(ctx);
+    const rc = rcPathFor(process.env.SHELL ?? "", process.env.HOME || homedir());
+    if (rc) {
+      const aliases = repairAlias(rc, msBinary());
+      if (aliases.problem) throw new SetupAbort(`The aliases were left alone: ${aliases.problem}`);
+      if (aliases.changed) ctx.say(`The existing aliases were refreshed in ${rc}, so open a new shell to pick them up.`);
+      if (aliases.backup) ctx.say(`The previous file was kept as ${aliases.backup}.`);
+    }
     await STEP_RUNNERS.finish(ctx);
     return 0;
   } catch (e) {

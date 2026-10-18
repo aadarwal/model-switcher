@@ -41,7 +41,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { handBackShell, releasePane } from "./handback.ts";
 import { Locked, withLock } from "./lock.ts";
-import { HANDOFF_SLOTS, backgroundReason, isBusy, logLine, recoverSession, safeCapture, sessionLockName, stopPane, takeFailReason } from "./recover.ts";
+import { HANDOFF_SLOTS, ServerOwnershipLost, assertServer, backgroundReason, isBusy, logLine, recoverSession, safeCapture, sessionLockName, stopPane, takeFailReason } from "./recover.ts";
 import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { Tmux, currentPane, tmuxFromEnv } from "./tmux.ts";
@@ -570,7 +570,11 @@ async function endPane(tmux: Tmux, session: SessionRow): Promise<Ending> {
 
   const was = tmux.paneInfo(session.pane)?.pid ?? null;
   await stopPane(tmux, session, session.generation);
-  switch (await settle(tmux, session.pane, was, settleMs())) {
+  const settled = await settle(tmux, session.pane, was, settleMs());
+  // The final settle may outlive the server too. A replacement pane must
+  // receive neither a login shell nor our remain-on-exit cleanup.
+  assertServer(tmux, session, session.generation);
+  switch (settled) {
     case "dead": {
       // The CLI has gone either way, so a tmux that will not respawn is a note
       // for the human, not an exception: throwing here would leave the session
@@ -683,6 +687,7 @@ export const stopVerb: Verb = async (argv) => {
         { waitMs: lockWaitMs() },
       );
     } catch (e) {
+      if (e instanceof ServerOwnershipLost) return refuse("stop", `${session.id}: ${e.message}`);
       if (e instanceof Locked || (e as Error)?.name === "Locked") {
         // The intent stays written: whoever holds the lock reads it, and a
         // second `ms stop` picks up where this one stood down.

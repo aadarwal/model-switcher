@@ -477,7 +477,7 @@ test("the opt-ins install when they are accepted", () => {
   assert.equal(r.code, 0, r.all);
   assert.deepEqual(s.setupState().optIns, { statusline: true, alias: true });
   assert.equal(s.settings().statusLine.command, `'${s.msBin}' _statusline`);
-  assert.ok(readFileSync(s.rcFile, "utf8").includes(`alias claude=${shellQuote(`${shellQuote(s.msBin)} claude`)}`));
+  assert.ok(readFileSync(s.rcFile, "utf8").includes(`alias claude=${shellQuote(`${shellQuote(s.msBin)} claude --`)}`));
 });
 
 test("a prerequisite the machine does not have stops the run before anything is installed", () => {
@@ -681,6 +681,35 @@ test("--repair with nothing registered says so and does not pretend to have repa
   assert.equal(r.code, 1, r.all);
   assert.match(r.stdout, /No accounts are registered yet/);
   assert.ok(!existsSync(s.settingsFile), "it wrote hooks for nobody");
+});
+
+test("--repair upgrades existing legacy aliases without logging in or asking about opt-ins", () => {
+  const s = scene({ noCodex: true });
+  assert.equal(s.run(["0", "1", "", "n", "n", "y"]).code, 0);
+  const block = readFileSync(s.rcFile, "utf8");
+  const legacy = block.replaceAll(" claude --'", " claude'").replaceAll(" codex --'", " codex'");
+  assert.notEqual(legacy, block);
+  writeFileSync(s.rcFile, legacy);
+  const logins = s.claudeCalls().filter((c) => /^(auth login|setup-token)/.test(c[0])).length;
+
+  const r = s.run([], { repair: true });
+  assert.equal(r.code, 0, r.all);
+  assert.deepEqual(s.asked(), []);
+  assert.equal(readFileSync(s.rcFile, "utf8"), block);
+  assert.match(r.stdout, /existing aliases were refreshed/);
+  assert.match(r.stdout, /previous file was kept as/);
+  assert.equal(s.claudeCalls().filter((c) => /^(auth login|setup-token)/.test(c[0])).length, logins);
+});
+
+test("--repair leaves an rc file with no managed aliases alone", () => {
+  const s = scene({ noCodex: true });
+  assert.equal(s.run(["0", "1", "", "n", "n", "n"]).code, 0);
+  const original = "claude() { command claude; }\n";
+  writeFileSync(s.rcFile, original);
+  const r = s.run([], { repair: true });
+  assert.equal(r.code, 0, r.all);
+  assert.equal(readFileSync(s.rcFile, "utf8"), original);
+  assert.deepEqual(s.asked(), []);
 });
 
 // --- B-I5: --remove -------------------------------------------------------

@@ -197,7 +197,7 @@ ms --version
 | `--resume` | Continue at the first unfinished step. Already the default when there is progress. |
 | `--reset` | Forget how far setup got. Touches no account, credential or hook. |
 | `--yes` | Take every default and ask nothing. This answers no to moving conversations into tmux and to both opt-ins, so it installs neither and moves nothing. |
-| `--repair` | Re-install the hooks for the accounts already registered, then re-run the check. No login, no questions. |
+| `--repair` | Re-install the hooks for the accounts already registered, refresh any existing managed shell aliases, then re-run the check. No login, no questions. |
 | `--remove statusline` / `--remove alias` | Undo an opt-in. Both may be given in one run. Not combinable with `--repair` or `--reset`. |
 
 ## Concepts
@@ -467,6 +467,17 @@ does not look like something `ms` wrote.
 | Statusline wrapper (opt-in, default no) | `statusLine` in the same `settings.json` | `ms setup --remove statusline` |
 | Shell aliases for `claude` and `codex` (opt-in, default no) | `~/.zshrc`, or `~/.bash_profile` / `~/.bashrc`, between `# ms-alias-begin` and `# ms-alias-end` | `ms setup --remove alias` |
 | The wizard's own progress | `MS_HOME/setup.json` | `ms setup --reset` |
+
+The shell aliases run `ms claude --` and `ms codex --`, so every argument belongs
+to the underlying CLI: `claude --continue` keeps Claude Code's meaning, and
+`claude --dangerously-skip-permissions` passes that flag through. For account
+selection or an `ms` continuation, use `ms claude --as <account> -- <claude args>`
+or `ms claude --continue -- --resume <id>` explicitly. Setup refuses visible
+`claude`/`codex` functions or aliases in the rc file instead of shadowing them;
+definitions loaded from sourced files or generated dynamically cannot be detected.
+After upgrading, `ms setup --repair` updates an existing managed alias block to
+this form. Open a new shell to load the change. It does not install aliases when
+there is no managed block.
 
 The hooks are how a wall is noticed at all, so removing them turns rotation off. Put them
 back with `ms setup --repair` or `ms doctor --fix`; neither re-runs a login. A re-point

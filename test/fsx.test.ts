@@ -130,7 +130,7 @@ test("installAlias writes through a symlinked rc file", () => {
   assert.equal(lstatSync(link).isSymbolicLink(), true, ".zshrc must still be a symlink");
   const after = readFileSync(real, "utf8");
   assert.ok(after.startsWith("export A=1\n"), after);
-  assert.ok(after.includes(`alias claude=${shellQuote(`${shellQuote(MS)} claude`)}`), after);
+  assert.ok(after.includes(`alias claude=${shellQuote(`${shellQuote(MS)} claude --`)}`), after);
 });
 
 test("installCodexHooks writes through a symlinked config.toml", () => {
@@ -171,7 +171,7 @@ test("installCodexHooks writes through a symlinked config.toml", () => {
  * and avoiding the unrelated bash/zsh quirk where an alias defined and used
  * on the very same parsed `-c` line never takes effect at all, fixed
  * quoting or not — and asserts the stub actually ran with `claude` as its
- * first argument.
+ * first argument, followed by `--` and the user's flags unchanged.
  */
 function assertAliasSurvivesShellUse(t: import("node:test").TestContext, home: string): void {
   const stubDir = path.join(home, "App Support", "it's");
@@ -180,7 +180,7 @@ function assertAliasSurvivesShellUse(t: import("node:test").TestContext, home: s
   writeFileSync(msBin, '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$MS_TEST_RECORDER"\n');
   chmodSync(msBin, 0o755);
 
-  function runAndCheck(shell: string, label: string, args: string[], env: Record<string, string>): void {
+  function runAndCheck(shell: string, label: string, args: string[], env: Record<string, string>, expected: string[]): void {
     const probe = spawnSync(shell, ["-c", "exit 0"]);
     if (probe.error) {
       t.diagnostic(`${shell} not installed — skipping (${label})`);
@@ -194,19 +194,25 @@ function assertAliasSurvivesShellUse(t: import("node:test").TestContext, home: s
       timeout: 10_000,
     });
     assert.ok(existsSync(recorder), `${label}: stub never ran — stdout=${runResult.stdout} stderr=${runResult.stderr}`);
-    assert.equal(readFileSync(recorder, "utf8").trim(), "claude", `${label}: stub's own argv`);
+    assert.deepEqual(readFileSync(recorder, "utf8").trim().split("\n"), expected, `${label}: stub's own argv`);
   }
 
   const bashRc = path.join(home, "bashrc-test");
   const bashInstalled = installAlias(bashRc, msBin);
   assert.equal(bashInstalled.changed, true, bashInstalled.problem ?? "installAlias (bash) did not write");
-  runAndCheck("bash", "bash", ["--rcfile", bashRc, "-i", "-c", "claude"], {});
+  const claudeCommand = "claude --continue --dangerously-skip-permissions -p 'hello $world' --help --version";
+  const claudeArgs = ["claude", "--", "--continue", "--dangerously-skip-permissions", "-p", "hello $world", "--help", "--version"];
+  const codexCommand = "codex resume --last --help --version";
+  const codexArgs = ["codex", "--", "resume", "--last", "--help", "--version"];
+  runAndCheck("bash", "bash-claude", ["--rcfile", bashRc, "-i", "-c", claudeCommand], {}, claudeArgs);
+  runAndCheck("bash", "bash-codex", ["--rcfile", bashRc, "-i", "-c", codexCommand], {}, codexArgs);
 
   const zdotDir = path.join(home, "zdotdir-test");
   const zshRc = path.join(zdotDir, ".zshrc"); // zsh only sources a file with this exact name
   const zshInstalled = installAlias(zshRc, msBin);
   assert.equal(zshInstalled.changed, true, zshInstalled.problem ?? "installAlias (zsh) did not write");
-  runAndCheck("zsh", "zsh", ["-i", "-c", "claude"], { ZDOTDIR: zdotDir });
+  runAndCheck("zsh", "zsh-claude", ["-i", "-c", claudeCommand], { ZDOTDIR: zdotDir }, claudeArgs);
+  runAndCheck("zsh", "zsh-codex", ["-i", "-c", codexCommand], { ZDOTDIR: zdotDir }, codexArgs);
 }
 
 test("a binary path with a space is one shell word in every command this tool writes", () => {
@@ -217,7 +223,7 @@ test("a binary path with a space is one shell word in every command this tool wr
   const rc = path.join(home, ".zshrc");
   installAlias(rc, spaced);
   const text = readFileSync(rc, "utf8");
-  assert.ok(text.includes(`alias claude=${shellQuote(`${shellQuote(spaced)} claude`)}`), text);
+  assert.ok(text.includes(`alias claude=${shellQuote(`${shellQuote(spaced)} claude --`)}`), text);
 
   const settings = path.join(home, "settings.json");
   installStatusline(settings, spaced);
@@ -232,7 +238,7 @@ test("a binary path containing a single quote is escaped, not left to break the 
   const rc = path.join(home, ".zshrc");
   installAlias(rc, quoted);
   const text = readFileSync(rc, "utf8");
-  assert.ok(text.includes(`alias claude=${shellQuote(`${shellQuote(quoted)} claude`)}`), text);
+  assert.ok(text.includes(`alias claude=${shellQuote(`${shellQuote(quoted)} claude --`)}`), text);
   // Prove it is really one word to a shell, not just escaped-looking — and
   // not just at the rc file's own parse, but at the alias's own use, which
   // re-parses the body a second time.

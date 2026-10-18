@@ -44,7 +44,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { resolveOnPath } from "./exec.ts";
 import { msBinary } from "./paths.ts";
-import { pickAccounts, reserveReached, type Need, type Window } from "./pick.ts";
+import { pickAccounts, reserveReached, roomAfterReset, type Need, type Window } from "./pick.ts";
 import { NAME_PATTERN, findAccount, loadRegistry, type Provider, type Registry } from "./registry.ts";
 import { DEFAULT_MAX_AGE_MS, ageLabel, getSnapshot, lastSnapshot, toPickInputs, type AccountUsage, type Snapshot } from "./snapshot.ts";
 import { openState, type SessionRow } from "./state.ts";
@@ -81,6 +81,8 @@ export type MeshRow = {
   out: string | null;
   /** Why this device cannot launch it, or null when it can. */
   unready: string | null;
+  /** When every capacity gate clears, or null when resets cannot establish it. */
+  roomAt: number | null;
   usage: AccountUsage["usage"];
   observedAt: number | null;
   stale: boolean;
@@ -167,11 +169,16 @@ const clockAt = (ms: number): string => {
   const d = new Date(ms);
   return `${two(d.getHours())}:${two(d.getMinutes())}`;
 };
-/** `%a %H:%M`, local. */
-const weekdayAt = (ms: number): string => `${WEEKDAYS[new Date(ms).getDay()]} ${clockAt(ms)}`;
-/** Today's reset is a clock time; any other day's carries its weekday. */
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+/** `%a %-d %b %H:%M`, local: the weekday AND the date, because a weekly
+ *  window resets days out and the weekday alone is ambiguous a week ahead. */
+const dateAt = (ms: number): string => {
+  const d = new Date(ms);
+  return `${WEEKDAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]} ${clockAt(ms)}`;
+};
+/** Today's reset is a clock time; any other day's carries its date. */
 function resetClock(ms: number, now: number): string {
-  return new Date(ms).toDateString() === new Date(now).toDateString() ? clockAt(ms) : weekdayAt(ms);
+  return new Date(ms).toDateString() === new Date(now).toDateString() ? clockAt(ms) : dateAt(ms);
 }
 function untilText(ms: number, now: number): string {
   const minutes = Math.floor((ms - now) / 60_000);
@@ -238,6 +245,7 @@ export function meshRows(input: MeshInput): MeshView {
   const wanted = new Set(input.names);
   const rows = snapshot.accounts.filter((a) => a.provider === provider && wanted.has(a.name));
   const inputs = toPickInputs({ ...snapshot, accounts: rows }, registry);
+  const inputOf = new Map(inputs.map((a) => [a.name, a]));
   const ranking = pickAccounts(inputs, need);
   const rankOf = new Map(ranking.picks.map((p, i) => [p.name, i + 1]));
   const outOf = new Map(ranking.out.map((o) => [o.name, o.why]));
@@ -281,6 +289,7 @@ export function meshRows(input: MeshInput): MeshView {
       rank,
       out: out === null ? null : clean(out),
       unready: unready === null ? null : clean(unready),
+      roomAt: unready === null ? roomAfterReset(inputOf.get(name), need, input.now) : null,
       usage: a.usage,
       observedAt: a.observedAt,
       stale: a.stale,
@@ -342,7 +351,7 @@ export function renderRow(row: MeshRow, view: Pick<MeshView, "provider" | "need"
     // Codex reports no Fable-scoped window at all (src/providers/codex-usage.ts).
     ...(view.provider === "claude" ? ["  ", percent("fable", row.usage?.weeklyFable)] : []),
     "  ",
-    cell(reset === null ? DASH : weekdayAt(reset), 9, null),
+    cell(reset === null ? DASH : dateAt(reset), 16, null),
     ...(row.panes.length ? ["  ", paint(`${row.panes.length} pane${row.panes.length === 1 ? "" : "s"}`, tone(null))] : []),
   ];
   return parts.join("").trimEnd();
@@ -466,9 +475,21 @@ export function meshHeader(view: MeshView): [string, string] {
       : `usage unreachable — no account could be read just now · ${newest}`];
   }
   const reading = age === null ? "no usage reading yet" : `usage ${age} old`;
-  return [HEADER_KEYS, view.starredBy !== null
-    ? `${star} what plain \`${cmd}\` would pick · ${reading}`
-    : `no account has room — plain \`${cmd}\` would refuse · ${reading}`];
+  if (view.starredBy !== null) return [HEADER_KEYS, `${star} what plain \`${cmd}\` would pick · ${reading}`];
+  const next = nextRoom(view);
+  const when = next === null ? "" : `next room: ${next.name} ${dateAt(next.at)} (${untilText(next.at, view.now)}) · `;
+  return [HEADER_KEYS, `no account has room — ${when}plain \`${cmd}\` would refuse · ${reading}`];
+}
+
+/** The first launchable account whose exhausted windows will all have reset.
+ *  Null when no reading establishes when capacity returns. */
+function nextRoom(view: MeshView): { name: string; at: number } | null {
+  let best: { name: string; at: number } | null = null;
+  for (const row of view.rows) {
+    const at = row.roomAt;
+    if (at !== null && at > view.now && (best === null || at < best.at)) best = { name: row.name, at };
+  }
+  return best;
 }
 
 // --- fzf -------------------------------------------------------------------

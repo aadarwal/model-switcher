@@ -104,6 +104,7 @@ ms dashboard [--port N] [--no-open]
 ```
 
 - `ms status` — two tables: the account pool as usage sees it, and every managed session. The accounts table ends in SESS, the number of live sessions on that account, then EMAIL, the login behind the name (`-` when unknown); `--json` lists the sessions per account (`sessions`) and carries each account's `email`. The sessions table ends in BETTER — where [rebalance](#rebalance) would put that session right now, `—` when it is already there or the rule could never move it, `pinned` when you picked its account by hand ([`mesh`](#picking-by-hand-mesh); `--json` carries `pinnedAccount`). `--watch` reprints every 5 s; `--json` prints the same rows as JSON. Sessions in state `gone` or `stopped` are hidden by default; `--all` shows them too.
+- Above the accounts, each provider's pool summary counts rows with STATE `ok`, lists known window resets in the next 24 hours, and names the next account whose exhausted windows all reset. Exactly one `ok` account raises `LAST ACCOUNT WITH ROOM`. The dashboard shows the same summary; `--json` exposes it as `pools.claude` / `pools.codex`. Reset events with the same account and instant are grouped; these are scheduled window resets, not a count of discretionary resets available from a provider. No verified provider field supplies that count, so `resetsAvailable` and an `AVAIL` column are omitted. A Fable reset is listed as an event; capacity recovery uses the ordinary launch's session/week gates and owner reserve.
 - `ms rotate` — move a session to the next account with room: the move a wall would have made, on demand. Always carries the unfinished work over.
 - `ms switch` — move a session to a named account. It carries the work over only when the pane reads as walled; `--continue` always carries it over.
 - `ms switch --all` — move every session of that account's provider that is not already on it, four at a time. `--timeout` bounds how long new moves are *started* (default 600 s); a move in flight is never cut off. `--provider` is needed only when the destination name is registered under both providers, same rule as `ms accounts`' own `--provider`.
@@ -289,6 +290,14 @@ own way out (`Escape` then `/exit` for Claude Code, Ctrl-C twice for Codex), and
 the *same* pane on the new account running `claude --resume <id> "<continuation>"` (or
 `codex resume <id>`). The continuation is an argument to that invocation, never keystrokes
 typed into a shell. Four handoffs run at a time across the whole tmux server.
+
+Handoffs carry the last recorded model and reasoning effort from Claude's transcript
+or Codex's rollout, replacing older launch-time model/effort flags. Claude's `--effort`
+is added only when the installed CLI advertises it. Missing or unreadable metadata
+keeps the original launch flags; the session's `recover.log` records the source and
+any fallback. This reflects the last recorded turn: a picker change made before the
+next turn may not yet be on disk. Account rotation does not enforce a provider's
+internal fallback policy or a formal model floor.
 
 Automatic recovery for Codex is **on**: the wall record was checked against 85 real walled
 rollouts and the whole handoff was watched end to end, so `ms` moves a walled Codex session

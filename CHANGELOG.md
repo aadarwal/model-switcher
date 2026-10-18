@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Status text, JSON (`pools`) and the dashboard header share per-provider pool
+  summaries: accounts with room, known window resets within 24 hours, the next
+  capacity recovery, and a warning when only one account has room. Recovery
+  waits for all exhausted launch windows and the owner's reserve to clear.
+  Missing or malformed required usage windows read `transient` rather than
+  inflating the table's `ok` state and the pool's capacity count.
+  Provider reset-availability counts remain absent until a source reports them.
 - Reset times carry the date, not only the weekday: the picker's resets column, its preview
   and the dashboard now read `Tue 20 Oct 20:00` (was `Tue 20:00`). A weekly window resets days
   out, and a weekday alone is ambiguous a week ahead. A reset later today is still just `20:00`.

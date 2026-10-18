@@ -26,6 +26,7 @@ import { openState, type SessionRow } from "../src/state.ts";
 import { backgroundReason, backgroundWork, codexConversation, isBusy, recoverSession, takeFailReason } from "../src/recover.ts";
 import * as screens from "./fixtures/claude-screens.ts";
 import { p } from "../src/paths.ts";
+import { shellQuote } from "../src/fsx.ts";
 
 /** The continuation text, spelled out here rather than imported: the whole
  *  point of the assertion is that the shipped constant still says this. */
@@ -515,6 +516,88 @@ test("the happy path: dirk hands off to gmail and the resumed session continues"
   assert.equal(attempts[0].outcome, "exhausted");
 
   assert.match(recoverLog(w), /s1: dirk → gmail \(session wall, generation 3\)/);
+});
+
+test("a handoff resumes with the live Claude model and effort, replacing old launch flags", async (t) => {
+  const w = await world(t, { session: { flags: ["--model=sonnet", "--effort", "low"] } });
+  const transcript = path.join(w.home, "conversation.jsonl");
+  writeFileSync(transcript, JSON.stringify({ type: "assistant", sessionId: "c-1", message: { model: "claude-opus-5-5" }, effort: "xhigh" }) + "\n");
+  const bin = path.join(path.dirname(w.log), "claude");
+  writeFileSync(bin, "#!/bin/sh\nprintf '%s\\n' '  --effort <level>  effort'\n");
+  chmodSync(bin, 0o755);
+  const st = openState();
+  try { st.updateSession("s1", { transcriptPath: transcript }); } finally { st.close(); }
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["claude", "--resume", "c-1", CONTINUATION, "--model", "claude-opus-5-5", "--effort", "xhigh"]);
+  assert.match(recoverLog(w), /model claude-opus-5-5, effort xhigh \(from transcript\)/);
+});
+
+test("a human's stop during the optional flag probe prevents the exit and respawn", async (t) => {
+  const w = await world(t);
+  const transcript = path.join(w.home, "conversation.jsonl");
+  writeFileSync(transcript, JSON.stringify({ type: "assistant", sessionId: "c-1", message: { model: "opus" }, effort: "max" }) + "\n");
+  const st = openState();
+  try { st.updateSession("s1", { transcriptPath: transcript }); } finally { st.close(); }
+  const script = path.join(w.home, "stop-during-help.mjs");
+  writeFileSync(script, `import { DatabaseSync } from 'node:sqlite';\nimport path from 'node:path';\nconst db = new DatabaseSync(path.join(process.env.MS_HOME, 'state.sqlite'));\ndb.prepare("UPDATE sessions SET desired = 'stopped' WHERE id = 's1'").run();\ndb.close();\n`);
+  const bin = path.join(path.dirname(w.log), "claude");
+  writeFileSync(bin, `#!/bin/sh\n${shellQuote(process.execPath)} ${shellQuote(script)}\nprintf '%s\\n' ' --effort <level>'\n`);
+  chmodSync(bin, 0o755);
+  assert.equal(await recoverSession("s1"), 0); // honoring a concurrent stop is a successful stand-down
+  assert.equal(session(w).desired, "stopped");
+  assert.equal(rows(w, "recoveries")[0].status, "obsolete");
+  assert.ok(!logLines(w).some((line) => line.includes("send-keys") || line.includes("respawn-pane")));
+});
+
+test("a live model requiring Fable room tightens the chooser before any pane is stopped", async (t) => {
+  const w = await world(t);
+  const transcript = path.join(w.home, "conversation.jsonl");
+  writeFileSync(transcript, JSON.stringify({ type: "assistant", sessionId: "c-1", message: { model: "claude-fable-5" }, effort: "max" }) + "\n");
+  const st = openState();
+  try { st.updateSession("s1", { transcriptPath: transcript }); } finally { st.close(); }
+  // Other accounts have general capacity, but none reports a Fable window.
+  assert.equal(await recoverSession("s1"), 2);
+  assert.equal(session(w).need, "fable");
+  assert.equal(session(w).account, "dirk");
+  assert.ok(!logLines(w).some((line) => line.includes("send-keys") || line.includes("respawn-pane")));
+  assert.match(recoverLog(w), /live model.*needs Fable room/);
+});
+
+test("an older Claude keeps the live model but is not given an unsupported effort flag", async (t) => {
+  const w = await world(t, { session: { flags: [] } });
+  const transcript = path.join(w.home, "conversation.jsonl");
+  writeFileSync(transcript, JSON.stringify({ type: "assistant", sessionId: "c-1", message: { model: "opus" }, effort: "max" }) + "\n");
+  const bin = path.join(path.dirname(w.log), "claude");
+  writeFileSync(bin, "#!/bin/sh\necho ' --model <model>'\n");
+  chmodSync(bin, 0o755);
+  const st = openState();
+  try { st.updateSession("s1", { transcriptPath: transcript }); } finally { st.close(); }
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["claude", "--resume", "c-1", CONTINUATION, "--model", "opus"]);
+  assert.match(recoverLog(w), /--effort unavailable/);
+});
+
+test("a missing transcript keeps the original command and names the model/effort fallback", async (t) => {
+  const w = await world(t);
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["claude", "--resume", "c-1", CONTINUATION, "--model", "sonnet"]);
+  assert.match(recoverLog(w), /model\/effort fallback:.*keeping launch flags/);
+});
+
+test("a handoff carries Codex's last rollout model and effort to the incoming account", async (t) => {
+  const w = await codexWorld(t, { rollout: "recorded" });
+  appendFileSync(session(w).transcriptPath!, JSON.stringify({ type: "turn_context", payload: { model: "gpt-6.1-sol", effort: "ultra" } }) + "\n");
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="ultra"']);
+  assert.match(recoverLog(w), /from rollout/);
 });
 
 test("a wall still rotates a session pinned by hand, and the move ends the pin", async (t) => {

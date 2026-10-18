@@ -18,6 +18,9 @@
 // `buildRotateBody`/`buildSwitchBody`/`buildStopBody` don't accept a force
 // argument at all; there is no way to build a body that sends one.
 
+import { poolSummaryText, type PoolSummaries } from "../pool-summary.ts";
+export { poolSummaryText, poolResetTime } from "../pool-summary.ts";
+
 /** `&<>"'` only — the five characters that matter inside an HTML attribute
  *  or text node built by string concatenation, which is everything the
  *  page's `innerHTML` interpolations do. */
@@ -219,6 +222,20 @@ export function chosenAccount(options: string[], chosen: string): string {
     if (options[i] === chosen) return chosen;
   }
   return options.length ? options[0]! : "";
+}
+
+/** Render the API's computed pool summaries without deriving account state
+ *  again in the browser. An older API without summaries leaves this empty. */
+export function poolSummariesHtml(pools: PoolSummaries | undefined, now: number): string {
+  var out = "";
+  var providers = ["claude", "codex"] as const;
+  for (var i = 0; i < providers.length; i++) {
+    var provider = providers[i]!;
+    var pool = pools && pools[provider];
+    if (!pool) continue;
+    out += '<p class="ms-pool' + (pool.withRoom <= 1 ? " worry" : "") + '" data-provider="' + provider + '">' + esc(poolSummaryText(provider, pool, now)) + "</p>";
+  }
+  return out;
 }
 
 // --- The accounts panel ----------------------------------------------------

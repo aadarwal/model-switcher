@@ -11,7 +11,8 @@
 // timers get throttled by the browser, so the 5 s interval alone can't be
 // trusted to keep the server's idle clock fresh while backgrounded.
 //
-// It renders `statusJson()`'s own rows — `{ accounts, sessions, takenAt }` —
+// It renders `statusJson()`'s own rows and pool summaries —
+// `{ accounts, sessions, takenAt, pools }` —
 // which, since review round 1's finding 1, carry the exact computed words the
 // text table renders (LABEL, STATE, PENDING, WALLED?), not just the raw
 // snapshot/store rows: this file renders them as given, it does not
@@ -65,6 +66,9 @@ import {
   accountSessionsHtml,
   accountRowHtml,
   accountGroupsHtml,
+  poolSummaryText,
+  poolResetTime,
+  poolSummariesHtml,
   providerSegHtml,
   shortSessionId,
   sessionRowHtml,
@@ -119,6 +123,7 @@ main { max-width: 980px; margin: 0 auto; padding: 40px 24px 72px; }
 /* ———— Masthead: the title, and the one caption on the page ———— */
 h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 4px; }
 .meta { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ms-pool { font-size: 12px; line-height: 1.6; margin: 12px 0 0; color: var(--ink-2); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 
 /* Sections are named, never captioned. */
 .ms-sechead { display: flex; align-items: baseline; margin: 38px 0 12px; }
@@ -337,6 +342,9 @@ const EMBEDDED = [
   accountSessionsHtml,
   accountRowHtml,
   accountGroupsHtml,
+  poolSummaryText,
+  poolResetTime,
+  poolSummariesHtml,
   providerSegHtml,
   shortSessionId,
   sessionRowHtml,
@@ -695,6 +703,7 @@ ${EMBEDDED_FUNCTIONS}
       currentAccounts = data.accounts || [];
       currentSessions = data.sessions || [];
       lastTakenAt = data.takenAt;
+      el("pool-summary").innerHTML = poolSummariesHtml(data.pools, Date.now());
       renderAccounts(currentAccounts);
       renderSessions(currentSessions, currentAccounts);
       renderMoveAll(currentAccounts);
@@ -738,6 +747,7 @@ export function renderDashboardPage(): string {
 <main>
   <h1>model-switcher</h1>
   <div class="meta" id="meta">reading…</div>
+  <div id="pool-summary" aria-live="polite"></div>
 
   <div id="accounts"></div>
 

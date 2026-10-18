@@ -55,6 +55,7 @@ import { msBinary } from "../paths.ts";
 // type-only: erased, so naming them here never loads node:sqlite
 import type { SessionRow, State, WallKind as RecoveryWallKind } from "../state.ts";
 import { Tmux } from "../tmux.ts";
+import { hookOwnedByLaunch } from "./owner.ts";
 
 // Nothing that reaches `node:sqlite` may be imported at module scope. `cli.ts`
 // loads this file for EVERY verb, and the hook's own unmanaged-pane return has
@@ -123,6 +124,8 @@ export const ROLLOUT_CHUNK_MAX = 4 << 20;
  * inherits none of it and this returns 0 having written nothing. The
  * generation is the INHERITED one, never the store's latest, so a late event
  * from a replaced generation stays attributable to the process that sent it.
+ * The PID pin is verified against actual ancestry before any effect: nested
+ * `codex exec` processes inherit the environment but do not own this pane.
  */
 export async function codexHook(): Promise<number> {
   try {
@@ -133,6 +136,7 @@ export async function codexHook(): Promise<number> {
     // A generation is a positive counter. `Number("")` is 0 and `Number(" ")`
     // is 0 too, so "finite" is not enough to tell a real one from a blank.
     if (!session || !Number.isInteger(gen) || gen <= 0 || !socket || !pane) return 0;
+    if (!await hookOwnedByLaunch("codex", session, gen, socket, pane)) return 0;
 
     // The two gates, carried from the human's shell into the store the
     // dispatched processes can actually read. Only when a variable is set

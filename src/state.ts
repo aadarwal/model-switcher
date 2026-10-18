@@ -13,8 +13,8 @@ export type SessionState = "launching" | "running" | "walled" | "stopping" | "re
 export type SessionRow = { id: string; provider: Provider; cliSessionId: string | null; cwd: string; socket: string; pane: string;
   serverStart: string; need: "any" | "fable"; account: string; generation: number; state: SessionState;
   desired: "running" | "stopped"; flags: string[]; wakeupAt: number | null; createdAt: number; updatedAt: number;
-  /** Codex's rollout file for this conversation, as its own hook payloads
-   *  report it (`transcript_path`). It is the ONLY place a usage-limit turn
+  /** The current conversation's transcript, as its own hook payloads report
+   *  it (`transcript_path`). For Codex this is the ONLY place a usage-limit turn
    *  leaves a record: that branch fires no hook and emits no notify, but it
    *  IS persisted here as a `task_complete` whose `error.codex_error_info` is
    *  `usage_limit_exceeded`. Null until a SessionStart has reported one. */

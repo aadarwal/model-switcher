@@ -520,6 +520,52 @@ function redispatch(tmux: Tmux, id: string, generation: number, delaySeconds?: n
  */
 const stopRequested = (st: State, id: string): boolean => st.getSession(id)?.desired === "stopped";
 
+/** Pane ids are scoped to one tmux server lifetime. A timer dispatched by a
+ * previous server must never act on the same `%N` in its replacement. Check
+ * before claiming a recovery and again after waits that can outlive a server.
+ *
+ * Unreadable is not gone: leave an unclaimed row untouched. Once a handoff
+ * is under way, park it rather than leaving an owned recovery behind or
+ * guessing whether the pane still belongs to this session. */
+function serverProblem(session: SessionRow, tmux: Tmux): { obsolete: boolean; why: string } | null {
+  if (!session.serverStart) return null;
+  const server = tmux.serverState();
+  if (server === "unreadable") {
+    return { obsolete: false, why: `could not confirm the tmux server identity for ${session.id}; the pane was left alone` };
+  }
+  if (server === "gone" || server.up !== session.serverStart) {
+    const why = server === "gone" ? "the tmux server is gone" : "the tmux server restarted; the pane id is stale";
+    return { obsolete: true, why: `${why}; ${session.id} is closed out and the pane left alone` };
+  }
+  return null;
+}
+
+function guardServer(st: State, session: SessionRow, tmux: Tmux, generation = session.generation, rec?: RecoveryRow): RecoverCode | null {
+  const problem = serverProblem(session, tmux);
+  if (!problem) return null;
+  if (problem.obsolete) st.retireFromPane(session.id);
+  else if (rec) return park(st, session.id, rec.id, generation, problem.why);
+  return fail(session.id, generation, problem.why);
+}
+
+export class ServerOwnershipLost extends Error {
+  constructor(readonly generation: number, why: string) { super(why); }
+}
+
+/** The exit sequence also waits between keys and signals. An outer handoff
+ * check cannot vouch for a server after one of those waits. Throwing (rather
+ * than treating this as a failed keypress) prevents the signal fallback from
+ * targeting a replacement server's pane, including in `ms stop`. */
+export function assertServer(tmux: Tmux, session: SessionRow, generation: number): void {
+  const problem = serverProblem(session, tmux);
+  if (!problem) return;
+  if (problem.obsolete) {
+    const st = openState();
+    try { st.retireFromPane(session.id); } finally { st.close(); }
+  }
+  throw new ServerOwnershipLost(generation, problem.why);
+}
+
 /**
  * Why `--as <name>` cannot be honoured, or null. Checked before the name is
  * used for anything: unvalidated it reaches `readLaunchToken`, where a name
@@ -742,10 +788,11 @@ function signal(pid: number, sig: NodeJS.Signals): void {
 }
 
 /** Poll the pane until it is dead (or its pid is), up to `budgetMs`. */
-async function waitForExit(tmux: Tmux, pane: string, budgetMs: number): Promise<boolean> {
+async function waitForExit(tmux: Tmux, session: SessionRow, generation: number, budgetMs: number): Promise<boolean> {
   const deadline = performance.now() + budgetMs;
   for (;;) {
-    const info = tmux.paneInfo(pane);
+    const info = tmux.paneInfo(session.pane);
+    assertServer(tmux, session, generation);
     if (!info || info.dead || !info.pid || !alive(info.pid)) return true;
     const left = deadline - performance.now();
     if (left <= 0) return false;
@@ -783,12 +830,16 @@ async function askedAndLeft(tmux: Tmux, session: SessionRow, generation: number)
     }
     const { keys, settleMs } = codexExitSequence();
     try {
-      for (const k of keys) tmux.sendKeys(session.pane, k);
+      for (const k of keys) {
+        assertServer(tmux, session, generation);
+        tmux.sendKeys(session.pane, k);
+      }
     } catch (e) {
+      if (e instanceof ServerOwnershipLost) throw e;
       logLine(session.id, generation, `send-keys failed (${(e as Error).message}); signalling instead`);
       return false;
     }
-    if (await waitForExit(tmux, session.pane, settleMs)) return true;
+    if (await waitForExit(tmux, session, generation, settleMs)) return true;
     logLine(session.id, generation, "the CLI did not leave on Ctrl-C; signalling");
     return false;
   }
@@ -798,13 +849,16 @@ async function askedAndLeft(tmux: Tmux, session: SessionRow, generation: number)
     return false;
   }
   try {
+    assertServer(tmux, session, generation);
     tmux.sendKeys(session.pane, ["Escape"]);
     await sleep(ESCAPE_SETTLE_MS);
+    assertServer(tmux, session, generation);
     tmux.sendKeys(session.pane, ["/exit", "Enter"]);
   } catch (e) {
+    if (e instanceof ServerOwnershipLost) throw e;
     logLine(session.id, generation, `send-keys failed (${(e as Error).message}); signalling instead`);
   }
-  if (await waitForExit(tmux, session.pane, GRACE_MS)) return true;
+  if (await waitForExit(tmux, session, generation, GRACE_MS)) return true;
   logLine(session.id, generation, "the CLI did not leave on /exit; signalling");
   return false;
 }
@@ -818,16 +872,21 @@ async function askedAndLeft(tmux: Tmux, session: SessionRow, generation: number)
  * afterwards, never in how the CLI is asked to go.
  */
 export async function stopPane(tmux: Tmux, session: SessionRow, generation: number): Promise<boolean> {
-  if (await askedAndLeft(tmux, session, generation)) return false;
+  assertServer(tmux, session, generation);
+  const left = await askedAndLeft(tmux, session, generation);
+  assertServer(tmux, session, generation);
+  if (left) return false;
 
   const info = tmux.paneInfo(session.pane);
+  assertServer(tmux, session, generation);
   if (!info || info.dead || !info.pid || !alive(info.pid)) return false;
   signal(info.pid, "SIGTERM");
   logLine(session.id, generation, `sent SIGTERM to pid ${info.pid}`);
-  if (await waitForExit(tmux, session.pane, TERM_MS)) return true;
+  if (await waitForExit(tmux, session, generation, TERM_MS)) return true;
+  assertServer(tmux, session, generation);
   signal(info.pid, "SIGKILL");
   logLine(session.id, generation, `sent SIGKILL to pid ${info.pid}`);
-  await waitForExit(tmux, session.pane, KILL_MS);
+  await waitForExit(tmux, session, generation, KILL_MS);
   return true;
 }
 
@@ -1122,6 +1181,10 @@ export async function recoverSession(id: string, opts: RecoverOptions = {}): Pro
     return await withLock(sessionLockName(id), () => transaction(id, opts), { waitMs: SESSION_LOCK_WAIT_MS });
   } catch (e) {
     if (e instanceof Locked || (e as Error)?.name === "Locked") return fail(id, 0, `another recovery holds ${id}`);
+    if (e instanceof ServerOwnershipLost) {
+      failOwnedRecovery(id, e.message);
+      return fail(id, e.generation, e.message);
+    }
     // Anything else — a store that would not write, a tmux call with no
     // handler of its own — is still a failed recovery, and the contract says
     // the reason goes to stderr AND the log. Throwing past here would put it
@@ -1189,6 +1252,9 @@ async function transaction(id: string, opts: RecoverOptions): Promise<RecoverCod
       if (open) st.finishRecovery(open.id, "obsolete");
       return fail(id, g, `${id} is stopping; the recovery is obsolete`);
     }
+
+    const serverRefusal = guardServer(st, session, tmux);
+    if (serverRefusal !== null) return serverRefusal;
 
     // 1b. The pane is no longer this session's (#22). A later launch into the
     //     same pane — the second `ms adopt` after the first failed and was
@@ -1611,6 +1677,9 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     );
   }
 
+  const beforeExit = guardServer(st, session, tmux, g, rec);
+  if (beforeExit !== null) return beforeExit;
+
   // 5. Say what is happening, and keep the pane alive across the exit. The
   // session reads `stopping` BEFORE anything is sent to the pane, so a reader
   // that catches this transaction mid-flight never sees a killed CLI under a
@@ -1660,6 +1729,8 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   }
 
   if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, g, "before the respawn");
+  const beforeRespawn = guardServer(st, session, tmux, g, rec);
+  if (beforeRespawn !== null) return beforeRespawn;
   const workedBeforeRespawn = manual ? null : workedPastWall(session, rec);
   if (workedBeforeRespawn) return standDownObsolete(st, tmux, session, rec, g, workedBeforeRespawn, "before the respawn");
 
@@ -1776,6 +1847,8 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   if (ready === "locked" && codex && session.cliSessionId) {
     const cid = session.cliSessionId;
     logLine(id, next, `the relaunch on ${to} shows "${cid} is open in another app" (read-only; the continuation was not sent); ending it, waiting for the conversation, relaunching once`);
+    const beforeRetryExit = guardServer(st, session, tmux, next, rec);
+    if (beforeRetryExit !== null) return beforeRetryExit;
     await stopPane(tmux, session, next);
     if (stopRequested(st, id)) return standDown(st, tmux, session, rec.id, next, "before the retry");
     const again = await releaseConversation(id, next, cid, from, to);
@@ -1783,6 +1856,8 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
       st.addAttempt({ recoveryId: rec.id, account: to, outcome: "resume-broken", note: "locked" });
       return park(st, id, rec.id, next, `${heldElsewhere(cid, id, `after the relaunch on ${to}`)}. ${id} is parked with its CLI stopped`);
     }
+    const beforeRetryRespawn = guardServer(st, session, tmux, next, rec);
+    if (beforeRetryRespawn !== null) return beforeRetryRespawn;
     try {
       tmux.respawn(session.pane, session.cwd, [msBinary(), "_exec", launchId]);
     } catch (e) {

@@ -16,7 +16,7 @@
 // the suite: in-process tests read `process.env` directly, and `run()` in
 // test/helpers.ts spreads `process.env` into every child. A test that WANTS one
 // of these still sets it explicitly, exactly as before.
-export const SCRUBBED = ["CLAUDE_CONFIG_DIR", "MS_HOME", "CODEX_HOME", "MS_BIN", "MS_ACCOUNT", "MS_SESSION", "MS_GENERATION", "MS_SOCKET", "MS_PANE"];
+export const SCRUBBED = ["CLAUDE_CONFIG_DIR", "MS_HOME", "CODEX_HOME", "MS_BIN", "MS_ACCOUNT", "MS_SESSION", "MS_GENERATION", "MS_SOCKET", "MS_PANE", "MS_CLI_PID", "MS_CLI_PROVIDER"];
 for (const name of SCRUBBED) delete process.env[name];
 
 // MS_CODEX_BASE_CONFIG is the fifth of that class and the one that cannot be

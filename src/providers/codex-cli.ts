@@ -80,9 +80,21 @@ export const CODEX_NO_DAEMON_SINCE = "0.157.0";
 /** Subcommands that are not the interactive TUI: `--no-daemon` is a TUI flag,
  *  and a command line naming one of these is left exactly as recorded. */
 const NOT_THE_TUI = new Set([
-  "exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "app", "completion",
+  "exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "completion",
   "update", "doctor", "sandbox", "debug", "apply", "a", "queue", "archive", "delete", "migrate-rollouts",
-  "unarchive", "cloud", "exec-server", "features", "help", "agents", "mcp-server",
+  "unarchive", "cloud", "cloud-tasks", "exec-server", "features", "help", "agents",
+  "tcp-tunnel", "execpolicy", "responses-api-proxy", "stdio-to-uds",
+]);
+
+/** TUI options that consume the next argv entry. Their values can be words
+ *  such as `review` or `resume`, so they must not be read as subcommands.
+ *  `--image`/`-i` also consume subsequent bare entries until another option;
+ *  an attached value (`--image=x` or `-ix`) ends that option's values.
+ *  Mirrors rust-v0.160.0's utils/cli shared options and CLI remote flags. */
+const TUI_VALUE_OPTIONS = new Set([
+  "--config", "-c", "--enable", "--disable", "--remote", "--remote-auth-token-env",
+  "--image", "-i", "--model", "-m", "--local-provider", "--profile", "-p",
+  "--sandbox", "-s", "--cd", "-C", "--add-dir", "--ask-for-approval", "-a",
 ]);
 
 /**
@@ -113,13 +125,35 @@ const NOT_THE_TUI = new Set([
  * refuses a repeated flag), never past `--`, and never for a non-interactive
  * subcommand. A version that could not be read is not one known to have it.
  */
-export function withNoDaemon(command: string[], version: string | null): string[] {
+export function withNoDaemon(command: string[], version: string | null, platform: NodeJS.Platform = process.platform): string[] {
   if (!version || compareVersions(version, CODEX_NO_DAEMON_SINCE) < 0) return command;
   const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
-  const head = command.slice(1, end);
-  if (head.includes("--no-daemon") || head.some((a) => NOT_THE_TUI.has(a))) return command;
-  const sub = head.findIndex((a) => a === "resume" || a === "fork");
-  const at = sub < 0 ? 1 : sub + 2;
+  let sub = -1;
+  for (let i = 1; i < end; i++) {
+    const arg = command[i]!;
+    if (arg === "--no-daemon") return command;
+    if (arg.startsWith("-")) {
+      const option = arg.startsWith("--") ? arg.split("=", 1)[0]! : arg.slice(0, 2);
+      const attached = arg.startsWith("--") ? arg.includes("=") : arg.length > 2;
+      if (TUI_VALUE_OPTIONS.has(option) && !attached) {
+        // Clap's image option accepts one or more values. Without an
+        // attached value, even `-` or a word such as `resume` is an image path.
+        if (option === "--image" || option === "-i") {
+          while (i + 1 < end && (command[i + 1] === "-" || !command[i + 1]!.startsWith("-"))) i++;
+        } else if (i + 1 < end) {
+          i++;
+        }
+      }
+      continue;
+    }
+    // Once inside resume/fork, bare words are the session id/name and
+    // prompt, never another subcommand. Options can still follow them.
+    if (sub >= 0) continue;
+    // The desktop app command is compiled only for macOS and Windows.
+    if (NOT_THE_TUI.has(arg) || (arg === "app" && (platform === "darwin" || platform === "win32"))) return command;
+    if (arg === "resume" || arg === "fork") sub = i;
+  }
+  const at = sub < 0 ? 1 : sub + 1;
   return [...command.slice(0, at), "--no-daemon", ...command.slice(at)];
 }
 

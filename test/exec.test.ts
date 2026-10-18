@@ -261,3 +261,25 @@ test("a codex that has --no-daemon is run in-process, and one without it is run 
     assert.equal(envOf(r.stdout).ARGS, args, version);
   }
 });
+
+test("_exec keeps Codex in-process when a prompt or profile names a subcommand", async () => {
+  for (const [command, expected] of [
+    [["codex", "resume", "cx-1", "review"], "resume --no-daemon cx-1 review"],
+    [["codex", "--profile", "review"], "--no-daemon --profile review"],
+    [["codex", "--image", "-", "review"], "--no-daemon --image - review"],
+    [["codex", "-i", "-", "resume", "cx-1"], "--no-daemon -i - resume cx-1"],
+  ] as const) {
+    const { home, msHome } = tempHome();
+    const { dir, stub } = stubDir();
+    await seedLaunch({ home, msHome, account: "work", provider: "codex", command: [...command] });
+    stub("codex", `if [ "$1" = "--version" ]; then echo "codex-cli 0.160.0"; exit 0; fi\n${CODEX_STUB}`);
+
+    const r = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+
+    assert.equal(r.code, 0, r.stderr);
+    const lines = envOf(r.stdout);
+    assert.equal(lines.ARGS, expected);
+    assert.equal(lines.CODEX_HOME, `${msHome}/codex/work`);
+    assert.equal(lines.MS_SESSION, "s1");
+  }
+});

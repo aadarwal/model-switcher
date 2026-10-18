@@ -25,8 +25,8 @@ test("accountState: no-token can never apply to a codex row — there is no sepa
   const a = { name: "x", provider: "codex" as const, shared: false, usage: null, error: null, errorKind: null, observedAt: 0, stale: false };
   // Even with hasToken=false (a claude-shaped question that does not apply
   // to codex at all), the row reads exactly as it would with hasToken=true:
-  // no error, not stale → ok.
-  assert.equal(accountState(a, false), "ok");
+  // no error, not stale, but no required weekly reading → transient.
+  assert.equal(accountState(a, false), "transient");
   assert.notEqual(accountState(a, false), "no-token");
 });
 
@@ -526,7 +526,7 @@ test("ms status: a Codex account with no auth.json reads STATE no-grant through 
   assert.equal(cCells[7], "no-grant");
 });
 
-test("ms status --json prints { accounts, sessions, takenAt } and parses", async () => {
+test("ms status --json prints { accounts, sessions, takenAt, pools } and parses", async () => {
   const { world: w, env } = await world({ panes: ["%1", "%2"], screens: { "%1": WALL_SCREEN, "%2": WALL_SCREEN } });
   await seedSessions(w);
 
@@ -534,13 +534,80 @@ test("ms status --json prints { accounts, sessions, takenAt } and parses", async
   assert.equal(r.code, 0, r.stderr);
 
   const parsed = JSON.parse(r.stdout) as { accounts: unknown[]; sessions: { id: string; account: string }[]; takenAt: number };
-  assert.equal(Object.keys(parsed).sort().join(","), "accounts,sessions,takenAt");
+  assert.equal(Object.keys(parsed).sort().join(","), "accounts,pools,sessions,takenAt");
   assert.equal(parsed.accounts.length, 2);
   assert.equal(parsed.sessions.length, 2);
   assert.ok(parsed.sessions.some((s) => s.id === "sess-1" && s.account === "dirk"));
   assert.ok(parsed.sessions.some((s) => s.id === "sess-2" && s.account === "gmail"));
   assert.ok(Number.isFinite(parsed.takenAt) && parsed.takenAt > 0);
 });
+
+test("ms status and JSON pool counts match account states and warn about the last usable account", async () => {
+  const { env } = await world({ panes: [], screens: {} });
+  const json = run(["status", "--json"], env());
+  assert.equal(json.code, 0, json.stderr);
+  const data = JSON.parse(json.stdout) as import("../src/status.ts").StatusJson;
+  assert.equal(data.pools.claude?.withRoom, data.accounts.filter((a) => a.provider === "claude" && a.state === "ok").length);
+  assert.equal(data.pools.claude?.total, data.accounts.filter((a) => a.provider === "claude").length);
+  assert.deepEqual(data.pools.claude?.lastAccount, { account: "dirk", sessionUsedPercent: 42.5 });
+  assert.equal("resetsAvailable" in data.pools.claude!, false);
+  const text = run(["status"], env());
+  assert.equal(text.code, 0, text.stderr);
+  const { poolSummaryText } = await import("../src/pool-summary.ts");
+  assert.equal(text.stdout.split("\n")[0], poolSummaryText("claude", data.pools.claude!, Date.now()));
+  assert.match(text.stdout, /LAST ACCOUNT WITH ROOM \(dirk, 5H 42\.5%\)/);
+});
+
+for (const [description, limits] of [
+  ["empty limits", []],
+  ["a missing session", [{ kind: "weekly_all", percent: 10 }]],
+  ["a missing week", [{ kind: "session", percent: 10 }]],
+  ["a malformed session", [{ kind: "session", percent: "broken" }, { kind: "weekly_all", percent: 10 }]],
+  ["a nonfinite week", [{ kind: "session", percent: 10 }, { kind: "weekly_all", percent: "Infinity" }]],
+] as const) {
+  test(`status pool and table reject a successful Claude reading with ${description}`, async () => {
+    const { env } = await world({ panes: [], screens: {} });
+    const options = env({ MS_TEST_USAGE: JSON.stringify({ "at-dirk": { body: { limits } } }) });
+    const json = run(["status", "--json"], options);
+    assert.equal(json.code, 0, json.stderr);
+    const data = JSON.parse(json.stdout) as import("../src/status.ts").StatusJson;
+    assert.equal(data.accounts.find((a) => a.name === "dirk")?.state, "transient", json.stdout);
+    assert.equal(data.pools.claude?.withRoom, 0, json.stdout);
+    assert.equal(data.pools.claude?.lastAccount, null);
+    const text = run(["status"], options);
+    assert.equal(text.code, 0, text.stderr);
+    assert.match(text.stdout, /^claude: 0\/2 with room/);
+    assert.equal(cells(text.stdout.split("\n").find((line) => line.startsWith("dirk "))!)[7], "transient", text.stdout);
+  });
+}
+
+for (const [description, rate_limit] of [
+  ["a missing week", { primary_window: { used_percent: 10, limit_window_seconds: 18_000 } }],
+  ["a malformed week", { secondary_window: { used_percent: "broken", limit_window_seconds: 604_800 } }],
+  ["a malformed session", { primary_window: { used_percent: "broken", limit_window_seconds: 18_000 }, secondary_window: { used_percent: 10, limit_window_seconds: 604_800 } }],
+] as const) {
+  test(`status pool and table reject a successful Codex reading with ${description}`, async () => {
+    const { world: w, env } = await world({ panes: [], screens: {} });
+    writeFileSync(path.join(w.msHome, "accounts.json"), JSON.stringify({ version: 1, accounts: [{ name: "codexacct", provider: "codex", label: "CodexAcct", shared: false }] }));
+    const codexDir = path.join(w.msHome, "codex", "codexacct");
+    mkdirSync(codexDir, { recursive: true, mode: 0o700 });
+    writeFileSync(path.join(codexDir, "auth.json"), JSON.stringify({
+      tokens: { id_token: "id-test", access_token: "at-codex", refresh_token: "rt-test", account_id: "acct-test" },
+      last_refresh: new Date().toISOString(),
+    }), { mode: 0o600 });
+    const options = env({ MS_TEST_USAGE: JSON.stringify({ "at-codex": { body: { rate_limit } } }) });
+    const json = run(["status", "--json"], options);
+    assert.equal(json.code, 0, json.stderr);
+    const data = JSON.parse(json.stdout) as import("../src/status.ts").StatusJson;
+    assert.equal(data.accounts[0]?.state, "transient", json.stdout);
+    assert.equal(data.pools.codex?.withRoom, 0, json.stdout);
+    assert.equal(data.pools.codex?.lastAccount, null);
+    const text = run(["status"], options);
+    assert.equal(text.code, 0, text.stderr);
+    assert.match(text.stdout, /^codex: 0\/1 with room/);
+    assert.equal(cells(text.stdout.split("\n").find((line) => line.startsWith("codexacct "))!)[7], "transient", text.stdout);
+  });
+}
 
 // --- Review round 1 (P4-T2), finding 1: LABEL/PENDING/WALLED? additive ----
 //

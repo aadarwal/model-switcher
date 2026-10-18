@@ -29,6 +29,8 @@ import {
   resetNote,
   accountRowHtml,
   accountGroupsHtml,
+  poolSummaryText,
+  poolSummariesHtml,
   providerSegHtml,
   sessionRowHtml,
   formatSwitchAll,
@@ -754,6 +756,22 @@ test("the served page's own script survives an empty store without throwing", as
 
   assert.match(el("#accounts").innerHTML, /no accounts/);
   assert.match(el("#sessions-table tbody").innerHTML, /no sessions/);
+});
+
+test("the served dashboard header renders the same pool summary as status, including warnings and escaped account names", async () => {
+  const summary = {
+    withRoom: 1, total: 2,
+    resetsNext24h: [{ account: "waiting", resetsAt: new Date(Date.now() + 3_600_000).toISOString(), windows: ["week"] }],
+    nextRoom: null,
+    lastAccount: { account: "last<script>", sessionUsedPercent: 68 },
+  };
+  const dom = await runPage({ ...TWO_PROVIDER_STATE, pools: { claude: summary } });
+  const html = dom.el("#pool-summary").innerHTML;
+  assert.ok(html.includes(esc(poolSummaryText("claude", summary, Date.now()))), html);
+  assert.ok(html.includes('class="ms-pool worry"'), html);
+  assert.ok(html.includes("last&lt;script&gt;"), html);
+  assert.ok(!html.includes("last<script>"), html);
+  assert.equal(poolSummariesHtml(undefined, Date.now()), "");
 });
 
 // --- The fleet move's own wiring, driven through the served page ----------

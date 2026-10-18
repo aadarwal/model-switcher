@@ -468,6 +468,17 @@ test("a launch that RESUMES is given no --session-id, and its row carries the co
   assert.deepEqual(s.flags, ["--resume", "abc"]);
 });
 
+test("CLI flags after --, including permissions and print flags, survive a managed launch", async () => {
+  const w = await world();
+  const args = ["--dangerously-skip-permissions", "-p", "hello world", "--help", "--version"];
+  const r = run(["claude", "--", ...args], w.env());
+  assert.equal(r.code, 0, r.stderr);
+  const st = await readState(w, launchIdOf(w));
+  const s = st.sessions[0]!;
+  assert.deepEqual(s.flags, args);
+  assert.deepEqual(st.launch!.command, ["claude", "--session-id", s.cliSessionId, ...args]);
+});
+
 test("`--continue` has no id to carry: the row waits for the hook to report one", async () => {
   const w = await world();
   const r = run(["claude", "--", "--continue"], w.env());

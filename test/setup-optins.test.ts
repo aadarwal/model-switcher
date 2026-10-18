@@ -5,17 +5,17 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import path from "node:path";
 import { tempHome, stubDir, run } from "./helpers.ts";
 import { installStatusline, removeStatusline } from "../src/setup/statusline.ts";
-import { installAlias, removeAlias, rcPathFor } from "../src/setup/alias.ts";
+import { installAlias, removeAlias, repairAlias, rcPathFor } from "../src/setup/alias.ts";
 import { shellQuote } from "../src/fsx.ts";
 
 const MS = "/opt/homebrew/bin/ms";
 
 /** The exact TEXT of one alias line `installAlias` writes: `msBin` quoted as
- *  its own shell word inside the value, then the whole `<bin> <name>`
+ *  its own shell word inside the value, then the whole `<bin> <name> --`
  *  command quoted again for the rc file — a shell re-parses an alias's body
  *  every time it is USED, after the outer layer has already been stripped
  *  by the rc file's own parse. */
-const aliasLine = (name: "claude" | "codex", bin: string) => `alias ${name}=${shellQuote(`${shellQuote(bin)} ${name}`)}`;
+const aliasLine = (name: "claude" | "codex", bin: string) => `alias ${name}=${shellQuote(`${shellQuote(bin)} ${name} --`)}`;
 
 /** The exact block `installAlias` writes, as a plain string, so a test can
  *  place it anywhere in a fixture file rather than only where install put it. */
@@ -465,6 +465,97 @@ test("installAlias appends to existing rc content, backs it up, and is idempoten
   assert.equal(second.backup, null);
   assert.equal(readFileSync(rc, "utf8"), afterFirst, "an unchanged install never rewrites the file");
   assert.equal(readdirSync(home).filter((f) => f.startsWith(".zshrc.bak-ms-")).length, backupsAfterFirst);
+});
+
+const legacyBlock = (bin: string) => [
+  "# ms-alias-begin",
+  ...["claude", "codex"].map((name) => `alias ${name}=${shellQuote(`${shellQuote(bin)} ${name}`)}`),
+  "# ms-alias-end",
+].join("\n");
+
+test("repairAlias upgrades the legacy block in place, preserves its backup, and is idempotent", () => {
+  const { home } = tempHome();
+  const rc = path.join(home, ".zshrc");
+  const bin = "/Users/it's/ms bin";
+  const original = ["export A=1", legacyBlock(bin), "export B=2", ""].join("\n");
+  writeFileSync(rc, original);
+  const r = repairAlias(rc, bin);
+  assert.equal(r.changed, true, r.problem);
+  assert.equal(readFileSync(r.backup!, "utf8"), original);
+  assert.equal(readFileSync(rc, "utf8"), ["export A=1", installBlock(bin), "export B=2", ""].join("\n"));
+  assert.deepEqual(repairAlias(rc, bin), { changed: false, backup: null });
+});
+
+test("removeAlias still removes a legacy block without changing surrounding bytes", () => {
+  const { home } = tempHome();
+  const rc = path.join(home, ".zshrc");
+  writeFileSync(rc, `export A=1\n${legacyBlock(MS)}\nexport B=2\n`);
+  assert.equal(removeAlias(rc).changed, true);
+  assert.equal(readFileSync(rc, "utf8"), "export A=1\nexport B=2\n");
+});
+
+test("repairAlias never installs aliases when the human has not opted in", () => {
+  const { home } = tempHome();
+  const rc = path.join(home, ".zshrc");
+  assert.deepEqual(repairAlias(rc, MS), { changed: false, backup: null });
+  assert.equal(existsSync(rc), false);
+  const original = "claude() { command claude --resume; }\n";
+  writeFileSync(rc, original);
+  assert.deepEqual(repairAlias(rc, MS), { changed: false, backup: null });
+  assert.equal(readFileSync(rc, "utf8"), original);
+});
+
+test("installAlias refuses existing Claude or Codex functions and aliases without writing or backing up", () => {
+  for (const declaration of [
+    "claude() { command claude; }",
+    "  codex ()\n{ command codex; }",
+    "function claude { command claude; }",
+    "  function codex() { command codex; }",
+    "function claude\n{ command claude; }",
+    "alias claude='wrapper claude'",
+    'alias "codex=wrapper codex"',
+    "builtin alias -- 'claude=wrapper claude'",
+    "alias ll='ls -l' codex='wrapper codex'",
+  ]) {
+    const { home } = tempHome();
+    const rc = path.join(home, ".zshrc");
+    const original = `export A=1\n${declaration}\n`;
+    writeFileSync(rc, original);
+    const r = installAlias(rc, MS);
+    assert.equal(r.changed, false, declaration);
+    assert.equal(r.backup, null);
+    assert.match(r.problem!, /existing (claude|codex) (function|alias)/, declaration);
+    assert.match(r.problem!, /refusing to (shadow|overwrite)/);
+    assert.ok(r.problem!.includes(`${rc}:2:`));
+    assert.equal(readFileSync(rc, "utf8"), original);
+    assert.ok(!readdirSync(home).some((name) => name.includes("bak-ms-")));
+  }
+});
+
+test("existing declarations outside a managed block also prevent an upgrade, but never prevent removal", () => {
+  for (const beforeBlock of [true, false]) {
+    const { home } = tempHome();
+    const rc = path.join(home, ".zshrc");
+    const fn = "claude() { command claude; }";
+    const original = (beforeBlock ? [fn, legacyBlock(MS)] : [legacyBlock(MS), fn]).join("\n");
+    writeFileSync(rc, original);
+    const r = repairAlias(rc, MS);
+    assert.equal(r.changed, false);
+    assert.match(r.problem!, /existing claude function/);
+    assert.equal(readFileSync(rc, "utf8"), original);
+    assert.equal(removeAlias(rc).changed, true);
+    assert.equal(readFileSync(rc, "utf8"), fn);
+  }
+});
+
+test("alias comments and unrelated quoted alias values do not block installation", () => {
+  const { home } = tempHome();
+  const rc = path.join(home, ".zshrc");
+  const original = "# claude() { command claude; }\n# alias codex='wrapper'\nalias help='echo claude=example codex=example'\nalias ls='ls -G' # alias claude=wrapper\n";
+  writeFileSync(rc, original);
+  const r = installAlias(rc, MS);
+  assert.equal(r.changed, true, r.problem);
+  assert.ok(readFileSync(rc, "utf8").startsWith(original));
 });
 
 test("removeAlias leaves the rest of the file byte-identical to before install", () => {

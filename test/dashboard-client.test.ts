@@ -407,7 +407,7 @@ test("accountRowHtml: one lane per window the account reports, percentages round
   assert.ok(html.includes(">12.3%</span>"), html);
   assert.ok(html.includes(">30%</span>"), html);
   // Each lane carries its own reset, in local time.
-  assert.ok(html.includes('<span class="ms-lane-note">resets Sun 09:00</span>'), html);
+  assert.ok(html.includes('<span class="ms-lane-note">resets Sun 20 Sep 09:00</span>'), html);
   // A window with no reset says nothing rather than guessing one: the 5h
   // window here has `resetsAt: null`.
   assert.equal(html.match(/ms-lane-note/g)!.length, 1, html);
@@ -526,9 +526,9 @@ test("providerMark: an inline SVG per provider — no external asset, and the co
   }
 });
 
-test("resetNote: the weekday and the local clock, and silence for a window that never said", () => {
-  assert.equal(resetNote(new Date(2026, 8, 15, 20, 0).toISOString()), "resets Tue 20:00");
-  assert.equal(resetNote(new Date(2026, 8, 20, 9, 5).toISOString()), "resets Sun 09:05");
+test("resetNote: the weekday, the date and the local clock, and silence for a window that never said", () => {
+  assert.equal(resetNote(new Date(2026, 8, 15, 20, 0).toISOString()), "resets Tue 15 Sep 20:00");
+  assert.equal(resetNote(new Date(2026, 8, 20, 9, 5).toISOString()), "resets Sun 20 Sep 09:05");
   assert.equal(resetNote(null), "");
   assert.equal(resetNote(undefined), "");
   assert.equal(resetNote("not a date"), "");

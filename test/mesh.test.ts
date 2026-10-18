@@ -182,11 +182,92 @@ test("meshRows: nothing with room means no ★, and every row is crossed out", (
   assert.match(meshHeader(v)[1], /no account has room/);
 });
 
+test("meshHeader: with no room, it names the soonest reset that brings an account back, with its date", () => {
+  const p = pool();
+  const hours = [30, 7, 52];
+  const full = { ...p.snapshot, accounts: p.snapshot.accounts.map((a, i) => (a.usage ? { ...a, usage: { ...a.usage, weeklyAll: { usedPercent: 100, resetsAt: inHours(hours[i % hours.length]!) } } } : a)) };
+  const v = meshRows({ provider: "claude", need: "any", names: p.names, registry: p.registry, snapshot: full, ready: () => null, sessions: [], now: now() });
+  const soonest = v.rows.map((r) => ({ name: r.name, at: Date.parse(r.usage?.weeklyAll?.resetsAt ?? "") })).filter((x) => Number.isFinite(x.at)).sort((a, b) => a.at - b.at)[0]!;
+  const d = new Date(soonest.at);
+  const label = `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()]} ${d.getDate()} ${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getMonth()]}`;
+  const status = plain(meshHeader(v)[1]);
+  assert.match(status, /^no account has room — next room: /);
+  assert.ok(status.includes(`next room: ${soonest.name} ${label} `), status);
+  assert.match(status, /\(in \d+h \d+m\)/);
+});
+
+test("meshHeader: with room, there is no next-room note", () => {
+  assert.doesNotMatch(plain(meshHeader(view())[1]), /next room/);
+});
+
+for (const scenario of [
+  { title: "a full session waits for its 5h reset", usage: { session: { used: 100, resetIn: 2 } }, need: "any", expected: "alpha", wait: "2h 0m" },
+  { title: "a full session and week both have to reset", usage: { session: { used: 100, resetIn: 52 }, weekly: { used: 100, resetIn: 7 } }, need: "any", expected: "bravo", wait: "1d 12h" },
+  { title: "a full Fable window cannot be cleared by an unblocked week's reset", usage: { weekly: { used: 20, resetIn: 7 }, fable: { used: 100, resetIn: 52 } }, need: "fable", expected: "bravo", wait: "1d 12h" },
+  { title: "a full week and Fable window both have to reset", usage: { weekly: { used: 100, resetIn: 30 }, fable: { used: 100, resetIn: 52 } }, need: "fable", expected: "bravo", wait: "1d 12h" },
+  { title: "an unblocked Fable reset does not clear a full week", usage: { weekly: { used: 100, resetIn: 30 }, fable: { used: 20, resetIn: 7 } }, need: "fable", expected: "alpha", wait: "1d 6h" },
+  { title: "the owner's reserve waits for the week as well as a full Fable window", usage: { weekly: { used: 75, resetIn: 30 }, fable: { used: 100, resetIn: 7 } }, reserve: 30, need: "fable", expected: "alpha", wait: "1d 6h" },
+  { title: "an ordinary run does not wait for a full Fable window", usage: { session: { used: 100, resetIn: 2 }, fable: { used: 100, resetIn: 52 } }, need: "any", expected: "alpha", wait: "2h 0m" },
+] as const) {
+  test(`meshHeader: next room — ${scenario.title}`, () => {
+    const current = now();
+    const registry: Registry = { version: 1, accounts: [account("alpha", { reservePercent: "reserve" in scenario ? scenario.reserve : 0 }), account("bravo")] };
+    const snapshot: Snapshot = {
+      takenAt: current, registryError: null,
+      accounts: [reading("alpha", scenario.usage), reading("bravo", { weekly: { used: 100, resetIn: 36 } })],
+    };
+    const v = meshRows({ provider: "claude", need: scenario.need, names: ["alpha", "bravo"], registry, snapshot, ready: () => null, sessions: [], now: current });
+    const status = plain(meshHeader(v)[1]);
+    assert.ok(status.includes(`next room: ${scenario.expected} `), status);
+    assert.ok(status.includes(`(in ${scenario.wait})`), status);
+  });
+}
+
+for (const scenario of [
+  { title: "missing launch credentials", usage: {}, unready: true },
+  { title: "a rejected usage credential", usage: { error: "unauthorized", errorKind: "auth" } },
+  { title: "a reading too stale for the chooser", usage: { stale: true, observedAt: now() - 20 * 60_000 } },
+  { title: "a missing required session window", usage: { session: null } },
+  { title: "a malformed required Fable window", usage: { fable: { used: Number.NaN, resetIn: 1 } } },
+  { title: "an infinite session percentage", usage: { session: { used: Number.POSITIVE_INFINITY, resetIn: 1 } } },
+  { title: "a full window with no reset", usage: { session: { used: 100, resetIn: null } } },
+  { title: "a full window whose reset is already past", usage: { session: { used: 100, resetIn: -1 } } },
+] as const) {
+  test(`meshHeader: next room excludes ${scenario.title}`, () => {
+    const registry: Registry = { version: 1, accounts: [account("alpha"), account("bravo")] };
+    const snapshot: Snapshot = {
+      takenAt: now(), registryError: null,
+      accounts: [reading("alpha", { weekly: { used: 100, resetIn: 1 }, ...scenario.usage }), reading("bravo", { weekly: { used: 100, resetIn: 36 } })],
+    };
+    const ready: Ready = (name) => name === "alpha" && "unready" in scenario ? { error: "no launch token" } : null;
+    const v = meshRows({ provider: "claude", need: "fable", names: ["alpha", "bravo"], registry, snapshot, ready, sessions: [], now: now() });
+    const status = plain(meshHeader(v)[1]);
+    assert.ok(status.includes("next room: bravo "), status);
+  });
+}
+
+test("meshHeader: no next-room promise when a blocked window has no known future reset", () => {
+  const registry: Registry = { version: 1, accounts: [account("alpha")] };
+  const snapshot: Snapshot = { takenAt: now(), registryError: null, accounts: [reading("alpha", { session: { used: 100, resetIn: null } })] };
+  const v = meshRows({ provider: "claude", need: "any", names: ["alpha"], registry, snapshot, ready: () => null, sessions: [], now: now() });
+  assert.doesNotMatch(plain(meshHeader(v)[1]), /next room/);
+});
+
+test("meshHeader: Codex capacity can return without a reported session window", () => {
+  const current = now();
+  const registry: Registry = { version: 1, accounts: [account("pro", { provider: "codex" })] };
+  const snapshot: Snapshot = { takenAt: current, registryError: null, accounts: [reading("pro", { provider: "codex", session: null, weekly: { used: 100, resetIn: 2 } })] };
+  const v = meshRows({ provider: "codex", need: "any", names: ["pro"], registry, snapshot, ready: () => null, sessions: [], now: current });
+  const status = plain(meshHeader(v)[1]);
+  assert.ok(status.includes("next room: pro "), status);
+  assert.ok(status.includes("(in 2h 0m)"), status);
+});
+
 test("renderRow: columns line up, and Codex has no fable column", () => {
   const v = view();
   const lines = renderRows(v).map(plain);
   // name padded to the widest (charlie), state to the widest (transient).
-  assert.match(lines[0]!, /^★ bravo {4}ok {9}5h {2}95% {2}wk {2}75% {2}fable {2}20% {2}\w{3} \d\d:\d\d$/);
+  assert.match(lines[0]!, /^★ bravo {4}ok {9}5h {2}95% {2}wk {2}75% {2}fable {2}20% {2}\w{3} \d{1,2} \w{3} \d\d:\d\d$/);
   // Every row puts its 5h column in the same place.
   const at = lines.map((l) => l.indexOf(" 5h "));
   assert.ok(at.every((i) => i === at[0]), lines.join("\n"));
@@ -224,7 +305,9 @@ test("renderRow: the resets column is the soonest reset among the windows the ra
   const reset = new Date(Date.parse(inHours(24)!));
   const day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][reset.getDay()];
   // The weekly reset (24 h), not the 5 h window's (2 h): the ranking reads the week.
-  assert.ok(bravo.includes(`${day} ${String(reset.getHours()).padStart(2, "0")}:`), bravo);
+  const mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][reset.getMonth()];
+  // The date, not only the weekday: a weekly reset is days out.
+  assert.ok(bravo.includes(`${day} ${reset.getDate()} ${mon} ${String(reset.getHours()).padStart(2, "0")}:`), bravo);
   assert.ok(bravo.endsWith("2 panes"), bravo);
   const alpha = plain(renderRow(v.rows[1]!, v, rowWidths(v.rows)));
   assert.doesNotMatch(alpha, /pane/, "no panes, no column");
@@ -239,8 +322,8 @@ test("renderPreview: who it is, where it stands, the bars, the resets, what is h
   assert.match(text, /^ Status {4}ok — ★ what `ms claude` would pick now$/m);
   assert.match(text, /^ Rank {6}1 of 3 with room \(need: any\)$/m);
   // The reading was stamped a moment ago, maybe in this same millisecond.
-  assert.match(text, /^ 5h {8}\[█{11}░\] {2}95% {2}resets (\w{3} )?\d\d:\d\d \(in (1h 59m|2h 0m)\)$/m);
-  assert.match(text, /^ Week {6}\[█{9}░{3}\] {2}75% {2}resets \w{3} \d\d:\d\d \(in (23h 59m|1d 0h)\)$/m);
+  assert.match(text, /^ 5h {8}\[█{11}░\] {2}95% {2}resets (\w{3} \d{1,2} \w{3} )?\d\d:\d\d \(in (1h 59m|2h 0m)\)$/m);
+  assert.match(text, /^ Week {6}\[█{9}░{3}\] {2}75% {2}resets \w{3} \d{1,2} \w{3} \d\d:\d\d \(in (23h 59m|1d 0h)\)$/m);
   assert.match(text, /^ Fable {5}\[█{2}░{10}\] {2}20% {2}resets /m);
   assert.match(text, /^ Here {6}launch token on this device ✓$/m);
   assert.match(text, /^ Panes {5}%12 running (~|\/nohome)\/src\/foo$/m);

@@ -615,9 +615,11 @@ never runs the code the canary installed. When it passes against a newer version
 `src/compat.ts`.
 
 The release script refuses a dirty tree, a version that does not match `package.json`, an
-existing tag, or a HEAD on no remote branch. It builds the tarball and prints its sha256;
-`--publish` also creates the GitHub release and commits the rendered formula into a local
-tap checkout. It never pushes.
+existing tag, or a HEAD on no remote branch. It builds the tarball and prints its sha256.
+`--publish` requires a clean tap checkout, creates the GitHub release using the version's
+CHANGELOG section (commit subjects when no section exists), and commits only the rendered
+formula there. Formula commits are unsigned and carry the required Claude, Codex, and Homi
+trailers. It prints the tap push command for the operator to run.
 
 ## Licence
 

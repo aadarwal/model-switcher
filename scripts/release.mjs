@@ -15,7 +15,8 @@
 // `--target <sha>`, which it now always is.
 //
 // `--publish` additionally: creates the GitHub release with `gh release
-// create` (notes are the commit subjects since the previous tag), then
+// create` (notes are the version's CHANGELOG section, or commit subjects
+// since the previous tag when there is no matching section), then
 // renders `packaging/model-switcher.rb` into a local checkout of the tap
 // (`--tap <path>`, default `../homebrew-tap`) with `url`/`sha256`/`version`
 // substituted, and commits it there with the three standard co-author
@@ -41,12 +42,12 @@ export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url
 
 const TARBALL_ENTRIES = ["dist/ms.js", "bin/ms", "bin/resolve-entry.mjs", "package.json", "LICENSE", "README.md"];
 
-// The third trailer is Com8 (the project formerly named HOMI; same GitHub
-// user id 322615700). A tap commit must carry exactly these three, once each.
+// Required repository attribution. A tap commit carries exactly these three,
+// once each, and is unsigned regardless of the maintainer's git defaults.
 const THREE_TRAILERS = [
   "Co-Authored-By: Claude <noreply@anthropic.com>",
   "Co-authored-by: Codex <codex@openai.com>",
-  "Co-authored-by: Com8 <322615700+Com8@users.noreply.github.com>",
+  "Co-authored-by: Homi <322615700+Homi@users.noreply.github.com>",
 ].join("\n");
 
 /** Pure: substitute the formula template's three placeholders. Throws
@@ -99,9 +100,14 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--publish") flags.publish = true;
     else if (a === "--dry-run") flags.dryRun = true;
-    else if (a === "--tap") flags.tap = argv[++i];
+    else if (a === "--tap") {
+      const value = argv[++i];
+      if (!value || value.startsWith("--")) fail("--tap needs a checkout path");
+      flags.tap = value;
+    } else if (a.startsWith("-")) fail(`unknown option ${a}`);
     else positional.push(a);
   }
+  if (positional.length !== 1) fail("provide exactly one release tag (vX.Y.Z)");
   flags.tag = positional[0];
   return flags;
 }
@@ -168,12 +174,38 @@ function previousTag(repoRoot) {
   return tags[0] ?? null;
 }
 
-function releaseNotes(repoRoot) {
+/** The requested version's section, including any subheadings, without
+ * adjacent releases or unreleased entries. */
+export function changelogNotes(changelog, version) {
+  const lines = changelog.split(/\r?\n/);
+  const heading = `## ${version}`;
+  const start = lines.findIndex((line) => line === heading || line.startsWith(`${heading} `));
+  if (start < 0) return null;
+  let end = start + 1;
+  while (end < lines.length && !lines[end].startsWith("## ")) end++;
+  return lines.slice(start + 1, end).join("\n").trim() || null;
+}
+
+function releaseNotes(repoRoot, version) {
+  try {
+    const notes = changelogNotes(readFileSync(path.join(repoRoot, "CHANGELOG.md"), "utf8"), version);
+    if (notes) return notes;
+  } catch { /* older checkouts may have no changelog */ }
   const prev = previousTag(repoRoot);
   const range = prev ? `${prev}..HEAD` : "HEAD";
   const r = git(repoRoot, ["log", range, "--pretty=%s"]);
   if (!r.ok) fail(`git log failed: ${r.stderr}`);
   return r.stdout.trim() || "(no commits)";
+}
+
+/** Never publish first and discover afterwards that the tap is missing or
+ * carries someone else's edits. This is checked again after the build. */
+function requireCleanTap(tapPath) {
+  const root = git(tapPath, ["rev-parse", "--show-toplevel"]);
+  if (!root.ok || realpathSync(root.stdout.trim()) !== realpathSync(tapPath)) fail(`--tap must name a git checkout root: ${tapPath}`);
+  const status = git(tapPath, ["status", "--porcelain"]);
+  if (!status.ok) fail(`cannot inspect tap ${tapPath}: ${status.stderr}`);
+  if (status.stdout.trim()) fail(`tap working tree is dirty — preserve its edits before publishing:\n${status.stdout}`);
 }
 
 function main() {
@@ -182,6 +214,7 @@ function main() {
     fail("usage: release.mjs vX.Y.Z [--publish] [--tap <path>] [--dry-run]");
   }
   const version = tag.slice(1);
+  const tapPath = path.resolve(REPO_ROOT, tap);
 
   const pkg = JSON.parse(readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
   if (version !== pkg.version) {
@@ -225,6 +258,7 @@ function main() {
     if (!onRemote.ok || onRemote.stdout.trim() === "") {
       fail(`HEAD (${head.slice(0, 12)}) is on no remote branch — push it first, or the release would tag a different commit`);
     }
+    requireCleanTap(tapPath);
   }
 
   const build = run("npm", ["run", "build"], { cwd: REPO_ROOT, timeout: 180_000 });
@@ -246,7 +280,8 @@ function main() {
     return;
   }
 
-  const notes = releaseNotes(REPO_ROOT);
+  requireCleanTap(tapPath);
+  const notes = releaseNotes(REPO_ROOT, version);
   const notesDir = mkdtempSync(path.join(tmpdir(), "ms-release-notes-"));
   const notesFile = path.join(notesDir, "notes.md");
   writeFileSync(notesFile, notes + "\n");
@@ -268,7 +303,6 @@ function main() {
   if (!ghResult.ok) fail(`gh release create failed:\n${ghResult.stdout}${ghResult.stderr}`);
   if (ghResult.stdout.trim()) process.stdout.write(ghResult.stdout);
 
-  const tapPath = path.resolve(REPO_ROOT, tap);
   const url = `https://github.com/aadarwal/model-switcher/releases/download/${tag}/${path.basename(tarballPath)}`;
   const template = readFileSync(path.join(REPO_ROOT, "packaging", "model-switcher.rb"), "utf8");
   const rendered = renderFormula(template, { version, url, sha256 });
@@ -280,7 +314,7 @@ function main() {
   if (!add.ok) fail(`git -C ${tapPath} add failed: ${add.stderr}`);
 
   const commitMessage = `model-switcher ${tag}: update formula\n\n${THREE_TRAILERS}`;
-  const commit = git(tapPath, ["-c", "commit.gpgsign=false", "commit", "-m", commitMessage]);
+  const commit = git(tapPath, ["-c", "commit.gpgsign=false", "-c", "anu.coauthors=false", "commit", "--no-gpg-sign", "--only", "-m", commitMessage, "--", "Formula/model-switcher.rb"]);
   if (!commit.ok) fail(`git -C ${tapPath} commit failed: ${commit.stderr}${commit.stdout}`);
 
   process.stdout.write(`release: formula written to ${formulaPath}\n`);

@@ -1496,6 +1496,8 @@ const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 export function flagsForResume(flags: string[]): string[] {
   const out: string[] = [];
   let mayBeAValue = false;
+  let listValues = false;
+  const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools"]);
   // A resume whose id did not follow it directly: flags stood in between
   // (`resume --no-daemon <id>`, Codex's own spelling). The id is still the
   // stored resume's and goes with it — found by its shape, because a flag
@@ -1507,6 +1509,7 @@ export function flagsForResume(flags: string[]): string[] {
     if (idPending && CONVERSATION_ID.test(a)) {
       idPending = false;
       mayBeAValue = false;
+      listValues = false;
       continue;
     }
     // Before the flag/value rules, because `--yolo resume` would otherwise
@@ -1518,14 +1521,16 @@ export function flagsForResume(flags: string[]): string[] {
         else idPending = next !== undefined;
       }
       mayBeAValue = false;
+      listValues = false;
       continue;
     }
     if (a.length > 1 && a.startsWith("-")) {
       out.push(a);
       mayBeAValue = !a.includes("=");
+      listValues = listFlags.has(a.split("=", 1)[0]!);
       continue;
     }
-    if (mayBeAValue) {
+    if (mayBeAValue || listValues) {
       out.push(a);
       mayBeAValue = false;
       continue;

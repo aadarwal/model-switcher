@@ -91,7 +91,7 @@ export const PANES_PER_WINDOW = 4;
  * command line cannot reach the new one.
  */
 export const KEPT_FLAGS: { claude: string[]; codex: string[] } = {
-  claude: ["--model", "--permission-mode", "--dangerously-skip-permissions", "--allowedTools"],
+  claude: ["--model", "--effort", "--permission-mode", "--dangerously-skip-permissions", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools"],
   codex: [
     "--model", "--yolo", "--sandbox", "--ask-for-approval", "--full-auto", "--profile",
     "--dangerously-bypass-approvals-and-sandbox",
@@ -102,8 +102,65 @@ export const KEPT_FLAGS: { claude: string[]; codex: string[] } = {
  *  next flag. None of them can carry a secret — they name a model, a sandbox
  *  policy, an approval mode, a profile or a tool filter. */
 const VALUE_FLAGS = new Set([
-  "--model", "--sandbox", "--ask-for-approval", "--profile", "--permission-mode", "--allowedTools",
+  "--model", "--effort", "--sandbox", "--ask-for-approval", "--profile", "--permission-mode",
 ]);
+
+const LIST_FLAGS = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools"]);
+/** Arbitrary JSON can contain credentials, hooks, relative paths and MCP
+ * executables. Carrying it safely requires a private immutable artifact,
+ * rather than copying it into a public command or dropping it silently. */
+const CONFIG_FLAGS: Record<ImportProvider, Set<string>> = {
+  claude: new Set(["--settings", "--mcp-config", "--strict-mcp-config", "--setting-sources", "--agents", "--agent", "--plugin-dir", "--plugin-url", "--bare", "--restricted"]),
+  codex: new Set(["--config", "-c"]),
+};
+
+function importArguments(provider: ImportProvider, argv: string[] | null): { flags: string[]; refusal: string | null } {
+  // An ambiguous unknown option must not hide a configuration flag. Refuse
+  // conservatively even when the spelling might instead be that option's
+  // literal value; neither interpretation justifies stopping the source.
+  for (const token of argv ?? []) {
+    if (token === "--") break;
+    const name = provider === "codex" && /^-c.+/.test(token) && !token.startsWith("--") ? "-c" : token.split("=", 1)[0]!;
+    if (CONFIG_FLAGS[provider].has(name)) return { flags: [], refusal: `cannot safely preserve ${name} configuration; source process remains untouched; relaunch with reviewed configuration instead` };
+  }
+  const allowed = new Set(KEPT_FLAGS[provider]);
+  const out: string[] = [];
+  for (let i = 0; i < (argv?.length ?? 0); i++) {
+    const token = argv![i]!;
+    if (token === "--") break; // the rest is prompt text, even if it resembles flags
+    if (!token.startsWith("-")) continue;
+    const eq = token.indexOf("=");
+    const name = provider === "codex" && /^-c.+/.test(token) && !token.startsWith("--") ? "-c" : eq < 0 ? token : token.slice(0, eq);
+    if (CONFIG_FLAGS[provider].has(name)) {
+      return { flags: [], refusal: `cannot safely preserve ${name} configuration; source process remains untouched; relaunch with reviewed configuration instead` };
+    }
+    if (!allowed.has(name)) {
+      // Unknown options may take a value, including one that looks like a
+      // known flag. Never promote such a value into the resumed command.
+      if (eq < 0) {
+        if (argv![i + 1]?.startsWith("-")) return { flags: [], refusal: "cannot safely distinguish command options from their values; source process remains untouched; relaunch with reviewed configuration instead" };
+        i++;
+      }
+      continue;
+    }
+    out.push(token);
+    if (LIST_FLAGS.has(name)) {
+      if (eq < 0 && (argv![i + 1] === undefined || argv![i + 1]!.startsWith("-"))) return { flags: [], refusal: `cannot safely preserve ${name} without its values; source process remains untouched` };
+      while (argv![i + 1] !== undefined && !argv![i + 1]!.startsWith("-")) out.push(argv![++i]!);
+    } else if (eq < 0 && VALUE_FLAGS.has(name)) {
+      const next = argv![i + 1];
+      if (next === undefined || next.startsWith("-")) return { flags: [], refusal: `cannot safely preserve ${name} without its value; source process remains untouched` };
+      out.push(argv![++i]!);
+    }
+  }
+  return { flags: out, refusal: null };
+}
+
+/** A value-free preflight, also run against current argv before signalling
+ * an old plan's PID. A previous importer may already have stripped its config. */
+export function configurationRefusal(provider: ImportProvider, argv: string[] | null): string | null {
+  return importArguments(provider, argv).refusal;
+}
 
 /**
  * The flags of `argv` this tool will carry into the new pane.
@@ -114,25 +171,7 @@ const VALUE_FLAGS = new Set([
  * a bare word, and a bare word is never kept.
  */
 export function keptFlags(provider: ImportProvider, argv: string[] | null): string[] {
-  if (!argv) return [];
-  const allowed = new Set(KEPT_FLAGS[provider]);
-  const out: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    const token = argv[i]!;
-    if (!token.startsWith("--")) continue; // a positional, or a dropped flag's value
-    const eq = token.indexOf("=");
-    const name = eq < 0 ? token : token.slice(0, eq);
-    if (!allowed.has(name)) continue;
-    out.push(token);
-    if (eq < 0 && VALUE_FLAGS.has(name)) {
-      const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("-")) {
-        out.push(next);
-        i++;
-      }
-    }
-  }
-  return out;
+  return importArguments(provider, argv).flags;
 }
 
 /**
@@ -201,7 +240,7 @@ function skipReason(c: Candidate): string | null {
   if (c.inTmux) return "in tmux";
   if (c.managed) return "already managed";
   if (c.id === "") return "live, no conversation found";
-  return null;
+  return configurationRefusal(c.provider, c.argv);
 }
 
 /**

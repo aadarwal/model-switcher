@@ -157,7 +157,7 @@ function namesBareClaudeResume(args: string[]): boolean {
 }
 
 /**
- * `ms <cli> [mesh] [--as name] [--need any|fable] [--continue] [-- <cli args>]`.
+ * `ms <cli> [mesh|--mesh] [--as name] [--need any|fable] [--continue] [-- <cli args>]`.
  *
  * `--` is the boundary, and it is a hard one: everything after it is the
  * user's own command line for the CLI and passes through untouched, and
@@ -166,7 +166,7 @@ function namesBareClaudeResume(args: string[]): boolean {
  * the CLI). `cli` appears only in that refusal, so the human is told where
  * their own argument belongs in the command they actually typed.
  *
- * `mesh` is the one bare word on our side of it: pick the account by hand
+ * `mesh` (also `--mesh`) on our side picks the account by hand
  * (src/mesh.ts). It is the whole of the choice, so it cannot be said twice
  * or beside `--as`, which is a choice already made. After `--` it is the
  * CLI's own argument like any other.
@@ -187,14 +187,14 @@ export function parseLaunchArgs(argv: string[], cli = "claude"): Parsed | { erro
     const a = argv[i]!;
     if (a === "--") { args.push(...argv.slice(i + 1)); break; }
     if (a === "--continue") { continueAfter = true; continue; }
-    if (a === "mesh") {
+    if (a === "mesh" || a === "--mesh") {
       if (mesh) return { error: "mesh is given twice" };
       mesh = true;
       continue;
     }
     if (a === "--as" || a.startsWith("--as=")) {
       const v = a.startsWith("--as=") ? a.slice("--as=".length) : argv[++i];
-      if (!v) return { error: "--as needs an account name" };
+      if (!v || v.startsWith("-")) return { error: "--as needs an account name" };
       as = v;
       continue;
     }
@@ -205,7 +205,10 @@ export function parseLaunchArgs(argv: string[], cli = "claude"): Parsed | { erro
       need = parsed;
       continue;
     }
-    return { error: `unexpected argument ${JSON.stringify(a)} — put ${cli}'s own arguments after --` };
+    const pickerHint = mesh || argv.includes("mesh") || argv.includes("--mesh")
+      ? `; choose an account with ms ${cli} mesh -- <${cli} args> (or ms ${cli} --mesh -- <${cli} args>)`
+      : "";
+    return { error: `unexpected argument ${JSON.stringify(a)} — put ${cli}'s own arguments after --${pickerHint}` };
   }
   if (mesh && as !== null) return { error: "mesh chooses the account; drop --as or drop mesh" };
   // `--session-id` is how the launch keeps its grip on the CLI session across

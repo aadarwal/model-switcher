@@ -523,9 +523,11 @@ test("a bad --need, and claude args not behind --, are usage errors", async () =
   assert.equal(loose.code, 2);
   assert.match(loose.stderr, /unexpected argument "--model" — put claude's own arguments after --/);
 
-  const dangling = run(["claude", "--as"], w.env());
-  assert.equal(dangling.code, 2);
-  assert.match(dangling.stderr, /^ms claude: --as needs an account name$/m);
+  for (const args of [["--as"], ["--as", "--mesh"], ["--as=--mesh"], ["--as", "--"]]) {
+    const dangling = run(["claude", ...args], w.env());
+    assert.equal(dangling.code, 2);
+    assert.match(dangling.stderr, /^ms claude: --as needs an account name$/m);
+  }
 
   const st = await readState(w);
   assert.equal(st.sessions.length, 0);
@@ -1321,16 +1323,75 @@ const fzfArgsOf = (w: World): string[] | null => {
 const tmuxActed = (w: World): string[] =>
   existsSync(w.log) ? logLines(w).filter((l) => /respawn-pane|set-option|set-hook|new-session|new-window/.test(l)) : [];
 
-test("parseLaunchArgs: `mesh` before -- is the picker, once, and never beside --as; after -- it is the CLI's", async () => {
+test("parseLaunchArgs: mesh and --mesh before -- choose the picker, once, and never beside --as", async () => {
   const { parseLaunchArgs } = await import("../src/launch.ts");
   assert.deepEqual(parseLaunchArgs(["mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: [] });
+  assert.deepEqual(parseLaunchArgs(["--mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: [] });
   assert.deepEqual(parseLaunchArgs(["--need", "fable", "mesh", "--", "x"]), { as: null, need: "fable", continueAfter: false, mesh: true, args: ["x"] });
+  assert.deepEqual(parseLaunchArgs(["--need", "fable", "--mesh", "--", "x"]), { as: null, need: "fable", continueAfter: false, mesh: true, args: ["x"] });
   assert.deepEqual(parseLaunchArgs(["--", "mesh"]), { as: null, need: null, continueAfter: false, mesh: false, args: ["mesh"] });
+  assert.deepEqual(parseLaunchArgs(["--", "--mesh", "--yolo", "mesh"], "codex"), { as: null, need: null, continueAfter: false, mesh: false, args: ["--mesh", "--yolo", "mesh"] });
   assert.deepEqual(parseLaunchArgs(["mesh", "--", "mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: ["mesh"] });
+  assert.deepEqual(parseLaunchArgs(["--mesh", "--", "--mesh", "mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: ["--mesh", "mesh"] });
   assert.deepEqual(parseLaunchArgs(["--as", "mesh"]), { as: "mesh", need: null, continueAfter: false, mesh: false, args: [] }, "an account may be called mesh");
+  assert.deepEqual(parseLaunchArgs(["--as", "--mesh"]), { error: "--as needs an account name" });
+  assert.deepEqual(parseLaunchArgs(["--as=--mesh"]), { error: "--as needs an account name" });
   assert.deepEqual(parseLaunchArgs(["mesh", "--as", "work"]), { error: "mesh chooses the account; drop --as or drop mesh" });
+  assert.deepEqual(parseLaunchArgs(["--mesh", "--as", "work"]), { error: "mesh chooses the account; drop --as or drop mesh" });
   assert.deepEqual(parseLaunchArgs(["--as=work", "mesh"]), { error: "mesh chooses the account; drop --as or drop mesh" });
-  assert.deepEqual(parseLaunchArgs(["mesh", "mesh"]), { error: "mesh is given twice" });
+  assert.deepEqual(parseLaunchArgs(["--as=work", "--mesh"]), { error: "mesh chooses the account; drop --as or drop mesh" });
+  for (const pair of [["mesh", "mesh"], ["mesh", "--mesh"], ["--mesh", "mesh"], ["--mesh", "--mesh"]]) {
+    assert.deepEqual(parseLaunchArgs(pair), { error: "mesh is given twice" });
+  }
+});
+
+test("the reported Codex picker command gives a correction before any picker or launch", async () => {
+  const w = await codexWorld([{ name: "home" }]);
+  const r = run(["codex", "--yolo", "--", "--mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "home" }));
+  assert.equal(r.code, 2, r.stderr);
+  assert.match(r.stderr, /unexpected argument "--yolo" — put codex's own arguments after --/);
+  assert.match(r.stderr, /ms codex mesh -- <codex args> \(or ms codex --mesh -- <codex args>\)/);
+  assert.equal(fzfArgsOf(w), null);
+  assert.deepEqual(tmuxActed(w), []);
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
+test("both Codex picker spellings preserve an explicitly supplied --yolo option", async () => {
+  for (const picker of ["mesh", "--mesh"]) {
+    const w = await codexWorld([{ name: "home", weekly: 10 }, { name: "work", weekly: 80 }]);
+    const r = run(["codex", picker, "--", "--yolo"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+    assert.equal(r.code, 0, `${picker}: ${r.stderr}`);
+    assert.ok(fzfArgsOf(w), "the account picker ran");
+    const st = await readState(w, launchIdOf(w));
+    assert.equal(st.sessions[0]!.account, "work");
+    assert.equal(st.sessions[0]!.pinnedAccount, "work");
+    assert.deepEqual(st.sessions[0]!.flags, ["--yolo"]);
+    assert.deepEqual(st.launch!.command, ["codex", "--yolo"]);
+  }
+});
+
+test("ms claude --mesh launches and pins the picked account with its provider arguments", async () => {
+  const w = await world();
+  const r = run(["claude", "--mesh", "--", "hello"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(fzfArgsOf(w));
+  const st = await readState(w, launchIdOf(w));
+  assert.equal(st.sessions[0]!.account, "work");
+  assert.equal(st.sessions[0]!.pinnedAccount, "work");
+  assert.deepEqual(st.sessions[0]!.flags, ["hello"]);
+  assert.deepEqual(st.launch!.command, ["claude", "--session-id", st.sessions[0]!.cliSessionId, "hello"]);
+});
+
+test("--mesh after the boundary remains a provider argument and never opens the picker", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }, { name: "work", weekly: 80 }]);
+  const r = run(["codex", "--", "--mesh", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fzfArgsOf(w), null);
+  const st = await readState(w, launchIdOf(w));
+  assert.equal(st.sessions[0]!.account, "home");
+  assert.equal(st.sessions[0]!.pinnedAccount, null);
+  assert.deepEqual(st.sessions[0]!.flags, ["--mesh", "mesh"]);
+  assert.deepEqual(st.launch!.command, ["codex", "--mesh", "mesh"]);
 });
 
 test("ms claude mesh: the account picked by hand is launched and pinned — and never remembered as the chooser's pick", async () => {

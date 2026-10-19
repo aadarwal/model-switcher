@@ -38,15 +38,15 @@ ms codex
 ### Launch
 
 ```
-ms claude [mesh] [--as <account>] [--need any|fable] [--continue] [-- <claude args>]
-ms codex  [mesh] [--as <account>] [--need any|fable] [--continue] [-- <codex args>]
+ms claude [mesh|--mesh] [--as <account>] [--need any|fable] [--continue] [-- <claude args>]
+ms codex  [mesh|--mesh] [--as <account>] [--need any|fable] [--continue] [-- <codex args>]
 ms adopt  <rollout-id|path> [--as <account>] [--continue] [-- <codex args>]
 ms attach [session]
 ```
 
 - `ms claude` / `ms codex` — pick an account with room and start that CLI in the current tmux pane under the account's credential. Everything after `--` goes to the CLI unchanged.
 - `--as <account>` — use the named account instead of choosing one. `--need fable` — also require room in the Fable window; `ms codex` rejects it, because Codex reports no such window.
-- `mesh` — choose the account yourself, in a picker showing the chooser's own ranking, and pin the session to it until its first wall. See [picking by hand](#picking-by-hand-mesh). It does not combine with `--as`; after `--` it is the CLI's own argument.
+- `mesh` / `--mesh` — choose the account yourself, in a picker showing the chooser's own ranking, and pin the session to it until its first wall. See [picking by hand](#picking-by-hand-mesh). It does not combine with `--as`; after `--` either spelling is the CLI's own argument.
 - `--continue` — for a resume you drove yourself (`ms codex --continue -- resume <id>`, `ms claude --continue -- --resume <id>`): hand the resumed conversation the same continuation a rotation sends, as the command line's own prompt. Refused when there is nothing to continue.
 - **A launch that resumes is given no `--session-id`.** `--session-id` makes a conversation, so on a command line that already names one (`--resume <id>`, `-r <id>`, `--resume=<id>`, `--continue`/`-c`) `ms` passes your command line through untouched and records the id it names — Claude Code's own SessionStart confirms it, exactly as it does after a rotation's `--resume` relaunch. `ms claude --continue -- --resume <id>` is the path **`ms import`** resumes every Claude conversation through. Still to be checked against a live Claude Code; if that pairing misbehaves, `ms rotate` / `ms switch --continue` remain the verified way to move a Claude session `ms` already manages.
 - `ms adopt` — take over a **Codex** conversation `ms` did not start, so it can be rotated like any other. See [rescuing a pane you didn't start with ms](#rescuing-a-pane-you-didnt-start-with-ms).
@@ -406,6 +406,19 @@ you choose. In a tmux pane it opens as a popup (fzf 0.53 or later); anywhere els
 the terminal — and so it does in a pane whose session no client is attached to, or one
 watched through a control-mode client (`tmux -C`, iTerm2's tmux integration), which cannot
 draw a popup.
+
+`--mesh` is an equivalent spelling before `--`. Keep the picker on that side and
+your provider arguments after the separator. For example, to pick a Codex account
+while passing your chosen `--yolo` option:
+
+```sh
+ms codex mesh -- --yolo
+ms codex --mesh -- --yolo
+```
+
+`ms codex --yolo -- --mesh` puts the arguments on the wrong sides: `--yolo` is a
+Codex option, while the account picker belongs to `ms`. The separator is a hard
+boundary: a `mesh` or `--mesh` after it passes to the provider unchanged.
 
 - **Rows.** One per account: `★` on the account a plain `ms claude` would pick right now
   (when no usage can be read, that is the pick it remembers), `✗` on one it cannot use (out

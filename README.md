@@ -365,6 +365,15 @@ moved even though the process cannot. That is what **`ms import`** does, in one 
    `#{pane_current_command}` too, so a pane back at a shell is `resume failed:` with the
    line the command printed, seconds in rather than a minute.
 
+Imports preserve Claude effort and complete allow/deny tool lists, including later
+account rotations. Sessions with explicit settings, MCP configuration, custom agents
+or plugins, or restricted/bare configuration are refused before their process is
+stopped: these may contain credentials or depend on configuration that cannot yet be
+carried safely. Codex `-c`/`--config` overrides are refused for the same reason. The
+manifest names the unsupported option without recording its value. Review the source
+configuration and relaunch it explicitly instead. This preserves import behavior; it
+does not establish formal governance or an enforced model floor.
+
 Every run writes a manifest — `MS_HOME/imports/<timestamp>.json`, 0600, rewritten after
 every step — and that file is the record to fall back on: each row names the conversation,
 its directory, the process it was planned against, where it went and what became of it
@@ -615,9 +624,11 @@ never runs the code the canary installed. When it passes against a newer version
 `src/compat.ts`.
 
 The release script refuses a dirty tree, a version that does not match `package.json`, an
-existing tag, or a HEAD on no remote branch. It builds the tarball and prints its sha256;
-`--publish` also creates the GitHub release and commits the rendered formula into a local
-tap checkout. It never pushes.
+existing tag, or a HEAD on no remote branch. It builds the tarball and prints its sha256.
+`--publish` requires a clean tap checkout, creates the GitHub release using the version's
+CHANGELOG section (commit subjects when no section exists), and commits only the rendered
+formula there. Formula commits are unsigned and carry the required Claude, Codex, and Homi
+trailers. It prints the tap push command for the operator to run.
 
 ## Licence
 

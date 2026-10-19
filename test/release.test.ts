@@ -11,12 +11,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import { stubDir, tempHome } from "./helpers.ts";
-import { renderFormula, REPO_ROOT as REAL_REPO_ROOT } from "../scripts/release.mjs";
+import { changelogNotes, renderFormula, REPO_ROOT as REAL_REPO_ROOT } from "../scripts/release.mjs";
 import { resolveOnPath } from "../src/exec.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -32,7 +33,7 @@ assert.equal(REAL_REPO_ROOT, REAL_REPO);
 // every git commit in these tests — including the ones scripts/release.mjs
 // itself makes — would go through that hook too, and it would silently
 // paper over a release.mjs that got a trailer wrong (proven live: mutating
-// the Com8 trailer's email here without this override still left the commit
+// a trailer's email here without this override still left the commit
 // with a correct line, added by the ambient hook, not by the code under
 // test). Isolating HOME is what makes the trailer assertions below actually
 // prove something about this script rather than about this machine.
@@ -46,12 +47,13 @@ const GIT_ENV = { HOME: GIT_HOME, GIT_AUTHOR_NAME: "Test", GIT_AUTHOR_EMAIL: "te
  *  `test/` and `.superpowers/` directory so the "not in the tarball"
  *  assertions are proving something, and its own from-scratch git history
  *  so `git status`/`git log` are real. */
-function makeFixture(): string {
+function makeFixture(changelog?: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), "ms-release-fixture-"));
-  for (const entry of ["bin", "src", "scripts", "packaging", "test", "package.json", "package-lock.json", "README.md", "LICENSE", "tsconfig.json", ".gitignore"]) {
+  for (const entry of ["bin", "src", "scripts", "packaging", "test", "package.json", "package-lock.json", "README.md", "CHANGELOG.md", "LICENSE", "tsconfig.json", ".gitignore"]) {
     const from = path.join(REAL_REPO, entry);
     if (existsSync(from)) execFileSync("cp", ["-R", from, path.join(dir, entry)]);
   }
+  if (changelog !== undefined) writeFileSync(path.join(dir, "CHANGELOG.md"), changelog);
   // The cases below name `v0.1.0` throughout: pin the fixture's package.json
   // (and lock) to that version, so the real repo's version can move on a
   // release without touching every assertion here.
@@ -121,10 +123,42 @@ function sha256Hex(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/** Read physical tar headers rather than asking bsdtar to list them: on
+ * macOS it silently folds AppleDouble members into their adjacent files.
+ * Keep extended/PAX headers in the result too, so the six-entry assertion
+ * checks the actual portable archive, including metadata. */
+function physicalTarEntries(file: string): { name: string; mode: number; type: string }[] {
+  const bytes = gunzipSync(readFileSync(file));
+  const entries: { name: string; mode: number; type: string }[] = [];
+  const text = (header: Buffer, start: number, length: number): string =>
+    header.subarray(start, start + length).toString("utf8").replace(/\0.*$/s, "").trim();
+  let offset = 0;
+  while (offset + 512 <= bytes.length) {
+    const header = bytes.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const checksum = Number.parseInt(text(header, 148, 8), 8);
+    const actual = header.reduce((sum, byte, index) => sum + (index >= 148 && index < 156 ? 32 : byte), 0);
+    assert.equal(checksum, actual, `invalid tar checksum at byte ${offset}`);
+    const prefix = text(header, 345, 155);
+    const name = text(header, 0, 100);
+    const size = Number.parseInt(text(header, 124, 12), 8);
+    assert.ok(Number.isSafeInteger(size) && size >= 0 && offset + 512 + size <= bytes.length, `invalid tar size for ${name}`);
+    entries.push({ name: prefix ? `${prefix}/${name}` : name, mode: Number.parseInt(text(header, 100, 8), 8), type: header.subarray(156, 157).toString() });
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  assert.ok(entries.length > 0, "archive contains no tar headers");
+  return entries;
+}
+
 // --- --dry-run: tarball contents and layout -------------------------------
 
 test("--dry-run produces the tarball with exactly the six entries", () => {
   const dir = makeFixture();
+  if (process.platform === "darwin") {
+    // A deterministic reproduction even on a checkout with no ambient xattrs.
+    // Extended attributes do not change the committed README's contents.
+    execFileSync("/usr/bin/xattr", ["-w", "com.model-switcher.release-test", "must not ship", path.join(dir, "README.md")]);
+  }
   const r = runRelease(dir, ["v0.1.0", "--dry-run"]);
   assert.equal(r.status, 0, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
 
@@ -136,7 +170,8 @@ test("--dry-run produces the tarball with exactly the six entries", () => {
   // /private/var for the OS temp dir) — `dir` itself is the unresolved form.
   assert.equal(realpathSync(path.dirname(tarballPath)), realpathSync(path.join(dir, "release")));
 
-  const listing = execFileSync("tar", ["-tzf", tarballPath], { encoding: "utf8" }).trim().split("\n").sort();
+  const entries = physicalTarEntries(tarballPath);
+  const listing = entries.map((entry) => entry.name).sort();
   const expected = [
     "model-switcher-v0.1.0/LICENSE",
     "model-switcher-v0.1.0/README.md",
@@ -145,7 +180,12 @@ test("--dry-run produces the tarball with exactly the six entries", () => {
     "model-switcher-v0.1.0/dist/ms.js",
     "model-switcher-v0.1.0/package.json",
   ].sort();
-  assert.deepEqual(listing, expected, `tar -tzf listing:\n${listing.join("\n")}`);
+  assert.deepEqual(listing, expected, `physical tar headers:\n${listing.join("\n")}`);
+  for (const entry of entries) {
+    assert.ok(entry.type === "0" || entry.type === "\0", `non-file archive entry: ${entry.name}`);
+    const relative = entry.name.slice("model-switcher-v0.1.0/".length);
+    assert.equal(entry.mode & 0o7777, statSync(path.join(dir, relative)).mode & 0o7777, `file mode changed for ${relative}`);
+  }
 
   for (const forbidden of ["src/", "test/", ".superpowers/", "node_modules/"]) {
     assert.ok(!listing.some((l) => l.includes(forbidden)), `should not contain ${forbidden}: ${listing.join(", ")}`);
@@ -181,6 +221,32 @@ test("a version that does not match package.json is refused", () => {
   assert.match(r.stderr, /version/i);
   assert.match(r.stderr, /0\.1\.0/);
   assert.ok(!existsSync(path.join(dir, "release")), "must refuse before building anything");
+});
+
+test("unknown flags, missing tap paths, and extra release tags refuse before publication or building", () => {
+  const dir = makeFixture();
+  const gh = stubDir();
+  const ghLog = path.join(gh.dir, "gh.log");
+  gh.stub("gh", `echo called >> '${ghLog}'`);
+  for (const args of [
+    ["v0.1.0", "--publish", "--dry-runn"],
+    ["v0.1.0", "--tap"],
+    ["v0.1.0", "--tap", "--dry-run"],
+    ["v0.1.0", "v0.2.0"],
+  ]) {
+    const r = runRelease(dir, args, { PATH: `${gh.dir}:${process.env.PATH}` });
+    assert.equal(r.status, 1, JSON.stringify(args));
+    assert.match(r.stderr, /unknown option|needs a checkout path|exactly one release tag/);
+    assert.ok(!existsSync(path.join(dir, "release")));
+    assert.ok(!existsSync(ghLog));
+  }
+});
+
+test("changelog notes contain only the requested release's body and subheadings", () => {
+  const text = "# Changelog\n\n## Unreleased\n\n- future\n\n## 0.4.0 — 2026-10-18\n\n### Fixed\n\n- shipped\n\n## 0.3.15\n\n- old\n";
+  assert.equal(changelogNotes(text, "0.4.0"), "### Fixed\n\n- shipped");
+  assert.equal(changelogNotes(text, "0.4.1"), null);
+  assert.equal(changelogNotes("## 0.4.01\n- different\n", "0.4.0"), null);
 });
 
 // --- renderFormula (pure) ---------------------------------------------------
@@ -248,14 +314,44 @@ test("two builds of the same commit, seconds apart, are byte-identical", () => {
 
 // --- --publish ---------------------------------------------------------------
 
-test("--publish records `gh release create`, writes+commits the formula into the tap, and only prints (never runs) the push", () => {
+test("missing or dirty tap checkouts refuse before building or calling gh, preserving staged edits", () => {
   const dir = makeFixture();
+  const gh = stubDir();
+  const ghLog = path.join(gh.dir, "gh.log");
+  gh.stub("gh", `echo called >> '${ghLog}'`);
+  const env = { ...process.env, ...GIT_ENV };
+  for (const state of ["not-a-checkout", "untracked", "staged"]) {
+    const tap = mkdtempSync(path.join(tmpdir(), "ms-release-tap-preflight-"));
+    let before = "";
+    if (state !== "not-a-checkout") {
+      execFileSync("git", ["init", "-q"], { cwd: tap, env });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "tap init"], { cwd: tap, env });
+      writeFileSync(path.join(tap, "unrelated.txt"), "keep this work\n");
+      if (state === "staged") execFileSync("git", ["add", "unrelated.txt"], { cwd: tap, env });
+      before = execFileSync("git", ["status", "--porcelain"], { cwd: tap, env, encoding: "utf8" });
+    }
+    const r = runRelease(dir, ["v0.1.0", "--publish", "--tap", tap], { PATH: `${gh.dir}:${process.env.PATH}` });
+    assert.equal(r.status, 1, state);
+    assert.match(r.stderr, /checkout root|tap working tree is dirty/);
+    assert.ok(!existsSync(ghLog));
+    assert.ok(!existsSync(path.join(dir, "release")));
+    assert.ok(!existsSync(path.join(tap, "Formula", "model-switcher.rb")));
+    if (state !== "not-a-checkout") {
+      assert.equal(readFileSync(path.join(tap, "unrelated.txt"), "utf8"), "keep this work\n");
+      assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: tap, env, encoding: "utf8" }), before);
+    }
+  }
+});
+
+test("--publish records `gh release create`, writes+commits the formula into the tap, and only prints (never runs) the push", () => {
+  const dir = makeFixture("# Changelog\n\n## Unreleased\n- later\n\n## 0.1.0\n- release behavior\n\n## 0.0.9\n- older behavior\n");
   const realGit = resolveOnPath("git");
   assert.ok(realGit, "git must be resolvable on PATH for this test to forward to it");
 
   const gh = stubDir();
   const ghLog = path.join(gh.dir, "gh.log");
-  gh.stub("gh", `echo "$@" >> "${ghLog}"\nexit 0\n`);
+  const notesLog = path.join(gh.dir, "notes.md");
+  gh.stub("gh", `echo "$@" >> "${ghLog}"\nprevious=''; for arg in "$@"; do if [ "$previous" = '--notes-file' ]; then cat "$arg" > "$MS_TEST_RELEASE_NOTES"; fi; previous="$arg"; done\nexit 0\n`);
 
   // A forwarding stub: every `git` invocation (by the release script,
   // against BOTH the source repo and the tap) is logged here, then handed
@@ -269,15 +365,22 @@ test("--publish records `gh release create`, writes+commits the formula into the
   const env = { ...process.env, ...GIT_ENV };
   execFileSync("git", ["init", "-q"], { cwd: tap, env });
   execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "tap init"], { cwd: tap, env });
+  // Maintainer defaults must not sign a tap update or append a fourth
+  // attribution trailer. Preserve hooks, using their supported scoped opt-out.
+  execFileSync("git", ["config", "commit.gpgsign", "true"], { cwd: tap, env });
+  execFileSync("git", ["config", "gpg.program", "/no-such-ms-release-signer"], { cwd: tap, env });
+  writeFileSync(path.join(tap, ".git", "hooks", "prepare-commit-msg"), '#!/bin/sh\n[ "$(git config --get anu.coauthors)" = false ] && exit 0\nprintf "\\nCo-authored-by: Com8 <322615700+Com8@users.noreply.github.com>\\n" >> "$1"\n', { mode: 0o755 });
 
   const r = runRelease(dir, ["v0.1.0", "--publish", "--tap", tap], {
     PATH: `${gh.dir}:${gitStub.dir}:${process.env.PATH}`,
+    MS_TEST_RELEASE_NOTES: notesLog,
     ...GIT_ENV,
   });
   assert.equal(r.status, 0, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
 
   const ghCalls = readFileSync(ghLog, "utf8").trim().split("\n");
   assert.ok(ghCalls.some((l) => l.startsWith("release create v0.1.0") && l.includes("--notes-file")), ghCalls.join("\n"));
+  assert.equal(readFileSync(notesLog, "utf8"), "- release behavior\n");
 
   const formulaPath = path.join(tap, "Formula", "model-switcher.rb");
   assert.ok(existsSync(formulaPath));
@@ -288,10 +391,11 @@ test("--publish records `gh release create`, writes+commits the formula into the
   const commitBody = execFileSync(realGit, ["-C", tap, "log", "-1", "--format=%B"], { encoding: "utf8", env: { ...process.env, ...GIT_ENV } });
   assert.match(commitBody, /Co-Authored-By: Claude <noreply@anthropic\.com>/);
   assert.match(commitBody, /Co-authored-by: Codex <codex@openai\.com>/);
-  assert.match(commitBody, /Co-authored-by: Com8 <322615700\+Com8@users\.noreply\.github\.com>/);
-  // Exactly the three, once each: the pre-rename Homi line must not come back.
-  assert.doesNotMatch(commitBody, /Homi/);
+  assert.match(commitBody, /Co-authored-by: Homi <322615700\+Homi@users\.noreply\.github\.com>/);
+  assert.doesNotMatch(commitBody, /Com8/);
   assert.equal((commitBody.match(/^Co-authored-by: /gim) ?? []).length, 3, commitBody);
+  const commitObject = execFileSync(realGit, ["-C", tap, "cat-file", "-p", "HEAD"], { encoding: "utf8", env });
+  assert.doesNotMatch(commitObject, /^gpgsig /m);
 
   assert.match(r.stdout, new RegExp(`git -C ${tap.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} push`));
 

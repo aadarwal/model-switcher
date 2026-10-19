@@ -40,7 +40,7 @@ import { spawnSync } from "node:child_process";
 import { msBinary } from "../paths.ts";
 import { defaultPs, providerOfArgv, type Candidate, type ProcessRow } from "./scan.ts";
 import { shellQuote, type Tmux } from "../tmux.ts";
-import type { Plan, PaneSpec } from "./plan.ts";
+import { configurationRefusal, keptFlags, type Plan, type PaneSpec } from "./plan.ts";
 import {
   OUTCOME_PLANNED, OUTCOME_STOPPED, candidateFields, killedOutcome, readManifest, resumeFailed, resumedOutcome,
   stopFailed, stopRefused, targetName, writeManifest, type Manifest, type ManifestRow, type ManifestTarget,
@@ -312,14 +312,22 @@ async function waitGone(pid: number, budgetMs: number, deps: ExecuteDeps): Promi
  * human can re-run the scan — which is not true of a SIGKILL sent to the wrong
  * process.
  */
-function sameProcess(c: Candidate, deps: ExecuteDeps): { ok: true } | { ok: false; why: string } {
+function sameProcess(c: Candidate, plannedFlags: string[], deps: ExecuteDeps): { ok: true } | { ok: false; why: string } {
   const pid = c.pid!;
   if (c.startedAt === null) return { ok: false, why: `pid ${pid} has no recorded start time to check against` };
   const table = (deps.ps ?? defaultPs)();
   const row = table.find((r) => r.pid === pid);
   if (!row) return { ok: false, why: `pid ${pid} is not in the process table any more` };
   const stranger = Math.abs(row.startedAt - c.startedAt) > 1000 || providerOfArgv(row.argv) !== c.provider;
-  return stranger ? { ok: false, why: `pid ${pid} is not the process the plan recorded` } : { ok: true };
+  if (stranger) return { ok: false, why: `pid ${pid} is not the process the plan recorded` };
+  const config = configurationRefusal(c.provider, row.argv);
+  if (config) return { ok: false, why: config };
+  // Older manifests may have discarded flags we now preserve. The approved
+  // command must still carry the live process's policy before it is stopped.
+  if (JSON.stringify(keptFlags(c.provider, row.argv)) !== JSON.stringify(plannedFlags)) {
+    return { ok: false, why: "current launch options differ from the saved plan; source process remains untouched; run a new import scan" };
+  }
+  return { ok: true };
 }
 
 /**
@@ -346,10 +354,10 @@ function sameProcess(c: Candidate, deps: ExecuteDeps): { ok: true } | { ok: fals
  * once the parent is gone its children are reparented and the link that names
  * them is lost, and it is signalled leaves first for the same reason.
  */
-async function stopProcess(c: Candidate, deps: ExecuteDeps): Promise<{ ok: true; forced: boolean; killed: number[] } | { ok: false; refused: boolean; why: string }> {
+async function stopProcess(c: Candidate, plannedFlags: string[], deps: ExecuteDeps): Promise<{ ok: true; forced: boolean; killed: number[] } | { ok: false; refused: boolean; why: string }> {
   const pid = c.pid!;
   if (!deps.alive(pid)) return { ok: true, forced: false, killed: [] }; // it left while we were planning
-  const same = sameProcess(c, deps);
+  const same = sameProcess(c, plannedFlags, deps);
   if (!same.ok) return { ok: false, refused: true, why: same.why };
   if (!deps.kill(pid, "SIGTERM") && deps.alive(pid)) return { ok: false, refused: false, why: `could not signal pid ${pid}` };
   if (await waitGone(pid, termMs(), deps)) return { ok: true, forced: false, killed: [] };
@@ -410,22 +418,37 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
     for (const window of session.windows) {
       for (const pane of window.panes) {
         const c = pane.candidate;
+        const separator = pane.command.indexOf("--");
+        const config = configurationRefusal(c.provider, c.argv)
+          ?? configurationRefusal(c.provider, separator < 0 ? pane.command : pane.command.slice(separator + 1));
         const target: ManifestTarget = { session: pane.session, window: pane.window, pane: pane.index, paneId: null, paneIndex: null };
         let row = byKey.get(rowKey(c.provider, c.id, target));
         if (!row) {
           row = {
             ...candidateFields(c),
             root: session.root, worktree: window.worktree,
-            command: [...pane.command], target, outcome: OUTCOME_PLANNED,
+            command: config ? null : [...pane.command], target, outcome: OUTCOME_PLANNED,
           };
           manifest.rows.push(row);
           byKey.set(rowKey(c.provider, c.id, target), row);
         }
         row.target ??= target;
 
+        // Replayed/manual plans need the same preflight as a new scan.
+        // Refused configuration never becomes a pane command or log value.
+        if (config) {
+          row.command = null;
+          row.argv = null;
+          row.outcome = stopRefused(config);
+          result.failed += 1;
+          save();
+          deps.log(`${short(c)}: ${row.outcome}`);
+          continue;
+        }
+
         // 1. The original process, if there still is one.
         if (c.pid !== null) {
-          const stop = await stopProcess(c, deps);
+          const stop = await stopProcess(c, keptFlags(c.provider, separator < 0 ? [] : pane.command.slice(separator + 1)), deps);
           if (!stop.ok) {
             row.outcome = stop.refused ? stopRefused(stop.why) : stopFailed(stop.why);
             result.failed += 1;

@@ -75,3 +75,36 @@ formal governance and does not establish a model floor.
    transcript or by copying the known model/effort fields.
 
 This triage introduces no permission, trust, fallback, hook, or Lean execution changes.
+
+## v0.4 verification
+
+The release investigation checked Claude Code 2.1.303 and the current official
+documentation. The private report and its repository both return HTTP 404 to the
+authenticated GitHub account used here. The local `work-contracts` repository has
+CUE/Python contracts and Lean proof examples, but no implementation of the proposed
+session/group `WC.lean` schema, refinement compiler, or generated-settings interface.
+Those examples cannot establish the missing runtime policy contract.
+
+The official controls require more than the proposal's original allowlist:
+
+- [Model configuration](https://code.claude.com/docs/en/model-config#enforce-the-allowlist-for-the-default-model)
+  documents `enforceAvailableModels: true` to cover the Default selection as well as
+  named models. It also documents an exception when no allowed model is available.
+  `availableModelsMatch: "exact"` and a required minimum version of at least 2.1.283
+  are needed when the policy intends an exact model version rather than aliases.
+  Therefore an allowlist alone is insufficient evidence of a fail-closed floor.
+- [Model-switch hooks](https://code.claude.com/docs/en/hooks#premodelswitch)
+  require Claude Code 2.1.251 or later. Requested switches can be blocked; automatic
+  fallback and resumed model selection use the post-switch event, which cannot
+  prevent the change. Per-turn fallback chains are outside both switch events.
+- [Managed mod policy](https://code.claude.com/docs/en/plugins/mods/admin)
+  distinguishes managed hook denials from ordinary hooks, which a user mod may
+  override. The managed `cc-plugin-sec-default@builtin` plugin's
+  `allowManagedModsOnly` control and `disableSideloadFlags` are also part of the
+  proposed boundary. A launch's `--settings` cannot install managed authority.
+
+No local system-file managed-settings installation was found. Other managed
+sources, such as server policy or device management, have not been established.
+The missing inputs are the actual contract/compiler artifacts and an identified
+principal and mechanism for provisioning managed policy. Issue #40 remains open;
+v0.4 does not claim Lean-backed governance or guaranteed model-floor enforcement.

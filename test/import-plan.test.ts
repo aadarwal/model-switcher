@@ -440,7 +440,67 @@ test("the whitelist keeps a flag's value with it, and drops a secret whatever sh
   assert.deepEqual(keptFlags("claude", ["claude", "--model=sonnet"]), ["--model=sonnet"]);
   assert.deepEqual(keptFlags("claude", ["claude", "a prompt", "--model", "sonnet"]), ["--model", "sonnet"]);
   assert.deepEqual(keptFlags("claude", null), []);
-  assert.deepEqual(keptFlags("codex", ["codex", "--profile"]), ["--profile"], "a value-taking flag at the end keeps itself");
+  assert.deepEqual(keptFlags("codex", ["codex", "--profile"]), [], "a missing value must not produce a malformed imported launch");
+});
+
+test("import preserves effort and every allow/deny/tool list value through later rotations", async () => {
+  const { keptFlags, paneCommand } = await import("../src/import/plan.ts");
+  const { flagsForResume } = await import("../src/recover.ts");
+  for (const name of ["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools"]) {
+    const flags = ["--effort", "high", name, "Read", "Bash(rm *)", "--model=opus"];
+    assert.deepEqual(keptFlags("claude", ["claude", ...flags]), flags);
+    assert.deepEqual(flagsForResume(flags), flags, "the next account handoff retains the complete rule list");
+    assert.deepEqual(paneCommand(cand({ cwd: "/tmp", id: "c1", argv: ["claude", ...flags] }), null, false), ["ms", "claude", "--", ...flags, "--resume", "c1"]);
+  }
+});
+
+test("settings and MCP configuration are refused without exposing their values, even after Boolean options", async () => {
+  const { keptFlags, configurationRefusal } = await import("../src/import/plan.ts");
+  const cases = [
+    ["claude", ["claude", "--verbose", "--settings", '{"env":{"KEY":"secret-value"}}'], "--settings"],
+    ["claude", ["claude", "--settings=./private.json"], "--settings"],
+    ["claude", ["claude", "--debug", "--mcp-config", '{"mcpServers":{"secret-value":{}}}'], "--mcp-config"],
+    ["claude", ["claude", "--strict-mcp-config"], "--strict-mcp-config"],
+    ["claude", ["claude", "--setting-sources", "user"], "--setting-sources"],
+    ["codex", ["codex", "--no-daemon", "--config", 'mcp_servers.secret="secret-value"'], "--config"],
+    ["codex", ["codex", "--no-daemon", "-c", 'mcp_servers.secret="secret-value"'], "-c"],
+    ["codex", ["codex", '-cmcp_servers.secret="secret-value"'], "-c"],
+  ] as const;
+  for (const [provider, input, name] of cases) {
+    const reason = configurationRefusal(provider, [...input]);
+    assert.ok(reason?.includes(name));
+    assert.match(reason!, /source process remains untouched/);
+    assert.ok(!reason!.includes("secret-value"));
+    assert.deepEqual(keptFlags(provider, [...input]), []);
+  }
+});
+
+test("an unknown option's flag-shaped value and flags after -- never become launch settings", async () => {
+  const { keptFlags, configurationRefusal } = await import("../src/import/plan.ts");
+  const ambiguous = ["claude", "--append-system-prompt", "--model=secret-value"];
+  assert.deepEqual(keptFlags("claude", ambiguous), []);
+  assert.ok(!configurationRefusal("claude", ambiguous)!.includes("secret-value"));
+  const prompt = ["claude", "--model", "opus", "--", "--settings", "secret-value", "--model=haiku"];
+  assert.equal(configurationRefusal("claude", prompt), null);
+  assert.deepEqual(keptFlags("claude", prompt), ["--model", "opus"]);
+  for (const name of ["--system-prompt", "--model", "--allowedTools", "--disallowedTools"]) {
+    const disguisedBoundary = ["claude", name, "--", "--settings", "secret-value"];
+    assert.match(configurationRefusal("claude", disguisedBoundary)!, /source process remains untouched/);
+    assert.deepEqual(keptFlags("claude", disguisedBoundary), []);
+    assert.ok(!configurationRefusal("claude", disguisedBoundary)!.includes("secret-value"));
+  }
+});
+
+test("an unsupported configured process is skipped before stop and its secret never enters the manifest", async () => {
+  const { planImport } = await import("../src/import/plan.ts");
+  const { manifestFromPlan } = await import("../src/import/manifest.ts");
+  const source = cand({ cwd: "/tmp", pid: 42, argv: ["claude", "--settings", '{"KEY":"secret-value"}'] });
+  const plan = planImport([source], opts());
+  assert.deepEqual(paneIds(plan), []);
+  assert.match(plan.skipped[0]!.reason, /--settings.*source process remains untouched/);
+  const manifest = manifestFromPlan(plan, { since: "2h", dirs: [] });
+  assert.ok(!JSON.stringify(manifest).includes("secret-value"));
+  assert.equal(manifest.rows[0]!.command, null);
 });
 
 // --- The target server -----------------------------------------------------

@@ -486,6 +486,81 @@ test("a pid that is no longer the process the plan recorded is not signalled", a
   assert.equal(rows[1]!.outcome, "resumed in data:main.5 (%1)", "the next row still runs");
 });
 
+test("an old sanitized manifest refuses the current process's settings before any signal or tmux action", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const plan = planOf([cand({ id: "s1", cwd: "/tmp", pid })]);
+  const w = await world(t, plan);
+  w.deps.ps = () => tableFor(plan).map((row) => ({ ...row, argv: ["claude", "--verbose", "--settings", '{"KEY":"secret-value"}'] }));
+  const signals: number[] = [];
+  w.deps.kill = (target) => { signals.push(target); return true; };
+  const { executeImport } = await import("../src/import/execute.ts");
+
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+
+  assert.deepEqual(signals, []);
+  assert.deepEqual(w.tmuxLog(), []);
+  assert.ok(w.deps.alive(pid));
+  assert.match(w.manifest().rows[0]!.outcome, /--settings.*source process remains untouched/);
+  assert.ok(!readFileSync(w.file, "utf8").includes("secret-value"));
+  assert.ok(!w.log.join("\n").includes("secret-value"));
+});
+
+test("a replayed command carrying raw MCP configuration is refused and removed before stopping", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const plan = planOf([cand({ id: "s1", cwd: "/tmp", pid })]);
+  plan.sessions[0]!.windows[0]!.panes[0]!.command = ["ms", "claude", "--", "--mcp-config", '{"KEY":"secret-value"}'];
+  const w = await world(t, plan);
+  const signals: number[] = [];
+  w.deps.kill = (target) => { signals.push(target); return true; };
+  const { executeImport } = await import("../src/import/execute.ts");
+
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+
+  assert.deepEqual(signals, []);
+  assert.deepEqual(w.tmuxLog(), []);
+  assert.ok(w.deps.alive(pid));
+  assert.equal(w.manifest().rows[0]!.command, null);
+  assert.ok(!readFileSync(w.file, "utf8").includes("secret-value"));
+  assert.ok(!w.log.join("\n").includes("secret-value"));
+});
+
+test("an old or edited plan cannot discard the current process's retained options", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  for (const flags of [["--disallowedTools", "Bash", "Read"], ["--tools", "Read"], ["--effort", "high"], ["--model", "opus"]]) {
+    const plan = planOf([cand({ id: "s1", cwd: "/tmp", pid })]);
+    const w = await world(t, plan);
+    w.deps.ps = () => tableFor(plan).map((row) => ({ ...row, argv: ["claude", ...flags] }));
+    const signals: number[] = [];
+    w.deps.kill = (target) => { signals.push(target); return true; };
+    const { executeImport } = await import("../src/import/execute.ts");
+
+    assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+    assert.deepEqual(signals, []);
+    assert.deepEqual(w.tmuxLog(), []);
+    assert.ok(w.deps.alive(pid));
+    assert.match(w.manifest().rows[0]!.outcome, /launch options differ.*source process remains untouched/);
+    assert.ok(!w.log.join("\n").includes(flags[0]!));
+  }
+});
+
+test("a current plan keeps all live restrictions before replacing its process", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const flags = ["--effort", "high", "--disallowedTools", "Bash", "Read"];
+  const plan = planOf([cand({ id: "s1", cwd: "/tmp", pid, argv: ["claude", ...flags] })]);
+  plan.sessions[0]!.windows[0]!.panes[0]!.command = ["ms", "claude", "--", ...flags, "--resume", "s1"];
+  const w = await world(t, plan);
+  w.deps.ps = () => tableFor(plan).map((row) => ({ ...row, argv: ["claude", ...flags] }));
+  const { executeImport } = await import("../src/import/execute.ts");
+
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 1, stopped: 1, failed: 0 });
+  assert.match(w.tmuxLog().find((line) => line.includes("send-keys"))!, /'--effort' 'high' '--disallowedTools' 'Bash' 'Read'/);
+  assert.ok(!w.deps.alive(pid));
+});
+
 test("a manifest that does not say when the process started cannot re-identify it, and refuses", async (t) => {
   const { dir } = stubDir();
   const pid = await liveProcess(t, dir, "polite");

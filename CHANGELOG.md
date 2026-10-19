@@ -2,18 +2,84 @@
 
 ## Unreleased
 
-- Status text, JSON (`pools`) and the dashboard header share per-provider pool
-  summaries: accounts with room, known window resets within 24 hours, the next
-  capacity recovery, and a warning when only one account has room. Recovery
-  waits for all exhausted launch windows and the owner's reserve to clear.
-  Missing or malformed required usage windows read `transient` rather than
-  inflating the table's `ok` state and the pool's capacity count.
-  Provider reset-availability counts remain absent until a source reports them.
-- Reset times carry the date, not only the weekday: the picker's resets column, its preview
-  and the dashboard now read `Tue 20 Oct 20:00` (was `Tue 20:00`). A weekly window resets days
-  out, and a weekday alone is ambiguous a week ahead. A reset later today is still just `20:00`.
-- When no account has room, the picker header names the account that comes back first and
-  when: `no account has room — next room: claude-6 Sun 18 Oct 14:59 (in 16h 9m) · …`.
+## 0.4.0 — 2026-10-18
+
+### Capacity visibility
+
+- Status text, JSON (`pools.claude` / `pools.codex`), and the dashboard header
+  share per-provider capacity summaries: accounts with room, scheduled window
+  resets in the next 24 hours, the next account expected to recover capacity,
+  and `LAST ACCOUNT WITH ROOM` when one account remains. Missing or malformed
+  required usage windows read `transient` and cannot inflate capacity counts
+  (#43, PR #51).
+- Future reset dates appear in the picker, its preview, and dashboard meters,
+  for example `Tue 20 Oct 20:00`; today's resets retain the clock-only format.
+  An empty picker names the next account expected to have room. Capacity
+  forecasts wait for every exhausted required window and owner reserve to
+  clear, and exclude unusable readings, missing launch credentials, and
+  unknown reset times (PR #48).
+
+### Handoff and identity fixes
+
+- Handoffs carry the last recorded model and reasoning effort from the managed
+  Claude transcript or Codex rollout, replacing stale launch overrides. Claude
+  effort is added only when a bounded, cached help probe advertises support.
+  The same reading informs scoped capacity selection and the resumed command;
+  missing metadata keeps launch flags and records the fallback. A stop during
+  the capability probe still prevents relaunch (#38, PR #53).
+- Headless Claude/Codex children cannot overwrite their parent pane's
+  conversation, transcript, or lifecycle state. Hooks check actual process
+  ownership, including Codex's npm launcher, shell wrappers, and legacy panes.
+  Genuine Claude hooks capture the current transcript and clear stale paths
+  when the conversation changes. Recovery also checks tmux server identity
+  before destructive actions and after waits, protecting reused pane IDs
+  after a server restart (#41, PR #52).
+- Managed Codex launches keep `--no-daemon` when option values, conversation
+  names, or prompts resemble subcommands. Parsing respects attached values,
+  variadic image arguments including a lone `-`, explicit `--no-daemon`, and
+  `--`. Noninteractive commands remain unchanged; `mcp-server` is a prompt and
+  `app` is a command only on macOS/Windows (PR #54).
+
+### Safer imports
+
+- Imports carry Claude effort and complete tool allow/deny lists, including
+  their documented flag aliases, through subsequent account handoffs.
+- Imports refuse sessions whose explicit settings, MCP, agent/plugin, or
+  restricted configuration cannot yet be preserved safely. Codex configuration
+  overrides are also refused. The source process stays untouched, and the
+  manifest records the option name without its value. Replayed plans recheck
+  the live process before stopping it so an older plan cannot silently drop
+  configuration or tool restrictions.
+
+### Setup and release maintenance
+
+- Optional shell aliases forward every CLI argument through `ms claude --` /
+  `ms codex --`, preserving the CLI's own `--continue` and ordinary flags.
+  Setup refuses existing functions or aliases in the selected rc file instead
+  of shadowing wrappers. `ms setup --repair` upgrades existing managed blocks
+  with backups and never installs a new alias opt-in (#13, PR #49).
+- Governance delivery notes split model/effort preservation, import fidelity,
+  policy identity, runtime enforcement, and Lean refinement into separate
+  contracts. The proposal remains open; this release adds no governance or
+  permission enforcement (#40, PR #50).
+- Release publication uses this version's changelog notes, validates the tap
+  before publishing, refuses ambiguous flags, and creates unsigned formula
+  commits with exactly the required Claude, Codex, and Homi trailers.
+- Release archives exclude macOS resource-fork metadata. Content checks inspect
+  raw archive entries so platform tools cannot hide extra AppleDouble files.
+
+### Upgrade and limits
+
+- After `brew upgrade model-switcher`, run `ms setup --repair` to refresh an
+  existing managed alias block, then open a new shell to load it. Wrapper
+  detection scans the selected rc file; sourced or generated declarations
+  cannot be discovered statically.
+- Runtime model/effort preservation reflects the last recorded turn. A picker
+  change before the next recorded turn may be absent from disk. It does not
+  enforce provider-internal fallback behavior or a formal model floor.
+- Scheduled window resets are distinct from restored account capacity or
+  discretionary resets. No verified provider field supplies a discretionary
+  reset count, so `resetsAvailable` and `AVAIL` remain omitted.
 
 ## 0.3.15
 

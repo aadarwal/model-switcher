@@ -44,12 +44,13 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { resolveOnPath } from "./exec.ts";
 import { msBinary } from "./paths.ts";
-import { pickAccounts, reserveReached, roomAfterReset, type Need, type Window } from "./pick.ts";
+import { budgetWindow, pickAccounts, reserveReached, roomAfterReset, type Need, type Window } from "./pick.ts";
 import { NAME_PATTERN, findAccount, loadRegistry, type Provider, type Registry } from "./registry.ts";
 import { DEFAULT_MAX_AGE_MS, ageLabel, getSnapshot, lastSnapshot, toPickInputs, type AccountUsage, type Snapshot } from "./snapshot.ts";
 import { openState, type SessionRow } from "./state.ts";
 import { computeAccount, sessionsByAccount, type AccountState } from "./status.ts";
 import { Tmux, shellQuote } from "./tmux.ts";
+import { reportedResetCount, usedPercentText, windowLimitLabel, windowPeriod, windowResetState, type DisplayUsage } from "./usage-display.ts";
 
 /** Why this device cannot launch an account, or null when it can. It is the
  *  launch's own credential check (`launchCredential`, src/launch.ts), handed
@@ -159,9 +160,7 @@ function severity(used: number | null): string | null {
 }
 
 const usedOf = (w: Window | null | undefined): number | null => (w && Number.isFinite(w.usedPercent) ? w.usedPercent : null);
-/** Whole percent, rounded DOWN: 99.6 is not full — the chooser still ranks it
- *  — and must not read as 100. */
-const percentText = (used: number | null): string => (used === null ? DASH : `${Math.floor(used)}%`);
+const percentText = (used: number | null): string => usedPercentText(used, DASH);
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const two = (n: number): string => String(n).padStart(2, "0");
@@ -189,12 +188,12 @@ function untilText(ms: number, now: number): string {
   return `in ${Math.floor(hours / 24)}d ${hours % 24}h`;
 }
 
-/** The soonest reset among the windows the RANKING reads — the week, and the
- *  Fable week for a run that needs it — not the 5 h window, which resets four
- *  times a day and orders nothing. */
+/** The soonest reset among the ranking's budget windows: the main limit,
+ *  Codex's sole short limit when that is all it reports, and Fable when needed. */
 function rankingReset(row: MeshRow, need: Need): number | null {
   const u = row.usage;
-  const windows = need === "fable" ? [u?.weeklyAll, u?.weeklyFable] : [u?.weeklyAll];
+  const budget = u?.weeklyAll ?? (row.provider === "codex" ? u?.session : null);
+  const windows = need === "fable" ? [budget, u?.weeklyFable] : [budget];
   const times = windows.map((w) => (w?.resetsAt ? Date.parse(w.resetsAt) : Number.NaN)).filter((t) => Number.isFinite(t));
   return times.length ? Math.min(...times) : null;
 }
@@ -259,7 +258,8 @@ export function meshRows(input: MeshInput): MeshView {
   // registry's: rows from `lastSnapshot` carry none of their own.
   const last = input.lastPick ?? null;
   const lastAccount = last !== null ? findAccount(registry, last, provider) : null;
-  const heldBack = last !== null && reserveReached(lastAccount?.reservePercent, usageOf.get(last)?.usage?.weeklyAll);
+  const lastInput = last !== null ? inputOf.get(last) : null;
+  const heldBack = reserveReached(lastAccount?.reservePercent, lastInput ? budgetWindow(lastInput) : null);
   const remembered = !ranking.picks.length && unreachable && last !== null && wanted.has(last) && lastAccount && !heldBack ? last : null;
   const star = ranking.picks[0]?.name ?? remembered;
   const seen = rows.map((a) => a.observedAt).filter((t): t is number => t !== null);
@@ -314,10 +314,11 @@ export function meshRows(input: MeshInput): MeshView {
   };
 }
 
-export type RowWidths = { name: number; state: number };
+export type RowWidths = { name: number; state: number; session?: number; main?: number; fable?: number };
 
 export function rowWidths(rows: MeshRow[]): RowWidths {
-  return { name: Math.max(0, ...rows.map((r) => r.name.length)), state: Math.max(0, ...rows.map((r) => r.state.length)) };
+  const width = (key: "session" | "weeklyAll" | "weeklyFable", label: string): number => Math.max(0, ...rows.map((r) => windowLimitLabel(r.usage?.[key], label).length + 1 + Math.max(4, percentText(usedOf(r.usage?.[key])).length)));
+  return { name: Math.max(0, ...rows.map((r) => r.name.length)), state: Math.max(0, ...rows.map((r) => r.state.length)), session: width("session", "5h"), main: width("weeklyAll", "wk"), fable: width("weeklyFable", "fable") };
 }
 
 /**
@@ -332,10 +333,12 @@ export function renderRow(row: MeshRow, view: Pick<MeshView, "provider" | "need"
   const crossed = row.mark === "✗";
   const tone = (sgr: string | null): string | null => (crossed ? (sgr ? `${SGR.dim};${sgr}` : SGR.dim) : sgr);
   const cell = (text: string, width: number, sgr: string | null): string => paint(text, tone(sgr)) + " ".repeat(Math.max(0, width - text.length));
-  const percent = (label: string, w: Window | null | undefined): string => {
+  const percent = (fallback: string, w: Window | null | undefined, width = 0): string => {
+    const label = windowLimitLabel(w, fallback);
     const used = usedOf(w);
     const text = percentText(used);
-    return `${paint(label, tone(null))} ${" ".repeat(Math.max(0, 4 - text.length))}${paint(text, tone(severity(used)))}`;
+    const padding = Math.max(0, 4 - text.length);
+    return `${paint(label, tone(null))} ${" ".repeat(padding)}${paint(text, tone(severity(used)))}${" ".repeat(Math.max(0, width - label.length - 1 - padding - text.length))}`;
   };
   const reset = rankingReset(row, view.need);
   const parts = [
@@ -345,11 +348,11 @@ export function renderRow(row: MeshRow, view: Pick<MeshView, "provider" | "need"
     "  ",
     cell(row.state, widths.state, null),
     "  ",
-    percent("5h", row.usage?.session),
+    percent("5h", row.usage?.session, widths.session),
     "  ",
-    percent("wk", row.usage?.weeklyAll),
+    percent("wk", row.usage?.weeklyAll, widths.main),
     // Codex reports no Fable-scoped window at all (src/providers/codex-usage.ts).
-    ...(view.provider === "claude" ? ["  ", percent("fable", row.usage?.weeklyFable)] : []),
+    ...(view.provider === "claude" ? ["  ", percent("fable", row.usage?.weeklyFable, widths.fable)] : []),
     "  ",
     cell(reset === null ? DASH : dateAt(reset), 16, null),
     ...(row.panes.length ? ["  ", paint(`${row.panes.length} pane${row.panes.length === 1 ? "" : "s"}`, tone(null))] : []),
@@ -392,8 +395,8 @@ function windowText(read: boolean, w: Window | null | undefined, now: number): s
   const bar = `[${"█".repeat(filled)}${"░".repeat(BAR_CELLS - filled)}]`;
   const text = percentText(used);
   const at = w.resetsAt ? Date.parse(w.resetsAt) : Number.NaN;
-  const reset = Number.isFinite(at) ? `  resets ${resetClock(at, now)} (${untilText(at, now)})` : "";
-  return `${paint(bar, severity(used))} ${" ".repeat(Math.max(0, 4 - text.length))}${paint(text, severity(used))}${reset}`;
+  const reset = Number.isFinite(at) ? `  resets ${resetClock(at, now)} (${untilText(at, now)})` : `  ${windowResetState(w)}`;
+  return `${paint(bar, severity(used))} ${" ".repeat(Math.max(0, 4 - text.length))}${paint(text, severity(used))} used${reset}`;
 }
 
 function statusText(row: MeshRow, view: MeshView): string {
@@ -428,14 +431,18 @@ export function renderPreview(row: MeshRow, view: MeshView): string {
   if (row.email) who.push(row.email);
   who.push(row.shared ? `${row.provider}, shared` : row.provider);
   const read = row.usage !== null;
+  const facts: DisplayUsage | null = row.usage;
+  const credits = reportedResetCount(facts);
   const lines = [
     ` ${who.join("  ·  ")}`,
     ` ${"─".repeat(42)}`,
     field("Status", statusText(row, view)),
     field("Rank", row.rank !== null ? `${row.rank} of ${view.ranked} with room (need: ${view.need})` : `not ranked (need: ${view.need})`),
-    field("5h", windowText(read, row.usage?.session, view.now)),
-    field("Week", windowText(read, row.usage?.weeklyAll, view.now)),
-    ...(view.provider === "claude" ? [field("Fable", windowText(read, row.usage?.weeklyFable, view.now))] : []),
+    ...(facts?.planType ? [field("Plan", clean(facts.planType))] : []),
+    ...(credits !== null ? [field("Resets", `${credits} available${row.stale || row.error || !["ok", "no room", "reserved"].includes(row.state) ? " (last reported)" : ""}`)] : []),
+    field(windowPeriod(row.usage?.session, "5h"), windowText(read, row.usage?.session, view.now)),
+    field(windowPeriod(row.usage?.weeklyAll, "Week"), windowText(read, row.usage?.weeklyAll, view.now)),
+    ...(view.provider === "claude" ? [field(windowLimitLabel(row.usage?.weeklyFable, "Fable"), windowText(read, row.usage?.weeklyFable, view.now))] : []),
     field("Here", row.unready !== null
       ? paint(`✗ ${row.unready}`, SGR.red)
       : `${row.provider === "codex" ? "codex home logged in here" : "launch token on this device"} ${paint("✓", SGR.green)}`),
@@ -459,7 +466,7 @@ export function renderPreview(row: MeshRow, view: MeshView): string {
   return lines.join("\n") + "\n";
 }
 
-const HEADER_KEYS = "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel";
+const HEADER_KEYS = "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel · percentages USED";
 
 /** fzf's two header lines: the keys, then what ★ means and how old the
  *  newest reading behind it is — or why there is no ★. The first is fixed

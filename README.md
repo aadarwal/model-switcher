@@ -38,17 +38,17 @@ ms codex
 ### Launch
 
 ```
-ms claude [mesh] [--as <account>] [--need any|fable] [--continue] [-- <claude args>]
-ms codex  [mesh] [--as <account>] [--need any|fable] [--continue] [-- <codex args>]
+ms claude [mesh|--mesh] [--as <account>] [--need any|fable] [--continue] [-- <claude args>]
+ms codex  [mesh|--mesh] [--as <account>] [--need any|fable] [--continue] [-- <codex args>]
 ms adopt  <rollout-id|path> [--as <account>] [--continue] [-- <codex args>]
 ms attach [session]
 ```
 
 - `ms claude` / `ms codex` — pick an account with room and start that CLI in the current tmux pane under the account's credential. Everything after `--` goes to the CLI unchanged.
 - `--as <account>` — use the named account instead of choosing one. `--need fable` — also require room in the Fable window; `ms codex` rejects it, because Codex reports no such window.
-- `mesh` — choose the account yourself, in a picker showing the chooser's own ranking, and pin the session to it until its first wall. See [picking by hand](#picking-by-hand-mesh). It does not combine with `--as`; after `--` it is the CLI's own argument.
+- `mesh` / `--mesh` — choose the account yourself, in a picker showing the chooser's own ranking, and pin the session to it until its first wall. See [picking by hand](#picking-by-hand-mesh). It does not combine with `--as`; after `--` either spelling is the CLI's own argument.
 - `--continue` — for a resume you drove yourself (`ms codex --continue -- resume <id>`, `ms claude --continue -- --resume <id>`): hand the resumed conversation the same continuation a rotation sends, as the command line's own prompt. Refused when there is nothing to continue.
-- **A launch that resumes is given no `--session-id`.** `--session-id` makes a conversation, so on a command line that already names one (`--resume <id>`, `-r <id>`, `--resume=<id>`, `--continue`/`-c`) `ms` passes your command line through untouched and records the id it names — Claude Code's own SessionStart confirms it, exactly as it does after a rotation's `--resume` relaunch. `ms claude --continue -- --resume <id>` is the path **`ms import`** resumes every Claude conversation through. Still to be checked against a live Claude Code; if that pairing misbehaves, `ms rotate` / `ms switch --continue` remain the verified way to move a Claude session `ms` already manages.
+- **A launch that resumes is given no `--session-id`.** `--session-id` makes a conversation, so on a command line that already names one (`--resume <id>`, `-r <id>`, `--resume=<id>`, `--continue`/`-c`) `ms` passes your command line through untouched and records the id it names — Claude Code's own SessionStart confirms it, exactly as it does after a rotation's `--resume` relaunch. `ms claude --continue -- --resume <id>` is the path **`ms import`** resumes every Claude conversation through. This path is live-verified on Claude Code 2.1.303, including a post-import response and preserved tool restrictions.
 - `ms adopt` — take over a **Codex** conversation `ms` did not start, so it can be rotated like any other. See [rescuing a pane you didn't start with ms](#rescuing-a-pane-you-didnt-start-with-ms).
 - **Where it lands.** Inside tmux, the launch replaces the pane you typed it in. Outside tmux, it goes to the **default tmux server** — the one plain `tmux` talks to, started if it is not running — in session `ms`, and attaches; the session shows in `tmux ls` like any other.
 - `ms attach [session]` — attach to a session on the default tmux server: `ms` (what a bare launch makes) when no name is given, or an import's repo-named session. Plain `tmux attach -t <session>` does the same. With no such session it says so and names the `tmux ls` to run; inside tmux it refuses rather than nest.
@@ -104,7 +104,8 @@ ms dashboard [--port N] [--no-open]
 ```
 
 - `ms status` — two tables: the account pool as usage sees it, and every managed session. The accounts table ends in SESS, the number of live sessions on that account, then EMAIL, the login behind the name (`-` when unknown); `--json` lists the sessions per account (`sessions`) and carries each account's `email`. The sessions table ends in BETTER — where [rebalance](#rebalance) would put that session right now, `—` when it is already there or the rule could never move it, `pinned` when you picked its account by hand ([`mesh`](#picking-by-hand-mesh); `--json` carries `pinnedAccount`). `--watch` reprints every 5 s; `--json` prints the same rows as JSON. Sessions in state `gone` or `stopped` are hidden by default; `--all` shows them too.
-- Above the accounts, each provider's pool summary counts rows with STATE `ok`, lists known window resets in the next 24 hours, and names the next account whose exhausted windows all reset. Exactly one `ok` account raises `LAST ACCOUNT WITH ROOM`. The dashboard shows the same summary; `--json` exposes it as `pools.claude` / `pools.codex`. Reset events with the same account and instant are grouped; these are scheduled window resets, not a count of discretionary resets available from a provider. No verified provider field supplies that count, so `resetsAvailable` and an `AVAIL` column are omitted. A Fable reset is listed as an event; capacity recovery uses the ordinary launch's session/week gates and owner reserve.
+- Above the accounts, each provider's pool summary counts rows with STATE `ok`, lists known window resets in the next 24 hours, and names the next account whose exhausted windows all reset. Exactly one `ok` account raises `LAST ACCOUNT WITH ROOM`. The dashboard shows the same summary; `--json` exposes it as `pools.claude` / `pools.codex`. Scheduled resets and discretionary reset credits are separate facts. When the provider reports a valid reset-credit count, status adds `RESETS AVAIL`, the picker preview and dashboard show it, and JSON preserves `usage.resetsAvailable`. A pool's `resetsAvailable` total requires a fresh count for every account. Partial coverage is labeled with its reported-account count and exposed as `reportedResetsAvailable`; unknown or stale accounts never silently contribute zero. These displays make no request to consume a reset credit.
+- Percentages are **used**, while Codex's own `/status` may show **remaining**: 1% used corresponds to 99% remaining. Small fractions stay visible. Reported window lengths travel with the reading, so a free account's 30-day main limit displays as `30d`, alongside `5h` or `7d` windows when reported. Older snapshots retain their legacy window labels. A missing 5h window is not reported; a missing reset time is unknown unless the provider explicitly reports that the window has not started. The picker preview also shows the reported plan.
 - `ms rotate` — move a session to the next account with room: the move a wall would have made, on demand. Always carries the unfinished work over.
 - `ms switch` — move a session to a named account. It carries the work over only when the pane reads as walled; `--continue` always carries it over.
 - `ms switch --all` — move every session of that account's provider that is not already on it, four at a time. `--timeout` bounds how long new moves are *started* (default 600 s); a move in flight is never cut off. `--provider` is needed only when the destination name is registered under both providers, same rule as `ms accounts`' own `--provider`.
@@ -155,8 +156,9 @@ ms accounts reserve codex-1 0 --provider codex  # clear the reserve
 `reserve` accepts an integer from 0 to 99; 0 clears it. A 30% reserve makes
 `codex-1` ineligible for automatic selection once its weekly usage reaches 70%.
 At 69% it has 1% left for automation. Launch, rebalance, recovery and the mesh
-ranking all use this cap. The reserve is on the weekly window that every model
-counts against (a Codex account's only weekly window). A Claude account's Fable
+ranking all use this cap. The reserve applies to the main reported budget: Claude's
+weekly window, or Codex's longer reported window (its only window when just one
+is reported). Codex can report a 30-day limit instead of a weekly one. A Claude account's Fable
 window has no reserve of its own, and `--need fable` stops only when that window
 is full.
 
@@ -265,7 +267,22 @@ keep this behavior. Codex launches that bypass `ms` can show
 the running shared server. For a managed session, use `ms codex`; for a direct launch
 that bypasses the server, pass `--no-daemon` or choose "Run without daemon this
 time" in that prompt. Restarting the shared server changes its persisted settings
-and can interrupt other clients.
+and can interrupt other clients. Managed interactive launches refuse explicit
+`--remote`: a remote server owns its own account and hooks, so use plain `codex`
+for remote sessions. Noninteractive Codex commands remain pass-through.
+
+On verified Codex 0.157+ binaries, a stored plain `--full-auto` is translated at
+execution to its former `--sandbox workspace-write --ask-for-approval on-request`
+policy. Mixed permission selectors are refused before a launch or handoff; review
+and replace those flags explicitly. The stored command is kept intact.
+
+### Invocation settings
+
+Launches retain the calling shell's `PATH`, `CLAUDE_CONFIG_DIR`,
+`ANTHROPIC_MODEL`, and `CLAUDE_CODE_EFFORT_LEVEL` through tmux and account
+handoffs. An unset setting clears an older value inherited from the tmux
+server. These invocation settings are recorded privately; account credentials
+are read separately at execution time.
 
 ### Credentials are per device
 
@@ -355,11 +372,12 @@ moved even though the process cannot. That is what **`ms import`** does, in one 
 4. **Move them.** Per row: re-read the process table and refuse to signal a pid whose
    start time or command is not the one the plan recorded (a manifest planned this morning
    and run this evening names pids the kernel has since re-used); SIGTERM the original,
-   SIGKILL after ten seconds — and on that fallback its descendants too, leaves first,
+   SIGKILL after ten seconds — and on that fallback its private descendants too, leaves first,
    because a CLI installed from npm is a wrapper plus the process doing the work and only
    a SIGTERM can be forwarded; never make the pane at all if it will not go; then type
-   the command and wait up to a minute for the conversation to report itself through the
-   CLI's own hook — by its own conversation id, never a neighbour's. A row that fails never
+   the command and wait for the conversation to report itself through the
+   CLI's own hook — by its own conversation id, never a neighbour's. Claude gets one
+   minute; Codex also gets the launcher's bounded writer-release wait. A row that fails never
    stops the next one, and a launch that fails inside the pane (no account has room, a
    rollout it cannot find) leaves a shell prompt rather than a dead pane: the wait watches
    `#{pane_current_command}` too, so a pane back at a shell is `resume failed:` with the
@@ -373,6 +391,14 @@ carried safely. Codex `-c`/`--config` overrides are refused for the same reason.
 manifest names the unsupported option without recording its value. Review the source
 configuration and relaunch it explicitly instead. This preserves import behavior; it
 does not establish formal governance or an enforced model floor.
+
+For a live Codex import, start the plain CLI with `codex --no-daemon`. If a background
+Codex service owns the conversation's writer lock, import refuses before stopping the
+frontend and leaves that service untouched. Codex 0.163.0 can retain a closed frontend's
+conversation for 30 minutes; closing its window does not release it immediately. Close
+the conversation there and wait for release before `ms adopt`, or use an in-process
+`--no-daemon` conversation for import. When a resume must wait for a writer to release,
+the import deadline includes that bounded wait as well as its normal startup budget.
 
 Every run writes a manifest — `MS_HOME/imports/<timestamp>.json`, 0600, rewritten after
 every step — and that file is the record to fall back on: each row names the conversation,
@@ -407,13 +433,26 @@ the terminal — and so it does in a pane whose session no client is attached to
 watched through a control-mode client (`tmux -C`, iTerm2's tmux integration), which cannot
 draw a popup.
 
+`--mesh` is an equivalent spelling before `--`. Keep the picker on that side and
+your provider arguments after the separator. For example, to pick a Codex account
+while passing your chosen `--yolo` option:
+
+```sh
+ms codex mesh -- --yolo
+ms codex --mesh -- --yolo
+```
+
+`ms codex --yolo -- --mesh` puts the arguments on the wrong sides: `--yolo` is a
+Codex option, while the account picker belongs to `ms`. The separator is a hard
+boundary: a `mesh` or `--mesh` after it passes to the provider unchanged.
+
 - **Rows.** One per account: `★` on the account a plain `ms claude` would pick right now
   (when no usage can be read, that is the pick it remembers), `✗` on one it cannot use (out
   of the ranking for want of room or a reading, or with no launch credential on this
-  device). Then STATE, the 5h, weekly and (Claude only) Fable percentages, the soonest
+  device). Then STATE, used percentages with reported window lengths and (Claude only) Fable usage, the soonest
   weekly reset and the number of live panes on it. The ranked accounts come first, in the
   chooser's order, then the rest by name; the `★` always leads, so enter alone takes it.
-- **Preview.** The account's e-mail, its rank, a bar and a reset per window, whether this
+- **Preview.** The account's e-mail, its rank, reported plan and reset credits when available, a used-percentage bar and a reset per window, whether this
   device can launch it, the panes running on it and how old the reading is.
 - **Keys.** enter launches the highlighted account; ctrl-r takes a fresh usage reading and
   redraws the rows, the previews and the line saying what `★` is (with fzf 0.71 or later

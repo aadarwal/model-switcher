@@ -33,6 +33,7 @@
 // of against whatever happens to be running.
 
 import { closeSync, openSync, readSync, readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
+import { isCodexTuiCommand } from "../providers/codex-cli.ts";
 import { spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
@@ -439,6 +440,12 @@ function codexConversation(file: string): Conversation | null {
  * on the whole stem, never a prefix: `claude-code-router` is a different
  * program and must not be stopped by an import.
  */
+export function codexCommandFromArgv(argv: string[]): string[] | null {
+  const stem = (p: string): string => path.basename(p).replace(/\.(m|c)?js$/, "");
+  const index = /^node(\d+)?$/.test(stem(argv[0] ?? "")) ? 1 : 0;
+  return stem(argv[index] ?? "") === "codex" ? argv.slice(index) : null;
+}
+
 export function providerOfArgv(argv: string[]): ImportProvider | null {
   if (!argv.length) return null;
   const stem = (p: string): string => path.basename(p).replace(/\.(m|c)?js$/, "");
@@ -446,7 +453,10 @@ export function providerOfArgv(argv: string[]): ImportProvider | null {
   if (/^node(\d+)?$/.test(names[0]!) && argv[1]) names.push(stem(argv[1]));
   for (const name of names) {
     if (name === "claude") return "claude";
-    if (name === "codex") return "codex";
+    if (name === "codex") {
+      const command = codexCommandFromArgv(argv);
+      return command && isCodexTuiCommand(command) ? "codex" : null;
+    }
   }
   return null;
 }

@@ -41,14 +41,15 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Verb } from "./cli.ts";
 import { codexAutorotateEnabled } from "./autorotate.ts";
 import { readEvents } from "./events.ts";
-import { cliSupportsFlag } from "./compat.ts";
+import { cliSupportsFlag, cliVersion } from "./compat.ts";
 import { resolveOnPath } from "./exec.ts";
+import { withLaunchEnvironment } from "./launch-env.ts";
 import { flagsWithLiveSettings, readLiveSettings } from "./live-settings.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
-import { pickAccounts, type PickInput, type Window } from "./pick.ts";
-import { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand } from "./providers/codex-cli.ts";
+import { budgetWindow, pickAccounts, reserveReached, type PickInput, type Window } from "./pick.ts";
+import { classifyCodexInvocation, codexExecutionCommand, codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand } from "./providers/codex-cli.ts";
 import { RELEASE_BUDGET_MS, lockCardMeansReadOnly, waitForWriterRelease, writerLockDirs, probeConversation, type LockState } from "./codex-writer-lock.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
@@ -167,7 +168,7 @@ const pollMs = (): number => Number(process.env.MS_POLL_MS) || 500;
 const readyMs = (): number => Number(process.env.MS_READY_MS) || READY_MS;
 const settleMs = (): number => Number(process.env.MS_SETTLE_MS) || SETTLE_MS;
 /** How long a Codex conversation is waited for after the pane's own CLI left
- *  (src/codex-writer-lock.ts says why it can take a minute). */
+ *  This tool budget is separate from the provider's idle retention limit. */
 const releaseMs = (): number => Number(process.env.MS_CODEX_RELEASE_MS) || RELEASE_BUDGET_MS;
 const nowSeconds = (): number => Math.floor(Date.now() / 1000);
 
@@ -1013,8 +1014,8 @@ function lockedOut(tmux: Tmux, pane: string, threadId: string | null): boolean {
  * Wait for `threadId` to be let go by whatever process still writes it, once
  * the pane's own CLI has left. Codex 0.160 allows one writer per conversation
  * (an flock every account home shares), and a conversation the pane had
- * loaded in `from`'s background server stays loaded there for about a minute
- * after the pane's TUI goes. A relaunch inside that minute is a read-only
+ * loaded in `from`'s background server can remain loaded after the pane's TUI
+ * goes (0.163 defaults to a 30-minute idle delay). A relaunch while held is a read-only
  * view, never a handoff. Nothing is stopped or signalled to shorten the wait:
  * that server hosts other panes' conversations too, and Codex offers no way
  * to unload one conversation from it (src/codex-writer-lock.ts).
@@ -1031,7 +1032,7 @@ async function releaseConversation(id: string, generation: number, threadId: str
   logLine(
     id,
     generation,
-    `${threadId} is still open in another codex process (its writer lock is held); waiting up to ${Math.round(releaseMs() / 1000)}s — a background server keeps a conversation about a minute after its last window closes`,
+    `${threadId} is still open in another codex process (its writer lock is held); waiting up to ${Math.round(releaseMs() / 1000)}s — a background server may retain it beyond this wait`,
   );
   const t0 = performance.now();
   const after = await waitForWriterRelease(dirs, threadId, releaseMs(), pollMs());
@@ -1068,8 +1069,8 @@ function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[]
     const input = by.get(o.name);
     if (!input) continue;
     // An account its owner holds back (`ms accounts reserve`, src/pick.ts)
-    // comes back when its week resets, though that window is not at 100.
-    if (o.why.startsWith("reserved:")) { consider(input.weeklyAll); continue; }
+    // comes back when its reported budget resets, even below 100.
+    if (o.why.startsWith("reserved:")) { consider(budgetWindow(input)); continue; }
     if (!/ at 100$/.test(o.why)) continue;
     consider(o.why.startsWith("session") ? input.session : o.why.startsWith("fable") ? input.weeklyFable : input.weeklyAll);
   }
@@ -1081,6 +1082,7 @@ function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[]
   // reset while its own five-hour window was minutes away.
   const leaving = by.get(from);
   if (leaving) {
+    if (reserveReached(leaving.reservePercent, budgetWindow(leaving))) consider(budgetWindow(leaving));
     for (const w of [leaving.session, leaving.weeklyAll, ...(need === "fable" ? [leaving.weeklyFable] : [])]) {
       // Only a window that is actually FULL says anything about when there
       // will be room; one with room left is not what we are waiting on.
@@ -1493,7 +1495,17 @@ const RESUME_TOKENS = new Set(["resume", "--resume", "-r"]);
 /** A conversation id, as both CLIs spell one. */
 const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export function flagsForResume(flags: string[]): string[] {
+export function flagsForResume(flags: string[], provider?: Provider): string[] {
+  if (provider === "codex") {
+    const end = flags.indexOf("--") < 0 ? flags.length : flags.indexOf("--");
+    const parsed = classifyCodexInvocation(["codex", ...flags]);
+    if (!parsed.unknownOptionIndexes.length) {
+      const positionals = new Set(parsed.positionalIndexes.map((i) => i - 1));
+      return flags.slice(0, end).filter((_, i) => !positionals.has(i));
+    }
+    // Preserve the previous one-value heuristic for unknown option arities.
+    // A future value option must not silently lose its value during handoff.
+  }
   const out: string[] = [];
   let mayBeAValue = false;
   let listValues = false;
@@ -1526,7 +1538,7 @@ export function flagsForResume(flags: string[]): string[] {
     }
     if (a.length > 1 && a.startsWith("-")) {
       out.push(a);
-      mayBeAValue = !a.includes("=");
+      mayBeAValue = a !== "--full-auto" && !a.includes("=");
       listValues = listFlags.has(a.split("=", 1)[0]!);
       continue;
     }
@@ -1559,12 +1571,27 @@ function standDownFrom(st: State, rec: RecoveryRow, manual: ManualRecovery | und
   else st.releaseRecovery(rec.id);
 }
 
+function codexCompatibilityProblem(session: SessionRow, env: NodeJS.ProcessEnv): string | null {
+  if (session.provider !== "codex" || !session.flags.some((a) => a === "--full-auto" || a === "--remote" || a.startsWith("--remote="))) return null;
+  const bin = resolveOnPath("codex", env, session.cwd);
+  try { codexExecutionCommand(codexLaunchCommand(flagsForResume(session.flags, "codex")), bin ? cliVersion(bin, undefined, env, session.cwd) : null); }
+  catch (error) { return `${(error as Error).message}; the current CLI was left untouched`; }
+  return null;
+}
+
 /** Steps 3–8: pick, leave, respawn, and wait to be told it worked. */
 async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: Tmux, opts: RecoverOptions): Promise<RecoverCode> {
   const id = session.id;
   const g = session.generation;
   const from = session.account;
   const manual = opts.manual;
+  const launchEnv = st.latestLaunch(id, g)?.env ?? {};
+  const runtimeEnv = withLaunchEnvironment(process.env, launchEnv);
+
+  // Configuration compatibility is independent of the destination account.
+  // Check before preparing any home, and again immediately before leaving.
+  const incompatible = codexCompatibilityProblem(session, runtimeEnv);
+  if (incompatible) return park(st, id, rec.id, g, incompatible);
 
   // Use one runtime-settings reading for BOTH the chooser and the relaunch.
   // A /model change can require the scoped window even when the original
@@ -1698,8 +1725,11 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
 
   // Probe optional flags before the final intent checks: a help probe can
   // take seconds, during which a human's stop must still win.
-  const claudeBin = session.provider === "claude" && liveAtPick.effort ? resolveOnPath("claude") : null;
-  const effortSupported = session.provider === "codex" || !!(claudeBin && cliSupportsFlag(claudeBin, "--effort"));
+  const claudeBin = session.provider === "claude" && liveAtPick.effort ? resolveOnPath("claude", runtimeEnv, session.cwd) : null;
+  const effortSupported = session.provider === "codex" || !!(claudeBin && cliSupportsFlag(claudeBin, "--effort", undefined, runtimeEnv, session.cwd));
+
+  const incompatibleBeforeExit = codexCompatibilityProblem(session, runtimeEnv);
+  if (incompatibleBeforeExit) return park(st, id, rec.id, g, incompatibleBeforeExit);
 
   const beforeExit = guardServer(st, session, tmux, g, rec);
   if (beforeExit !== null) return beforeExit;
@@ -1776,7 +1806,7 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   // launch's own positional prompt is not re-submitted beside the
   // continuation, and never re-submitted at all (see `flagsForResume`).
   const live = fresh ? { model: null, effort: null } : liveAtPick;
-  const flags = flagsWithLiveSettings(session.provider, flagsForResume(session.flags), live, effortSupported);
+  const flags = flagsWithLiveSettings(session.provider, flagsForResume(session.flags, session.provider), live, effortSupported);
   logLine(id, next, live.model
     ? `resuming on ${to} with model ${live.model}, effort ${effortSupported && live.effort ? live.effort : "from launch flags/default"} (from ${codex ? "rollout" : "transcript"}${!effortSupported && live.effort ? "; --effort unavailable, keeping launch effort" : ""})`
     : "model/effort fallback: no usable current-conversation transcript metadata; keeping launch flags");
@@ -1797,7 +1827,7 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     );
   }
   const launchId = randomUUID();
-  st.createLaunch({ id: launchId, sessionId: id, generation: next, account: to, command, env: {}, createdAt: nowSeconds() });
+  st.createLaunch({ id: launchId, sessionId: id, generation: next, account: to, command, env: launchEnv, createdAt: nowSeconds() });
   // The attempt records the account we LEFT — that is what was consumed, and
   // what the next try through this recovery must not go back to. A forced exit
   // is worth recording, but when a human asked for the move it is still their

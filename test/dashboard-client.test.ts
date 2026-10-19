@@ -400,23 +400,44 @@ test("accountRowHtml: a card — the name, the LABEL when it says something the 
   assert.ok(accountRowHtml({ ...ACCOUNT, state: "stale" }, "—").includes('<span class="ms-chip">stale</span>'));
 });
 
-test("accountRowHtml: one lane per window the account reports, percentages round to one place, a missing window is absent — never a dash lane", () => {
+test("accountRowHtml: one lane per reported window, precise used percentages, and explicit unknown resets", () => {
   const html = accountRowHtml(ACCOUNT, "—");
   assert.ok(html.includes(">Session · 5h</span>"), html);
   assert.ok(html.includes(">Week · all models</span>"), html);
   assert.ok(!html.includes("Week · Fable"), `the absent fable window must not draw a lane: ${html}`);
   assert.ok(!html.includes("—"), `a lane never reads as a dash: ${html}`);
-  assert.ok(html.includes(">12.3%</span>"), html);
-  assert.ok(html.includes(">30%</span>"), html);
+  assert.ok(html.includes(">12.25% used</span>"), html);
+  assert.ok(html.includes(">30% used</span>"), html);
   // Each lane carries its own reset, in local time.
   assert.ok(html.includes('<span class="ms-lane-note">resets Sun 20 Sep 09:00</span>'), html);
   // A window with no reset says nothing rather than guessing one: the 5h
   // window here has `resetsAt: null`.
-  assert.equal(html.match(/ms-lane-note/g)!.length, 1, html);
+  assert.equal(html.match(/ms-lane-note/g)!.length, 2, html);
+  assert.ok(html.includes("reset unknown"), html);
   // The fill is the severity palette only; a brand colour on a bar would
   // read as a severity.
   assert.ok(html.includes('data-severity="normal"'), html);
   assert.ok(!html.includes("brand"), html);
+});
+
+test("Codex cards use actual durations, precise USED values, escaped plan names, and reported reset credits", () => {
+  const a: AccountRowView = { name: "free", label: "free", provider: "codex", state: "ok", usage: {
+    session: null, weeklyAll: { usedPercent: 0.7, resetsAt: null, windowSeconds: 2592000, resetStarted: false },
+    planType: '<free & "trial">', resetsAvailable: 1,
+  } };
+  const html = accountRowHtml(a, "—");
+  assert.ok(html.includes("30d · all models"), html);
+  assert.ok(!html.includes("Week · all models"), html);
+  assert.ok(!html.includes("Session · 5h"), html);
+  assert.ok(html.includes("0.7% used"), html);
+  assert.ok(html.includes('aria-valuenow="0.7"'), html);
+  assert.ok(html.includes("reset not started"), html);
+  assert.ok(html.includes("Plan: &lt;free &amp; &quot;trial&quot;&gt;"), html);
+  assert.ok(html.includes("Resets available: 1"), html);
+  assert.ok(accountRowHtml({ ...a, stale: true }, "—").includes("Last reported resets available: 1"));
+  const unknown = accountRowHtml({ ...a, usage: { weeklyAll: { usedPercent: 0.01, resetsAt: null, windowSeconds: 2592000 } } }, "—");
+  assert.ok(unknown.includes("0.01% used") && unknown.includes("reset unknown"), unknown);
+  assert.ok(!unknown.includes("Resets available") && !unknown.includes("reset not started"), unknown);
 });
 
 test("accountRowHtml: an account with no readable window says so, rather than drawing meters of nothing", () => {
@@ -546,7 +567,7 @@ test("providerSegHtml: one pressed segment, in brand casing, over whichever prov
 
 test("fmtPercent / localTime / earliestWeeklyReset: the small readings the tables are built from", () => {
   assert.equal(fmtPercent({ usedPercent: 0, resetsAt: null }, "—"), "0%");
-  assert.equal(fmtPercent({ usedPercent: 99.94, resetsAt: null }, "—"), "99.9%");
+  assert.equal(fmtPercent({ usedPercent: 99.94, resetsAt: null }, "—"), "99.94%");
   assert.equal(fmtPercent(null, "—"), "—");
   assert.equal(fmtPercent(undefined, "—"), "—");
   assert.equal(fmtPercent({ usedPercent: null, resetsAt: null }, "—"), "—");

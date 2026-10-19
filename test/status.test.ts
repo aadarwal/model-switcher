@@ -321,12 +321,12 @@ test("ms status: accounts table (NAME PROVIDER LABEL 5H WEEK FABLE RESETS STATE 
   const lines = r.stdout.split("\n");
   const accHeaderIdx = lines.findIndex((l) => l.startsWith("NAME"));
   assert.ok(accHeaderIdx >= 0, r.stdout);
-  assert.deepEqual(cells(lines[accHeaderIdx]!), ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE", "SESS", "EMAIL"]);
+  assert.deepEqual(cells(lines[accHeaderIdx]!), ["NAME", "PROVIDER", "LABEL", "SESSION USED", "MAIN USED", "FABLE USED", "RESETS", "STATE", "SESS", "EMAIL"]);
 
   const dirkLine = lines.find((l) => l.startsWith("dirk"))!;
   assert.ok(dirkLine, r.stdout);
   assert.deepEqual(cells(dirkLine), [
-    "dirk", "claude", "Dirk", "42.5%", "10%", "33.3%", localTimeCli(Date.parse("2026-09-18T12:30:00Z")), "ok", "1", "-",
+    "dirk", "claude", "Dirk", "42.5%", "10%", "33.333%", localTimeCli(Date.parse("2026-09-18T12:30:00Z")), "ok", "1", "-",
   ]); // SESS 1: seedSessions() put sess-1 (walled, still live) on dirk; EMAIL "-": its profile read failed (the stub 500s it)
 
   const gmailLine = lines.find((l) => l.startsWith("gmail"))!;
@@ -555,7 +555,7 @@ test("ms status and JSON pool counts match account states and warn about the las
   assert.equal(text.code, 0, text.stderr);
   const { poolSummaryText } = await import("../src/pool-summary.ts");
   assert.equal(text.stdout.split("\n")[0], poolSummaryText("claude", data.pools.claude!, Date.now()));
-  assert.match(text.stdout, /LAST ACCOUNT WITH ROOM \(dirk, 5H 42\.5%\)/);
+  assert.match(text.stdout, /LAST ACCOUNT WITH ROOM \(dirk, 5H 42\.5% used\)/);
 });
 
 for (const [description, limits] of [
@@ -582,7 +582,7 @@ for (const [description, limits] of [
 }
 
 for (const [description, rate_limit] of [
-  ["a missing week", { primary_window: { used_percent: 10, limit_window_seconds: 18_000 } }],
+  ["no windows", {}],
   ["a malformed week", { secondary_window: { used_percent: "broken", limit_window_seconds: 604_800 } }],
   ["a malformed session", { primary_window: { used_percent: "broken", limit_window_seconds: 18_000 }, secondary_window: { used_percent: 10, limit_window_seconds: 604_800 } }],
 ] as const) {
@@ -807,7 +807,7 @@ test("ms status --watch actually loops: MS_WATCH_ITERATIONS=2 redraws twice, not
   // newline between them), so "starts with NAME" per split("\n") line only
   // matches the SECOND redraw onward — count occurrences in the raw text
   // instead.
-  const headerCount = (r.stdout.match(/NAME\s+PROVIDER\s+LABEL\s+5H\s+WEEK\s+FABLE\s+RESETS\s+STATE\s+SESS\s+EMAIL/g) ?? []).length;
+  const headerCount = (r.stdout.match(/NAME\s+PROVIDER\s+LABEL\s+SESSION USED\s+MAIN USED\s+FABLE USED\s+RESETS\s+STATE\s+SESS\s+EMAIL/g) ?? []).length;
   assert.equal(headerCount, 2, r.stdout);
   const sessionHeaderCount = (r.stdout.match(/SESSION\s+PANE\s+PROVIDER\s+ACCOUNT\s+NEED\s+STATE\s+GEN\s+PENDING\s+WAKEUP\s+WALLED\?/g) ?? []).length;
   assert.equal(sessionHeaderCount, 2, r.stdout);
@@ -963,6 +963,57 @@ test("accountState: a codex account whose only weekly window reads 100 is 'no ro
   });
   assert.equal(accountState(row(100), true), "no room");
   assert.equal(accountState(row(99), true), "ok");
+});
+
+test("accountState honors provider request gates and Codex single-window reserve budgets", async () => {
+  const { accountState } = await import("../src/status.ts");
+  const base = { name: "short", provider: "codex" as const, shared: false,
+    usage: { session: { usedPercent: 0.7, resetsAt: null }, weeklyAll: null, weeklyFable: null },
+    error: null, errorKind: null, observedAt: Date.now(), stale: false };
+  assert.equal(accountState(base, true), "ok");
+  assert.equal(accountState({ ...base, provider: "claude" }, true), "transient");
+  assert.equal(accountState({ ...base, usage: { ...base.usage, session: { usedPercent: -1, resetsAt: null } } }, true), "transient");
+  assert.equal(accountState({ ...base, usage: { ...base.usage, session: null, weeklyAll: { usedPercent: -1, resetsAt: null } } }, true), "transient");
+  for (const facts of [{ requestsAllowed: false }, { limitReached: true }]) {
+    const row = { ...base, usage: { ...base.usage, ...facts } };
+    assert.equal(accountState(row, true), "no room");
+    assert.equal(row.usage.session.usedPercent, 0.7);
+    assert.equal(accountState({ ...row, stale: true }, true), "stale");
+  }
+  assert.equal(accountState({ ...base, usage: { ...base.usage, session: { usedPercent: 70, resetsAt: null } } }, true, 30), "reserved");
+});
+
+test("status text and JSON preserve actual durations, small used values, reset state, and partial credits", async () => {
+  const { world: w, env } = await world({ panes: [], screens: {} });
+  const names = ["free", "pro", "unknown"];
+  writeFileSync(path.join(w.msHome, "accounts.json"), JSON.stringify({ version: 1, accounts: names.map((name) => ({ name, provider: "codex", label: name, shared: false })) }));
+  const now = Date.now();
+  const main = { usedPercent: 0.7, resetsAt: null, windowSeconds: 2592000, resetStarted: false };
+  const accounts = [
+    { name: "free", usage: { session: null, weeklyAll: main, weeklyFable: null, planType: "free", resetsAvailable: 1 } },
+    { name: "pro", usage: { session: { usedPercent: 0.01, resetsAt: null, windowSeconds: 18000 }, weeklyAll: { usedPercent: 1, resetsAt: null, windowSeconds: 604800 }, weeklyFable: null, resetsAvailable: 2 } },
+    { name: "unknown", usage: { session: null, weeklyAll: { usedPercent: 0, resetsAt: "bad-date" }, weeklyFable: null, resetsAvailable: -5 } },
+  ].map((a) => ({ ...a, provider: "codex", shared: false, error: null, errorKind: null, observedAt: now, stale: false }));
+  writeFileSync(path.join(w.msHome, "snapshot.json"), JSON.stringify({ takenAt: now, accounts, backoff: {} }));
+  const text = run(["status"], env());
+  assert.equal(text.code, 0, text.stderr);
+  assert.match(text.stdout, /SESSION USED.*MAIN USED.*RESETS AVAIL/);
+  assert.match(text.stdout, /3 reported \(2\/3 accounts; 1 unknown\)/);
+  const free = cells(text.stdout.split("\n").find((line) => line.startsWith("free "))!);
+  assert.equal(free[3], "—");
+  assert.equal(free[4], "0.7% (30d)");
+  assert.equal(free[6], "reset not started");
+  assert.equal(free[9], "1");
+  assert.match(text.stdout, /0\.01% \(5h\)/);
+  assert.doesNotMatch(text.stdout, /NaN/);
+  assert.match(text.stdout.split("\n").find((line) => line.startsWith("unknown "))!, /reset unknown/);
+  const json = run(["status", "--json"], env());
+  assert.equal(json.code, 0, json.stderr);
+  const data = JSON.parse(json.stdout);
+  assert.equal(data.accounts[0].usage.weeklyAll.usedPercent, 0.7);
+  assert.deepEqual(data.pools.codex.reportedResetsAvailable, { count: 3, accounts: 2, total: 3 });
+  assert.equal("resetsAvailable" in data.pools.codex, false);
+  assert.equal("resetsAvailable" in data.accounts.find((a: { name: string }) => a.name === "unknown").usage, false);
 });
 
 test("accountState: a claude 5h window at 100 is 'no room' too, and a full FABLE window is not — the chooser only gates on fable for --need fable", async () => {

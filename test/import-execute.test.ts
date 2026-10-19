@@ -440,6 +440,96 @@ test("a process tree is read off `ps -axo pid=,ppid=` and walked deepest-first",
   assert.deepEqual(descendantsOf(20, cycle), [21]);
 });
 
+test("forced CLI cleanup never enters a protected shared Codex service subtree", async () => {
+  const { descendantsOf, parsePidParents } = await import("../src/import/execute.ts");
+  // TUI wrapper 12 -> native 13 -> shared app-server 14 -> helper 15.
+  // An ordinary subprocess 16 remains part of the forced cleanup.
+  const parents = parsePidParents("12 1\n13 12\n14 13\n15 14\n16 13\n");
+  assert.deepEqual(descendantsOf(12, parents, new Set([14])), [16, 13]);
+});
+
+test("the real descendant lookup protects Codex services without mistaking a model value for a command", async () => {
+  const { dir, stub } = stubDir();
+  stub("ps", `#!/bin/sh
+cat <<'TABLE'
+12 1 node /private/bin/codex --model gpt-6-luna
+13 12 /private/bin/codex --model gpt-6-luna
+14 13 /private/bin/codex app-server --listen unix:// --managed-daemon
+15 14 node daemon-helper.js
+16 13 /private/bin/codex --model app-server
+17 13 node /private/bin/codex app-server daemon pid-update-loop
+18 17 helper
+TABLE
+`);
+  const previous = process.env.PATH;
+  process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
+  try {
+    const { defaultDescendants } = await import("../src/import/execute.ts");
+    assert.deepEqual(defaultDescendants(12), [16, 13]);
+  } finally { process.env.PATH = previous; }
+});
+
+test("an old manifest naming a Codex daemon cannot signal it", async (t) => {
+  const source = cand({ provider: "codex", id: "daemon-was-misidentified", pid: 12, cwd: "/tmp", startedAt: 1 });
+  const plan = planOf([source]);
+  const w = await world(t, plan);
+  const signals: number[] = [];
+  w.deps.alive = () => true;
+  w.deps.ps = () => [{ pid: 12, startedAt: 1, tty: "??", argv: ["codex", "app-server", "daemon", "pid-update-loop"] }];
+  w.deps.kill = (pid) => { signals.push(pid); return true; };
+  const { executeImport } = await import("../src/import/execute.ts");
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+  assert.deepEqual(signals, []);
+  assert.match(w.manifest().rows[0]!.outcome, /not the process the plan recorded/);
+});
+
+test("Codex import allows the existing writer-release wait before timing out its resumed pane", async (t) => {
+  const plan = planOf([cand({ provider: "codex", id: "daemon-backed-conversation", cwd: "/tmp" })]);
+  const w = await world(t, plan);
+  const previous = process.env.MS_IMPORT_READY_MS;
+  delete process.env.MS_IMPORT_READY_MS;
+  t.after(() => { if (previous === undefined) delete process.env.MS_IMPORT_READY_MS; else process.env.MS_IMPORT_READY_MS = previous; });
+  // A daemon releases this conversation after 65s, then the TUI needs 5s to
+  // report. The launcher's existing 75s lease wait is valid throughout.
+  w.deps.waitReady = async (_id, deadline) => deadline >= w.clock() + 70_000 ? "ready" : "timeout";
+  const { executeImport } = await import("../src/import/execute.ts");
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 1, stopped: 0, failed: 0 });
+});
+
+test("a daemon-owned Codex conversation is refused before signalling its live frontend", async (t) => {
+  const source = cand({ provider: "codex", id: "daemon-thread", pid: 12, cwd: "/tmp", startedAt: 1 });
+  const plan = planOf([source]), w = await world(t, plan);
+  const signals: number[] = [];
+  w.deps.alive = () => true;
+  w.deps.ps = () => [
+    { pid: 12, startedAt: 1, tty: "s001", argv: ["node", "/private/bin/codex"] },
+    { pid: 13, startedAt: 2, tty: "??", argv: ["/private/bin/codex", "app-server", "--managed-daemon"] },
+  ];
+  w.deps.writerHeldBy = (pid, threadId) => pid === 13 && threadId === source.id;
+  w.deps.kill = (pid) => { signals.push(pid); return true; };
+  const { executeImport } = await import("../src/import/execute.ts");
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+  assert.deepEqual(signals, []);
+  assert.equal(w.ready.calls.length, 0);
+  assert.match(w.manifest().rows[0]!.outcome, /background Codex.*source process remains untouched.*--no-daemon/);
+});
+
+test("unknown Codex writer ownership leaves the bounded resume check in place", async (t) => {
+  const source = cand({ provider: "codex", id: "unknown-owner-thread", pid: 12, cwd: "/tmp", startedAt: 1 });
+  const plan = planOf([source]), w = await world(t, plan);
+  let alive = true;
+  w.deps.alive = () => alive;
+  w.deps.kill = () => { alive = false; return true; };
+  w.deps.ps = () => [
+    { pid: 12, startedAt: 1, tty: "s001", argv: ["codex"] },
+    { pid: 13, startedAt: 2, tty: "??", argv: ["codex", "app-server", "--managed-daemon"] },
+  ];
+  w.deps.writerHeldBy = () => null;
+  const { executeImport } = await import("../src/import/execute.ts");
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 1, stopped: 1, failed: 0 });
+  assert.equal(w.ready.calls.length, 1);
+});
+
 test("a process that cannot be signalled fails its own row and stops nothing else", async (t) => {
   const { dir } = stubDir();
   const pid = await liveProcess(t, dir, "polite");
@@ -504,6 +594,68 @@ test("an old sanitized manifest refuses the current process's settings before an
   assert.match(w.manifest().rows[0]!.outcome, /--settings.*source process remains untouched/);
   assert.ok(!readFileSync(w.file, "utf8").includes("secret-value"));
   assert.ok(!w.log.join("\n").includes("secret-value"));
+});
+
+test("an old Codex plan refuses current remote ownership before signalling or touching tmux", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const address = "unix:///private/secret-remote-address.sock";
+  for (const argv of [
+    ["codex", "--remote", address],
+    ["node", "/private/bin/codex.mjs", "resume", "r-1", "--remote=" + address],
+  ]) {
+    const plan = planOf([cand({ provider: "codex", id: "r-1", cwd: "/tmp", pid })]);
+    const w = await world(t, plan);
+    w.deps.ps = () => tableFor(plan).map((row) => ({ ...row, argv }));
+    const signals: number[] = [];
+    w.deps.kill = (target) => { signals.push(target); return true; };
+    const { executeImport } = await import("../src/import/execute.ts");
+
+    assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+    assert.deepEqual(signals, []);
+    assert.deepEqual(w.tmuxLog(), []);
+    assert.ok(w.deps.alive(pid));
+    assert.match(w.manifest().rows[0]!.outcome, /--remote.*source process remains untouched/);
+    assert.ok(!readFileSync(w.file, "utf8").includes(address));
+    assert.ok(!w.log.join("\n").includes(address));
+  }
+});
+
+test("a manually edited Codex pane command cannot bypass remote refusal through provider-only argv", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const address = "unix:///private/secret-manual-remote.sock";
+  const plan = planOf([cand({ provider: "codex", id: "r-1", cwd: "/tmp", pid })]);
+  plan.sessions[0]!.windows[0]!.panes[0]!.command = ["ms", "adopt", "r-1", "--", "--remote", address];
+  const w = await world(t, plan);
+  const signals: number[] = [];
+  w.deps.kill = (target) => { signals.push(target); return true; };
+  const { executeImport } = await import("../src/import/execute.ts");
+
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+  assert.deepEqual(signals, []);
+  assert.deepEqual(w.tmuxLog(), []);
+  assert.ok(w.deps.alive(pid));
+  assert.equal(w.manifest().rows[0]!.command, null);
+  assert.ok(!readFileSync(w.file, "utf8").includes(address));
+  assert.ok(!w.log.join("\n").includes(address));
+});
+
+test("a Codex prompt word or attached profile value named remote does not refuse an otherwise valid import", async (t) => {
+  for (const flags of [["--profile=--remote"], ["--model", "gpt-6-luna", "--", "--remote=prompt"]]) {
+    const { dir } = stubDir();
+    const pid = await liveProcess(t, dir, "polite");
+    const source = cand({ provider: "codex", id: "r-1", cwd: "/tmp", pid, argv: ["codex", ...flags] });
+    const plan = planOf([source]);
+    const { keptFlags } = await import("../src/import/plan.ts");
+    plan.sessions[0]!.windows[0]!.panes[0]!.command = ["ms", "adopt", "r-1", "--", ...keptFlags("codex", source.argv)];
+    const w = await world(t, plan);
+    w.deps.ps = () => tableFor(plan).map((row) => ({ ...row, argv: source.argv! }));
+    const { executeImport } = await import("../src/import/execute.ts");
+
+    assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 1, stopped: 1, failed: 0 });
+    assert.ok(!w.deps.alive(pid));
+  }
 });
 
 test("a replayed command carrying raw MCP configuration is refused and removed before stopping", async (t) => {

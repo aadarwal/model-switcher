@@ -7,12 +7,11 @@
 // unlike Claude there is no separate launch-vs-poll split here, so the same
 // tokens both run `codex` as the account and read its usage.
 //
-// Endpoint, token URL, client id, the `wham/usage` response shape and the
-// "untouched window" rule are COPIED VERBATIM from the author's working
-// poller at data/lib/providers/openai.ts (`fetchOpenAIUsage`) — the version
-// proven against these endpoints. Nothing here is invented, and this tool
-// carries no OAuth client code of its own (spec §6). The differences from
-// that source are deliberate and narrow: the credential file is `auth.json`
+// Endpoint, token URL, client id and the "untouched window" rule originated
+// in the author's working poller at data/lib/providers/openai.ts
+// (`fetchOpenAIUsage`). Rate-limit windows and optional reset-credit counts
+// are also checked against Codex 0.163.0's provider schema and live readings.
+// The credential file is `auth.json`
 // under the caller-supplied dir (not `~/.codex` via CODEX_HOME expansion),
 // the refresh body drops the `scope` field, and errors classify through the
 // same AuthError/TransientError contract `claude-usage.ts` already defines
@@ -144,12 +143,9 @@ function isInvalidGrant(body: string): boolean {
   }
 }
 
-type RawWindow = {
-  used_percent?: number;
-  reset_at?: number;
-  reset_after_seconds?: number;
-  limit_window_seconds?: number;
-};
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
 
 /** One rate-limit window as `wham/usage` reports it, mapped to this tool's
  *  `Window`. `usedPercent` is carried raw, unrounded — `pick.ts` gates
@@ -159,18 +155,58 @@ type RawWindow = {
  *
  *  An untouched window whose reset sits a full window away isn't running:
  *  its `reset_at` is a synthetic "now + window", recomputed every poll. A
- *  null `resetsAt` renders as "not started" instead of a sliding countdown —
- *  copied verbatim from the dashboard's `toWindow`. */
-function toWindow(w: RawWindow): Window {
-  const usedPercent = w.used_percent ?? 0;
+ *  `resetStarted: false` lets displays say "not started" instead of showing
+ *  a sliding countdown. A missing reset without that evidence stays unknown. */
+function toWindow(value: unknown): Window | null {
+  if (value === null || value === undefined) return null;
+  const w = record(value);
+  if (!w || typeof w.used_percent !== "number" || !Number.isFinite(w.used_percent) || w.used_percent < 0
+    || typeof w.limit_window_seconds !== "number" || !Number.isSafeInteger(w.limit_window_seconds) || w.limit_window_seconds <= 0) {
+    throw new TransientError("malformed rate-limit window from wham/usage");
+  }
+  const usedPercent = w.used_percent;
+  const duration = w.limit_window_seconds;
+  const after = w.reset_after_seconds;
+  if (after != null && (typeof after !== "number" || !Number.isFinite(after) || after < 0)) {
+    throw new TransientError("malformed reset interval from wham/usage");
+  }
+  const reset = w.reset_at;
+  if (reset != null && (typeof reset !== "number" || !Number.isFinite(reset) || !Number.isFinite(new Date(reset * 1000).getTime()))) {
+    throw new TransientError("malformed reset time from wham/usage");
+  }
   const notStarted =
     usedPercent === 0 &&
-    w.reset_after_seconds != null &&
-    w.limit_window_seconds != null &&
-    w.reset_after_seconds >= w.limit_window_seconds;
+    typeof after === "number" && after >= duration;
   return {
     usedPercent,
-    resetsAt: !notStarted && w.reset_at != null ? new Date(w.reset_at * 1000).toISOString() : null,
+    resetsAt: !notStarted && typeof reset === "number" ? new Date(reset * 1000).toISOString() : null,
+    windowSeconds: duration,
+    ...(notStarted ? { resetStarted: false } : usedPercent > 0 || (typeof after === "number" && after < duration) ? { resetStarted: true } : {}),
+  };
+}
+
+/** Preserve actual provider intervals and explicit capacity gates. The legacy
+ * slot `weeklyAll` also carries a single 30-day free-plan window; its name
+ * must not turn the reported duration into a fabricated weekly limit. */
+export function normalizeCodexUsage(value: unknown): Usage {
+  const data = record(value);
+  const rl = record(data?.rate_limit);
+  if (!data || !rl) throw new TransientError("no rate-limit reading from wham/usage");
+  for (const key of ["allowed", "limit_reached"] as const) {
+    if (rl[key] !== undefined && typeof rl[key] !== "boolean") throw new TransientError("malformed capacity flag from wham/usage");
+  }
+  const windows = [toWindow(rl.primary_window), toWindow(rl.secondary_window)]
+    .filter((w): w is Window => w !== null).sort((a, b) => a.windowSeconds! - b.windowSeconds!);
+  const session = windows.length > 1 ? windows[0]! : windows[0] && windows[0].windowSeconds! < 86_400 ? windows[0] : null;
+  const weeklyAll = windows.length > 1 ? windows[1]! : windows[0] && windows[0].windowSeconds! >= 86_400 ? windows[0] : null;
+  const credits = record(data.rate_limit_reset_credits)?.available_count;
+  const plan = data.plan_type;
+  return {
+    session, weeklyAll, weeklyFable: null,
+    ...(typeof plan === "string" && plan.length > 0 && plan.length <= 80 && !/[\x00-\x1f\x7f]/.test(plan) ? { planType: plan } : {}),
+    ...(typeof rl.allowed === "boolean" ? { requestsAllowed: rl.allowed } : {}),
+    ...(typeof rl.limit_reached === "boolean" ? { limitReached: rl.limit_reached } : {}),
+    ...(typeof credits === "number" && Number.isSafeInteger(credits) && credits >= 0 ? { resetsAvailable: credits } : {}),
   };
 }
 
@@ -205,19 +241,14 @@ export async function fetchCodexUsage(auth: CodexAuth, signal: AbortSignal): Pro
   if (!res.ok) throw new Error(`${res.status} from wham/usage`);
 
   const raw = await res.text().catch(() => "");
-  let data: { rate_limit?: { primary_window?: RawWindow | null; secondary_window?: RawWindow | null } };
+  let data: unknown;
   try {
     data = JSON.parse(raw) as typeof data;
   } catch {
     throw new TransientError("non-JSON body from wham/usage");
   }
 
-  const rl = data.rate_limit;
-  return {
-    session: classify(rl).session,
-    weeklyAll: classify(rl).weeklyAll,
-    weeklyFable: null,
-  };
+  return normalizeCodexUsage(data);
 }
 
 /** The token endpoint's success body, as far as this file uses it. */
@@ -291,13 +322,4 @@ export async function refreshCodexCredentials(
   };
   writeCodexCredentials(dir, next);
   return next;
-}
-
-/** Sort the reported windows into `session` (under a day) and `weeklyAll`
- *  (a day or longer) by `limit_window_seconds`; position is meaningless. */
-function classify(rl: { primary_window?: RawWindow | null; secondary_window?: RawWindow | null } | undefined): { session: Window | null; weeklyAll: Window | null } {
-  const raws = [rl?.primary_window, rl?.secondary_window].filter((w): w is RawWindow => !!w);
-  const short = raws.filter((w) => (w.limit_window_seconds ?? 0) < 86_400).sort((a, b) => (a.limit_window_seconds ?? 0) - (b.limit_window_seconds ?? 0));
-  const long = raws.filter((w) => (w.limit_window_seconds ?? 0) >= 86_400).sort((a, b) => (a.limit_window_seconds ?? 0) - (b.limit_window_seconds ?? 0));
-  return { session: short[0] ? toWindow(short[0]) : null, weeklyAll: long[0] ? toWindow(long[0]) : null };
 }

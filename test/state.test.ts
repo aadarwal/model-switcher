@@ -170,6 +170,18 @@ test("createLaunch/getLaunch round-trip command and env as JSON", async () => {
   st.close();
 });
 
+test("latestLaunch is bound to its session and generation, preserving null and empty settings", async () => {
+  const { st } = await fresh();
+  for (const [id, sessionId, generation, createdAt] of [["old", "s1", 1, 1], ["first", "s1", 2, 5], ["last", "s1", 2, 5], ["future", "s1", 3, 9], ["other", "s2", 2, 20]] as const) {
+    st.createLaunch({ id, sessionId, generation, createdAt, account: "gmail", command: ["claude"], env: { PATH: null, ANTHROPIC_MODEL: "" } });
+  }
+  assert.equal(st.latestLaunch("s1", 2)?.id, "last");
+  assert.deepEqual(st.latestLaunch("s1", 2)?.env, { PATH: null, ANTHROPIC_MODEL: "" });
+  assert.equal(st.latestLaunch("s1", 4), null);
+  assert.equal(st.latestLaunch("missing", 2), null);
+  st.close();
+});
+
 test("listSessions returns every session, ordered by createdAt", async () => {
   const { st } = await fresh();
   st.createSession({ id: "s1", ...base });

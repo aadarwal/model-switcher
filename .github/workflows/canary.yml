@@ -21,6 +21,8 @@ on:
     branches: [main]
     paths:
       - scripts/canary.mjs
+      - scripts/canary-contracts.mjs
+      - scripts/canary-contracts.d.mts
       - scripts/canary-issues.mjs
       - .github/workflows/canary.yml
       - src/compat.ts

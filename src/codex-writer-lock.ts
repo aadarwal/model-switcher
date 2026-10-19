@@ -31,9 +31,10 @@
 //     last descriptor);
 //   * a background server holds it for as long as the conversation is LOADED
 //     there, which outlives the TUI that asked for it. A server unloads an
-//     idle conversation `thread_unload_delay_secs` (default 60) after its last
-//     client leaves, with up to 10 s for the shutdown itself
-//     (app-server/src/request_processors/thread_lifecycle.rs:56-63, :408-469).
+//     idle conversation after `thread_unload_delay_secs` without subscribers
+//     or activity. This was 60 s in 0.160; rust-v0.163.0 defaults to 1800 s
+//     (core/src/config/mod.rs, config/src/config_toml.rs). Shutdown and new
+//     subscriptions can extend the wait further.
 //     There is no request a client can send to unload a conversation another
 //     client holds — `thread/unsubscribe` only removes the caller, and the
 //     only force paths are `thread/archive` and `thread/delete`, which are
@@ -198,7 +199,7 @@ export function lockCardMeansReadOnly(screen: string, pid: number | null | undef
   return holdsWriterLock(pid, threadId) !== true;
 }
 
-/** How long a background server may keep a conversation after its last
- *  client left: Codex's default `thread_unload_delay_secs` (60) plus its
- *  10 s shutdown bound, plus margin. */
+/** Our bounded wait for a held writer, not the provider's retention limit.
+ * Codex 0.163 defaults to 30 minutes and can remain loaded with subscribers;
+ * exhausting this budget refuses the relaunch rather than killing a server. */
 export const RELEASE_BUDGET_MS = 75_000;

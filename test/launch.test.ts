@@ -182,6 +182,26 @@ async function readState(w: World, launchId?: string) {
   }
 }
 
+test("inside and outside launches persist only the caller's nonsecret invocation settings", async () => {
+  for (const outside of [false, true]) {
+    const w = await world();
+    const env = w.env({ ...(outside ? OUTSIDE : {}), CLAUDE_CONFIG_DIR: path.join(w.home, "private-claude"),
+      ANTHROPIC_MODEL: "sonnet", CLAUDE_CODE_EFFORT_LEVEL: "", ANTHROPIC_API_KEY: "secret-api-key",
+      OPENAI_API_KEY: "secret-openai-key", HOMI_AGENT_NAME: "peer" });
+    const result = run(["claude", "--as", "gmail"], env);
+    assert.equal(result.code, 0, result.stderr);
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(path.join(w.msHome, "state.sqlite"));
+    try {
+      const row = db.prepare("SELECT env FROM launches").get() as { env: string };
+      assert.deepEqual(JSON.parse(row.env), { PATH: env.PATH, CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR,
+        ANTHROPIC_MODEL: "sonnet", CLAUDE_CODE_EFFORT_LEVEL: "" });
+      assert.ok(!row.env.includes("secret"));
+      assert.ok(!row.env.includes(SAMPLE_TOKEN));
+    } finally { db.close(); }
+  }
+});
+
 // --- inside tmux -------------------------------------------------------
 
 test("inside tmux: picks, records, and respawns the caller's own pane", async () => {
@@ -240,8 +260,8 @@ test("inside tmux: picks, records, and respawns the caller's own pane", async ()
   assert.equal(launch!.account, "gmail");
   assert.equal(launch!.generation, 1);
   assert.deepEqual(launch!.command, ["claude", "--session-id", s.cliSessionId, "hello", "world"]);
-  // nothing but the record: no environment is carried in the launch row
-  assert.deepEqual(launch!.env, {});
+  assert.equal(launch!.env.PATH, w.env().PATH);
+  assert.ok(!JSON.stringify(launch!.env).includes(SAMPLE_TOKEN));
 
   // the row was whole before tmux was told to start the CLI
   const early = await sessionsAtRespawn(w);
@@ -523,9 +543,11 @@ test("a bad --need, and claude args not behind --, are usage errors", async () =
   assert.equal(loose.code, 2);
   assert.match(loose.stderr, /unexpected argument "--model" — put claude's own arguments after --/);
 
-  const dangling = run(["claude", "--as"], w.env());
-  assert.equal(dangling.code, 2);
-  assert.match(dangling.stderr, /^ms claude: --as needs an account name$/m);
+  for (const args of [["--as"], ["--as", "--mesh"], ["--as=--mesh"], ["--as", "--"]]) {
+    const dangling = run(["claude", ...args], w.env());
+    assert.equal(dangling.code, 2);
+    assert.match(dangling.stderr, /^ms claude: --as needs an account name$/m);
+  }
 
   const st = await readState(w);
   assert.equal(st.sessions.length, 0);
@@ -595,7 +617,7 @@ test("outside tmux: the default server — a placeholder pane first, then the CL
   assert.equal(session.state, "launching");
   assert.deepEqual(session.flags, ["hi"]);
   assert.deepEqual(st.launch!.command, ["claude", "--session-id", session.cliSessionId, "hi"]);
-  assert.deepEqual(st.launch!.env, {});
+  assert.equal(st.launch!.env.PATH, w.env().PATH);
   assert.match(r.stderr, /^ms: gmail \(any\) → pane %42$/m);
   assert.equal(readFileSync(w.log, "utf8").includes(SAMPLE_TOKEN), false);
 });
@@ -890,6 +912,53 @@ async function codexWorld(codex: CodexSpec[]): Promise<World> {
 
 const configToml = (msHome: string, name: string) => path.join(msHome, "codex", name, "config.toml");
 
+test("unreachable Codex usage cannot bypass a remembered single-window reserve", async () => {
+  const w = await codexWorld([{ name: "work", unreachable: true }]);
+  const registryFile = path.join(w.msHome, "accounts.json");
+  const registry = JSON.parse(readFileSync(registryFile, "utf8"));
+  registry.accounts.find((a: { name: string; provider: string }) => a.name === "work" && a.provider === "codex").reservePercent = 30;
+  writeFileSync(registryFile, JSON.stringify(registry), { mode: 0o600 });
+  const snapshotFile = path.join(w.msHome, "snapshot.json");
+  const snapshot = JSON.parse(readFileSync(snapshotFile, "utf8"));
+  const row = snapshot.accounts.find((a: { name: string; provider: string }) => a.name === "work" && a.provider === "codex");
+  row.observedAt = Date.now() - 20 * 60_000;
+  row.usage = { session: { usedPercent: 75, resetsAt: null, windowSeconds: 18_000 }, weeklyAll: null, weeklyFable: null };
+  writeFileSync(snapshotFile, JSON.stringify(snapshot), { mode: 0o600 });
+  writeFileSync(path.join(w.msHome, "last-pick.json"), JSON.stringify({ "codex:any": { name: "work", at: Date.now() - 60_000 } }), { mode: 0o600 });
+
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 4, r.stderr);
+  assert.match(r.stderr, /held back by its owner's reserve \(30%; its last reading had the reported window at 75%\)/);
+  assert.equal((await readState(w)).sessions.length, 0);
+  assert.equal(existsSync(w.log), false, "no pane is created or changed");
+});
+
+test("ambiguous legacy full-auto refuses before preparing an account or touching tmux", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const { dir, stub } = stubDir();
+  stub("codex", "echo 'codex-cli 0.163.0'");
+  const env = w.env();
+  const result = run(["codex", "--", "--full-auto", "--sandbox", "read-only"], { ...env, PATH: `${dir}:${env.PATH}` });
+  assert.equal(result.code, 2, result.stderr);
+  assert.match(result.stderr, /cannot safely adapt --full-auto/);
+  assert.equal(existsSync(w.log), false);
+  assert.equal(existsSync(configToml(w.msHome, "home")), false);
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
+test("a managed remote Codex launch refuses before preparing an account or touching tmux", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const { dir, stub } = stubDir();
+  stub("codex", "echo 'codex-cli 0.163.0'");
+  const env = w.env();
+  const result = run(["codex", "--", "--remote", "unix:///private/no-server.sock"], { ...env, PATH: `${dir}:${env.PATH}` });
+  assert.equal(result.code, 2, result.stderr);
+  assert.match(result.stderr, /cannot use --remote.*use plain codex/);
+  assert.equal(existsSync(w.log), false);
+  assert.equal(existsSync(configToml(w.msHome, "home")), false);
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
 test("ms codex launches the codex account with the most room, on its own home", async () => {
   // `work` is ALSO a claude account name in the other world; identity is
   // (provider, name), and nothing here may reach for the claude side.
@@ -924,7 +993,7 @@ test("ms codex launches the codex account with the most room, on its own home", 
   assert.equal(s.cliSessionId, null);
 
   assert.deepEqual(st.launch!.command, ["codex", "--model", "gpt-5"]);
-  assert.deepEqual(st.launch!.env, {});
+  assert.equal(st.launch!.env.PATH, w.env().PATH);
 
   // The memo is per provider: a codex pick may never be offered to claude.
   const lastPick = JSON.parse(readFileSync(path.join(w.msHome, "last-pick.json"), "utf8"));
@@ -1297,6 +1366,21 @@ test("codexResumeId reads the conversation a codex command line resumes, flags b
   assert.equal(codexResumeId(["resume", "my-named-thread"]), null, "a name is not a lock file");
   assert.equal(codexResumeId(["--", "resume", CONVERSATION]), null, "past `--` it is a prompt");
   assert.equal(codexResumeId(["--model", "gpt-5"]), null);
+  assert.equal(codexResumeId(["--profile", "resume", CONVERSATION]), null, "a profile value is not a subcommand");
+  assert.equal(codexResumeId(["resume", "--profile", CONVERSATION]), null, "a profile value is not a conversation id");
+  assert.equal(codexResumeId(["resume", "thread-name", CONVERSATION]), null, "a UUID in the prompt does not replace a thread name");
+  assert.equal(codexResumeId(["resume", "--last", CONVERSATION]), null, "the most recent conversation is selected by Codex");
+});
+
+test("a Codex profile or image value named resume cannot authorize a continuation", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  for (const args of [["--profile", "resume"], ["--image", "resume"], ["--", "resume"]]) {
+    const result = run(["codex", "--continue", "--", ...args], w.env());
+    assert.equal(result.code, 2, result.stderr);
+    assert.match(result.stderr, /--continue needs something to continue/);
+  }
+  assert.equal(existsSync(w.log), false);
+  assert.equal((await readState(w)).sessions.length, 0);
 });
 
 // --- mesh: the account, picked by hand ------------------------------------------
@@ -1321,16 +1405,75 @@ const fzfArgsOf = (w: World): string[] | null => {
 const tmuxActed = (w: World): string[] =>
   existsSync(w.log) ? logLines(w).filter((l) => /respawn-pane|set-option|set-hook|new-session|new-window/.test(l)) : [];
 
-test("parseLaunchArgs: `mesh` before -- is the picker, once, and never beside --as; after -- it is the CLI's", async () => {
+test("parseLaunchArgs: mesh and --mesh before -- choose the picker, once, and never beside --as", async () => {
   const { parseLaunchArgs } = await import("../src/launch.ts");
   assert.deepEqual(parseLaunchArgs(["mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: [] });
+  assert.deepEqual(parseLaunchArgs(["--mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: [] });
   assert.deepEqual(parseLaunchArgs(["--need", "fable", "mesh", "--", "x"]), { as: null, need: "fable", continueAfter: false, mesh: true, args: ["x"] });
+  assert.deepEqual(parseLaunchArgs(["--need", "fable", "--mesh", "--", "x"]), { as: null, need: "fable", continueAfter: false, mesh: true, args: ["x"] });
   assert.deepEqual(parseLaunchArgs(["--", "mesh"]), { as: null, need: null, continueAfter: false, mesh: false, args: ["mesh"] });
+  assert.deepEqual(parseLaunchArgs(["--", "--mesh", "--yolo", "mesh"], "codex"), { as: null, need: null, continueAfter: false, mesh: false, args: ["--mesh", "--yolo", "mesh"] });
   assert.deepEqual(parseLaunchArgs(["mesh", "--", "mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: ["mesh"] });
+  assert.deepEqual(parseLaunchArgs(["--mesh", "--", "--mesh", "mesh"]), { as: null, need: null, continueAfter: false, mesh: true, args: ["--mesh", "mesh"] });
   assert.deepEqual(parseLaunchArgs(["--as", "mesh"]), { as: "mesh", need: null, continueAfter: false, mesh: false, args: [] }, "an account may be called mesh");
+  assert.deepEqual(parseLaunchArgs(["--as", "--mesh"]), { error: "--as needs an account name" });
+  assert.deepEqual(parseLaunchArgs(["--as=--mesh"]), { error: "--as needs an account name" });
   assert.deepEqual(parseLaunchArgs(["mesh", "--as", "work"]), { error: "mesh chooses the account; drop --as or drop mesh" });
+  assert.deepEqual(parseLaunchArgs(["--mesh", "--as", "work"]), { error: "mesh chooses the account; drop --as or drop mesh" });
   assert.deepEqual(parseLaunchArgs(["--as=work", "mesh"]), { error: "mesh chooses the account; drop --as or drop mesh" });
-  assert.deepEqual(parseLaunchArgs(["mesh", "mesh"]), { error: "mesh is given twice" });
+  assert.deepEqual(parseLaunchArgs(["--as=work", "--mesh"]), { error: "mesh chooses the account; drop --as or drop mesh" });
+  for (const pair of [["mesh", "mesh"], ["mesh", "--mesh"], ["--mesh", "mesh"], ["--mesh", "--mesh"]]) {
+    assert.deepEqual(parseLaunchArgs(pair), { error: "mesh is given twice" });
+  }
+});
+
+test("the reported Codex picker command gives a correction before any picker or launch", async () => {
+  const w = await codexWorld([{ name: "home" }]);
+  const r = run(["codex", "--yolo", "--", "--mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "home" }));
+  assert.equal(r.code, 2, r.stderr);
+  assert.match(r.stderr, /unexpected argument "--yolo" — put codex's own arguments after --/);
+  assert.match(r.stderr, /ms codex mesh -- <codex args> \(or ms codex --mesh -- <codex args>\)/);
+  assert.equal(fzfArgsOf(w), null);
+  assert.deepEqual(tmuxActed(w), []);
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
+test("both Codex picker spellings preserve an explicitly supplied --yolo option", async () => {
+  for (const picker of ["mesh", "--mesh"]) {
+    const w = await codexWorld([{ name: "home", weekly: 10 }, { name: "work", weekly: 80 }]);
+    const r = run(["codex", picker, "--", "--yolo"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+    assert.equal(r.code, 0, `${picker}: ${r.stderr}`);
+    assert.ok(fzfArgsOf(w), "the account picker ran");
+    const st = await readState(w, launchIdOf(w));
+    assert.equal(st.sessions[0]!.account, "work");
+    assert.equal(st.sessions[0]!.pinnedAccount, "work");
+    assert.deepEqual(st.sessions[0]!.flags, ["--yolo"]);
+    assert.deepEqual(st.launch!.command, ["codex", "--yolo"]);
+  }
+});
+
+test("ms claude --mesh launches and pins the picked account with its provider arguments", async () => {
+  const w = await world();
+  const r = run(["claude", "--mesh", "--", "hello"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(fzfArgsOf(w));
+  const st = await readState(w, launchIdOf(w));
+  assert.equal(st.sessions[0]!.account, "work");
+  assert.equal(st.sessions[0]!.pinnedAccount, "work");
+  assert.deepEqual(st.sessions[0]!.flags, ["hello"]);
+  assert.deepEqual(st.launch!.command, ["claude", "--session-id", st.sessions[0]!.cliSessionId, "hello"]);
+});
+
+test("--mesh after the boundary remains a provider argument and never opens the picker", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }, { name: "work", weekly: 80 }]);
+  const r = run(["codex", "--", "--mesh", "mesh"], meshEnv(w, { MS_TEST_FZF_PICK: "work" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fzfArgsOf(w), null);
+  const st = await readState(w, launchIdOf(w));
+  assert.equal(st.sessions[0]!.account, "home");
+  assert.equal(st.sessions[0]!.pinnedAccount, null);
+  assert.deepEqual(st.sessions[0]!.flags, ["--mesh", "mesh"]);
+  assert.deepEqual(st.launch!.command, ["codex", "--mesh", "mesh"]);
 });
 
 test("ms claude mesh: the account picked by hand is launched and pinned — and never remembered as the chooser's pick", async () => {

@@ -34,12 +34,15 @@ import type { Verb } from "./cli.ts";
 import { codexBaseDir, ensureStore, msBinary, p } from "./paths.ts";
 import { findAccount, loadRegistry, type Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
-import { parseNeed, pickAccounts, reserveReached, type Need, type PickInput } from "./pick.ts";
+import { budgetWindow, parseNeed, pickAccounts, reserveReached, type Need, type PickInput } from "./pick.ts";
 import { syncCodexAutorotate, syncRebalance } from "./autorotate.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
-import { codexLaunchCommand } from "./providers/codex-cli.ts";
+import { classifyCodexInvocation, codexExecutionCommand, codexLaunchCommand } from "./providers/codex-cli.ts";
+import { cliVersion } from "./compat.ts";
+import { resolveOnPath } from "./exec.ts";
+import { captureLaunchEnvironment } from "./launch-env.ts";
 import { RELEASE_BUDGET_MS, probeConversation, waitForWriterRelease, writerLockDirs } from "./codex-writer-lock.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { chooseAccount } from "./mesh.ts";
@@ -106,7 +109,7 @@ type Parsed = { as: string | null; need: Need | null; continueAfter: boolean; me
  * `resume <id>` itself.
  */
 function namesAResume(provider: Provider, args: string[]): boolean {
-  if (provider === "codex") return args.includes("resume");
+  if (provider === "codex") return classifyCodexInvocation(["codex", ...args]).subcommand === "resume";
   return args.some((a) => a === "--resume" || a === "-r" || a === "--continue" || a === "-c" || a.startsWith("--resume="));
 }
 
@@ -144,10 +147,12 @@ export function claudeResumeId(args: string[]): string | null {
  * Null for `--last`, the picker, a thread NAME, and anything past `--`.
  */
 export function codexResumeId(args: string[]): string | null {
-  const end = args.indexOf("--") < 0 ? args.length : args.indexOf("--");
-  const at = args.indexOf("resume");
-  if (at < 0 || at >= end) return null;
-  return args.slice(at + 1, end).find((a) => CONVERSATION_ID.test(a)) ?? null;
+  const command = ["codex", ...args];
+  const parsed = classifyCodexInvocation(command);
+  if (parsed.subcommand !== "resume" || parsed.subcommandIndex === null || parsed.optionIndexes.some((i) => command[i] === "--last")) return null;
+  const index = parsed.positionalIndexes.find((i) => i > parsed.subcommandIndex!);
+  const id = index === undefined ? undefined : command[index];
+  return id && CONVERSATION_ID.test(id) ? id : null;
 }
 const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -157,7 +162,7 @@ function namesBareClaudeResume(args: string[]): boolean {
 }
 
 /**
- * `ms <cli> [mesh] [--as name] [--need any|fable] [--continue] [-- <cli args>]`.
+ * `ms <cli> [mesh|--mesh] [--as name] [--need any|fable] [--continue] [-- <cli args>]`.
  *
  * `--` is the boundary, and it is a hard one: everything after it is the
  * user's own command line for the CLI and passes through untouched, and
@@ -166,7 +171,7 @@ function namesBareClaudeResume(args: string[]): boolean {
  * the CLI). `cli` appears only in that refusal, so the human is told where
  * their own argument belongs in the command they actually typed.
  *
- * `mesh` is the one bare word on our side of it: pick the account by hand
+ * `mesh` (also `--mesh`) on our side picks the account by hand
  * (src/mesh.ts). It is the whole of the choice, so it cannot be said twice
  * or beside `--as`, which is a choice already made. After `--` it is the
  * CLI's own argument like any other.
@@ -187,14 +192,14 @@ export function parseLaunchArgs(argv: string[], cli = "claude"): Parsed | { erro
     const a = argv[i]!;
     if (a === "--") { args.push(...argv.slice(i + 1)); break; }
     if (a === "--continue") { continueAfter = true; continue; }
-    if (a === "mesh") {
+    if (a === "mesh" || a === "--mesh") {
       if (mesh) return { error: "mesh is given twice" };
       mesh = true;
       continue;
     }
     if (a === "--as" || a.startsWith("--as=")) {
       const v = a.startsWith("--as=") ? a.slice("--as=".length) : argv[++i];
-      if (!v) return { error: "--as needs an account name" };
+      if (!v || v.startsWith("-")) return { error: "--as needs an account name" };
       as = v;
       continue;
     }
@@ -205,7 +210,10 @@ export function parseLaunchArgs(argv: string[], cli = "claude"): Parsed | { erro
       need = parsed;
       continue;
     }
-    return { error: `unexpected argument ${JSON.stringify(a)} — put ${cli}'s own arguments after --` };
+    const pickerHint = mesh || argv.includes("mesh") || argv.includes("--mesh")
+      ? `; choose an account with ms ${cli} mesh -- <${cli} args> (or ms ${cli} --mesh -- <${cli} args>)`
+      : "";
+    return { error: `unexpected argument ${JSON.stringify(a)} — put ${cli}'s own arguments after --${pickerHint}` };
   }
   if (mesh && as !== null) return { error: "mesh chooses the account; drop --as or drop mesh" };
   // `--session-id` is how the launch keeps its grip on the CLI session across
@@ -533,6 +541,14 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     return EXIT_USAGE_ERROR;
   }
 
+  // Refuse ambiguous legacy permission combinations before account setup or
+  // any pane is created/replaced. _exec repeats this against its actual CLI.
+  if (provider === "codex" && cliArgs.some((a) => a === "--full-auto" || a === "--remote" || a.startsWith("--remote="))) {
+    const bin = resolveOnPath("codex");
+    try { codexExecutionCommand(codexLaunchCommand(cliArgs), bin ? cliVersion(bin) : null); }
+    catch (error) { say((error as Error).message); return EXIT_USAGE_ERROR; }
+  }
+
   // An unreadable accounts.json is "could not look", never "nothing is
   // there": reporting it as an empty pool would send the human hunting for a
   // missing account instead of a broken file. It is checked once, before
@@ -619,9 +635,10 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
       // accounts reserve`) is policy, not usage: a pick remembered before the
       // reserve was drawn is not launched on if its last reading is past it.
       const lastRow = rows.find((a) => a.name === last.name);
-      const lastWeek = lastRow?.usage?.weeklyAll;
-      if (lastRow && lastWeek && reserveReached(lastRow.reservePercent, lastWeek)) {
-        say(`usage unreachable, and the last pick '${last.name}' is held back by its owner's reserve (${lastRow.reservePercent}%; its last reading had the week at ${lastWeek.usedPercent}%)`, reasons);
+      const lastBudget = lastRow ? budgetWindow({ provider, session: lastRow.usage?.session ?? null, weeklyAll: lastRow.usage?.weeklyAll ?? null }) : null;
+      if (lastRow && lastBudget && reserveReached(lastRow.reservePercent, lastBudget)) {
+        const label = provider === "claude" ? "the week" : "the reported window";
+        say(`usage unreachable, and the last pick '${last.name}' is held back by its owner's reserve (${lastRow.reservePercent}%; its last reading had ${label} at ${lastBudget.usedPercent}%)`, reasons);
         return EXIT_UNREACHABLE;
       }
       account = last.name;
@@ -650,8 +667,8 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
 
   // A Codex conversation can be launched only once nothing else writes it.
   // The human typically just closed it somewhere — a plain `codex`, another
-  // pane — and that home's background server keeps it loaded for about a
-  // minute afterwards; a launch inside that minute is a read-only view
+  // pane — and that home's background server can keep it loaded afterwards
+  // (0.163 defaults to a 30-minute idle delay). A launch while held is read-only
   // (src/codex-writer-lock.ts). After `prepare`, which is what links this
   // home's lock directory at the one every home shares.
   const resumes = provider === "codex" ? (resumeId ?? codexResumeId(parsed.args)) : null;
@@ -660,7 +677,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     if (probeConversation(dirs, resumes) === "held") {
       const budget = Number(process.env.MS_CODEX_RELEASE_MS) || RELEASE_BUDGET_MS;
       process.stderr.write(
-        `ms codex: ${resumes} is still open in another codex process; waiting up to ${Math.round(budget / 1000)}s for it to be let go (a background server keeps a conversation about a minute after its window closes)\n`,
+        `ms codex: ${resumes} is still open in another codex process; waiting up to ${Math.round(budget / 1000)}s for it to be let go (a background server may retain it beyond this wait)\n`,
       );
       if ((await waitForWriterRelease(dirs, resumes, budget, Number(process.env.MS_POLL_MS) || 500)) === "held") {
         say(`${resumes} is still open in another codex process`, [
@@ -675,6 +692,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   const sessionId = randomUUID();
   const cliSessionId = plan.cliSessionId();
   const launchId = randomUUID();
+  const launchEnv = captureLaunchEnvironment();
   const command = plan.command(cliSessionId, cliArgs);
   // A hand pick says so on the one line the human reads.
   const label = `${plan.label(need)}${pinned ? ", pinned" : ""}`;
@@ -713,7 +731,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
         flags: parsed.args,
         pinnedAccount: pinned ? account : null,
       });
-      st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
+      st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: launchEnv, createdAt: nowSeconds() });
       retireSuperseded(st, { id: sessionId, socket, pane, serverStart });
 
       tmux.remainOnExit(pane, true);
@@ -747,7 +765,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
       need, account, generation: 1, state: "launching", desired: "running", flags: parsed.args,
       pinnedAccount: pinned ? account : null,
     });
-    st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
+    st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: launchEnv, createdAt: nowSeconds() });
     retireSuperseded(st, { id: sessionId, socket, pane, serverStart });
 
     tmux.remainOnExit(pane, true);

@@ -83,6 +83,46 @@ test("pool summary text names the last account, its 5h usage, reset events and t
   const text = poolSummaryText("claude", summary, NOW);
   assert.match(text, /^claude: 1\/2 with room · resets in next 24 h: 1 \(waiting 5h \d{4}-\d\d-\d\d \d\d:\d\d\)/);
   assert.match(text, /next room: waiting .* \(in 2h 0m\)/);
-  assert.match(text, /LAST ACCOUNT WITH ROOM \(last, 5H 68%\)$/);
+  assert.match(text, /LAST ACCOUNT WITH ROOM \(last, 5H 68% used\)$/);
   assert.doesNotMatch(text, /resets available/);
+});
+
+test("reported reset credits distinguish complete, partial, stale, malformed, and unknown coverage", () => {
+  const credited = (name: string, count: number) => account(name, { provider: "codex", usage: Object.assign({ session: null, weeklyAll: win(0), weeklyFable: null }, { resetsAvailable: count }) });
+  const members = [credited("aadarwal", 1), credited("kratuvak", 2), credited("tulp", 0)];
+  const complete = poolSummaries(members, NOW).codex!;
+  assert.equal(complete.resetsAvailable, 3);
+  assert.equal("reportedResetsAvailable" in complete, false);
+  assert.match(poolSummaryText("codex", complete, NOW), /resets available: 3$/);
+  const partial = poolSummaries([members[0]!, account("unknown", { provider: "codex" })], NOW).codex!;
+  assert.equal("resetsAvailable" in partial, false);
+  assert.deepEqual(partial.reportedResetsAvailable, { count: 1, accounts: 1, total: 2 });
+  assert.match(poolSummaryText("codex", partial, NOW), /1 reported \(1\/2 accounts; 1 unknown\)/);
+  const stale = poolSummaries([members[0]!, { ...members[1]!, stale: true }, { ...members[2]!, error: "timeout" }], NOW).codex!;
+  assert.equal("resetsAvailable" in stale, false);
+  assert.deepEqual(stale.reportedResetsAvailable, { count: 1, accounts: 1, total: 3 });
+  for (const value of [-1, 0.5, Number.NaN, Infinity]) {
+    const invalid = poolSummaries([credited("bad", value)], NOW).codex!;
+    assert.equal("resetsAvailable" in invalid, false);
+    assert.equal("reportedResetsAvailable" in invalid, false);
+  }
+  assert.equal(poolSummaries([credited("zero", 0)], NOW).codex!.resetsAvailable, 0);
+  const partialZero = poolSummaries([credited("zero", 0), account("unknown", { provider: "codex" })], NOW).codex!;
+  assert.equal("resetsAvailable" in partialZero, false);
+  assert.deepEqual(partialZero.reportedResetsAvailable, { count: 0, accounts: 1, total: 2 });
+});
+
+test("pool reset events name actual long-window durations", () => {
+  const a = account("free", { provider: "codex", usage: { session: null, weeklyAll: Object.assign(win(0.7, 2), { windowSeconds: 2592000 }), weeklyFable: null } });
+  assert.deepEqual(poolSummaries([a], NOW).codex!.resetsNext24h[0]!.windows, ["30d"]);
+});
+
+test("window reset dates do not promise recovery from an independent provider refusal", () => {
+  for (const facts of [{ requestsAllowed: false }, { limitReached: true }]) {
+    const a = account("blocked", { provider: "codex", state: "no room", usage: Object.assign({ session: win(100, 1), weeklyAll: win(100, 2), weeklyFable: null }, facts) });
+    const summary = poolSummaries([a], NOW).codex!;
+    assert.equal(summary.nextRoom, null);
+    assert.equal(summary.withRoom, 0);
+    assert.equal(summary.resetsNext24h.length, 2, "scheduled window events remain separate from a capacity promise");
+  }
 });

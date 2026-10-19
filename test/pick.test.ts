@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pickAccounts, parseNeed, type PickInput } from "../src/pick.ts";
+import { budgetWindow, pickAccounts, parseNeed, roomAfterReset, type PickInput } from "../src/pick.ts";
 
 const w = (used: number, resets: string | null = "2026-09-20T00:00:00Z") => ({ usedPercent: used, resetsAt: resets });
 const acct = (name: string, o: Partial<PickInput> = {}): PickInput => ({
@@ -95,6 +95,33 @@ test("a Codex account with no session window (Pro plans) is eligible on its week
   assert.deepEqual(r.out, [{ name: "cl", why: "no session window" }]);
   const walled = pickAccounts([{ name: "pro", provider: "codex", shared: false, reservePercent: 0, session: null, weeklyAll: { usedPercent: 100, resetsAt: null }, weeklyFable: null, error: null }], "any");
   assert.deepEqual(walled.out, [{ name: "pro", why: "weekly window at 100" }]);
+});
+
+test("Codex accepts its only reported short window and applies reserve to that budget", () => {
+  const only = acct("single", { provider: "codex", session: { ...w(69.5), windowSeconds: 18000 }, weeklyAll: null, weeklyFable: null, reservePercent: 30 });
+  assert.equal(pickAccounts([only], "any").picks[0]?.remaining, 0.5);
+  assert.match(pickAccounts([{ ...only, session: w(70) }], "any").out[0]!.why, /reserved/);
+  assert.equal(pickAccounts([{ ...only, provider: "claude" }], "any").picks.length, 0);
+});
+
+test("the shared budget follows the reported longest window without relaxing Claude requirements", () => {
+  const single = acct("single", { provider: "codex", weeklyAll: null });
+  assert.equal(budgetWindow(single), single.session);
+  assert.equal(budgetWindow({ ...single, provider: "claude" }), null);
+  const both = acct("both", { provider: "codex" });
+  assert.equal(budgetWindow(both), both.weeklyAll);
+  assert.equal(budgetWindow({ ...single, session: null }), null);
+});
+
+test("provider capacity gates exclude zero-percent accounts without fabricating their usage", () => {
+  const ordinary = acct("current", { provider: "codex", session: null, weeklyAll: w(0), weeklyFable: null });
+  for (const over of [{ requestsAllowed: false }, { limitReached: true }]) {
+    assert.deepEqual(pickAccounts([{ ...ordinary, ...over }], "any").out, [{ name: "current", why: "provider reports no capacity" }]);
+    assert.equal(roomAfterReset({ ...ordinary, ...over, weeklyAll: w(100, "2026-11-20T00:00:00Z") }, "any", Date.parse("2026-10-19T00:00:00Z")), null,
+      "a window reset cannot promise that an independent provider gate will clear");
+  }
+  assert.equal(pickAccounts([{ ...ordinary, requestsAllowed: true, limitReached: false }], "any").picks.length, 1);
+  assert.equal(pickAccounts([{ ...ordinary, weeklyAll: w(-1) }], "any").picks.length, 0);
 });
 
 

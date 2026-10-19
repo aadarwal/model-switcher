@@ -29,7 +29,7 @@
 import { rebalanceEnabled } from "./autorotate.ts";
 import { appendEvent, lastEvent } from "./events.ts";
 import { msBinary } from "./paths.ts";
-import { pickAccounts, reserveReached, type Need, type PickInput } from "./pick.ts";
+import { budgetWindow, pickAccounts, reserveReached, type Need, type PickInput } from "./pick.ts";
 import { backgroundWork, isBusy, safeCapture } from "./recover.ts";
 import type { Provider } from "./registry.ts";
 import { getSnapshot, toPickInputs, type Snapshot, type SnapshotOptions } from "./snapshot.ts";
@@ -149,36 +149,36 @@ const ms = (iso: string | null): number => (iso ? Date.parse(iso) : Number.NaN);
  * reading is not one this rule may judge: a missing window, a percentage that
  * is not a number, or an account the snapshot has marked dead.
  *
- * A Codex Pro plan reports no 5 h window at all (`src/pick.ts`), so its
- * absence is a gating window fewer there and an unreadable account for Claude.
+ * Codex may report either window alone. Claude requires both.
  */
 function gatingWindows(a: PickInput, need: Need): W[] | null {
   if (a.error) return null;
   const out: W[] = [];
   if (a.session) out.push(a.session);
   else if (a.provider !== "codex") return null;
-  if (!a.weeklyAll) return null;
-  out.push(a.weeklyAll);
+  if (!budgetWindow(a)) return null;
+  if (a.weeklyAll) out.push(a.weeklyAll);
   if (need === "fable") {
     if (!a.weeklyFable) return null;
     out.push(a.weeklyFable);
   }
-  return out.every((x) => Number.isFinite(x.usedPercent)) ? out : null;
+  return out.every((x) => Number.isFinite(x.usedPercent) && x.usedPercent >= 0) ? out : null;
 }
 
 /**
- * The WEEKLY windows only — what "the week" means in condition 2. The 5 h
- * session window is deliberately left out: it resets four times a day, and a
- * budget argument made from it would move a session every afternoon.
+ * The longest reported budget, plus Fable when required. A separate short
+ * session window does not establish the budget's next reset; when Codex
+ * reports only that window, it is the entire budget the chooser can rank.
  */
-function weeklyWindows(a: PickInput, need: Need): W[] | null {
-  if (a.error || !a.weeklyAll) return null;
-  const out: W[] = [a.weeklyAll];
+function budgetWindows(a: PickInput, need: Need): W[] | null {
+  const budget = budgetWindow(a);
+  if (a.error || !budget) return null;
+  const out: W[] = [budget];
   if (need === "fable") {
     if (!a.weeklyFable) return null;
     out.push(a.weeklyFable);
   }
-  return out.every((x) => Number.isFinite(x.usedPercent)) ? out : null;
+  return out.every((x) => Number.isFinite(x.usedPercent) && x.usedPercent >= 0) ? out : null;
 }
 
 const mostUsed = (ws: W[]): number => Math.max(...ws.map((x) => x.usedPercent));
@@ -186,7 +186,7 @@ const mostUsed = (ws: W[]): number => Math.max(...ws.map((x) => x.usedPercent));
  *  owner's reserve (`ms accounts reserve`): the line the chooser itself stops
  *  at, and how src/pick.ts measures `remaining`. */
 const leastRoom = (a: PickInput, ws: W[]): number =>
-  Math.min(...ws.map((x) => (x === a.weeklyAll ? 100 - (a.reservePercent ?? 0) : 100) - x.usedPercent));
+  Math.min(...ws.map((x) => (x === budgetWindow(a) ? 100 - (a.reservePercent ?? 0) : 100) - x.usedPercent));
 /** The soonest of these windows' resets, or NaN when none of them names one.
  *  NaN is the point: "I do not know when this resets" must never compare as
  *  "it resets at the end of time" and win condition 2 by default. */
@@ -216,15 +216,15 @@ function hasRoom(a: PickInput, need: Need): boolean {
  *  of the current week is spent does not matter: a sooner reset is worth more
  *  now regardless. */
 function betterBudget(from: PickInput, to: PickInput, need: Need): boolean {
-  const here = weeklyWindows(from, need);
-  const there = weeklyWindows(to, need);
+  const here = budgetWindows(from, need);
+  const there = budgetWindows(to, need);
   if (!here || !there) return false;
   // …except onto an account whose owner keeps a reserve, with less than
   // condition 1's room left in its week before that line: the move would only
   // spend the owner's share. Only the week: the reserve has no say over the
   // 5 h or Fable windows, and without a reserve nothing changes.
   const reserve = to.reservePercent ?? 0;
-  if (reserve > 0 && 100 - reserve - to.weeklyAll!.usedPercent < REBALANCE_RULES.DESTINATION_ROOM_PERCENT) return false;
+  if (reserve > 0 && 100 - reserve - budgetWindow(to)!.usedPercent < REBALANCE_RULES.DESTINATION_ROOM_PERCENT) return false;
   const hereReset = soonestReset(here);
   const thereReset = soonestReset(there);
   if (!Number.isFinite(hereReset) || !Number.isFinite(thereReset)) return false;
@@ -287,7 +287,7 @@ export function decide(input: DecisionInput): Decision {
   // the owner's share is not left to drain for that. The destination is what
   // the move reports as `better` too: the dry run, `ms status` and the
   // dashboard's confirm all show `better`, and must name where it goes.
-  if (reserveReached(from.reservePercent, from.weeklyAll)) {
+  if (reserveReached(from.reservePercent, budgetWindow(from))) {
     const dest = ranked.find((p) => p.name !== session.account && hasRoom(mine.find((a) => a.name === p.name)!, need));
     if (dest) return { move: true, to: dest.name, better: dest.name, reason: "reserve" };
   }

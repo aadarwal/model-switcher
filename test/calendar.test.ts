@@ -6,6 +6,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+test("calendar events keep the real 30-day duration and fractional used amount", async () => {
+  const { resetEvents, eventTitle, eventDetails } = await import("../src/calendar.ts");
+  const now = Date.parse("2026-10-19T00:00:00Z");
+  const events = resetEvents([{ name: "free", provider: "codex", usage: { session: null, weeklyAll: Object.assign({ usedPercent: 0.7, resetsAt: new Date(now + 3600000).toISOString() }, { windowSeconds: 2592000 }), weeklyFable: null } }], now, 8);
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0]!.windows, ["30d"]);
+  assert.match(eventTitle(events[0]!), /30d limit resets/);
+  assert.match(eventDetails(events[0]!), /0\.7% used/);
+});
+
 const NOW = Date.parse("2026-09-18T12:00:00Z");
 const at = (h: number): string => new Date(NOW + h * 3600_000).toISOString();
 

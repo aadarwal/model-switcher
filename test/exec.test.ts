@@ -14,7 +14,7 @@ const SESSION_BASE = {
  * subprocess `run()` spawns later shares the same sqlite file on disk) and
  * returns the env `run()` needs to see the same store and stub PATH. */
 async function seedLaunch(opts: {
-  home: string; msHome: string; account?: string; generation?: number; env?: Record<string, string>;
+  home: string; msHome: string; account?: string; generation?: number; env?: Record<string, string | null>;
   skipSession?: boolean; provider?: "claude" | "codex"; command?: string[];
 }) {
   const account = opts.account ?? "gmail";
@@ -116,6 +116,42 @@ test("a missing launch token exits 3 and stderr names only the account", async (
   assert.match(r.stderr, /gmail/);
   assert.equal(r.stderr.trim().split("\n").length, 1);
   assert.equal(r.stderr.includes(SAMPLE_TOKEN), false);
+});
+
+test("_exec restores the caller PATH before resolving and preserves empty versus unset Claude settings", async () => {
+  const { home, msHome } = tempHome();
+  const selected = stubDir(), stale = stubDir();
+  selected.stub("claude", `echo SELECTED=caller\necho CONFIG="\${CLAUDE_CONFIG_DIR-<unset>}"\necho MODEL="\${ANTHROPIC_MODEL-<unset>}"\necho EFFORT="\${CLAUDE_CODE_EFFORT_LEVEL-<unset>}"`);
+  stale.stub("claude", "echo SELECTED=server");
+  await seedLaunch({ home, msHome, env: { PATH: selected.dir, CLAUDE_CONFIG_DIR: "", ANTHROPIC_MODEL: null, CLAUDE_CODE_EFFORT_LEVEL: "medium" } });
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  saveLaunchToken("gmail", SAMPLE_TOKEN);
+  const r = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: stale.dir,
+    CLAUDE_CONFIG_DIR: "/stale/config", ANTHROPIC_MODEL: "stale-model", CLAUDE_CODE_EFFORT_LEVEL: "low" });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, "SELECTED=caller\nCONFIG=\nMODEL=<unset>\nEFFORT=medium\n");
+});
+
+test("_exec removes legacy account ownership from inherited and recorded env while retaining HOMI identity", async () => {
+  const { home, msHome } = tempHome(), cli = stubDir();
+  const keys = ["ANU_ACCOUNT", "ANU_PROVIDER", "ANU_LAUNCH_NONCE", "ANU_PANE"];
+  cli.stub("claude", keys.map(k => `echo ${k}="\${${k}-<unset>}"`).join("\n") + '\necho HOMI="$HOMI_AGENT_NAME"');
+  await seedLaunch({ home, msHome, env: { ANU_ACCOUNT: "recorded-owner" } });
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts");
+  saveLaunchToken("gmail", SAMPLE_TOKEN);
+  const r = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: cli.dir,
+    ...Object.fromEntries(keys.map(k => [k, "stale-owner"])), HOMI_AGENT_NAME: "retained-peer" });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, keys.map(k => `${k}=<unset>\n`).join("") + "HOMI=retained-peer\n");
+});
+
+test("an explicitly unset caller PATH cannot fall back to a stale server CLI", async () => {
+  const { home, msHome } = tempHome(), stale = stubDir();
+  stale.stub("claude", "echo WRONG_SERVER_CLI");
+  await seedLaunch({ home, msHome, env: { PATH: null } });
+  const { saveLaunchToken } = await import("../src/launch-credentials.ts"); saveLaunchToken("gmail", SAMPLE_TOKEN);
+  const r = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: stale.dir });
+  assert.equal(r.code, 3); assert.match(r.stderr, /claude not found on PATH/); assert.equal(r.stdout, "");
 });
 
 test("a missing launch row exits 3 with a one-line message", async () => {
@@ -282,4 +318,42 @@ test("_exec keeps Codex in-process when a prompt or profile names a subcommand",
     assert.equal(lines.CODEX_HOME, `${msHome}/codex/work`);
     assert.equal(lines.MS_SESSION, "s1");
   }
+});
+
+test("_exec adapts a legacy full-auto resume at runtime without rewriting its launch record", async () => {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  const command = ["codex", "resume", "cx-1", "--full-auto"];
+  await seedLaunch({ home, msHome, account: "work", provider: "codex", command });
+  stub("codex", `if [ "$1" = "--version" ]; then echo 'codex-cli 0.163.0'; exit 0; fi\n${CODEX_STUB}`);
+  const result = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(envOf(result.stdout).ARGS, "resume --no-daemon cx-1 --sandbox workspace-write --ask-for-approval on-request");
+  const { openState } = await import("../src/state.ts");
+  const state = openState();
+  try { assert.deepEqual(state.getLaunch("L1")!.command, command); }
+  finally { state.close(); }
+});
+
+test("_exec refuses ambiguous legacy permission selectors without running the CLI", async () => {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  await seedLaunch({ home, msHome, account: "work", provider: "codex", command: ["codex", "--full-auto", "--sandbox", "read-only"] });
+  stub("codex", `if [ "$1" = "--version" ]; then echo 'codex-cli 0.163.0'; exit 0; fi\n${CODEX_STUB}`);
+  const result = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /cannot safely adapt --full-auto/);
+  assert.equal(result.stdout, "");
+});
+
+test("_exec repeats the managed remote ownership refusal without echoing its endpoint", async () => {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  await seedLaunch({ home, msHome, account: "work", provider: "codex", command: ["codex", "--remote", "wss://secret-endpoint.invalid"] });
+  stub("codex", `if [ "$1" = "--version" ]; then echo 'codex-cli 0.163.0'; exit 0; fi\n${CODEX_STUB}`);
+  const result = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /cannot use --remote.*use plain codex/);
+  assert.doesNotMatch(result.stderr, /secret-endpoint/);
+  assert.equal(result.stdout, "");
 });

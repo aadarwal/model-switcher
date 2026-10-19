@@ -322,9 +322,9 @@ test("renderPreview: who it is, where it stands, the bars, the resets, what is h
   assert.match(text, /^ Status {4}ok — ★ what `ms claude` would pick now$/m);
   assert.match(text, /^ Rank {6}1 of 3 with room \(need: any\)$/m);
   // The reading was stamped a moment ago, maybe in this same millisecond.
-  assert.match(text, /^ 5h {8}\[█{11}░\] {2}95% {2}resets (\w{3} \d{1,2} \w{3} )?\d\d:\d\d \(in (1h 59m|2h 0m)\)$/m);
-  assert.match(text, /^ Week {6}\[█{9}░{3}\] {2}75% {2}resets \w{3} \d{1,2} \w{3} \d\d:\d\d \(in (23h 59m|1d 0h)\)$/m);
-  assert.match(text, /^ Fable {5}\[█{2}░{10}\] {2}20% {2}resets /m);
+  assert.match(text, /^ 5h {8}\[█{11}░\] {2}95% used {2}resets (\w{3} \d{1,2} \w{3} )?\d\d:\d\d \(in (1h 59m|2h 0m)\)$/m);
+  assert.match(text, /^ Week {6}\[█{9}░{3}\] {2}75% used {2}resets \w{3} \d{1,2} \w{3} \d\d:\d\d \(in (23h 59m|1d 0h)\)$/m);
+  assert.match(text, /^ Fable {5}\[█{2}░{10}\] {2}20% used {2}resets /m);
   assert.match(text, /^ Here {6}launch token on this device ✓$/m);
   assert.match(text, /^ Panes {5}%12 running (~|\/nohome)\/src\/foo$/m);
   assert.match(text, /^ Reading {3}\d+s old$/m);
@@ -358,10 +358,32 @@ test("renderPreview: nulls everywhere — no reading, no e-mail, an error, a win
   });
   const home = plain(renderPreview(codex.rows[0]!, codex));
   assert.match(home, /^ home {2}· {2}codex, shared$/m);
-  assert.match(home, /^ Week {6}\[█{2}░{10}\] {2}12% *$/m, "no reset, no reset text");
+  assert.match(home, /^ Week {6}\[█{2}░{10}\] 12\.5% used {2}reset unknown$/m, "a missing reset is unknown, not a claimed unstarted window");
   assert.match(home, /^ 5h {8}— {2}\(not reported\)$/m);
   assert.doesNotMatch(home, /Fable/, "codex has no fable window to show");
   assert.match(home, /^ Here {6}codex home logged in here ✓$/m);
+});
+
+test("mesh shows 30-day Codex windows, small USED values, plan, credits, and proven reset state", () => {
+  const free = reading("free", { provider: "codex", session: null, weekly: { used: 0.7, resetIn: null } });
+  Object.assign(free.usage!, { planType: "free", resetsAvailable: 1 });
+  Object.assign(free.usage!.weeklyAll!, { windowSeconds: 2592000, resetStarted: false });
+  const pro = reading("pro", { provider: "codex", weekly: { used: 0.01, resetIn: null } });
+  Object.assign(pro.usage!.weeklyAll!, { windowSeconds: 604800 });
+  const v = meshRows({ provider: "codex", need: "any", names: ["free", "pro"], registry: { version: 1, accounts: [account("free", { provider: "codex" }), account("pro", { provider: "codex" })] }, snapshot: { takenAt: now(), registryError: null, accounts: [free, pro] }, ready: () => null, sessions: [], now: now() });
+  const row = v.rows.find((r) => r.name === "free")!;
+  const preview = plain(renderPreview(row, v));
+  assert.match(preview, /^ Plan +free$/m);
+  assert.match(preview, /^ Resets +1 available$/m);
+  assert.match(preview, /^ 30d +\[░{12}\] +0\.7% used +reset not started$/m);
+  assert.match(preview, /^ 5h +— +\(not reported\)$/m);
+  assert.doesNotMatch(preview, /^ Week /m);
+  assert.match(plain(meshHeader(v)[0]), /percentages USED/);
+  const lines = renderRows(v).map(plain);
+  assert.ok(lines.some((line) => /30d +0\.7%/.test(line)), lines.join("\n"));
+  assert.ok(lines.some((line) => /7d +0\.01%/.test(line)), lines.join("\n"));
+  const unknown = { ...row, usage: { ...row.usage!, weeklyAll: { ...row.usage!.weeklyAll!, resetStarted: undefined } } };
+  assert.match(plain(renderPreview(unknown, v)), /0\.7% used +reset unknown/);
 });
 
 test("clean: control characters from a label, an e-mail or an error never reach the terminal", () => {
@@ -385,7 +407,7 @@ test("meshHeader: the keys, then ★ and how old the newest reading is — or th
   const aged = { ...p.snapshot, takenAt: now(), accounts: p.snapshot.accounts.map((a) => (a.observedAt === null ? a : { ...a, observedAt: now() - (a.name === "alpha" ? 14_000 : 95_000) })) };
   const v = meshRows({ provider: "claude", need: "any", names: p.names, registry: p.registry, snapshot: aged, ready: p.ready, sessions: [], now: now() });
   const [keys, status] = meshHeader(v);
-  assert.equal(keys, "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel");
+  assert.equal(keys, "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel · percentages USED");
   assert.match(plain(status), /^★ what plain `ms claude` would pick · usage 1[45]s old$/);
 
   const down = {
@@ -450,6 +472,21 @@ test("meshRows: usage unreachable, the ★ is the remembered pick a plain launch
   assert.equal(ranked.rows[0]!.name, "bravo");
 });
 
+test("meshRows: an unreachable remembered Codex pick honors the reserve on its sole short window", () => {
+  const snapshot: Snapshot = { takenAt: now(), registryError: null, accounts: [reading("single", {
+    provider: "codex", session: { used: 75, resetIn: 3 }, weekly: null,
+    observedAt: now() - 20 * 60_000, stale: true, error: "fetch failed", errorKind: "transient",
+  })] };
+  for (const reservePercent of [30, 20]) {
+    const registry: Registry = { version: 1, accounts: [account("single", { provider: "codex", reservePercent })] };
+    const v = meshRows({ provider: "codex", need: "any", names: ["single"], registry, snapshot,
+      ready: () => null, lastPick: "single", sessions: [], now: now() });
+    assert.equal(v.unreachable, true);
+    assert.equal(v.starredBy, reservePercent === 30 ? null : "last pick");
+    assert.equal(v.rows[0]!.mark === "★", reservePercent !== 30);
+  }
+});
+
 test("parseFzfVersion reads what fzf --version prints, and nothing else", () => {
   assert.deepEqual(parseFzfVersion("0.73.1 (Homebrew)"), [0, 73, 1]);
   assert.deepEqual(parseFzfVersion("0.53.0 (c4a9ccd)\n"), [0, 53, 0]);
@@ -466,7 +503,7 @@ test("fzfArgs: the fixed flags, the prompt, the header (keys, then the input's s
   assert.equal(value("--delimiter"), "\t");
   assert.equal(value("--with-nth"), "2..");
   assert.equal(value("--prompt"), "claude account> ");
-  assert.equal(value("--header"), "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel");
+  assert.equal(value("--header"), "enter: launch here (pinned) · ctrl-r: refresh usage · esc: cancel · percentages USED");
   // Line 2 is the first line of fzf's input, so a reload rewrites it too.
   assert.equal(value("--header-lines"), "1");
   assert.equal(value("--preview"), "cat '/tmp/ms-mesh-abc123'/{1}");
@@ -829,7 +866,7 @@ test("_mesh_rows: a fresh reading of the picker's accounts, the previews re-rend
   for (const l of lines.slice(1)) assert.match(l, /^[0-2]\t/, `then only rows: ${JSON.stringify(l)}`);
   const charlie = lines[1]!;
   assert.match(plain(charlie), /^2\t★ charlie /, "charlie has room again, the soonest reset, and the ★");
-  assert.match(plain(readFileSync(path.join(dir, "2"), "utf8")), /^ Week {6}\[░{12}\] {3}1%/m, "its preview was re-rendered from the new reading");
+  assert.match(plain(readFileSync(path.join(dir, "2"), "utf8")), /^ Week {6}\[░{12}\] {3}1% used/m, "its preview was re-rendered from the new reading");
   assert.deepEqual(JSON.parse(readFileSync(path.join(dir, "rows.json"), "utf8")).out, [null, null, null]);
 });
 

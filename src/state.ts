@@ -7,6 +7,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, closeSync, existsSync, openSync } from "node:fs";
 import { ensureStore, p } from "./paths.ts";
+import type { LaunchEnvironment } from "./launch-env.ts";
 
 export type Provider = "claude" | "codex";
 export type SessionState = "launching" | "running" | "walled" | "stopping" | "resuming" | "continuing" | "parked" | "waiting" | "stopped";
@@ -40,7 +41,7 @@ export type SessionRow = { id: string; provider: Provider; cliSessionId: string 
    *  `ms switch` — writes null here in the same update that moves `account`
    *  (src/recover.ts): the pin lasts until the first wall, and no longer. */
   pinnedAccount: string | null };
-export type LaunchRow = { id: string; sessionId: string; generation: number; account: string; command: string[]; env: Record<string, string>; createdAt: number };
+export type LaunchRow = { id: string; sessionId: string; generation: number; account: string; command: string[]; env: LaunchEnvironment; createdAt: number };
 export type WallKind = "session" | "weekly" | "fable" | "unknown";
 export type RecoveryRow = { id: number; sessionId: string; generation: number; turnId: string | null; kind: WallKind;
   status: "pending" | "owned" | "done" | "obsolete" | "failed"; owner: string | null; attempts: number; nextAttemptAt: number | null; createdAt: number; updatedAt: number };
@@ -266,6 +267,12 @@ export class State {
   getLaunch(id: string): LaunchRow | null {
     const r = this.db.prepare("SELECT * FROM launches WHERE id=?").get(id) as Record<string, unknown> | undefined;
     return r ? { ...(r as unknown as LaunchRow), command: JSON.parse(String(r.command)), env: JSON.parse(String(r.env)) } : null;
+  }
+  /** Only this generation's invocation settings may carry into its handoff. */
+  latestLaunch(sessionId: string, generation: number): LaunchRow | null {
+    const r = this.db.prepare("SELECT id FROM launches WHERE sessionId=? AND generation=? ORDER BY createdAt DESC, rowid DESC LIMIT 1")
+      .get(sessionId, generation) as { id: string } | undefined;
+    return r ? this.getLaunch(r.id) : null;
   }
   /** Raw insert of a new pending recovery row, with no pre-check — this is
    * the fix for the addRecovery TOCTOU race: two processes (e.g. a

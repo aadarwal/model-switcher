@@ -534,6 +534,32 @@ test("a handoff resumes with the live Claude model and effort, replacing old lau
   assert.match(recoverLog(w), /model claude-opus-5-5, effort xhigh \(from transcript\)/);
 });
 
+test("a handoff carries recorded settings and probes the selected Claude rather than the stale server CLI", async (t) => {
+  const w = await world(t);
+  const selected = stubDir();
+  selected.stub("claude", 'if [ "${CLAUDE_CONFIG_DIR+set}" = "" ] && [ "$ANTHROPIC_MODEL" = "" ] && [ "$CLAUDE_CODE_EFFORT_LEVEL" = medium ]; then echo " --effort <level>"; fi');
+  writeFileSync(path.join(path.dirname(w.log), "claude"), "#!/bin/sh\necho old-cli\n");
+  chmodSync(path.join(path.dirname(w.log), "claude"), 0o755);
+  const saved = { PATH: `${selected.dir}:${ORIGINAL_PATH}`, CLAUDE_CONFIG_DIR: null, ANTHROPIC_MODEL: "", CLAUDE_CODE_EFFORT_LEVEL: "medium" };
+  const transcript = path.join(w.home, "settings.jsonl");
+  writeFileSync(transcript, JSON.stringify({ type: "assistant", sessionId: "c-1", message: { model: "sonnet" }, effort: "xhigh" }) + "\n");
+  const st = openState();
+  try {
+    st.createLaunch({ id: "selected-invocation", sessionId: "s1", generation: 2, account: "dirk", command: ["claude"], env: saved, createdAt: nowSeconds() });
+    st.updateSession("s1", { transcriptPath: transcript });
+  } finally { st.close(); }
+  const previous = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL, CLAUDE_CODE_EFFORT_LEVEL: process.env.CLAUDE_CODE_EFFORT_LEVEL };
+  process.env.CLAUDE_CONFIG_DIR = "/stale/server"; process.env.ANTHROPIC_MODEL = "server-model"; process.env.CLAUDE_CODE_EFFORT_LEVEL = "low";
+  t.after(() => { for (const [k, v] of Object.entries(previous)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  t.after(reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" }));
+  assert.equal(await recoverSession("s1"), 0);
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.deepEqual(launch.env, saved);
+  assert.ok(launch.command.includes("--effort"), "the capability probe used the persisted PATH and settings");
+  assert.ok(launch.command.includes("xhigh"));
+  assert.doesNotMatch(JSON.stringify(launch.env), /sk-ant-|TOKEN|API_KEY/);
+});
+
 test("a human's stop during the optional flag probe prevents the exit and respawn", async (t) => {
   const w = await world(t);
   const transcript = path.join(w.home, "conversation.jsonl");
@@ -1954,6 +1980,87 @@ const sendKeys = (w: World): string[] =>
 const configToml = (w: CodexWorld, account: string): string => path.join(w.msHome, "codex", account, "config.toml");
 const trustAtRespawn = (w: CodexWorld, account: string): string => readFileSync(path.join(w.atRespawn, account, "config.toml"), "utf8");
 
+for (const reservedAccount of ["home", "work"]) {
+  test(`Codex waits for the single-window reserve reset of ${reservedAccount === "work" ? "the account being left" : "a candidate"}`, async (t) => {
+    const w = await codexWorld(t, { accounts: reservedAccount === "work"
+      ? [{ name: "work", weekly: 75 }]
+      : [{ name: "work", weekly: 100 }, { name: "home", weekly: 75 }] });
+    const registryFile = path.join(w.msHome, "accounts.json");
+    const registry = JSON.parse(readFileSync(registryFile, "utf8"));
+    registry.accounts.find((a: { name: string; provider: string }) => a.name === reservedAccount && a.provider === "codex").reservePercent = 30;
+    writeFileSync(registryFile, JSON.stringify(registry), { mode: 0o600 });
+    const reset = new Date(Date.now() + 2 * HOUR).toISOString();
+    const snapshotFile = path.join(w.msHome, "snapshot.json");
+    const snapshot = JSON.parse(readFileSync(snapshotFile, "utf8"));
+    for (const row of snapshot.accounts) {
+      if (row.provider !== "codex") continue;
+      row.usage.session = { ...row.usage.weeklyAll, windowSeconds: 18_000,
+        resetsAt: row.name === reservedAccount ? reset : new Date(Date.now() + 4 * HOUR).toISOString() };
+      row.usage.weeklyAll = null;
+    }
+    writeFileSync(snapshotFile, JSON.stringify(snapshot), { mode: 0o600 });
+
+    assert.equal(await recoverSession("s1"), 2);
+    const row = session(w);
+    assert.equal(row.state, "waiting");
+    assert.ok(Math.abs(row.wakeupAt! - Math.floor(Date.parse(reset) / 1000)) < 5,
+      `wakeup ${row.wakeupAt} must match the sole reported reserve window reset`);
+    assert.deepEqual(sendKeys(w), []);
+    assert.equal(respawnLine(w), undefined);
+  });
+}
+
+test("ambiguous legacy full-auto refuses recovery before stopping the CLI or preparing a home", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--full-auto", "--sandbox", "read-only"] } });
+  const { dir, stub } = stubDir();
+  stub("codex", "echo 'codex-cli 0.163.0'");
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+
+  assert.equal(await recoverSession("s1"), 1);
+  assert.match(recoverLog(w), /cannot safely adapt --full-auto.*current CLI was left untouched/);
+  assert.deepEqual(sendKeys(w), []);
+  assert.equal(respawnLine(w), undefined);
+  assert.equal(existsSync(configToml(w, "home")), false);
+  assert.doesNotThrow(() => process.kill(w.pid, 0));
+  assert.equal(session(w).generation, 2);
+  assert.equal(rows(w, "recoveries")[0].status, "failed");
+  assert.equal(session(w).state, "parked");
+});
+
+test("legacy full-auto remains a flag during recovery and never carries the original prompt", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--full-auto", "finish the docs"] } });
+  const { dir, stub } = stubDir();
+  stub("codex", "echo 'codex-cli 0.163.0'");
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--full-auto"]);
+});
+
+test("Codex handoff preserves option values named resume while dropping the old prompt", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--profile", "resume", "--model", "review", "original prompt"] } });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--profile", "resume", "--model", "review"]);
+});
+
+test("a managed remote Codex recovery refuses before stopping its existing process", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--remote=unix:///private/no-server.sock"] } });
+  assert.equal(await recoverSession("s1"), 1);
+  assert.match(recoverLog(w), /cannot use --remote.*use plain codex/);
+  assert.deepEqual(sendKeys(w), []);
+  assert.equal(respawnLine(w), undefined);
+  assert.equal(existsSync(configToml(w, "home")), false);
+  assert.doesNotThrow(() => process.kill(w.pid, 0));
+});
+
+test("unknown Codex value options retain the prior recovery heuristic", async () => {
+  const { flagsForResume } = await import("../src/recover.ts");
+  assert.deepEqual(flagsForResume(["--future-option", "value", "old prompt"], "codex"), ["--future-option", "value"]);
+});
+
 test("the codex happy path: work hands off to home and the resumed conversation continues", async (t) => {
   const w = await codexWorld(t);
   const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
@@ -2817,4 +2924,24 @@ test("codex: the card's words in a resumed conversation's own history are not th
   assert.equal(sendKeys(w).length, 2, "only the walled CLI was asked to leave");
   assert.equal(session(w).state, "continuing");
   assert.doesNotMatch(recoverLog(w), /shows .* open in another app/);
+});
+
+test("Codex handoff compatibility checks use the recorded CLI PATH before touching its pane", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--full-auto", "--sandbox", "read-only"] } });
+  const selected = path.join(w.cwd, "relative-cli"); mkdirSync(selected);
+  writeFileSync(path.join(selected, "codex"), "#!/bin/sh\nif [ -f ./relative-cli/codex ]; then echo codex-cli 0.163.0; else echo codex-cli 0.156.0; fi\n");
+  chmodSync(path.join(selected, "codex"), 0o755);
+  const server = path.join(path.dirname(w.log), "codex");
+  writeFileSync(server, "#!/bin/sh\necho codex-cli 0.156.0\n"); chmodSync(server, 0o755);
+  // startupNotices or another invocation may already have cached this same
+  // shim from a different directory before recovery reads the saved context.
+  const { cliVersion } = await import("../src/compat.ts");
+  assert.equal(cliVersion(path.join(selected, "codex")), "0.156.0");
+  const st = openState();
+  try { st.createLaunch({ id: "recorded-codex", sessionId: "s1", generation: 2, account: st.getSession("s1")!.account,
+    command: ["codex"], env: { PATH: "./relative-cli" }, createdAt: nowSeconds() }); } finally { st.close(); }
+  assert.equal(await recoverSession("s1"), 1);
+  assert.equal(respawnLines(w).length, 0);
+  assert.equal(sendKeys(w).length, 0);
+  assert.match(takeFailReason("s1") ?? "", /full-auto/);
 });

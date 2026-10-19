@@ -534,6 +534,32 @@ test("a handoff resumes with the live Claude model and effort, replacing old lau
   assert.match(recoverLog(w), /model claude-opus-5-5, effort xhigh \(from transcript\)/);
 });
 
+test("a handoff carries recorded settings and probes the selected Claude rather than the stale server CLI", async (t) => {
+  const w = await world(t);
+  const selected = stubDir();
+  selected.stub("claude", 'if [ "${CLAUDE_CONFIG_DIR+set}" = "" ] && [ "$ANTHROPIC_MODEL" = "" ] && [ "$CLAUDE_CODE_EFFORT_LEVEL" = medium ]; then echo " --effort <level>"; fi');
+  writeFileSync(path.join(path.dirname(w.log), "claude"), "#!/bin/sh\necho old-cli\n");
+  chmodSync(path.join(path.dirname(w.log), "claude"), 0o755);
+  const saved = { PATH: `${selected.dir}:${ORIGINAL_PATH}`, CLAUDE_CONFIG_DIR: null, ANTHROPIC_MODEL: "", CLAUDE_CODE_EFFORT_LEVEL: "medium" };
+  const transcript = path.join(w.home, "settings.jsonl");
+  writeFileSync(transcript, JSON.stringify({ type: "assistant", sessionId: "c-1", message: { model: "sonnet" }, effort: "xhigh" }) + "\n");
+  const st = openState();
+  try {
+    st.createLaunch({ id: "selected-invocation", sessionId: "s1", generation: 2, account: "dirk", command: ["claude"], env: saved, createdAt: nowSeconds() });
+    st.updateSession("s1", { transcriptPath: transcript });
+  } finally { st.close(); }
+  const previous = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL, CLAUDE_CODE_EFFORT_LEVEL: process.env.CLAUDE_CODE_EFFORT_LEVEL };
+  process.env.CLAUDE_CONFIG_DIR = "/stale/server"; process.env.ANTHROPIC_MODEL = "server-model"; process.env.CLAUDE_CODE_EFFORT_LEVEL = "low";
+  t.after(() => { for (const [k, v] of Object.entries(previous)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  t.after(reportOnRespawn(w, { generation: 3, cliSessionId: "c-1" }));
+  assert.equal(await recoverSession("s1"), 0);
+  const launch = launchOf(w, respawnLaunchId(w))!;
+  assert.deepEqual(launch.env, saved);
+  assert.ok(launch.command.includes("--effort"), "the capability probe used the persisted PATH and settings");
+  assert.ok(launch.command.includes("xhigh"));
+  assert.doesNotMatch(JSON.stringify(launch.env), /sk-ant-|TOKEN|API_KEY/);
+});
+
 test("a human's stop during the optional flag probe prevents the exit and respawn", async (t) => {
   const w = await world(t);
   const transcript = path.join(w.home, "conversation.jsonl");
@@ -2898,4 +2924,24 @@ test("codex: the card's words in a resumed conversation's own history are not th
   assert.equal(sendKeys(w).length, 2, "only the walled CLI was asked to leave");
   assert.equal(session(w).state, "continuing");
   assert.doesNotMatch(recoverLog(w), /shows .* open in another app/);
+});
+
+test("Codex handoff compatibility checks use the recorded CLI PATH before touching its pane", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--full-auto", "--sandbox", "read-only"] } });
+  const selected = path.join(w.cwd, "relative-cli"); mkdirSync(selected);
+  writeFileSync(path.join(selected, "codex"), "#!/bin/sh\nif [ -f ./relative-cli/codex ]; then echo codex-cli 0.163.0; else echo codex-cli 0.156.0; fi\n");
+  chmodSync(path.join(selected, "codex"), 0o755);
+  const server = path.join(path.dirname(w.log), "codex");
+  writeFileSync(server, "#!/bin/sh\necho codex-cli 0.156.0\n"); chmodSync(server, 0o755);
+  // startupNotices or another invocation may already have cached this same
+  // shim from a different directory before recovery reads the saved context.
+  const { cliVersion } = await import("../src/compat.ts");
+  assert.equal(cliVersion(path.join(selected, "codex")), "0.156.0");
+  const st = openState();
+  try { st.createLaunch({ id: "recorded-codex", sessionId: "s1", generation: 2, account: st.getSession("s1")!.account,
+    command: ["codex"], env: { PATH: "./relative-cli" }, createdAt: nowSeconds() }); } finally { st.close(); }
+  assert.equal(await recoverSession("s1"), 1);
+  assert.equal(respawnLines(w).length, 0);
+  assert.equal(sendKeys(w).length, 0);
+  assert.match(takeFailReason("s1") ?? "", /full-auto/);
 });

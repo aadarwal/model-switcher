@@ -42,6 +42,7 @@ import { readCodexAuth } from "./providers/codex-probe.ts";
 import { classifyCodexInvocation, codexExecutionCommand, codexLaunchCommand } from "./providers/codex-cli.ts";
 import { cliVersion } from "./compat.ts";
 import { resolveOnPath } from "./exec.ts";
+import { captureLaunchEnvironment } from "./launch-env.ts";
 import { RELEASE_BUDGET_MS, probeConversation, waitForWriterRelease, writerLockDirs } from "./codex-writer-lock.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { chooseAccount } from "./mesh.ts";
@@ -691,6 +692,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   const sessionId = randomUUID();
   const cliSessionId = plan.cliSessionId();
   const launchId = randomUUID();
+  const launchEnv = captureLaunchEnvironment();
   const command = plan.command(cliSessionId, cliArgs);
   // A hand pick says so on the one line the human reads.
   const label = `${plan.label(need)}${pinned ? ", pinned" : ""}`;
@@ -729,7 +731,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
         flags: parsed.args,
         pinnedAccount: pinned ? account : null,
       });
-      st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
+      st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: launchEnv, createdAt: nowSeconds() });
       retireSuperseded(st, { id: sessionId, socket, pane, serverStart });
 
       tmux.remainOnExit(pane, true);
@@ -763,7 +765,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
       need, account, generation: 1, state: "launching", desired: "running", flags: parsed.args,
       pinnedAccount: pinned ? account : null,
     });
-    st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: {}, createdAt: nowSeconds() });
+    st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: launchEnv, createdAt: nowSeconds() });
     retireSuperseded(st, { id: sessionId, socket, pane, serverStart });
 
     tmux.remainOnExit(pane, true);

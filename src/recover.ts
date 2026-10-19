@@ -43,6 +43,7 @@ import { codexAutorotateEnabled } from "./autorotate.ts";
 import { readEvents } from "./events.ts";
 import { cliSupportsFlag, cliVersion } from "./compat.ts";
 import { resolveOnPath } from "./exec.ts";
+import { withLaunchEnvironment } from "./launch-env.ts";
 import { flagsWithLiveSettings, readLiveSettings } from "./live-settings.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
@@ -1570,10 +1571,10 @@ function standDownFrom(st: State, rec: RecoveryRow, manual: ManualRecovery | und
   else st.releaseRecovery(rec.id);
 }
 
-function codexCompatibilityProblem(session: SessionRow): string | null {
+function codexCompatibilityProblem(session: SessionRow, env: NodeJS.ProcessEnv): string | null {
   if (session.provider !== "codex" || !session.flags.some((a) => a === "--full-auto" || a === "--remote" || a.startsWith("--remote="))) return null;
-  const bin = resolveOnPath("codex");
-  try { codexExecutionCommand(codexLaunchCommand(flagsForResume(session.flags, "codex")), bin ? cliVersion(bin) : null); }
+  const bin = resolveOnPath("codex", env, session.cwd);
+  try { codexExecutionCommand(codexLaunchCommand(flagsForResume(session.flags, "codex")), bin ? cliVersion(bin, undefined, env, session.cwd) : null); }
   catch (error) { return `${(error as Error).message}; the current CLI was left untouched`; }
   return null;
 }
@@ -1584,10 +1585,12 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
   const g = session.generation;
   const from = session.account;
   const manual = opts.manual;
+  const launchEnv = st.latestLaunch(id, g)?.env ?? {};
+  const runtimeEnv = withLaunchEnvironment(process.env, launchEnv);
 
   // Configuration compatibility is independent of the destination account.
   // Check before preparing any home, and again immediately before leaving.
-  const incompatible = codexCompatibilityProblem(session);
+  const incompatible = codexCompatibilityProblem(session, runtimeEnv);
   if (incompatible) return park(st, id, rec.id, g, incompatible);
 
   // Use one runtime-settings reading for BOTH the chooser and the relaunch.
@@ -1722,10 +1725,10 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
 
   // Probe optional flags before the final intent checks: a help probe can
   // take seconds, during which a human's stop must still win.
-  const claudeBin = session.provider === "claude" && liveAtPick.effort ? resolveOnPath("claude") : null;
-  const effortSupported = session.provider === "codex" || !!(claudeBin && cliSupportsFlag(claudeBin, "--effort"));
+  const claudeBin = session.provider === "claude" && liveAtPick.effort ? resolveOnPath("claude", runtimeEnv, session.cwd) : null;
+  const effortSupported = session.provider === "codex" || !!(claudeBin && cliSupportsFlag(claudeBin, "--effort", undefined, runtimeEnv, session.cwd));
 
-  const incompatibleBeforeExit = codexCompatibilityProblem(session);
+  const incompatibleBeforeExit = codexCompatibilityProblem(session, runtimeEnv);
   if (incompatibleBeforeExit) return park(st, id, rec.id, g, incompatibleBeforeExit);
 
   const beforeExit = guardServer(st, session, tmux, g, rec);
@@ -1824,7 +1827,7 @@ async function handoff(st: State, session: SessionRow, rec: RecoveryRow, tmux: T
     );
   }
   const launchId = randomUUID();
-  st.createLaunch({ id: launchId, sessionId: id, generation: next, account: to, command, env: {}, createdAt: nowSeconds() });
+  st.createLaunch({ id: launchId, sessionId: id, generation: next, account: to, command, env: launchEnv, createdAt: nowSeconds() });
   // The attempt records the account we LEFT — that is what was consumed, and
   // what the next try through this recovery must not go back to. A forced exit
   // is worth recording, but when a human asked for the move it is still their

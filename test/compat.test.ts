@@ -142,6 +142,24 @@ test("cliSupportsFlag probes help once per binary and invalidates on upgrade", (
   assert.equal(cliSupportsFlag(bin, "--effort", cache), false);
 });
 
+test("CLI probe caches distinguish nonsecret invocation context for unchanged shims", () => {
+  const { home } = tempHome(), { dir, stub } = stubDir();
+  const cache = path.join(home, "context-flags.json"), versions = path.join(home, "context-versions.json");
+  stub("claude", `if [ "$CLAUDE_CODE_EFFORT_LEVEL" = medium ]; then
+    if [ "$1" = --version ]; then echo 2.1.303; else echo ' --effort <level>'; fi
+  else
+    if [ "$1" = --version ]; then echo 2.0.0; else echo ' --model <model>'; fi
+  fi`);
+  const bin = path.join(dir, "claude"), stale = { PATH: "/usr/bin:/bin", CLAUDE_CODE_EFFORT_LEVEL: "low", ANTHROPIC_API_KEY: "unrecorded-secret" };
+  const current = { ...stale, CLAUDE_CODE_EFFORT_LEVEL: "medium" };
+  assert.equal(cliVersion(bin, versions, stale), "2.0.0");
+  assert.equal(cliVersion(bin, versions, current), "2.1.303");
+  assert.equal(cliSupportsFlag(bin, "--effort", cache, stale), false);
+  assert.equal(cliSupportsFlag(bin, "--effort", cache, current), true);
+  assert.ok(!readFileSync(cache, "utf8").includes("unrecorded-secret"));
+  assert.ok(!readFileSync(versions, "utf8").includes("unrecorded-secret"));
+});
+
 test("cliVersion: a CLI that fails --version is cached as unknown, not re-spawned on every launch", (t) => {
   const cli = countingCli(t, "0.160.0");
   writeFileSync(cli.bin, `#!/bin/bash\necho x >> '${cli.count}'\nexit 3\n`);

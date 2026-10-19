@@ -25,9 +25,11 @@
 
 import { readFileSync, renameSync, statSync, writeFileSync, existsSync, realpathSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { msHome } from "./paths.ts";
+import { captureLaunchEnvironment } from "./launch-env.ts";
 
 export type Cli = "codex" | "claude";
 export type Compat = {
@@ -99,6 +101,8 @@ export function standing(cli: Cli, version: string, table: Readonly<Record<Cli, 
 // path; an npm install rewrites the file in place, which changes the ctime
 // even though npm pins every packed file's mtime to 1985 — mtime and size
 // alone would read an npm-upgraded launcher as unchanged for ever.
+// The key also includes the invocation directory and approved environment
+// settings, because an unchanged version-manager shim can select another CLI.
 
 const PROBE_TIMEOUT_MS = 5_000;
 /** Plenty for a human with a few installs; old keys go first. */
@@ -117,6 +121,15 @@ function fileKey(real: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** Version-manager shims can choose a different CLI for a directory or PATH.
+ * Hash only the approved nonsecret context; never persist inherited secrets. */
+function contextualFileKey(real: string, env: NodeJS.ProcessEnv, cwd: string): string | null {
+  const file = fileKey(real);
+  if (!file) return null;
+  const context = JSON.stringify({ cwd: path.resolve(cwd), settings: captureLaunchEnvironment(env) });
+  return `${file}:${createHash("sha256").update(context).digest("hex")}`;
 }
 
 function readJson(file: string): unknown {
@@ -148,24 +161,24 @@ export function writeSmallJson(file: string, value: unknown): void {
 
 /**
  * The version of the CLI at `bin` (an absolute path), from the cache when the
- * file is the one that answered last time, else from one bounded `--version`.
+ * file and invocation context answered last time, else one bounded `--version`.
  * A binary that does not answer is cached as `null` too — a CLI that hangs on
  * `--version` should cost one timeout, not one per launch. Never throws.
  */
-export function cliVersion(bin: string, cacheFile = probeCachePath()): string | null {
+export function cliVersion(bin: string, cacheFile = probeCachePath(), env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string | null {
   let real: string;
   try {
     real = realpathSync(bin);
   } catch {
     return null;
   }
-  const key = fileKey(real);
+  const key = contextualFileKey(real, env, cwd);
   if (!key) return null;
   const raw = readJson(cacheFile);
   const cache: Record<string, ProbeEntry> = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, ProbeEntry>) : {};
   const hit = cache[real];
   if (hit && hit.key === key) return hit.version;
-  const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: PROBE_TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"] });
+  const r = spawnSync(bin, ["--version"], { env, cwd, encoding: "utf8", timeout: PROBE_TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"] });
   const version = !r.error && r.status === 0 ? parseVersion(r.stdout ?? "") : null;
   cache[real] = { key, version, at: Date.now() };
   const kept = Object.entries(cache)
@@ -178,10 +191,10 @@ export function cliVersion(bin: string, cacheFile = probeCachePath()): string | 
 /** Probe an optional CLI flag instead of guessing its introduction version.
  * The same binary identity as the version cache invalidates this after an
  * upgrade. Failed probes are conservative and bounded, and cached too. */
-export function cliSupportsFlag(bin: string, flag: string, cacheFile = path.join(msHome(), "cli-flags.json")): boolean {
+export function cliSupportsFlag(bin: string, flag: string, cacheFile = path.join(msHome(), "cli-flags.json"), env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): boolean {
   let real: string;
   try { real = realpathSync(bin); } catch { return false; }
-  const key = fileKey(real);
+  const key = contextualFileKey(real, env, cwd);
   if (!key) return false;
   type Entry = { key: string; supported: boolean; at: number };
   const raw = readJson(cacheFile);
@@ -189,7 +202,7 @@ export function cliSupportsFlag(bin: string, flag: string, cacheFile = path.join
   const name = `${real}:${flag}`;
   const hit = cache[name];
   if (hit?.key === key && typeof hit.supported === "boolean") return hit.supported;
-  const r = spawnSync(bin, ["--help"], { encoding: "utf8", timeout: PROBE_TIMEOUT_MS, maxBuffer: 1 << 20, stdio: ["ignore", "pipe", "ignore"] });
+  const r = spawnSync(bin, ["--help"], { env, cwd, encoding: "utf8", timeout: PROBE_TIMEOUT_MS, maxBuffer: 1 << 20, stdio: ["ignore", "pipe", "ignore"] });
   const supported = !r.error && r.status === 0 && (r.stdout ?? "").split(/\s+/).includes(flag);
   cache[name] = { key, supported, at: Date.now() };
   const kept = Object.entries(cache).sort(([, a], [, b]) => (b?.at ?? 0) - (a?.at ?? 0)).slice(0, PROBE_CACHE_MAX);

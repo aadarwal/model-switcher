@@ -182,6 +182,26 @@ async function readState(w: World, launchId?: string) {
   }
 }
 
+test("inside and outside launches persist only the caller's nonsecret invocation settings", async () => {
+  for (const outside of [false, true]) {
+    const w = await world();
+    const env = w.env({ ...(outside ? OUTSIDE : {}), CLAUDE_CONFIG_DIR: path.join(w.home, "private-claude"),
+      ANTHROPIC_MODEL: "sonnet", CLAUDE_CODE_EFFORT_LEVEL: "", ANTHROPIC_API_KEY: "secret-api-key",
+      OPENAI_API_KEY: "secret-openai-key", HOMI_AGENT_NAME: "peer" });
+    const result = run(["claude", "--as", "gmail"], env);
+    assert.equal(result.code, 0, result.stderr);
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(path.join(w.msHome, "state.sqlite"));
+    try {
+      const row = db.prepare("SELECT env FROM launches").get() as { env: string };
+      assert.deepEqual(JSON.parse(row.env), { PATH: env.PATH, CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR,
+        ANTHROPIC_MODEL: "sonnet", CLAUDE_CODE_EFFORT_LEVEL: "" });
+      assert.ok(!row.env.includes("secret"));
+      assert.ok(!row.env.includes(SAMPLE_TOKEN));
+    } finally { db.close(); }
+  }
+});
+
 // --- inside tmux -------------------------------------------------------
 
 test("inside tmux: picks, records, and respawns the caller's own pane", async () => {
@@ -240,8 +260,8 @@ test("inside tmux: picks, records, and respawns the caller's own pane", async ()
   assert.equal(launch!.account, "gmail");
   assert.equal(launch!.generation, 1);
   assert.deepEqual(launch!.command, ["claude", "--session-id", s.cliSessionId, "hello", "world"]);
-  // nothing but the record: no environment is carried in the launch row
-  assert.deepEqual(launch!.env, {});
+  assert.equal(launch!.env.PATH, w.env().PATH);
+  assert.ok(!JSON.stringify(launch!.env).includes(SAMPLE_TOKEN));
 
   // the row was whole before tmux was told to start the CLI
   const early = await sessionsAtRespawn(w);
@@ -597,7 +617,7 @@ test("outside tmux: the default server — a placeholder pane first, then the CL
   assert.equal(session.state, "launching");
   assert.deepEqual(session.flags, ["hi"]);
   assert.deepEqual(st.launch!.command, ["claude", "--session-id", session.cliSessionId, "hi"]);
-  assert.deepEqual(st.launch!.env, {});
+  assert.equal(st.launch!.env.PATH, w.env().PATH);
   assert.match(r.stderr, /^ms: gmail \(any\) → pane %42$/m);
   assert.equal(readFileSync(w.log, "utf8").includes(SAMPLE_TOKEN), false);
 });
@@ -973,7 +993,7 @@ test("ms codex launches the codex account with the most room, on its own home", 
   assert.equal(s.cliSessionId, null);
 
   assert.deepEqual(st.launch!.command, ["codex", "--model", "gpt-5"]);
-  assert.deepEqual(st.launch!.env, {});
+  assert.equal(st.launch!.env.PATH, w.env().PATH);
 
   // The memo is per provider: a codex pick may never be offered to claude.
   const lastPick = JSON.parse(readFileSync(path.join(w.msHome, "last-pick.json"), "utf8"));

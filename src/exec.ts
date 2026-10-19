@@ -6,6 +6,7 @@ import { readLaunchToken } from "./launch-credentials.ts";
 import { msBinary, p } from "./paths.ts";
 import { cliVersion } from "./compat.ts";
 import { codexExecutionCommand } from "./providers/codex-cli.ts";
+import { withLaunchEnvironment } from "./launch-env.ts";
 
 // spec §7 step 4, §11: `ms _exec <launch-id>` is the command tmux runs in
 // the pane. It loads the launch record and the account's launch credential
@@ -60,11 +61,11 @@ export function scrubProviderEnv(env: NodeJS.ProcessEnv, provider: Provider): vo
  * way a shell would (first executable regular file named `name` wins).
  * Exported for `src/doctor.ts`'s "ms on PATH" check — the one other module
  * that needs to resolve a name on PATH the same way. */
-export function resolveOnPath(name: string): string | null {
-  const dirs = (process.env.PATH ?? "").split(path.delimiter);
+export function resolveOnPath(name: string, env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string | null {
+  const dirs = (env.PATH ?? "").split(path.delimiter);
   for (const dir of dirs) {
     if (!dir) continue;
-    const candidate = path.join(dir, name);
+    const candidate = path.resolve(cwd, dir, name);
     try {
       if (!statSync(candidate).isFile()) continue;
       accessSync(candidate, constants.X_OK);
@@ -126,7 +127,12 @@ export const execLaunch: Verb = async (args) => {
     };
   }
 
-  const cli = resolveOnPath(launch.command[0]);
+  // tmux respawns inherit its server environment, not the calling shell.
+  // Restore the recorded settings before resolving or probing the CLI.
+  const env = withLaunchEnvironment(process.env, launch.env);
+  scrubProviderEnv(env, provider);
+  for (const key of ["ANU_ACCOUNT", "ANU_PROVIDER", "ANU_LAUNCH_NONCE", "ANU_PANE"]) delete env[key];
+  const cli = resolveOnPath(launch.command[0], env);
   if (!cli) {
     st.close();
     process.stderr.write(`ms _exec: ${launch.command[0]} not found on PATH\n`);
@@ -134,16 +140,7 @@ export const execLaunch: Verb = async (args) => {
   }
   st.close();
 
-  // Strip the conflicting provider vars, then layer launch.env (non-secret
-  // extras recorded at launch) *before* the token and the identity
-  // variables below — never after, so a launch.env entry (whatever wrote
-  // it) can never shadow the real credential or MS_* identity.
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  scrubProviderEnv(env, provider);
-  for (const [k, v] of Object.entries(launch.env)) env[k] = v;
-  // The codex arm re-runs its own strip in here, for the same reason the
-  // token is set here: a launch.env entry must never be able to put back what
-  // was scrubbed, any more than it can shadow the credential itself.
+  // Credential and MS identity always override recorded settings.
   applyCredential(env);
   env.MS_SESSION = launch.sessionId;
   env.MS_GENERATION = String(launch.generation);
@@ -158,7 +155,7 @@ export const execLaunch: Verb = async (args) => {
   // (`withNoDaemon` says why): decided against the binary about to run.
   let argv: string[];
   try {
-    argv = provider === "codex" ? codexExecutionCommand(launch.command, cliVersion(cli)) : launch.command;
+    argv = provider === "codex" ? codexExecutionCommand(launch.command, cliVersion(cli, undefined, env)) : launch.command;
   } catch (error) {
     process.stderr.write(`ms _exec: ${(error as Error).message}\n`);
     return 1;

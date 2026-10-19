@@ -102,7 +102,14 @@ export type PollCredentials = {
   expiresAt: number;
   source: "file" | "keychain";
 };
-export type Usage = { session: Window | null; weeklyAll: Window | null; weeklyFable: Window | null };
+export type Usage = {
+  session: Window | null; weeklyAll: Window | null; weeklyFable: Window | null;
+  /** Optional, provider-reported metadata; absence is unknown, never zero. */
+  planType?: string;
+  requestsAllowed?: boolean;
+  limitReached?: boolean;
+  resetsAvailable?: number;
+};
 export type Profile = { email: string; orgId: string; orgName: string; tier: string | null };
 
 // --- The scoped keychain item -----------------------------------------

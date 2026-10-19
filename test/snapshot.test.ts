@@ -1177,3 +1177,19 @@ test("toPickInputs reads no file: a registry broken after the snapshot was taken
   const inputs = toPickInputs({ takenAt: Date.now(), registryError: null, accounts: [row] });
   assert.deepEqual(inputs.map((a) => [a.name, a.reservePercent]), [["one", 30]]);
 });
+
+test("current provider capacity flags survive snapshot projection and exclude a zero-percent account", async () => {
+  const { toPickInputs } = await load();
+  const { normalizeCodexUsage } = await import("../src/providers/codex-usage.ts");
+  const { pickAccounts, roomAfterReset } = await import("../src/pick.ts");
+  const usage = normalizeCodexUsage({ rate_limit: { allowed: false, limit_reached: true,
+    primary_window: { used_percent: 0, limit_window_seconds: 2592000, reset_after_seconds: 2592000, reset_at: 1795034749 } } });
+  const row = { name: "blocked", provider: "codex" as const, shared: false, usage,
+    error: null, errorKind: null, observedAt: Date.now(), stale: false };
+  const inputs = toPickInputs({ takenAt: Date.now(), registryError: null, accounts: [row] });
+  assert.equal(inputs[0]!.weeklyAll?.usedPercent, 0);
+  assert.equal(inputs[0]!.requestsAllowed, false);
+  assert.equal(inputs[0]!.limitReached, true);
+  assert.equal(pickAccounts(inputs, "any").picks.length, 0);
+  assert.equal(roomAfterReset(inputs[0], "any", Date.now()), null, "a provider-only block cannot promise an invented reset");
+});

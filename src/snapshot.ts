@@ -718,6 +718,8 @@ export function toPickInputs(s: Snapshot, registry?: Registry): PickInput[] {
       session: a.usage?.session ?? null,
       weeklyAll: a.usage?.weeklyAll ?? null,
       weeklyFable: a.usage?.weeklyFable ?? null,
+      ...(typeof a.usage?.requestsAllowed === "boolean" ? { requestsAllowed: a.usage.requestsAllowed } : {}),
+      ...(typeof a.usage?.limitReached === "boolean" ? { limitReached: a.usage.limitReached } : {}),
       error: alive ? null : deadReason(a, now),
     };
   });

@@ -40,6 +40,17 @@
   `--`. Noninteractive commands remain unchanged; `mcp-server` is a prompt and
   `app` is a command only on macOS/Windows (PR #54).
 
+### Safer imports
+
+- Imports carry Claude effort and complete tool allow/deny lists, including
+  their documented flag aliases, through subsequent account handoffs.
+- Imports refuse sessions whose explicit settings, MCP, agent/plugin, or
+  restricted configuration cannot yet be preserved safely. Codex configuration
+  overrides are also refused. The source process stays untouched, and the
+  manifest records the option name without its value. Replayed plans recheck
+  the live process before stopping it so an older plan cannot silently drop
+  configuration or tool restrictions.
+
 ### Setup and release maintenance
 
 - Optional shell aliases forward every CLI argument through `ms claude --` /
@@ -54,6 +65,8 @@
 - Release publication uses this version's changelog notes, validates the tap
   before publishing, refuses ambiguous flags, and creates unsigned formula
   commits with exactly the required Claude, Codex, and Homi trailers.
+- Release archives exclude macOS resource-fork metadata. Content checks inspect
+  raw archive entries so platform tools cannot hide extra AppleDouble files.
 
 ### Upgrade and limits
 

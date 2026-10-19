@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+## 0.4.1 — 2026-10-19
+
+### Current Claude and Codex compatibility
+
+- Validate Claude Code 2.1.303 and Codex 0.163.0 with real launch, resume,
+  account handoff, distinct model and effort changes, nested children, picker,
+  adopt, and import checks. Refresh the tested-version markers after validation.
+- Accept `ms codex --mesh -- <codex arguments>` alongside the existing bare
+  `mesh` spelling. Keep provider arguments after `--` and give concrete syntax
+  guidance when they appear on the wrong side of that boundary.
+- Adapt a stored plain Codex `--full-auto` on verified current versions to
+  `--sandbox workspace-write --ask-for-approval on-request`. Refuse ambiguous
+  combinations before creating a pane or stopping a session. Preserve explicit
+  permission choices and literal prompt/option values.
+- Use one Codex argument classifier for managed execution, resume detection,
+  and imports so option values named `resume` or `review` remain values.
+- Apply a single reported Codex budget consistently to reserves, remembered
+  picks, recovery reset times, and rebalance decisions.
+- Exclude Codex background services from interactive import candidates and
+  protect their process subtrees during forced cleanup. Preserve the explicit
+  `--no-daemon` Boolean when importing an interactive session. Refuse before
+  stopping a frontend when a background service holds its conversation: Codex
+  0.163.0 can retain the writer for 30 minutes and provides no safe force-unload
+  operation. Codex import readiness includes the launcher's bounded writer wait.
+- Refuse managed interactive `--remote` before launch or handoff: the remote
+  server owns its account and hooks. Import also refuses before stopping its
+  source. Plain Codex remains the remote-session path.
+- Preserve the caller's CLI search path and Claude configuration directory,
+  model, and effort environment across an existing tmux server and subsequent
+  handoffs. Missing settings remove stale server values; credentials are never
+  captured in the launch record.
+- Remove inherited legacy account-automation identity from managed CLI
+  environments so legacy hooks cannot attribute a new ms launch to that account.
+- Strengthen the credential-free canary with Codex's actual parsed hook
+  inventory, computed trust hashes, and safe argument checks.
+
+### Accurate capacity displays
+
+- Preserve Codex's reported limit duration: a 30-day free-plan limit is labeled
+  `30d`, rather than `Week`. A missing limit stays unreported, and a malformed
+  reported percentage never becomes zero.
+- Label percentages as used, preserve fractional values, and distinguish an
+  unstarted reset from an unknown reset time across the picker, status,
+  dashboard, and calendar.
+- Honor explicit provider capacity refusals even when reported usage is zero.
+  A Codex account with one valid reported window can be ranked; Claude still
+  requires its normal session and weekly readings.
+- Show verified Codex available reset-credit counts and plan names when the
+  provider reports them. Pool totals distinguish complete coverage from counts
+  reported by only some accounts; unknown or stale counts never become zero.
+
 ## 0.4.0 — 2026-10-18
 
 ### Capacity visibility

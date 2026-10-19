@@ -512,9 +512,8 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
           deps.log(`${short(c)}: ${row.outcome}`);
           continue;
         }
-        // A daemon-backed source may keep its writer lease for about a
-        // minute after the frontend exits. The launch already waits for it;
-        // import must allow that bounded wait before its own startup budget.
+        // A writer may outlive the frontend. The launch already makes a
+        // bounded wait; import must allow it before its own startup budget.
         const budget = readyMs(c.provider);
         const seen = await deps.waitReady(c.id, deps.now() + budget, paneId);
         // A pane whose command has exited explains a silence tmux could have

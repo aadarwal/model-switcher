@@ -48,7 +48,7 @@ ms attach [session]
 - `--as <account>` — use the named account instead of choosing one. `--need fable` — also require room in the Fable window; `ms codex` rejects it, because Codex reports no such window.
 - `mesh` / `--mesh` — choose the account yourself, in a picker showing the chooser's own ranking, and pin the session to it until its first wall. See [picking by hand](#picking-by-hand-mesh). It does not combine with `--as`; after `--` either spelling is the CLI's own argument.
 - `--continue` — for a resume you drove yourself (`ms codex --continue -- resume <id>`, `ms claude --continue -- --resume <id>`): hand the resumed conversation the same continuation a rotation sends, as the command line's own prompt. Refused when there is nothing to continue.
-- **A launch that resumes is given no `--session-id`.** `--session-id` makes a conversation, so on a command line that already names one (`--resume <id>`, `-r <id>`, `--resume=<id>`, `--continue`/`-c`) `ms` passes your command line through untouched and records the id it names — Claude Code's own SessionStart confirms it, exactly as it does after a rotation's `--resume` relaunch. `ms claude --continue -- --resume <id>` is the path **`ms import`** resumes every Claude conversation through. Still to be checked against a live Claude Code; if that pairing misbehaves, `ms rotate` / `ms switch --continue` remain the verified way to move a Claude session `ms` already manages.
+- **A launch that resumes is given no `--session-id`.** `--session-id` makes a conversation, so on a command line that already names one (`--resume <id>`, `-r <id>`, `--resume=<id>`, `--continue`/`-c`) `ms` passes your command line through untouched and records the id it names — Claude Code's own SessionStart confirms it, exactly as it does after a rotation's `--resume` relaunch. `ms claude --continue -- --resume <id>` is the path **`ms import`** resumes every Claude conversation through. This path is live-verified on Claude Code 2.1.303, including a post-import response and preserved tool restrictions.
 - `ms adopt` — take over a **Codex** conversation `ms` did not start, so it can be rotated like any other. See [rescuing a pane you didn't start with ms](#rescuing-a-pane-you-didnt-start-with-ms).
 - **Where it lands.** Inside tmux, the launch replaces the pane you typed it in. Outside tmux, it goes to the **default tmux server** — the one plain `tmux` talks to, started if it is not running — in session `ms`, and attaches; the session shows in `tmux ls` like any other.
 - `ms attach [session]` — attach to a session on the default tmux server: `ms` (what a bare launch makes) when no name is given, or an import's repo-named session. Plain `tmux attach -t <session>` does the same. With no such session it says so and names the `tmux ls` to run; inside tmux it refuses rather than nest.
@@ -156,8 +156,9 @@ ms accounts reserve codex-1 0 --provider codex  # clear the reserve
 `reserve` accepts an integer from 0 to 99; 0 clears it. A 30% reserve makes
 `codex-1` ineligible for automatic selection once its weekly usage reaches 70%.
 At 69% it has 1% left for automation. Launch, rebalance, recovery and the mesh
-ranking all use this cap. The reserve is on the weekly window that every model
-counts against (a Codex account's only weekly window). A Claude account's Fable
+ranking all use this cap. The reserve applies to the main reported budget: Claude's
+weekly window, or Codex's longer reported window (its only window when just one
+is reported). Codex can report a 30-day limit instead of a weekly one. A Claude account's Fable
 window has no reserve of its own, and `--need fable` stops only when that window
 is full.
 
@@ -266,7 +267,22 @@ keep this behavior. Codex launches that bypass `ms` can show
 the running shared server. For a managed session, use `ms codex`; for a direct launch
 that bypasses the server, pass `--no-daemon` or choose "Run without daemon this
 time" in that prompt. Restarting the shared server changes its persisted settings
-and can interrupt other clients.
+and can interrupt other clients. Managed interactive launches refuse explicit
+`--remote`: a remote server owns its own account and hooks, so use plain `codex`
+for remote sessions. Noninteractive Codex commands remain pass-through.
+
+On verified Codex 0.157+ binaries, a stored plain `--full-auto` is translated at
+execution to its former `--sandbox workspace-write --ask-for-approval on-request`
+policy. Mixed permission selectors are refused before a launch or handoff; review
+and replace those flags explicitly. The stored command is kept intact.
+
+### Invocation settings
+
+Launches retain the calling shell's `PATH`, `CLAUDE_CONFIG_DIR`,
+`ANTHROPIC_MODEL`, and `CLAUDE_CODE_EFFORT_LEVEL` through tmux and account
+handoffs. An unset setting clears an older value inherited from the tmux
+server. These invocation settings are recorded privately; account credentials
+are read separately at execution time.
 
 ### Credentials are per device
 
@@ -356,11 +372,12 @@ moved even though the process cannot. That is what **`ms import`** does, in one 
 4. **Move them.** Per row: re-read the process table and refuse to signal a pid whose
    start time or command is not the one the plan recorded (a manifest planned this morning
    and run this evening names pids the kernel has since re-used); SIGTERM the original,
-   SIGKILL after ten seconds — and on that fallback its descendants too, leaves first,
+   SIGKILL after ten seconds — and on that fallback its private descendants too, leaves first,
    because a CLI installed from npm is a wrapper plus the process doing the work and only
    a SIGTERM can be forwarded; never make the pane at all if it will not go; then type
-   the command and wait up to a minute for the conversation to report itself through the
-   CLI's own hook — by its own conversation id, never a neighbour's. A row that fails never
+   the command and wait for the conversation to report itself through the
+   CLI's own hook — by its own conversation id, never a neighbour's. Claude gets one
+   minute; Codex also gets the launcher's bounded writer-release wait. A row that fails never
    stops the next one, and a launch that fails inside the pane (no account has room, a
    rollout it cannot find) leaves a shell prompt rather than a dead pane: the wait watches
    `#{pane_current_command}` too, so a pane back at a shell is `resume failed:` with the

@@ -892,6 +892,32 @@ async function codexWorld(codex: CodexSpec[]): Promise<World> {
 
 const configToml = (msHome: string, name: string) => path.join(msHome, "codex", name, "config.toml");
 
+test("ambiguous legacy full-auto refuses before preparing an account or touching tmux", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const { dir, stub } = stubDir();
+  stub("codex", "echo 'codex-cli 0.163.0'");
+  const env = w.env();
+  const result = run(["codex", "--", "--full-auto", "--sandbox", "read-only"], { ...env, PATH: `${dir}:${env.PATH}` });
+  assert.equal(result.code, 2, result.stderr);
+  assert.match(result.stderr, /cannot safely adapt --full-auto/);
+  assert.equal(existsSync(w.log), false);
+  assert.equal(existsSync(configToml(w.msHome, "home")), false);
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
+test("a managed remote Codex launch refuses before preparing an account or touching tmux", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  const { dir, stub } = stubDir();
+  stub("codex", "echo 'codex-cli 0.163.0'");
+  const env = w.env();
+  const result = run(["codex", "--", "--remote", "unix:///private/no-server.sock"], { ...env, PATH: `${dir}:${env.PATH}` });
+  assert.equal(result.code, 2, result.stderr);
+  assert.match(result.stderr, /cannot use --remote.*use plain codex/);
+  assert.equal(existsSync(w.log), false);
+  assert.equal(existsSync(configToml(w.msHome, "home")), false);
+  assert.equal((await readState(w)).sessions.length, 0);
+});
+
 test("ms codex launches the codex account with the most room, on its own home", async () => {
   // `work` is ALSO a claude account name in the other world; identity is
   // (provider, name), and nothing here may reach for the claude side.
@@ -1299,6 +1325,21 @@ test("codexResumeId reads the conversation a codex command line resumes, flags b
   assert.equal(codexResumeId(["resume", "my-named-thread"]), null, "a name is not a lock file");
   assert.equal(codexResumeId(["--", "resume", CONVERSATION]), null, "past `--` it is a prompt");
   assert.equal(codexResumeId(["--model", "gpt-5"]), null);
+  assert.equal(codexResumeId(["--profile", "resume", CONVERSATION]), null, "a profile value is not a subcommand");
+  assert.equal(codexResumeId(["resume", "--profile", CONVERSATION]), null, "a profile value is not a conversation id");
+  assert.equal(codexResumeId(["resume", "thread-name", CONVERSATION]), null, "a UUID in the prompt does not replace a thread name");
+  assert.equal(codexResumeId(["resume", "--last", CONVERSATION]), null, "the most recent conversation is selected by Codex");
+});
+
+test("a Codex profile or image value named resume cannot authorize a continuation", async () => {
+  const w = await codexWorld([{ name: "home", weekly: 10 }]);
+  for (const args of [["--profile", "resume"], ["--image", "resume"], ["--", "resume"]]) {
+    const result = run(["codex", "--continue", "--", ...args], w.env());
+    assert.equal(result.code, 2, result.stderr);
+    assert.match(result.stderr, /--continue needs something to continue/);
+  }
+  assert.equal(existsSync(w.log), false);
+  assert.equal((await readState(w)).sessions.length, 0);
 });
 
 // --- mesh: the account, picked by hand ------------------------------------------

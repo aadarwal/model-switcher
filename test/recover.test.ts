@@ -1954,6 +1954,57 @@ const sendKeys = (w: World): string[] =>
 const configToml = (w: CodexWorld, account: string): string => path.join(w.msHome, "codex", account, "config.toml");
 const trustAtRespawn = (w: CodexWorld, account: string): string => readFileSync(path.join(w.atRespawn, account, "config.toml"), "utf8");
 
+test("ambiguous legacy full-auto refuses recovery before stopping the CLI or preparing a home", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--full-auto", "--sandbox", "read-only"] } });
+  const { dir, stub } = stubDir();
+  stub("codex", "echo 'codex-cli 0.163.0'");
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+
+  assert.equal(await recoverSession("s1"), 1);
+  assert.match(recoverLog(w), /cannot safely adapt --full-auto.*current CLI was left untouched/);
+  assert.deepEqual(sendKeys(w), []);
+  assert.equal(respawnLine(w), undefined);
+  assert.equal(existsSync(configToml(w, "home")), false);
+  assert.doesNotThrow(() => process.kill(w.pid, 0));
+  assert.equal(session(w).generation, 2);
+  assert.equal(rows(w, "recoveries")[0].status, "failed");
+  assert.equal(session(w).state, "parked");
+});
+
+test("legacy full-auto remains a flag during recovery and never carries the original prompt", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--full-auto", "finish the docs"] } });
+  const { dir, stub } = stubDir();
+  stub("codex", "echo 'codex-cli 0.163.0'");
+  process.env.PATH = `${dir}:${process.env.PATH}`;
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--full-auto"]);
+});
+
+test("Codex handoff preserves option values named resume while dropping the old prompt", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--profile", "resume", "--model", "review", "original prompt"] } });
+  const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });
+  t.after(stop);
+  assert.equal(await recoverSession("s1"), 0);
+  assert.deepEqual(launchOf(w, respawnLaunchId(w))!.command, ["codex", "resume", "cx-1", CONTINUATION, "--profile", "resume", "--model", "review"]);
+});
+
+test("a managed remote Codex recovery refuses before stopping its existing process", async (t) => {
+  const w = await codexWorld(t, { session: { flags: ["--remote=unix:///private/no-server.sock"] } });
+  assert.equal(await recoverSession("s1"), 1);
+  assert.match(recoverLog(w), /cannot use --remote.*use plain codex/);
+  assert.deepEqual(sendKeys(w), []);
+  assert.equal(respawnLine(w), undefined);
+  assert.equal(existsSync(configToml(w, "home")), false);
+  assert.doesNotThrow(() => process.kill(w.pid, 0));
+});
+
+test("unknown Codex value options retain the prior recovery heuristic", async () => {
+  const { flagsForResume } = await import("../src/recover.ts");
+  assert.deepEqual(flagsForResume(["--future-option", "value", "old prompt"], "codex"), ["--future-option", "value"]);
+});
+
 test("the codex happy path: work hands off to home and the resumed conversation continues", async (t) => {
   const w = await codexWorld(t);
   const stop = reportOnRespawn(w, { generation: 3, cliSessionId: "cx-1" });

@@ -39,7 +39,9 @@ import { syncCodexAutorotate, syncRebalance } from "./autorotate.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { readCodexAuth } from "./providers/codex-probe.ts";
-import { codexLaunchCommand } from "./providers/codex-cli.ts";
+import { classifyCodexInvocation, codexExecutionCommand, codexLaunchCommand } from "./providers/codex-cli.ts";
+import { cliVersion } from "./compat.ts";
+import { resolveOnPath } from "./exec.ts";
 import { RELEASE_BUDGET_MS, probeConversation, waitForWriterRelease, writerLockDirs } from "./codex-writer-lock.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { chooseAccount } from "./mesh.ts";
@@ -106,7 +108,7 @@ type Parsed = { as: string | null; need: Need | null; continueAfter: boolean; me
  * `resume <id>` itself.
  */
 function namesAResume(provider: Provider, args: string[]): boolean {
-  if (provider === "codex") return args.includes("resume");
+  if (provider === "codex") return classifyCodexInvocation(["codex", ...args]).subcommand === "resume";
   return args.some((a) => a === "--resume" || a === "-r" || a === "--continue" || a === "-c" || a.startsWith("--resume="));
 }
 
@@ -144,10 +146,12 @@ export function claudeResumeId(args: string[]): string | null {
  * Null for `--last`, the picker, a thread NAME, and anything past `--`.
  */
 export function codexResumeId(args: string[]): string | null {
-  const end = args.indexOf("--") < 0 ? args.length : args.indexOf("--");
-  const at = args.indexOf("resume");
-  if (at < 0 || at >= end) return null;
-  return args.slice(at + 1, end).find((a) => CONVERSATION_ID.test(a)) ?? null;
+  const command = ["codex", ...args];
+  const parsed = classifyCodexInvocation(command);
+  if (parsed.subcommand !== "resume" || parsed.subcommandIndex === null || parsed.optionIndexes.some((i) => command[i] === "--last")) return null;
+  const index = parsed.positionalIndexes.find((i) => i > parsed.subcommandIndex!);
+  const id = index === undefined ? undefined : command[index];
+  return id && CONVERSATION_ID.test(id) ? id : null;
 }
 const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -536,6 +540,14 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     return EXIT_USAGE_ERROR;
   }
 
+  // Refuse ambiguous legacy permission combinations before account setup or
+  // any pane is created/replaced. _exec repeats this against its actual CLI.
+  if (provider === "codex" && cliArgs.some((a) => a === "--full-auto" || a === "--remote" || a.startsWith("--remote="))) {
+    const bin = resolveOnPath("codex");
+    try { codexExecutionCommand(codexLaunchCommand(cliArgs), bin ? cliVersion(bin) : null); }
+    catch (error) { say((error as Error).message); return EXIT_USAGE_ERROR; }
+  }
+
   // An unreadable accounts.json is "could not look", never "nothing is
   // there": reporting it as an empty pool would send the human hunting for a
   // missing account instead of a broken file. It is checked once, before
@@ -653,8 +665,8 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
 
   // A Codex conversation can be launched only once nothing else writes it.
   // The human typically just closed it somewhere — a plain `codex`, another
-  // pane — and that home's background server keeps it loaded for about a
-  // minute afterwards; a launch inside that minute is a read-only view
+  // pane — and that home's background server can keep it loaded afterwards
+  // (0.163 defaults to a 30-minute idle delay). A launch while held is read-only
   // (src/codex-writer-lock.ts). After `prepare`, which is what links this
   // home's lock directory at the one every home shares.
   const resumes = provider === "codex" ? (resumeId ?? codexResumeId(parsed.args)) : null;
@@ -663,7 +675,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     if (probeConversation(dirs, resumes) === "held") {
       const budget = Number(process.env.MS_CODEX_RELEASE_MS) || RELEASE_BUDGET_MS;
       process.stderr.write(
-        `ms codex: ${resumes} is still open in another codex process; waiting up to ${Math.round(budget / 1000)}s for it to be let go (a background server keeps a conversation about a minute after its window closes)\n`,
+        `ms codex: ${resumes} is still open in another codex process; waiting up to ${Math.round(budget / 1000)}s for it to be let go (a background server may retain it beyond this wait)\n`,
       );
       if ((await waitForWriterRelease(dirs, resumes, budget, Number(process.env.MS_POLL_MS) || 500)) === "held") {
         say(`${resumes} is still open in another codex process`, [

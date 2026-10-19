@@ -90,12 +90,68 @@ const NOT_THE_TUI = new Set([
  *  such as `review` or `resume`, so they must not be read as subcommands.
  *  `--image`/`-i` also consume subsequent bare entries until another option;
  *  an attached value (`--image=x` or `-ix`) ends that option's values.
- *  Mirrors rust-v0.160.0's utils/cli shared options and CLI remote flags. */
+ *  Checked against rust-v0.163.0's utils/cli shared options and CLI flags. */
 const TUI_VALUE_OPTIONS = new Set([
   "--config", "-c", "--enable", "--disable", "--remote", "--remote-auth-token-env",
   "--image", "-i", "--model", "-m", "--local-provider", "--profile", "-p",
   "--sandbox", "-s", "--cd", "-C", "--add-dir", "--ask-for-approval", "-a",
 ]);
+
+const TUI_BOOLEAN_OPTIONS = new Set([
+  "--no-daemon", "--no-alt-screen", "--oss", "--search", "--help", "-h", "--version", "-V", "--worktree", "--strict-config",
+  "--dangerously-bypass-hook-trust", "--yolo", "--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--not-so-yolo", "--full-auto",
+  "--last", "--all", "--include-non-interactive",
+]);
+const optionName = (arg: string): string => arg.startsWith("--") ? arg.split("=", 1)[0]! : arg.slice(0, 2);
+
+export type CodexInvocation = {
+  kind: "interactive" | "noninteractive";
+  subcommand: "resume" | "fork" | null;
+  subcommandIndex: number | null;
+  optionIndexes: number[];
+  positionalIndexes: number[];
+  unknownOptionIndexes: number[];
+};
+
+/** Parse a normalized [codex, ...args] once for launch, execution and import.
+ * Only the first bare word can select a subcommand. Known option values and
+ * variadic image paths cannot become commands; -- ends option processing. */
+export function classifyCodexInvocation(command: string[], platform: NodeJS.Platform = process.platform): CodexInvocation {
+  const result: CodexInvocation = { kind: "interactive", subcommand: null, subcommandIndex: null, optionIndexes: [], positionalIndexes: [], unknownOptionIndexes: [] };
+  let firstPositional = true;
+  const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
+  for (let i = 1; i < end; i++) {
+    const arg = command[i]!;
+    if (arg.startsWith("-")) {
+      result.optionIndexes.push(i);
+      const option = optionName(arg);
+      if (!TUI_VALUE_OPTIONS.has(option) && !TUI_BOOLEAN_OPTIONS.has(option)) result.unknownOptionIndexes.push(i);
+      const attached = arg.startsWith("--") ? arg.includes("=") : arg.length > 2;
+      if (TUI_VALUE_OPTIONS.has(option) && !attached) {
+        if (option === "--image" || option === "-i") {
+          while (i + 1 < end && (command[i + 1] === "-" || !command[i + 1]!.startsWith("-"))) i++;
+        } else if (i + 1 < end) i++;
+      }
+      continue;
+    }
+    result.positionalIndexes.push(i);
+    if (!firstPositional) continue;
+    firstPositional = false;
+    if (NOT_THE_TUI.has(arg) || (arg === "app" && (platform === "darwin" || platform === "win32"))) {
+      result.kind = "noninteractive";
+      return result;
+    }
+    if (arg === "resume" || arg === "fork") {
+      result.subcommand = arg;
+      result.subcommandIndex = i;
+    }
+  }
+  return result;
+}
+
+export function isCodexTuiCommand(command: string[], platform: NodeJS.Platform = process.platform): boolean {
+  return classifyCodexInvocation(command, platform).kind === "interactive";
+}
 
 /**
  * The command line a Codex pane is actually started with: the recorded one,
@@ -107,9 +163,9 @@ const TUI_VALUE_OPTIONS = new Set([
  * pane this tool moves between accounts (verified against codex-rs
  * rust-v0.160.0 and the live 0.160 handoff of 2026-10-04):
  *
- *   * it keeps the conversation LOADED — holding its writer lock — for about
- *     a minute after the pane's TUI is gone, so a relaunch on another account
- *     in that minute opens a read-only view with the continuation unsent
+ *   * it keeps the conversation LOADED — holding its writer lock — after
+ *     the pane's TUI is gone (0.163 defaults to a 30-minute idle delay), so
+ *     a relaunch while held opens a read-only view with the continuation unsent
  *     (src/codex-writer-lock.ts). In-process, the lock dies with the pane;
  *   * it runs every conversation's hooks with ITS OWN environment, inherited
  *     from whichever pane spawned it — that pane's `MS_SESSION`, `MS_PANE`
@@ -127,34 +183,41 @@ const TUI_VALUE_OPTIONS = new Set([
  */
 export function withNoDaemon(command: string[], version: string | null, platform: NodeJS.Platform = process.platform): string[] {
   if (!version || compareVersions(version, CODEX_NO_DAEMON_SINCE) < 0) return command;
-  const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
-  let sub = -1;
-  for (let i = 1; i < end; i++) {
-    const arg = command[i]!;
-    if (arg === "--no-daemon") return command;
-    if (arg.startsWith("-")) {
-      const option = arg.startsWith("--") ? arg.split("=", 1)[0]! : arg.slice(0, 2);
-      const attached = arg.startsWith("--") ? arg.includes("=") : arg.length > 2;
-      if (TUI_VALUE_OPTIONS.has(option) && !attached) {
-        // Clap's image option accepts one or more values. Without an
-        // attached value, even `-` or a word such as `resume` is an image path.
-        if (option === "--image" || option === "-i") {
-          while (i + 1 < end && (command[i + 1] === "-" || !command[i + 1]!.startsWith("-"))) i++;
-        } else if (i + 1 < end) {
-          i++;
-        }
-      }
-      continue;
-    }
-    // Once inside resume/fork, bare words are the session id/name and
-    // prompt, never another subcommand. Options can still follow them.
-    if (sub >= 0) continue;
-    // The desktop app command is compiled only for macOS and Windows.
-    if (NOT_THE_TUI.has(arg) || (arg === "app" && (platform === "darwin" || platform === "win32"))) return command;
-    if (arg === "resume" || arg === "fork") sub = i;
-  }
-  const at = sub < 0 ? 1 : sub + 1;
+  const parsed = classifyCodexInvocation(command, platform);
+  if (parsed.kind !== "interactive" || parsed.optionIndexes.some((i) => command[i] === "--no-daemon" || optionName(command[i]!) === "--remote")) return command;
+  const at = parsed.subcommandIndex === null ? 1 : parsed.subcommandIndex + 1;
   return [...command.slice(0, at), "--no-daemon", ...command.slice(at)];
+}
+
+/** Oldest binary directly checked to reject --full-auto. This is a verified
+ * compatibility boundary, not a claim about when Codex removed the option. */
+export const CODEX_FULL_AUTO_REJECTED_FROM = "0.157.0";
+
+/** Adapt recorded legacy argv against the binary about to execute it.
+ * rust-v0.120.0 tui/src/lib.rs selected WorkspaceWrite + OnRequest when
+ * full_auto was true, ahead of explicit sandbox/approval choices. Its Clap
+ * definition rejected full_auto combined with yolo. Root/subcommand merging
+ * complicates mixed selectors, so refuse those instead of changing their
+ * effective permissions. --approve-for-me is a different policy entirely. */
+export function codexExecutionCommand(command: string[], version: string | null, platform: NodeJS.Platform = process.platform): string[] {
+  const parsed = classifyCodexInvocation(command, platform);
+  if (parsed.kind !== "interactive") return command;
+  if (parsed.optionIndexes.some((i) => optionName(command[i]!) === "--remote")) {
+    throw new Error("managed Codex sessions cannot use --remote: the remote server owns account credentials and hooks; use plain codex for remote sessions");
+  }
+  if (!version || compareVersions(version, CODEX_FULL_AUTO_REJECTED_FROM) < 0) return withNoDaemon(command, version, platform);
+  const legacy = parsed.optionIndexes.filter((i) => command[i] === "--full-auto");
+  const permissionSelector = parsed.optionIndexes.some((i) => ["--sandbox", "-s", "--ask-for-approval", "-a", "--yolo", "--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--not-so-yolo"].includes(optionName(command[i]!)));
+  // A future option may consume a flag-looking value. Refuse to promote it.
+  const ambiguousLegacyValue = parsed.optionIndexes.some((i) => !TUI_VALUE_OPTIONS.has(optionName(command[i]!)) && !TUI_BOOLEAN_OPTIONS.has(optionName(command[i]!)) && !command[i]!.includes("=") && command[i + 1] === "--full-auto");
+  if (ambiguousLegacyValue) throw new Error("cannot distinguish --full-auto from an unknown option's value; relaunch with reviewed options");
+  if (!legacy.length) return withNoDaemon(command, version, platform);
+  if (permissionSelector || legacy.length > 1) {
+    throw new Error("cannot safely adapt --full-auto combined with other permission options or repeated --full-auto; replace it with reviewed --sandbox and --ask-for-approval options");
+  }
+  const index = legacy[0]!;
+  const adapted = [...command.slice(0, index), "--sandbox", "workspace-write", "--ask-for-approval", "on-request", ...command.slice(index + 1)];
+  return withNoDaemon(adapted, version, platform);
 }
 
 /** How a Codex pane is asked to leave: the keys, and how long the TUI is

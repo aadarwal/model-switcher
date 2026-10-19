@@ -283,3 +283,41 @@ test("_exec keeps Codex in-process when a prompt or profile names a subcommand",
     assert.equal(lines.MS_SESSION, "s1");
   }
 });
+
+test("_exec adapts a legacy full-auto resume at runtime without rewriting its launch record", async () => {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  const command = ["codex", "resume", "cx-1", "--full-auto"];
+  await seedLaunch({ home, msHome, account: "work", provider: "codex", command });
+  stub("codex", `if [ "$1" = "--version" ]; then echo 'codex-cli 0.163.0'; exit 0; fi\n${CODEX_STUB}`);
+  const result = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(envOf(result.stdout).ARGS, "resume --no-daemon cx-1 --sandbox workspace-write --ask-for-approval on-request");
+  const { openState } = await import("../src/state.ts");
+  const state = openState();
+  try { assert.deepEqual(state.getLaunch("L1")!.command, command); }
+  finally { state.close(); }
+});
+
+test("_exec refuses ambiguous legacy permission selectors without running the CLI", async () => {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  await seedLaunch({ home, msHome, account: "work", provider: "codex", command: ["codex", "--full-auto", "--sandbox", "read-only"] });
+  stub("codex", `if [ "$1" = "--version" ]; then echo 'codex-cli 0.163.0'; exit 0; fi\n${CODEX_STUB}`);
+  const result = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /cannot safely adapt --full-auto/);
+  assert.equal(result.stdout, "");
+});
+
+test("_exec repeats the managed remote ownership refusal without echoing its endpoint", async () => {
+  const { home, msHome } = tempHome();
+  const { dir, stub } = stubDir();
+  await seedLaunch({ home, msHome, account: "work", provider: "codex", command: ["codex", "--remote", "wss://secret-endpoint.invalid"] });
+  stub("codex", `if [ "$1" = "--version" ]; then echo 'codex-cli 0.163.0'; exit 0; fi\n${CODEX_STUB}`);
+  const result = run(["_exec", "L1"], { HOME: home, MS_HOME: msHome, PATH: `${dir}:${process.env.PATH}` });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /cannot use --remote.*use plain codex/);
+  assert.doesNotMatch(result.stderr, /secret-endpoint/);
+  assert.equal(result.stdout, "");
+});

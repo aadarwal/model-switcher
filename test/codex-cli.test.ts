@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSy
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-const { codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand, ensureCodexTrust, withNoDaemon } = await import("../src/providers/codex-cli.ts");
+const { classifyCodexInvocation, isCodexTuiCommand, codexExecutionCommand, codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand, ensureCodexTrust, withNoDaemon } = await import("../src/providers/codex-cli.ts");
 
 // Resolved: `os.tmpdir()` is `/tmp` on macOS, itself a symlink to `/private/tmp`,
 // and `src/paths.ts`'s `msHome()` now resolves `MS_HOME` the same way — so an
@@ -279,6 +279,66 @@ test("a 'projects' key inside somebody else's table is not a projects definition
 });
 
 // --- in-process: `--no-daemon` ---------------------------------------------
+
+test("shared Codex classifier excludes daemon workers and preserves actual TUI option boundaries", () => {
+  for (const command of [
+    ["codex", "app-server", "--listen", "unix://", "--analytics-default-enabled", "--managed-daemon"],
+    ["codex", "app-server", "daemon", "pid-update-loop"], ["codex", "exec", "resume"],
+    ["codex", "--profile", "resume", "app-server", "--managed-daemon"],
+  ]) assert.equal(isCodexTuiCommand(command), false, JSON.stringify(command));
+  for (const command of [
+    ["codex", "--model", "app-server"], ["codex", "--profile=resume"],
+    ["codex", "--image", "-", "app-server"], ["codex", "--", "app-server"],
+    ["codex", "resume", "review"], ["codex", "fork", "app-server"],
+  ]) assert.equal(isCodexTuiCommand(command), true, JSON.stringify(command));
+  assert.equal(classifyCodexInvocation(["codex", "--profile", "resume"]).subcommand, null);
+  assert.equal(classifyCodexInvocation(["codex", "--model", "resume", "resume", "--profile", "review", "thread"]).subcommandIndex, 3);
+  assert.equal(isCodexTuiCommand(["codex", "app"], "linux"), true);
+  assert.equal(isCodexTuiCommand(["codex", "app"], "darwin"), false);
+});
+
+test("legacy full-auto uses its original workspace-write/on-request policy on verified rejecting versions", () => {
+  for (const version of ["0.157.0", "0.163.0"]) {
+    assert.deepEqual(codexExecutionCommand(["codex", "--full-auto", "--model", "gpt-6.1-sol"], version),
+      ["codex", "--no-daemon", "--sandbox", "workspace-write", "--ask-for-approval", "on-request", "--model", "gpt-6.1-sol"]);
+    assert.deepEqual(codexExecutionCommand(["codex", "resume", "conversation", "--full-auto"], version),
+      ["codex", "resume", "--no-daemon", "conversation", "--sandbox", "workspace-write", "--ask-for-approval", "on-request"]);
+  }
+  for (const version of [null, "0.156.9"]) {
+    const command = ["codex", "--full-auto"];
+    assert.deepEqual(codexExecutionCommand(command, version), command);
+  }
+});
+
+test("legacy full-auto does not reinterpret model/profile/config values, image paths or prompt boundaries", () => {
+  for (const args of [["--profile", "--full-auto"], ["--config", "--full-auto"], ["--model=--full-auto"], ["-i--full-auto"], ["--image", "-", "resume"], ["--", "--full-auto"]]) {
+    const command = ["codex", ...args];
+    assert.deepEqual(codexExecutionCommand(command, "0.163.0"), withNoDaemon(command, "0.163.0"));
+  }
+  const exec = ["codex", "exec", "--full-auto"];
+  assert.deepEqual(codexExecutionCommand(exec, "0.163.0"), exec);
+  assert.throws(() => codexExecutionCommand(["codex", "--future-option", "--full-auto"], "0.163.0"), /unknown option's value/);
+});
+
+test("mixed or repeated legacy permission selectors refuse instead of changing approval semantics", () => {
+  for (const selector of [["--sandbox", "read-only"], ["-sread-only"], ["--ask-for-approval=never"], ["-a", "on-request"], ["--yolo"], ["--dangerously-bypass-approvals-and-sandbox"], ["--approve-for-me"], ["--not-so-yolo"], ["--full-auto"]]) {
+    for (const command of [["codex", "--full-auto", ...selector], ["codex", ...selector, "resume", "conversation", "--full-auto"]]) {
+      assert.throws(() => codexExecutionCommand(command, "0.163.0"), /cannot safely adapt --full-auto/);
+    }
+  }
+});
+
+test("remote TUI argv stays untouched by daemon adaptation and refuses managed account ownership", () => {
+  for (const command of [["codex", "--remote", "unix:///private/server.sock"], ["codex", "resume", "thread", "--remote=unix:///private/server.sock"]]) {
+    assert.deepEqual(withNoDaemon(command, "0.163.0"), command);
+    assert.throws(() => codexExecutionCommand(command, "0.163.0"), /cannot use --remote.*use plain codex/);
+  }
+  for (const command of [["codex", "agents", "--remote", "unix:///private/server.sock"], ["codex", "queue", "thread", "--remote=unix:///private/server.sock"]]) {
+    assert.deepEqual(codexExecutionCommand(command, "0.163.0"), command);
+  }
+  const value = ["codex", "--profile=--remote"];
+  assert.deepEqual(codexExecutionCommand(value, "0.163.0"), withNoDaemon(value, "0.163.0"));
+});
 //
 // A pane that runs its conversation in its own process lets go of it the
 // instant it exits, and its hooks run with ITS environment — never with the

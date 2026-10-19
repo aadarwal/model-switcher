@@ -11,10 +11,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import { stubDir, tempHome } from "./helpers.ts";
 import { changelogNotes, renderFormula, REPO_ROOT as REAL_REPO_ROOT } from "../scripts/release.mjs";
 import { resolveOnPath } from "../src/exec.ts";
@@ -122,10 +123,42 @@ function sha256Hex(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/** Read physical tar headers rather than asking bsdtar to list them: on
+ * macOS it silently folds AppleDouble members into their adjacent files.
+ * Keep extended/PAX headers in the result too, so the six-entry assertion
+ * checks the actual portable archive, including metadata. */
+function physicalTarEntries(file: string): { name: string; mode: number; type: string }[] {
+  const bytes = gunzipSync(readFileSync(file));
+  const entries: { name: string; mode: number; type: string }[] = [];
+  const text = (header: Buffer, start: number, length: number): string =>
+    header.subarray(start, start + length).toString("utf8").replace(/\0.*$/s, "").trim();
+  let offset = 0;
+  while (offset + 512 <= bytes.length) {
+    const header = bytes.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const checksum = Number.parseInt(text(header, 148, 8), 8);
+    const actual = header.reduce((sum, byte, index) => sum + (index >= 148 && index < 156 ? 32 : byte), 0);
+    assert.equal(checksum, actual, `invalid tar checksum at byte ${offset}`);
+    const prefix = text(header, 345, 155);
+    const name = text(header, 0, 100);
+    const size = Number.parseInt(text(header, 124, 12), 8);
+    assert.ok(Number.isSafeInteger(size) && size >= 0 && offset + 512 + size <= bytes.length, `invalid tar size for ${name}`);
+    entries.push({ name: prefix ? `${prefix}/${name}` : name, mode: Number.parseInt(text(header, 100, 8), 8), type: header.subarray(156, 157).toString() });
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  assert.ok(entries.length > 0, "archive contains no tar headers");
+  return entries;
+}
+
 // --- --dry-run: tarball contents and layout -------------------------------
 
 test("--dry-run produces the tarball with exactly the six entries", () => {
   const dir = makeFixture();
+  if (process.platform === "darwin") {
+    // A deterministic reproduction even on a checkout with no ambient xattrs.
+    // Extended attributes do not change the committed README's contents.
+    execFileSync("/usr/bin/xattr", ["-w", "com.model-switcher.release-test", "must not ship", path.join(dir, "README.md")]);
+  }
   const r = runRelease(dir, ["v0.1.0", "--dry-run"]);
   assert.equal(r.status, 0, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
 
@@ -137,7 +170,8 @@ test("--dry-run produces the tarball with exactly the six entries", () => {
   // /private/var for the OS temp dir) — `dir` itself is the unresolved form.
   assert.equal(realpathSync(path.dirname(tarballPath)), realpathSync(path.join(dir, "release")));
 
-  const listing = execFileSync("tar", ["-tzf", tarballPath], { encoding: "utf8" }).trim().split("\n").sort();
+  const entries = physicalTarEntries(tarballPath);
+  const listing = entries.map((entry) => entry.name).sort();
   const expected = [
     "model-switcher-v0.1.0/LICENSE",
     "model-switcher-v0.1.0/README.md",
@@ -146,7 +180,12 @@ test("--dry-run produces the tarball with exactly the six entries", () => {
     "model-switcher-v0.1.0/dist/ms.js",
     "model-switcher-v0.1.0/package.json",
   ].sort();
-  assert.deepEqual(listing, expected, `tar -tzf listing:\n${listing.join("\n")}`);
+  assert.deepEqual(listing, expected, `physical tar headers:\n${listing.join("\n")}`);
+  for (const entry of entries) {
+    assert.ok(entry.type === "0" || entry.type === "\0", `non-file archive entry: ${entry.name}`);
+    const relative = entry.name.slice("model-switcher-v0.1.0/".length);
+    assert.equal(entry.mode & 0o7777, statSync(path.join(dir, relative)).mode & 0o7777, `file mode changed for ${relative}`);
+  }
 
   for (const forbidden of ["src/", "test/", ".superpowers/", "node_modules/"]) {
     assert.ok(!listing.some((l) => l.includes(forbidden)), `should not contain ${forbidden}: ${listing.join(", ")}`);

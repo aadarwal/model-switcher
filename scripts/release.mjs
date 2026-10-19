@@ -145,8 +145,13 @@ function buildTarball(repoRoot, tag) {
     mkdirSync(releaseDir, { recursive: true });
     const tarballPath = path.join(releaseDir, `${versionDir}.tar.gz`);
 
-    const tarArgs = ["-cf", "-", "--uid", "0", "--gid", "0", "--numeric-owner", "-C", scratch, ...TARBALL_ENTRIES.map((rel) => path.join(versionDir, rel))];
-    const tarResult = runBuffer("tar", tarArgs, { timeout: 60_000 });
+    const tarArgs = ["-cf", "-", "--format=ustar", "--no-xattrs", "--uid", "0", "--gid", "0", "--numeric-owner", "-C", scratch, ...TARBALL_ENTRIES.map((rel) => path.join(versionDir, rel))];
+    // macOS bsdtar otherwise emits hidden AppleDouble `._*` members for
+    // copied extended attributes. Its own listing folds those into the
+    // payload files, hiding that the archive contains more than six entries.
+    // Ustar and --no-xattrs also prevent those attributes from moving into
+    // PAX metadata headers instead. The payload's ordinary modes survive.
+    const tarResult = runBuffer("tar", tarArgs, { timeout: 60_000, env: { ...process.env, COPYFILE_DISABLE: "1" } });
     // THROW, never `fail()`: `fail` calls process.exit, which skips the
     // `finally` below and leaks the scratch directory on every tar/gzip
     // failure. main() turns this back into the same one-line exit.

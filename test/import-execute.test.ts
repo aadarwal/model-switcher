@@ -596,6 +596,68 @@ test("an old sanitized manifest refuses the current process's settings before an
   assert.ok(!w.log.join("\n").includes("secret-value"));
 });
 
+test("an old Codex plan refuses current remote ownership before signalling or touching tmux", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const address = "unix:///private/secret-remote-address.sock";
+  for (const argv of [
+    ["codex", "--remote", address],
+    ["node", "/private/bin/codex.mjs", "resume", "r-1", "--remote=" + address],
+  ]) {
+    const plan = planOf([cand({ provider: "codex", id: "r-1", cwd: "/tmp", pid })]);
+    const w = await world(t, plan);
+    w.deps.ps = () => tableFor(plan).map((row) => ({ ...row, argv }));
+    const signals: number[] = [];
+    w.deps.kill = (target) => { signals.push(target); return true; };
+    const { executeImport } = await import("../src/import/execute.ts");
+
+    assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+    assert.deepEqual(signals, []);
+    assert.deepEqual(w.tmuxLog(), []);
+    assert.ok(w.deps.alive(pid));
+    assert.match(w.manifest().rows[0]!.outcome, /--remote.*source process remains untouched/);
+    assert.ok(!readFileSync(w.file, "utf8").includes(address));
+    assert.ok(!w.log.join("\n").includes(address));
+  }
+});
+
+test("a manually edited Codex pane command cannot bypass remote refusal through provider-only argv", async (t) => {
+  const { dir } = stubDir();
+  const pid = await liveProcess(t, dir, "polite");
+  const address = "unix:///private/secret-manual-remote.sock";
+  const plan = planOf([cand({ provider: "codex", id: "r-1", cwd: "/tmp", pid })]);
+  plan.sessions[0]!.windows[0]!.panes[0]!.command = ["ms", "adopt", "r-1", "--", "--remote", address];
+  const w = await world(t, plan);
+  const signals: number[] = [];
+  w.deps.kill = (target) => { signals.push(target); return true; };
+  const { executeImport } = await import("../src/import/execute.ts");
+
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+  assert.deepEqual(signals, []);
+  assert.deepEqual(w.tmuxLog(), []);
+  assert.ok(w.deps.alive(pid));
+  assert.equal(w.manifest().rows[0]!.command, null);
+  assert.ok(!readFileSync(w.file, "utf8").includes(address));
+  assert.ok(!w.log.join("\n").includes(address));
+});
+
+test("a Codex prompt word or attached profile value named remote does not refuse an otherwise valid import", async (t) => {
+  for (const flags of [["--profile=--remote"], ["--model", "gpt-6-luna", "--", "--remote=prompt"]]) {
+    const { dir } = stubDir();
+    const pid = await liveProcess(t, dir, "polite");
+    const source = cand({ provider: "codex", id: "r-1", cwd: "/tmp", pid, argv: ["codex", ...flags] });
+    const plan = planOf([source]);
+    const { keptFlags } = await import("../src/import/plan.ts");
+    plan.sessions[0]!.windows[0]!.panes[0]!.command = ["ms", "adopt", "r-1", "--", ...keptFlags("codex", source.argv)];
+    const w = await world(t, plan);
+    w.deps.ps = () => tableFor(plan).map((row) => ({ ...row, argv: source.argv! }));
+    const { executeImport } = await import("../src/import/execute.ts");
+
+    assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 1, stopped: 1, failed: 0 });
+    assert.ok(!w.deps.alive(pid));
+  }
+});
+
 test("a replayed command carrying raw MCP configuration is refused and removed before stopping", async (t) => {
   const { dir } = stubDir();
   const pid = await liveProcess(t, dir, "polite");

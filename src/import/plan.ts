@@ -25,8 +25,9 @@
 // fails open, and the failure is a secret in a tmux command string.
 
 import path from "node:path";
+import { classifyCodexInvocation } from "../providers/codex-cli.ts";
 import { targetServer, type ServerKind } from "../tmux.ts";
-import type { Candidate, ImportProvider } from "./scan.ts";
+import { codexCommandFromArgv, type Candidate, type ImportProvider } from "./scan.ts";
 
 export interface PaneSpec {
   candidate: Candidate;
@@ -115,6 +116,15 @@ const CONFIG_FLAGS: Record<ImportProvider, Set<string>> = {
 };
 
 function importArguments(provider: ImportProvider, argv: string[] | null): { flags: string[]; refusal: string | null } {
+  if (provider === "codex" && argv) {
+    // Raw process argv may name a native binary or a Node launcher. Replayed
+    // pane commands instead supply just provider flags after ms's separator.
+    const command = codexCommandFromArgv(argv) ?? ["codex", ...argv];
+    const parsed = classifyCodexInvocation(command);
+    if (parsed.kind === "interactive" && parsed.optionIndexes.some((i) => command[i]!.split("=", 1)[0] === "--remote")) {
+      return { flags: [], refusal: "cannot import Codex --remote sessions: the remote server owns account credentials and hooks; source process remains untouched; use plain codex for remote sessions" };
+    }
+  }
   // An ambiguous unknown option must not hide a configuration flag. Refuse
   // conservatively even when the spelling might instead be that option's
   // literal value; neither interpretation justifies stopping the source.

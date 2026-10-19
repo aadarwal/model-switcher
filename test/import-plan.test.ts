@@ -514,6 +514,43 @@ test("an unsupported configured process is skipped before stop and its secret ne
   assert.equal(manifest.rows[0]!.command, null);
 });
 
+test("remote Codex frontends are refused without persisting the address, including launcher and attached forms", async () => {
+  const { configurationRefusal, keptFlags, planImport } = await import("../src/import/plan.ts");
+  const { manifestFromPlan } = await import("../src/import/manifest.ts");
+  const address = "unix:///private/secret-remote-address.sock";
+  for (const argv of [
+    ["codex", "--remote", address],
+    ["/private/bin/codex", `--remote=${address}`],
+    ["node", "/private/bin/codex.mjs", "resume", "r-1", "--remote", address],
+    ["node22", "/private/bin/codex.js", "--profile", "work", "--remote=" + address],
+  ]) {
+    const source = cand({ cwd: "/tmp", provider: "codex", pid: 42, argv });
+    const plan = planImport([source], opts());
+    assert.deepEqual(paneIds(plan), []);
+    assert.match(plan.skipped[0]!.reason, /--remote.*source process remains untouched.*use plain codex/);
+    assert.deepEqual(keptFlags("codex", argv), []);
+    const manifest = manifestFromPlan(plan, { since: "2h", dirs: [] });
+    assert.ok(!JSON.stringify(manifest).includes(address));
+    assert.equal(manifest.rows[0]!.command, null);
+  }
+  assert.match(configurationRefusal("codex", ["--remote", address])!, /cannot import Codex --remote/,
+    "a replayed provider argument list has the same preflight");
+});
+
+test("Codex remote-looking values and prompt words are not promoted into remote options", async () => {
+  const { configurationRefusal } = await import("../src/import/plan.ts");
+  for (const argv of [
+    ["codex", "--model=--remote"],
+    ["node", "/private/bin/codex.js", "--profile=--remote"],
+    ["codex", "--image=--remote"],
+    ["codex", "--model", "gpt-6-luna", "--", "--remote", "a prompt word"],
+    ["codex", "resume", "r-1", "--", "--remote=prompt"],
+  ]) assert.equal(configurationRefusal("codex", argv), null, JSON.stringify(argv));
+  // The importer's existing strict value check may refuse a flag-shaped
+  // scalar value; it must not reinterpret that value as remote ownership.
+  assert.doesNotMatch(configurationRefusal("codex", ["codex", "--profile", "--remote"])!, /cannot import Codex --remote/);
+});
+
 // --- The target server -----------------------------------------------------
 
 test("the plan targets the server the command is being run from, else the default server", async () => {

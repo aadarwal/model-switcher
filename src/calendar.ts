@@ -26,8 +26,9 @@ import { createHash } from "node:crypto";
 import type { Verb } from "./cli.ts";
 import type { Provider } from "./registry.ts";
 import type { Window } from "./pick.ts";
+import { usedPercentText, windowLimitLabel } from "./usage-display.ts";
 
-export type ResetWindow = "5h" | "week" | "fable";
+export type ResetWindow = string;
 
 export type ResetEvent = {
   account: string;
@@ -64,7 +65,7 @@ const WINDOW_KEYS: readonly [keyof NonNullable<CalendarAccount["usage"]>, ResetW
 ];
 
 /** Upcoming resets inside `(now, now + days]`, soonest first. A past reset, a
- *  window that has not started (`resetsAt: null`), an unparseable date and an
+ *  reset time that is unknown or not started, an unparseable date and an
  *  account that has never been polled are all simply not events. */
 export function resetEvents(accounts: CalendarAccount[], nowMs: number, days: number, opts: { includeIdle?: boolean } = {}): ResetEvent[] {
   const horizon = nowMs + days * 86_400_000;
@@ -72,8 +73,9 @@ export function resetEvents(accounts: CalendarAccount[], nowMs: number, days: nu
   for (const a of accounts) {
     if (!a.usage) continue;
     const byInstant = new Map<number, ResetEvent>();
-    for (const [key, name] of WINDOW_KEYS) {
+    for (const [key, fallback] of WINDOW_KEYS) {
       const w = a.usage[key];
+      const name = windowLimitLabel(w, fallback);
       // Snapped to the minute: a provider reports the same reset a fraction of a
       // second differently from poll to poll (13:59:59.87, then 14:00:00.12), and
       // an unsnapped instant would split one reset into two rows and give each
@@ -107,7 +109,7 @@ export function eventTitle(e: ResetEvent): string {
 
 export function eventDetails(e: ResetEvent): string {
   const who = e.label ? `${e.account} — ${e.label}` : e.account;
-  return `${who}: the ${windowsPhrase(e.windows)} usage window resets. ${Math.round(e.usedPercent)}% used when this was written. From model-switcher (ms calendar).`;
+  return `${who}: the ${windowsPhrase(e.windows)} usage window resets. ${usedPercentText(e.usedPercent, "unknown")} used when this was written. From model-switcher (ms calendar).`;
 }
 
 /** `20260918T150405Z` — the UTC "basic" form both Google's template link and iCalendar use. */

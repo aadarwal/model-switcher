@@ -19,6 +19,8 @@
 // argument at all; there is no way to build a body that sends one.
 
 import { poolSummaryText, type PoolSummaries } from "../pool-summary.ts";
+import { reportedResetCount, usedPercentText, windowPeriod, windowResetState } from "../usage-display.ts";
+export { reportedResetCount, usedPercentText, windowPeriod, windowResetState } from "../usage-display.ts";
 export { poolSummaryText, poolResetTime } from "../pool-summary.ts";
 
 /** `&<>"'` only — the five characters that matter inside an HTML attribute
@@ -98,13 +100,15 @@ export function pollStateOnVisible(state: PollState): PollState {
 // alongside it — test/dashboard-client.test.ts pins that "all of them" is
 // what gets embedded, so a helper can never be left behind.
 
-export type UsageWindow = { usedPercent?: number | null; resetsAt?: string | null } | null;
+export type UsageWindow = { usedPercent?: number | null; resetsAt?: string | null; windowSeconds?: number; resetStarted?: boolean } | null;
 export type AccountRowView = {
   name: string;
   label: string;
   state: string;
   provider?: string;
-  usage?: { session?: UsageWindow; weeklyAll?: UsageWindow; weeklyFable?: UsageWindow } | null;
+  usage?: { session?: UsageWindow; weeklyAll?: UsageWindow; weeklyFable?: UsageWindow; planType?: string; resetsAvailable?: number } | null;
+  stale?: boolean;
+  error?: string | null;
   /** The login behind the name; absent from an older /api/state and until the account is next verified. */
   email?: string | null;
   /** Live sessions on this account (src/status.ts's sessionsByAccount). */
@@ -160,8 +164,7 @@ export function chipClass(v: unknown): string {
 
 export function fmtPercent(w: UsageWindow | undefined, dash: string): string {
   if (!w || typeof w.usedPercent !== "number" || !isFinite(w.usedPercent)) return dash;
-  var v = Math.round(w.usedPercent * 10) / 10;
-  return (Math.floor(v) === v ? String(v) : v.toFixed(1)) + "%";
+  return usedPercentText(w.usedPercent, dash);
 }
 
 /**
@@ -311,17 +314,17 @@ export function laneHtml(label: string, w: UsageWindow | undefined, dash: string
   if (!w || typeof w.usedPercent !== "number" || !isFinite(w.usedPercent)) return "";
   var pct = Math.max(0, Math.min(100, w.usedPercent));
   var idle = pct === 0;
-  var note = resetNote(w.resetsAt);
+  var note = resetNote(w.resetsAt) || windowResetState(w);
   return (
     '<div class="ms-lane">' +
     '<div class="ms-lane-top">' +
     '<span class="ms-lane-label">' + esc(label) + "</span>" +
     '<span class="ms-lane-read">' +
     (note ? '<span class="ms-lane-note">' + esc(note) + "</span>" : "") +
-    '<span class="ms-lane-value"' + (idle ? " data-idle" : "") + ">" + fmtPercent(w, dash) + "</span>" +
+    '<span class="ms-lane-value"' + (idle ? " data-idle" : "") + ">" + fmtPercent(w, dash) + " used</span>" +
     "</span>" +
     "</div>" +
-    '<div class="ms-track" role="progressbar" aria-valuenow="' + Math.round(pct) + '" aria-valuemin="0" aria-valuemax="100" aria-label="' + esc(label) + ": " + fmtPercent(w, dash) + ' used">' +
+    '<div class="ms-track" role="progressbar" aria-valuenow="' + pct + '" aria-valuemin="0" aria-valuemax="100" aria-label="' + esc(label) + ": " + fmtPercent(w, dash) + ' used">' +
     '<span class="ms-fill" data-severity="' + (idle ? "idle" : severityWord(pct)) + '" style="width:' + pct + '%"></span>' +
     "</div>" +
     "</div>"
@@ -335,9 +338,9 @@ export function laneHtml(label: string, w: UsageWindow | undefined, dash: string
 export function accountLanesHtml(a: AccountRowView, dash: string): string {
   var u = a.usage || {};
   return (
-    laneHtml("Session · 5h", u.session, dash) +
-    laneHtml("Week · all models", u.weeklyAll, dash) +
-    laneHtml("Week · Fable", u.weeklyFable, dash)
+    laneHtml("Session · " + windowPeriod(u.session, "5h"), u.session, dash) +
+    laneHtml(windowPeriod(u.weeklyAll, "Week") + " · all models", u.weeklyAll, dash) +
+    laneHtml(windowPeriod(u.weeklyFable, "Week") + " · Fable", u.weeklyFable, dash)
   );
 }
 
@@ -358,6 +361,7 @@ export function accountSessionsHtml(sessions: { id: string; pane: string; state:
 export function accountRowHtml(a: AccountRowView, dash: string): string {
   var lanes = accountLanesHtml(a, dash);
   var showLabel = a.label && a.label !== a.name;
+  var credits = reportedResetCount(a.usage);
   return (
     '<section class="ms-acct">' +
     '<header class="ms-acct-head">' +
@@ -366,6 +370,8 @@ export function accountRowHtml(a: AccountRowView, dash: string): string {
     (showLabel ? '<span class="ms-meta">' + esc(a.label) + "</span>" : "") +
     "</header>" +
     (a.email ? '<div class="ms-email">' + esc(a.email) + "</div>" : "") +
+    (a.usage && a.usage.planType ? '<div class="ms-meta">Plan: ' + esc(a.usage.planType) + "</div>" : "") +
+    (credits !== null ? '<div class="ms-meta">' + (a.stale || a.error || ["ok", "no room", "reserved"].indexOf(a.state) < 0 ? "Last reported resets available: " : "Resets available: ") + credits + "</div>" : "") +
     accountSessionsHtml(a.sessions) +
     (lanes || '<div class="ms-note">no windows reported</div>') +
     "</section>"

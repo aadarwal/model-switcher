@@ -18,6 +18,7 @@ import { findAccount, loadRegistry, type Registry } from "./registry.ts";
 import { getSnapshot, toPickInputs, type AccountUsage } from "./snapshot.ts";
 import { reserveReached, type PickInput, type Window } from "./pick.ts";
 import { poolSummaries, poolSummaryText, type PoolSummaries } from "./pool-summary.ts";
+import { reportedResetCount, usageRequestsBlocked, usedPercentText, windowPeriod, windowResetState } from "./usage-display.ts";
 import { decide, isPinned, lastMoveAtMs, lastWallAtMs, movable, paneReading } from "./rebalance.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { openState, type SessionRow, type State } from "./state.ts";
@@ -91,7 +92,10 @@ export function accountState(a: AccountUsage, hasToken: boolean, reservePercent 
   // Codex Pro legitimately omits the session window; when present, it must
   // be finite for both providers, just as pickAccounts requires.
   const u = a.usage;
-  if (!u?.weeklyAll || !Number.isFinite(u.weeklyAll.usedPercent)
+  if (usageRequestsBlocked(u)) return "no room";
+  if (!u || (!u.weeklyAll && a.provider !== "codex")
+    || (!u.weeklyAll && !u.session)
+    || (u.weeklyAll && !Number.isFinite(u.weeklyAll.usedPercent))
     || (!u.session && a.provider !== "codex")
     || (u.session && !Number.isFinite(u.session.usedPercent))) return "transient";
   // Last, and only ever in place of `ok`: everything above describes the
@@ -101,12 +105,12 @@ export function accountState(a: AccountUsage, hasToken: boolean, reservePercent 
   // every launch and every rotation is about to skip.
   // A full window is "no room" whatever the reserve: the reserve only explains a stop BELOW 100.
   if (noRoom(a.usage)) return "no room";
-  if (reserveReached(reservePercent, a.usage?.weeklyAll)) return "reserved";
+  if (reserveReached(reservePercent, u.weeklyAll ?? (a.provider === "codex" ? u.session : null))) return "reserved";
   return "ok";
 }
 
-/** One decimal only when the value isn't integral (42, not 42.0; 42.5, not
- *  42.50); "—" for a window the account doesn't have.
+/** Preserve the reported used percentage, with a duration when available;
+ *  "—" for a window the account doesn't have.
  *
  *  `Cli`-suffixed on purpose: src/dashboard/client-logic.ts has its own
  *  `fmtPercent`, doing the same job for the dashboard page's <script>, whose
@@ -118,8 +122,8 @@ export function accountState(a: AccountUsage, hasToken: boolean, reservePercent 
  *  client-logic.ts's again. */
 function fmtPercentCli(w: Window | null | undefined): string {
   if (!w || !Number.isFinite(w.usedPercent)) return DASH;
-  const v = Math.round(w.usedPercent * 10) / 10;
-  return `${Number.isInteger(v) ? v : v.toFixed(1)}%`;
+  const period = windowPeriod(w, "");
+  return usedPercentText(w.usedPercent, DASH) + (period ? ` (${period})` : "");
 }
 
 /** The earliest of the account's WEEKLY resets — session/5h resets far more
@@ -129,7 +133,7 @@ function fmtPercentCli(w: Window | null | undefined): string {
  *  once both are bundled into dist/ms.js. */
 export function earliestWeeklyResetCli(u: AccountUsage["usage"]): string | null {
   if (!u) return null;
-  const candidates = [u.weeklyAll?.resetsAt, u.weeklyFable?.resetsAt].filter((x): x is string => !!x);
+  const candidates = [u.weeklyAll?.resetsAt, u.weeklyFable?.resetsAt].filter((x): x is string => !!x && Number.isFinite(Date.parse(x)));
   if (!candidates.length) return null;
   return candidates.reduce((a, b) => (Date.parse(a) <= Date.parse(b) ? a : b));
 }
@@ -178,8 +182,11 @@ export function computeAccount(a: AccountUsage, registry: Registry, hasToken = !
   return { label: row?.label ?? a.name, state: accountState(a, hasToken, reservePercent), email: row?.email ?? null, reservePercent };
 }
 
-function accountRow(a: AccountUsage, c: AccountComputed, live: number): string[] {
-  const reset = earliestWeeklyResetCli(a.usage);
+function accountRow(a: AccountUsage, c: AccountComputed, live: number, showResetCredits: boolean): string[] {
+  const main = a.usage?.weeklyAll ?? a.usage?.session;
+  const reset = earliestWeeklyResetCli(a.usage) ?? main?.resetsAt;
+  const resetMs = Date.parse(reset ?? "");
+  const credits = reportedResetCount(a.usage);
   return [
     a.name,
     a.provider,
@@ -187,9 +194,10 @@ function accountRow(a: AccountUsage, c: AccountComputed, live: number): string[]
     fmtPercentCli(a.usage?.session ?? null),
     fmtPercentCli(a.usage?.weeklyAll ?? null),
     fmtPercentCli(a.usage?.weeklyFable ?? null),
-    reset ? localTimeCli(Date.parse(reset)) : DASH,
+    Number.isFinite(resetMs) ? localTimeCli(resetMs) : main ? windowResetState(main) : DASH,
     c.state,
     String(live),
+    ...(showResetCredits ? [credits === null ? DASH : String(credits) + (a.stale || a.error || a.errorKind || !["ok", "no room", "reserved"].includes(c.state) ? " (last reported)" : "")] : []),
     // EMAIL, last: the widest cell and the only optional one, printed as
     // `ms accounts ls` prints it (`-` when unknown).
     c.email ?? "-",
@@ -365,6 +373,15 @@ export type StatusAccountRow = AccountUsage & AccountComputed & { sessions: Acco
 export type StatusSessionRow = Omit<SessionRow, "state"> & { state: string; pending: string | null; walled: Walled; better: string | null };
 export type StatusJson = { accounts: StatusAccountRow[]; sessions: StatusSessionRow[]; takenAt: number | null; pools: PoolSummaries };
 
+/** A malformed optional credit count in an older cache is not a reported
+ * fact. Do not expose it through status JSON or the dashboard API. */
+function publicAccountUsage(a: AccountUsage): AccountUsage {
+  if (!a.usage || !Object.prototype.hasOwnProperty.call(a.usage, "resetsAvailable") || reportedResetCount(a.usage) !== null) return a;
+  const usage = { ...a.usage } as NonNullable<AccountUsage["usage"]> & { resetsAvailable?: number };
+  delete usage.resetsAvailable;
+  return { ...a, usage };
+}
+
 /**
  * The `--json` shape below, isolated so another caller (the dashboard API,
  * Plan 4 Task 1/2) can get the same numbers without going through stdout —
@@ -388,7 +405,7 @@ export async function statusJson(): Promise<StatusJson> {
       return { ...s, state: c.state, pending: c.pending, walled: c.walled, better: c.better };
     });
     const on = sessionsByAccount(sessions);
-    const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry), sessions: on.get(`${a.provider}:${a.name}`) ?? [] }));
+    const accounts = snapshot.accounts.map(publicAccountUsage).map((a) => ({ ...a, ...computeAccount(a, registry), sessions: on.get(`${a.provider}:${a.name}`) ?? [] }));
     return { accounts, sessions, takenAt: snapshot.takenAt, pools: poolSummaries(accounts, Date.now()) };
   } finally {
     st.close();
@@ -410,7 +427,7 @@ async function render(json: boolean, all: boolean): Promise<string> {
     const sessions = st.listSessions().map((s) => ({ session: s, computed: computeSession(s, st, pool) }));
     const visible = all ? sessions : sessions.filter((r) => !isFinishedState(r.computed.state));
     const on = sessionsByAccount(sessions.map((r) => ({ ...r.session, state: r.computed.state })));
-    const accounts = snapshot.accounts.map((a) => ({ ...a, ...computeAccount(a, registry) }));
+    const accounts = snapshot.accounts.map(publicAccountUsage).map((a) => ({ ...a, ...computeAccount(a, registry) }));
     const now = Date.now();
     const summaries = poolSummaries(accounts, now);
     const lines: string[] = [];
@@ -422,6 +439,7 @@ async function render(json: boolean, all: boolean): Promise<string> {
       const summary = summaries[provider];
       if (summary) lines.push(poolSummaryText(provider, summary, now));
     }
+    const showResetCredits = accounts.some((a) => reportedResetCount(a.usage) !== null);
     lines.push(...table(
       // PROVIDER sits next to NAME for the same reason it sits next to
       // ACCOUNT in the sessions table below: identity in this tool is
@@ -430,8 +448,8 @@ async function render(json: boolean, all: boolean): Promise<string> {
       // SESS: how many live sessions run on the account -- the pool's other half, which otherwise
       // means reading the sessions table below sideways. EMAIL (0.3.7) closes the row: the login
       // behind the name, so `claude-1`…`claude-5` can be told apart. Every older column keeps its place.
-      ["NAME", "PROVIDER", "LABEL", "5H", "WEEK", "FABLE", "RESETS", "STATE", "SESS", "EMAIL"],
-      accounts.map((a) => accountRow(a, a, (on.get(`${a.provider}:${a.name}`) ?? []).length)),
+      ["NAME", "PROVIDER", "LABEL", "SESSION USED", "MAIN USED", "FABLE USED", "RESETS", "STATE", "SESS", ...(showResetCredits ? ["RESETS AVAIL"] : []), "EMAIL"],
+      accounts.map((a) => accountRow(a, a, (on.get(`${a.provider}:${a.name}`) ?? []).length, showResetCredits)),
     ));
     lines.push("");
     lines.push(...table(

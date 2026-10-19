@@ -95,9 +95,9 @@ export function accountState(a: AccountUsage, hasToken: boolean, reservePercent 
   if (usageRequestsBlocked(u)) return "no room";
   if (!u || (!u.weeklyAll && a.provider !== "codex")
     || (!u.weeklyAll && !u.session)
-    || (u.weeklyAll && !Number.isFinite(u.weeklyAll.usedPercent))
+    || (u.weeklyAll && (!Number.isFinite(u.weeklyAll.usedPercent) || u.weeklyAll.usedPercent < 0))
     || (!u.session && a.provider !== "codex")
-    || (u.session && !Number.isFinite(u.session.usedPercent))) return "transient";
+    || (u.session && (!Number.isFinite(u.session.usedPercent) || u.session.usedPercent < 0))) return "transient";
   // Last, and only ever in place of `ok`: everything above describes the
   // READING (missing, refused, old), and a fact about the reading outranks a
   // fact about the numbers in it. `ok` was the one word this row could say

@@ -972,6 +972,8 @@ test("accountState honors provider request gates and Codex single-window reserve
     error: null, errorKind: null, observedAt: Date.now(), stale: false };
   assert.equal(accountState(base, true), "ok");
   assert.equal(accountState({ ...base, provider: "claude" }, true), "transient");
+  assert.equal(accountState({ ...base, usage: { ...base.usage, session: { usedPercent: -1, resetsAt: null } } }, true), "transient");
+  assert.equal(accountState({ ...base, usage: { ...base.usage, session: null, weeklyAll: { usedPercent: -1, resetsAt: null } } }, true), "transient");
   for (const facts of [{ requestsAllowed: false }, { limitReached: true }]) {
     const row = { ...base, usage: { ...base.usage, ...facts } };
     assert.equal(accountState(row, true), "no room");

@@ -189,8 +189,8 @@ export function withNoDaemon(command: string[], version: string | null, platform
   return [...command.slice(0, at), "--no-daemon", ...command.slice(at)];
 }
 
-/** Oldest binary directly checked to reject --full-auto. This is a verified
- * compatibility boundary, not a claim about when Codex removed the option. */
+/** Verified rejecting baseline selected for this compatibility adapter.
+ * This is not a claim about when Codex first removed the option. */
 export const CODEX_FULL_AUTO_REJECTED_FROM = "0.157.0";
 
 /** Adapt recorded legacy argv against the binary about to execute it.

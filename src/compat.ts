@@ -40,11 +40,11 @@ export type Compat = {
 };
 
 export const COMPAT: Readonly<Record<Cli, Compat>> = {
-  codex: { name: "Codex", testedUpTo: "0.160.0", incompatibleBelow: null },
-  claude: { name: "Claude Code", testedUpTo: "2.1.289", incompatibleBelow: null },
+  codex: { name: "Codex", testedUpTo: "0.163.0", incompatibleBelow: null },
+  claude: { name: "Claude Code", testedUpTo: "2.1.303", incompatibleBelow: null },
 };
 /** The day `COMPAT`'s `testedUpTo` versions were last verified. */
-export const VERIFIED_ON = "2026-10-04";
+export const VERIFIED_ON = "2026-10-19";
 
 /** Where a human reports a version that misbehaves. */
 export const ISSUES_URL = "https://github.com/aadarwal/model-switcher/issues";

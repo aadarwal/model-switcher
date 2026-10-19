@@ -20,6 +20,9 @@
 //     `ms status` names a wall by. A string that disappears is the earliest
 //     sign that a rename is coming — it is not proof of breakage, but it is
 //     exactly the thing to look at before users do.
+//   * Codex parses the generated hooks and reports their event, source path,
+//     timeout, hash and trusted/enabled state through hooks/list. This starts
+//     no conversation, runs no hook command and needs no credentials.
 //   * Codex only: in a scratch HOME, an account home built by `ms`'s own code
 //     (src/accounts-codex.ts `ensureCodexHome`, src/hooks/codex-install.ts)
 //     on top of a base Codex has already populated; then `codex app-server
@@ -47,6 +50,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { markdown } from "./canary-issues.mjs";
+import { checkCodexHooks, codexHookList } from "./canary-contracts.mjs";
 
 // --- A scratch world, before any `ms` module reads its environment ----------
 
@@ -54,7 +58,12 @@ const scratch = realpathSync(mkdtempSync(path.join(tmpdir(), "ms-canary-")));
 const home = path.join(scratch, "home");
 mkdirSync(home, { recursive: true });
 const realPath = process.env.PATH;
-for (const k of ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "MS_ACCOUNT", "MS_SESSION", "MS_GENERATION", "MS_SOCKET", "MS_PANE"]) delete process.env[k];
+for (const k of [
+  "CODEX_HOME", "CODEX_SQLITE_HOME", "CODEX_LOG_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_DEBUG_LOGS_DIR",
+  "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+  "MS_ACCOUNT", "MS_SESSION", "MS_GENERATION", "MS_SOCKET", "MS_PANE", "MS_CLI_PID", "MS_CLI_PROVIDER",
+]) delete process.env[k];
 Object.assign(process.env, {
   HOME: home,
   MS_HOME: path.join(home, ".config", "model-switcher"),
@@ -67,9 +76,10 @@ Object.assign(process.env, {
 const { COMPAT, VERIFIED_ON, compareVersions, parseVersion } = await import("../src/compat.ts");
 const { resolveOnPath } = await import("../src/exec.ts");
 const { EVENTS: CLAUDE_EVENTS } = await import("../src/hooks/install.ts");
-const { EVENTS: CODEX_EVENTS, installCodexHooks } = await import("../src/hooks/codex-install.ts");
+const { EVENTS: CODEX_EVENTS, codexConfigPath, codexHookCommand, codexTrustedHash, installCodexHooks } = await import("../src/hooks/codex-install.ts");
 const { CODEX_HOME_OWN, isHomeOwn, isRuntimeState } = await import("../src/codex-share.ts");
 const { ensureCodexHome } = await import("../src/accounts-codex.ts");
+const { codexExecutionCommand, withNoDaemon } = await import("../src/providers/codex-cli.ts");
 
 const args = process.argv.slice(2);
 const jsonOut = args.includes("--json") ? args[args.indexOf("--json") + 1] : null;
@@ -162,6 +172,42 @@ function versionCheck(tool, bin) {
   return report;
 }
 
+function helpCheck(report, bin, flags) {
+  const help = run(bin, ["--help"], { env: { ...process.env, PATH: realPath }, cwd: home });
+  report.results.push({ name: "--help advertises required launch options", ok: help.ok && flags.every((flag) => help.stdout.split(/[\s,]+/).includes(flag)), detail: help.ok ? flags.filter((flag) => !help.stdout.split(/[\s,]+/).includes(flag)).join(", ") || "all required options advertised" : `exit ${help.status}: ${help.stderr.trim().slice(0, 400)}` });
+  return help;
+}
+
+function codexArgumentChecks(report, bin) {
+  const help = helpCheck(report, bin, ["--no-daemon", "--model", "--profile", "--sandbox", "--ask-for-approval", "--config"]);
+  // Advertised commands must never acquire the TUI-only --no-daemon flag.
+  const commands = help.stdout.split("Commands:\n")[1]?.split("\nArguments:")[0]?.split("\n").flatMap((line) => line.match(/^  ([\w-]+)\s/)?.[1] ?? []) ?? [];
+  const changed = commands.filter((name) => name !== "resume" && name !== "fork" && withNoDaemon(["codex", name], report.version).length !== 2);
+  report.results.push({ name: "--no-daemon keeps advertised noninteractive commands intact", ok: help.ok && commands.length > 0 && changed.length === 0, detail: changed.length ? `unrecognized commands: ${changed.join(", ")}` : `${commands.length} advertised commands classified` });
+  // --help makes these parser-only probes: no session, account or model call.
+  // Include values that resemble subcommands and the variadic image boundary.
+  const examples = [
+    ["root model/profile values", ["codex", "--model", "review", "--profile", "resume"]],
+    ["resume model and effort", ["codex", "resume", "00000000-0000-4000-8000-000000000000", "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="medium"']],
+    ["fork profile", ["codex", "fork", "--profile", "review"]],
+    ["resume picker booleans", ["codex", "resume", "--last", "--all", "--include-non-interactive"]],
+    ["fork picker booleans", ["codex", "fork", "--last", "--all"]],
+    ["variadic image values", ["codex", "--image", "-", "resume"]],
+    ["explicit prompt boundary", ["codex", "--", "review"]],
+    ["legacy full-auto launch", ["codex", "--full-auto", "--model", "review"]],
+    ["legacy full-auto resume", ["codex", "resume", "00000000-0000-4000-8000-000000000000", "--full-auto"]],
+    ["legacy full-auto before resume", ["codex", "--full-auto", "resume", "00000000-0000-4000-8000-000000000000"]],
+    ["legacy full-auto last session", ["codex", "resume", "--last", "--full-auto"]],
+  ];
+  for (const [name, command] of examples) {
+    const args = codexExecutionCommand(command, report.version).slice(1);
+    const boundary = args.indexOf("--");
+    args.splice(boundary < 0 ? args.length : boundary, 0, "--help");
+    const result = run(bin, args, { env: { ...process.env, PATH: realPath }, cwd: home });
+    report.results.push({ name: `Codex parses ms argv: ${name}`, ok: result.ok && result.stdout.includes("Usage:"), detail: result.ok ? "parser accepted generated argv" : `exit ${result.status}: ${result.stderr.trim().slice(0, 400)}` });
+  }
+}
+
 // --- Claude Code --------------------------------------------------------------
 
 function claudeCanary() {
@@ -171,6 +217,9 @@ function claudeCanary() {
     return;
   }
   const report = versionCheck("claude", bin);
+  // Claude's --help bypasses unknown-option validation, so advertise exactly
+  // what this establishes rather than calling it a full argument parser test.
+  helpCheck(report, bin, ["--session-id", "--resume", "--model", "--effort", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--settings", "--mcp-config"]);
   // What `ms` depends on in Claude Code (find each in src/):
   //   hook events and the StopFailure matcher   src/hooks/install.ts EVENTS
   //   hook input fields                         src/hooks/claude-hook.ts
@@ -185,6 +234,8 @@ function claudeCanary() {
     ...CLAUDE_EVENTS.filter(([, m]) => m).map(([event, m]) => [`${event} matcher ${m}`, [`"${m}"`, `'${m}'`, m]]),
     ["hook field hook_event_name", ["hook_event_name"]],
     ["hook field session_id", ["session_id"]],
+    ["hook field transcript_path", ["transcript_path"]],
+    ["transcript effort metadata", ["perTurnEffort"]],
     ["wall: You've hit your … limit", ["You've hit your"]],
     ["wall: You've reached your Fable limit", ["You've reached your Fable limit"]],
     ["wall: new messages wait for your usage limit to reset", ["new messages wait for your usage limit to reset"]],
@@ -199,13 +250,14 @@ function claudeCanary() {
 
 // --- Codex ----------------------------------------------------------------
 
-function codexCanary() {
+async function codexCanary() {
   const bin = resolveOnPath("codex");
   if (!bin) {
     reports.push({ tool: "codex", version: null, results: [{ name: "codex on PATH", ok: false, detail: "not found" }], notes: [] });
     return;
   }
   const report = versionCheck("codex", bin);
+  codexArgumentChecks(report, bin);
   // What `ms` depends on in Codex (find each in src/):
   //   hook TOML tables and trust-key events   src/hooks/codex-install.ts EVENTS
   //   the trust entry                          `[hooks.state."…"] trusted_hash`
@@ -221,8 +273,11 @@ function codexCanary() {
     ["hook field hook_event_name", ["hook_event_name"]],
     ["hook field turn_id", ["turn_id"]],
     ["hook field transcript_path", ["transcript_path"]],
-    ["rollout task_complete", ["task_complete"]],
+    ["rollout turn completion", ["task_complete", "turn_complete"]],
     ["rollout codex_error_info", ["codex_error_info"]],
+    ["rollout turn_context", ["turn_context"]],
+    ["rollout effort", ["effort"]],
+    ["reasoning effort configuration", ["model_reasoning_effort"]],
     ["usage_limit_exceeded", ["usage_limit_exceeded"]],
     // The link as the wall sentence carries it, not the bare URL: since
     // 0.161.0 the same page is also linked from /status, which would keep a
@@ -234,7 +289,7 @@ function codexCanary() {
     ]],
   ];
   stringChecks(report, nativeBinaries(bin), needles);
-  daemonCheck(report, bin);
+  await daemonCheck(report, bin);
 }
 
 /** Every top-level entry of `dir` that is runtime state by a reading of its
@@ -309,7 +364,7 @@ function daemon(bin, codexHome, verb) {
   return { ...r, json };
 }
 
-function daemonCheck(report, bin) {
+async function daemonCheck(report, bin) {
   const add = (name, ok, detail) => report.results.push({ name, ok, detail });
   const base = process.env.MS_CODEX_BASE_DIR;
   mkdirSync(base, { recursive: true });
@@ -335,6 +390,19 @@ function daemonCheck(report, bin) {
   }
   const shared = readdirSync(codexHome).filter((n) => lstatSync(path.join(codexHome, n)).isSymbolicLink());
   report.notes.push(`home links ${shared.length} base entries: ${shared.join(", ")}`);
+  try {
+    const command = codexHookCommand(process.env.MS_BIN);
+    const configPath = codexConfigPath(codexHome);
+    const expected = CODEX_EVENTS.map((event) => ({
+      eventName: event.table[0].toLowerCase() + event.table.slice(1),
+      key: `${configPath}:${event.snake}:0:0`, timeout: event.timeout,
+      hash: codexTrustedHash(event.snake, command, event.timeout),
+    }));
+    const inventory = await codexHookList(bin, { cwd: home, env: { ...process.env, PATH: realPath, CODEX_HOME: codexHome } });
+    report.results.push(...checkCodexHooks(inventory, expected, command, configPath));
+  } catch (e) {
+    add("Codex reads generated hook trust", false, String(e?.message ?? e));
+  }
   const before = new Set(readdirSync(codexHome));
   // 3. The daemon, in the home.
   const start = daemon(bin, codexHome, "start");
@@ -378,7 +446,7 @@ function daemonCheck(report, bin) {
 // --- Run and report ----------------------------------------------------------
 
 try {
-  codexCanary();
+  await codexCanary();
 } catch (e) {
   reports.push({ tool: "codex", version: null, results: [{ name: "canary ran", ok: false, detail: String(e?.stack ?? e) }], notes: [] });
 }

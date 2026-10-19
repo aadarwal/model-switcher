@@ -375,6 +375,14 @@ manifest names the unsupported option without recording its value. Review the so
 configuration and relaunch it explicitly instead. This preserves import behavior; it
 does not establish formal governance or an enforced model floor.
 
+For a live Codex import, start the plain CLI with `codex --no-daemon`. If a background
+Codex service owns the conversation's writer lock, import refuses before stopping the
+frontend and leaves that service untouched. Codex 0.163.0 can retain a closed frontend's
+conversation for 30 minutes; closing its window does not release it immediately. Close
+the conversation there and wait for release before `ms adopt`, or use an in-process
+`--no-daemon` conversation for import. When a resume must wait for a writer to release,
+the import deadline includes that bounded wait as well as its normal startup budget.
+
 Every run writes a manifest — `MS_HOME/imports/<timestamp>.json`, 0600, rewritten after
 every step — and that file is the record to fall back on: each row names the conversation,
 its directory, the process it was planned against, where it went and what became of it

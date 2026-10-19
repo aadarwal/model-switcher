@@ -440,6 +440,96 @@ test("a process tree is read off `ps -axo pid=,ppid=` and walked deepest-first",
   assert.deepEqual(descendantsOf(20, cycle), [21]);
 });
 
+test("forced CLI cleanup never enters a protected shared Codex service subtree", async () => {
+  const { descendantsOf, parsePidParents } = await import("../src/import/execute.ts");
+  // TUI wrapper 12 -> native 13 -> shared app-server 14 -> helper 15.
+  // An ordinary subprocess 16 remains part of the forced cleanup.
+  const parents = parsePidParents("12 1\n13 12\n14 13\n15 14\n16 13\n");
+  assert.deepEqual(descendantsOf(12, parents, new Set([14])), [16, 13]);
+});
+
+test("the real descendant lookup protects Codex services without mistaking a model value for a command", async () => {
+  const { dir, stub } = stubDir();
+  stub("ps", `#!/bin/sh
+cat <<'TABLE'
+12 1 node /private/bin/codex --model gpt-6-luna
+13 12 /private/bin/codex --model gpt-6-luna
+14 13 /private/bin/codex app-server --listen unix:// --managed-daemon
+15 14 node daemon-helper.js
+16 13 /private/bin/codex --model app-server
+17 13 node /private/bin/codex app-server daemon pid-update-loop
+18 17 helper
+TABLE
+`);
+  const previous = process.env.PATH;
+  process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
+  try {
+    const { defaultDescendants } = await import("../src/import/execute.ts");
+    assert.deepEqual(defaultDescendants(12), [16, 13]);
+  } finally { process.env.PATH = previous; }
+});
+
+test("an old manifest naming a Codex daemon cannot signal it", async (t) => {
+  const source = cand({ provider: "codex", id: "daemon-was-misidentified", pid: 12, cwd: "/tmp", startedAt: 1 });
+  const plan = planOf([source]);
+  const w = await world(t, plan);
+  const signals: number[] = [];
+  w.deps.alive = () => true;
+  w.deps.ps = () => [{ pid: 12, startedAt: 1, tty: "??", argv: ["codex", "app-server", "daemon", "pid-update-loop"] }];
+  w.deps.kill = (pid) => { signals.push(pid); return true; };
+  const { executeImport } = await import("../src/import/execute.ts");
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+  assert.deepEqual(signals, []);
+  assert.match(w.manifest().rows[0]!.outcome, /not the process the plan recorded/);
+});
+
+test("Codex import allows the existing writer-release wait before timing out its resumed pane", async (t) => {
+  const plan = planOf([cand({ provider: "codex", id: "daemon-backed-conversation", cwd: "/tmp" })]);
+  const w = await world(t, plan);
+  const previous = process.env.MS_IMPORT_READY_MS;
+  delete process.env.MS_IMPORT_READY_MS;
+  t.after(() => { if (previous === undefined) delete process.env.MS_IMPORT_READY_MS; else process.env.MS_IMPORT_READY_MS = previous; });
+  // A daemon releases this conversation after 65s, then the TUI needs 5s to
+  // report. The launcher's existing 75s lease wait is valid throughout.
+  w.deps.waitReady = async (_id, deadline) => deadline >= w.clock() + 70_000 ? "ready" : "timeout";
+  const { executeImport } = await import("../src/import/execute.ts");
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 1, stopped: 0, failed: 0 });
+});
+
+test("a daemon-owned Codex conversation is refused before signalling its live frontend", async (t) => {
+  const source = cand({ provider: "codex", id: "daemon-thread", pid: 12, cwd: "/tmp", startedAt: 1 });
+  const plan = planOf([source]), w = await world(t, plan);
+  const signals: number[] = [];
+  w.deps.alive = () => true;
+  w.deps.ps = () => [
+    { pid: 12, startedAt: 1, tty: "s001", argv: ["node", "/private/bin/codex"] },
+    { pid: 13, startedAt: 2, tty: "??", argv: ["/private/bin/codex", "app-server", "--managed-daemon"] },
+  ];
+  w.deps.writerHeldBy = (pid, threadId) => pid === 13 && threadId === source.id;
+  w.deps.kill = (pid) => { signals.push(pid); return true; };
+  const { executeImport } = await import("../src/import/execute.ts");
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 0, stopped: 0, failed: 1 });
+  assert.deepEqual(signals, []);
+  assert.equal(w.ready.calls.length, 0);
+  assert.match(w.manifest().rows[0]!.outcome, /background Codex.*source process remains untouched.*--no-daemon/);
+});
+
+test("unknown Codex writer ownership leaves the bounded resume check in place", async (t) => {
+  const source = cand({ provider: "codex", id: "unknown-owner-thread", pid: 12, cwd: "/tmp", startedAt: 1 });
+  const plan = planOf([source]), w = await world(t, plan);
+  let alive = true;
+  w.deps.alive = () => alive;
+  w.deps.kill = () => { alive = false; return true; };
+  w.deps.ps = () => [
+    { pid: 12, startedAt: 1, tty: "s001", argv: ["codex"] },
+    { pid: 13, startedAt: 2, tty: "??", argv: ["codex", "app-server", "--managed-daemon"] },
+  ];
+  w.deps.writerHeldBy = () => null;
+  const { executeImport } = await import("../src/import/execute.ts");
+  assert.deepEqual(await executeImport(plan, w.file, w.deps), { moved: 1, stopped: 1, failed: 0 });
+  assert.equal(w.ready.calls.length, 1);
+});
+
 test("a process that cannot be signalled fails its own row and stops nothing else", async (t) => {
   const { dir } = stubDir();
   const pid = await liveProcess(t, dir, "polite");

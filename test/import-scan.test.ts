@@ -129,6 +129,45 @@ test("a process is a CLI by its own name, or by the script a node wrapper runs",
   assert.equal(providerOfArgv([]), null);
 });
 
+test("Codex services and commands cannot claim a TUI conversation, including through node wrappers", async () => {
+  const { providerOfArgv } = await import("../src/import/scan.ts");
+  for (const args of [
+    ["app-server", "--listen", "unix://", "--analytics-default-enabled", "--managed-daemon"],
+    ["app-server", "daemon", "pid-update-loop"], ["exec", "sentinel"], ["review"],
+    ["--model", "review", "app-server"],
+  ]) {
+    assert.equal(providerOfArgv(["/private/bin/codex", ...args]), null);
+    assert.equal(providerOfArgv(["node", "/private/bin/codex.mjs", ...args]), null);
+  }
+  for (const args of [
+    ["--model", "app-server"], ["--profile=review"], ["--", "app-server"],
+    ["resume", "app-server"], ["--image", "app-server", "review"],
+    ["--image", "-", "app-server"], ["--no-daemon", "--model", "review"],
+  ]) assert.equal(providerOfArgv(["node", "/private/bin/codex", ...args]), "codex");
+});
+
+test("a newer no-tty Codex daemon never steals its frontend's rollout or appears as an orphan", async () => {
+  const { home } = tempHome();
+  const codexHome = path.join(home, ".codex"), cwd = path.join(home, "work");
+  mkdirSync(cwd, { recursive: true });
+  const id = "bbbbbbbb-0000-4000-8000-000000000003";
+  codexFile(codexHome, "2026-09-19", id, { cwd, mtime: T0 });
+  const { scanConversations } = await import("../src/import/scan.ts");
+  const got = scanConversations(opts({
+    claudeConfigDir: path.join(home, ".claude"), codexHome, cwdOf: () => cwd,
+    ps: () => [
+      proc({ pid: 50, startedAt: T0 - H, tty: "s004", argv: ["node", "/private/bin/codex", "--model", "gpt-6-luna", "--sandbox", "read-only"] }),
+      proc({ pid: 51, startedAt: T0 - H, tty: "s004", argv: ["/private/bin/codex", "--model", "gpt-6-luna", "--sandbox", "read-only"] }),
+      proc({ pid: 52, startedAt: T0 - 1000, tty: "??", argv: ["/private/bin/codex", "app-server", "--listen", "unix://", "--analytics-default-enabled", "--managed-daemon"] }),
+      proc({ pid: 53, startedAt: T0 - 500, tty: "??", argv: ["/private/bin/codex", "app-server", "daemon", "pid-update-loop"] }),
+    ],
+  }));
+  assert.equal(got.length, 1);
+  assert.equal(got[0]!.id, id);
+  assert.equal(got[0]!.pid, 50);
+  assert.deepEqual(got[0]!.argv, ["node", "/private/bin/codex", "--model", "gpt-6-luna", "--sandbox", "read-only"]);
+});
+
 test("`ps -axo pid,lstart,tty,command` parses into rows, header and all", async () => {
   const { parsePs } = await import("../src/import/scan.ts");
   const rows = parsePs([

@@ -491,6 +491,17 @@ test("an unknown option's flag-shaped value and flags after -- never become laun
   }
 });
 
+test("a Codex in-process frontend preserves no-daemon without swallowing following model or policy", async () => {
+  const { keptFlags, configurationRefusal } = await import("../src/import/plan.ts");
+  const flags = ["--no-daemon", "--model", "gpt-6-luna", "--sandbox", "read-only"];
+  for (const input of [["codex", ...flags], ["node", "/private/bin/codex", ...flags]]) {
+    assert.equal(configurationRefusal("codex", input), null);
+    assert.deepEqual(keptFlags("codex", input), flags);
+  }
+  assert.equal(configurationRefusal("codex", ["codex", "--profile=--no-daemon"]), null);
+  assert.deepEqual(keptFlags("codex", ["codex", "--profile=--no-daemon"]), ["--profile=--no-daemon"]);
+});
+
 test("an unsupported configured process is skipped before stop and its secret never enters the manifest", async () => {
   const { planImport } = await import("../src/import/plan.ts");
   const { manifestFromPlan } = await import("../src/import/manifest.ts");

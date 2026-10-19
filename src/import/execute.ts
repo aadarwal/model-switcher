@@ -38,7 +38,9 @@
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { msBinary } from "../paths.ts";
-import { defaultPs, providerOfArgv, type Candidate, type ProcessRow } from "./scan.ts";
+import { codexCommandFromArgv, defaultPs, providerOfArgv, type Candidate, type ProcessRow } from "./scan.ts";
+import { isCodexTuiCommand } from "../providers/codex-cli.ts";
+import { holdsWriterLock, RELEASE_BUDGET_MS } from "../codex-writer-lock.ts";
 import { shellQuote, type Tmux } from "../tmux.ts";
 import { configurationRefusal, keptFlags, type Plan, type PaneSpec } from "./plan.ts";
 import {
@@ -68,7 +70,8 @@ const SHELL_STREAK = 3;
 const envMs = (name: string, fallback: number): number => Number(process.env[name]) || fallback;
 const termMs = (): number => envMs("MS_IMPORT_TERM_MS", TERM_MS);
 const killMs = (): number => envMs("MS_IMPORT_KILL_MS", KILL_MS);
-export const readyMs = (): number => envMs("MS_IMPORT_READY_MS", READY_MS);
+export const readyMs = (provider?: Candidate["provider"]): number => envMs("MS_IMPORT_READY_MS",
+  READY_MS + (provider === "codex" ? envMs("MS_CODEX_RELEASE_MS", RELEASE_BUDGET_MS) : 0));
 const pollMs = (): number => envMs("MS_IMPORT_POLL_MS", POLL_MS);
 export const shellPollMs = (): number => envMs("MS_IMPORT_SHELL_POLL_MS", SHELL_POLL_MS);
 const shellSettleMs = (): number => envMs("MS_IMPORT_SHELL_SETTLE_MS", SHELL_SETTLE_MS);
@@ -169,6 +172,9 @@ export interface ExecuteDeps {
    * the default walks `ps -axo pid=,ppid=`.
    */
   descendants?: (pid: number) => number[];
+  /** Whether another Codex process owns this conversation's writer lease.
+   * Unknown leaves the launcher's bounded release wait as the fallback. */
+  writerHeldBy?: (pid: number, threadId: string) => boolean | null;
   /**
    * The process table, NOW — read again just before anything is signalled, so
    * a pid can be re-identified rather than taken on trust. Optional: the
@@ -240,7 +246,7 @@ export function parsePidParents(stdout: string): Map<number, number> {
  * survives. `seen` bounds it — a table that claims a process is its own
  * ancestor is malformed, and here it simply terminates.
  */
-export function descendantsOf(pid: number, parents: Map<number, number>): number[] {
+export function descendantsOf(pid: number, parents: Map<number, number>, protectedPids: ReadonlySet<number> = new Set()): number[] {
   const children = new Map<number, number[]>();
   for (const [child, parent] of parents) {
     const list = children.get(parent);
@@ -254,7 +260,7 @@ export function descendantsOf(pid: number, parents: Map<number, number>): number
     const next: number[] = [];
     for (const p of frontier) {
       for (const child of children.get(p) ?? []) {
-        if (seen.has(child)) continue;
+        if (seen.has(child) || protectedPids.has(child)) continue;
         seen.add(child);
         next.push(child);
       }
@@ -273,10 +279,20 @@ export function descendantsOf(pid: number, parents: Map<number, number>): number
  * SIGKILLed.
  */
 export function defaultDescendants(pid: number): number[] {
-  const r = spawnSync("ps", ["-axo", "pid=,ppid="], {
+  const r = spawnSync("ps", ["-axo", "pid=,ppid=,command="], {
     encoding: "utf8", timeout: SUBPROCESS_TIMEOUT_MS, maxBuffer: 16 << 20,
   });
-  return r.stdout ? descendantsOf(pid, parsePidParents(r.stdout)) : [];
+  if (!r.stdout) return [];
+  const protectedPids = new Set<number>();
+  for (const line of r.stdout.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    const command = codexCommandFromArgv(parts.slice(2));
+    // Background services can host other frontends on the same account.
+    // Leaving their whole subtree intact also protects daemon helpers whose
+    // own executable name is not `codex`.
+    if (command && !isCodexTuiCommand(command)) protectedPids.add(Number(parts[0]));
+  }
+  return descendantsOf(pid, parsePidParents(r.stdout), protectedPids);
 }
 
 const SUBPROCESS_TIMEOUT_MS = 10_000;
@@ -326,6 +342,14 @@ function sameProcess(c: Candidate, plannedFlags: string[], deps: ExecuteDeps): {
   // command must still carry the live process's policy before it is stopped.
   if (JSON.stringify(keptFlags(c.provider, row.argv)) !== JSON.stringify(plannedFlags)) {
     return { ok: false, why: "current launch options differ from the saved plan; source process remains untouched; run a new import scan" };
+  }
+  if (c.provider === "codex") {
+    for (const other of table) {
+      const command = codexCommandFromArgv(other.argv);
+      if (command && !isCodexTuiCommand(command) && (deps.writerHeldBy ?? holdsWriterLock)(other.pid, c.id) === true) {
+        return { ok: false, why: "a background Codex process still holds this conversation; source process remains untouched; close it there and wait before ms adopt, or start plain codex --no-daemon before importing" };
+      }
+    }
   }
   return { ok: true };
 }
@@ -488,7 +512,11 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
           deps.log(`${short(c)}: ${row.outcome}`);
           continue;
         }
-        const seen = await deps.waitReady(c.id, deps.now() + readyMs(), paneId);
+        // A daemon-backed source may keep its writer lease for about a
+        // minute after the frontend exits. The launch already waits for it;
+        // import must allow that bounded wait before its own startup budget.
+        const budget = readyMs(c.provider);
+        const seen = await deps.waitReady(c.id, deps.now() + budget, paneId);
         // A pane whose command has exited explains a silence tmux could have
         // explained in one call; `paneDead` is null when tmux could not be
         // asked, which is never evidence of a death (src/tmux.ts).
@@ -498,7 +526,7 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
           row.outcome = resumedOutcome(row.target!);
         } else {
           result.failed += 1;
-          row.outcome = resumeFailed(whyNotResumed(verdict, paneId, deps.tmux));
+          row.outcome = resumeFailed(whyNotResumed(verdict, paneId, deps.tmux, budget));
         }
         save();
         deps.log(`${short(c)}: ${row.outcome}`);
@@ -516,9 +544,9 @@ export async function executeImport(plan: Plan, manifestPath: string, deps: Exec
  * still on it, and that sentence is worth more than any phrasing of ours. The
  * pane id carries the fallback, for a command that refused without a word.
  */
-function whyNotResumed(verdict: "timeout" | "died" | "returned", paneId: string, tmux: Tmux): string {
+function whyNotResumed(verdict: "timeout" | "died" | "returned", paneId: string, tmux: Tmux, budget: number): string {
   if (verdict === "died") return `the pane died (${paneId})`;
-  if (verdict === "timeout") return `no report within ${Math.round(readyMs() / 1000)}s (the pane is ${paneId})`;
+  if (verdict === "timeout") return `no report within ${Math.round(budget / 1000)}s (the pane is ${paneId})`;
   const said = lastScreenLines(tmux.capture(paneId))[0];
   return said ?? `the command returned to a shell (the pane is ${paneId})`;
 }

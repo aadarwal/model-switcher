@@ -93,7 +93,7 @@ export const PANES_PER_WINDOW = 4;
 export const KEPT_FLAGS: { claude: string[]; codex: string[] } = {
   claude: ["--model", "--effort", "--permission-mode", "--dangerously-skip-permissions", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools"],
   codex: [
-    "--model", "--yolo", "--sandbox", "--ask-for-approval", "--full-auto", "--profile",
+    "--model", "--yolo", "--sandbox", "--ask-for-approval", "--full-auto", "--profile", "--no-daemon",
     "--dangerously-bypass-approvals-and-sandbox",
   ],
 };

@@ -50,6 +50,9 @@ const sess = (o: Partial<RebalanceSession> = {}): RebalanceSession => ({
   ...o,
 });
 
+const singleCodex = (name: string, used: number, resetHours: number, reservePercent = 0): PickInput =>
+  acct(name, { provider: "codex", session: { ...w(used, at(resetHours)), windowSeconds: 18_000 }, weeklyAll: null, weeklyFable: null, reservePercent });
+
 /** The baseline: two accounts, `here` is where the session is, `there` resets
  *  sooner so the chooser prefers it — but neither condition holds, so nothing
  *  moves until a test makes one true. The reset gap between them is
@@ -143,6 +146,43 @@ test("condition 1's gating windows follow the session's need", () => {
 });
 
 // --- Condition 2: a clearly better budget --------------------------------
+
+test("a single Codex window can trigger an imminent wall and measures destination room before reserve", () => {
+  const to = (used: number) => decide(input({
+    session: sess({ provider: "codex" }),
+    accounts: [singleCodex("here", 90, 4), singleCodex("there", used, 3, 20)],
+  }));
+  assert.deepEqual(to(50), { move: true, to: "there", better: "there", reason: "imminent-wall" });
+  assert.deepEqual(to(51), { move: false, better: "there", reason: "neither condition holds" });
+});
+
+test("a single Codex budget that reaches its owner's reserve moves without waiting for 85 percent", () => {
+  const from = (used: number) => decide(input({
+    session: sess({ provider: "codex" }),
+    accounts: [singleCodex("here", used, 4, 30), singleCodex("there", 20, 3)],
+  }));
+  assert.deepEqual(from(70), { move: true, to: "there", better: "there", reason: "reserve" });
+  assert.deepEqual(from(69.9), { move: false, better: "there", reason: "neither condition holds" });
+});
+
+test("better-budget destinations can have one Codex window and still honor their reserve", () => {
+  // A long current budget and a short sole destination budget differ by
+  // more than 24 h. No separate destination weekly window can be assumed.
+  const to = (used: number) => decide(input({
+    session: sess({ provider: "codex" }),
+    accounts: [acct("here", { provider: "codex", session: null, weeklyAll: w(20, at(60)) }), singleCodex("there", used, 3, 20)],
+  }));
+  assert.deepEqual(to(50), { move: true, to: "there", better: "there", reason: "better-budget" });
+  assert.deepEqual(to(51), { move: false, better: "there", reason: "neither condition holds" });
+});
+
+test("rebalance does not judge a malformed single Codex budget as capacity", () => {
+  const d = decide(input({
+    session: sess({ provider: "codex" }),
+    accounts: [singleCodex("here", -1, 40), singleCodex("there", 20, 3)],
+  }));
+  assert.deepEqual(d, { move: false, better: "there", reason: "the current account has no usable reading" });
+});
 
 test("condition 2: a week that resets 24 h earlier moves, whatever the current week has used", () => {
   const d = decide(input({

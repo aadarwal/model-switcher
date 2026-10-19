@@ -1954,6 +1954,36 @@ const sendKeys = (w: World): string[] =>
 const configToml = (w: CodexWorld, account: string): string => path.join(w.msHome, "codex", account, "config.toml");
 const trustAtRespawn = (w: CodexWorld, account: string): string => readFileSync(path.join(w.atRespawn, account, "config.toml"), "utf8");
 
+for (const reservedAccount of ["home", "work"]) {
+  test(`Codex waits for the single-window reserve reset of ${reservedAccount === "work" ? "the account being left" : "a candidate"}`, async (t) => {
+    const w = await codexWorld(t, { accounts: reservedAccount === "work"
+      ? [{ name: "work", weekly: 75 }]
+      : [{ name: "work", weekly: 100 }, { name: "home", weekly: 75 }] });
+    const registryFile = path.join(w.msHome, "accounts.json");
+    const registry = JSON.parse(readFileSync(registryFile, "utf8"));
+    registry.accounts.find((a: { name: string; provider: string }) => a.name === reservedAccount && a.provider === "codex").reservePercent = 30;
+    writeFileSync(registryFile, JSON.stringify(registry), { mode: 0o600 });
+    const reset = new Date(Date.now() + 2 * HOUR).toISOString();
+    const snapshotFile = path.join(w.msHome, "snapshot.json");
+    const snapshot = JSON.parse(readFileSync(snapshotFile, "utf8"));
+    for (const row of snapshot.accounts) {
+      if (row.provider !== "codex") continue;
+      row.usage.session = { ...row.usage.weeklyAll, windowSeconds: 18_000,
+        resetsAt: row.name === reservedAccount ? reset : new Date(Date.now() + 4 * HOUR).toISOString() };
+      row.usage.weeklyAll = null;
+    }
+    writeFileSync(snapshotFile, JSON.stringify(snapshot), { mode: 0o600 });
+
+    assert.equal(await recoverSession("s1"), 2);
+    const row = session(w);
+    assert.equal(row.state, "waiting");
+    assert.ok(Math.abs(row.wakeupAt! - Math.floor(Date.parse(reset) / 1000)) < 5,
+      `wakeup ${row.wakeupAt} must match the sole reported reserve window reset`);
+    assert.deepEqual(sendKeys(w), []);
+    assert.equal(respawnLine(w), undefined);
+  });
+}
+
 test("ambiguous legacy full-auto refuses recovery before stopping the CLI or preparing a home", async (t) => {
   const w = await codexWorld(t, { session: { flags: ["--full-auto", "--sandbox", "read-only"] } });
   const { dir, stub } = stubDir();

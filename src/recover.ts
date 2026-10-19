@@ -47,7 +47,7 @@ import { flagsWithLiveSettings, readLiveSettings } from "./live-settings.ts";
 import { readLaunchToken } from "./launch-credentials.ts";
 import { Locked, acquire, withLock, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
-import { pickAccounts, type PickInput, type Window } from "./pick.ts";
+import { budgetWindow, pickAccounts, reserveReached, type PickInput, type Window } from "./pick.ts";
 import { classifyCodexInvocation, codexExecutionCommand, codexExitSequence, codexHome, codexLaunchCommand, codexResumeCommand } from "./providers/codex-cli.ts";
 import { RELEASE_BUDGET_MS, lockCardMeansReadOnly, waitForWriterRelease, writerLockDirs, probeConversation, type LockState } from "./codex-writer-lock.ts";
 import { ensureCodexReady } from "./hooks/codex-install.ts";
@@ -1068,8 +1068,8 @@ function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[]
     const input = by.get(o.name);
     if (!input) continue;
     // An account its owner holds back (`ms accounts reserve`, src/pick.ts)
-    // comes back when its week resets, though that window is not at 100.
-    if (o.why.startsWith("reserved:")) { consider(input.weeklyAll); continue; }
+    // comes back when its reported budget resets, even below 100.
+    if (o.why.startsWith("reserved:")) { consider(budgetWindow(input)); continue; }
     if (!/ at 100$/.test(o.why)) continue;
     consider(o.why.startsWith("session") ? input.session : o.why.startsWith("fable") ? input.weeklyFable : input.weeklyAll);
   }
@@ -1081,6 +1081,7 @@ function nextAttemptAt(inputs: PickInput[], out: { name: string; why: string }[]
   // reset while its own five-hour window was minutes away.
   const leaving = by.get(from);
   if (leaving) {
+    if (reserveReached(leaving.reservePercent, budgetWindow(leaving))) consider(budgetWindow(leaving));
     for (const w of [leaving.session, leaving.weeklyAll, ...(need === "fable" ? [leaving.weeklyFable] : [])]) {
       // Only a window that is actually FULL says anything about when there
       // will be room; one with room left is not what we are waiting on.

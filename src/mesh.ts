@@ -44,7 +44,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { resolveOnPath } from "./exec.ts";
 import { msBinary } from "./paths.ts";
-import { pickAccounts, reserveReached, roomAfterReset, type Need, type Window } from "./pick.ts";
+import { budgetWindow, pickAccounts, reserveReached, roomAfterReset, type Need, type Window } from "./pick.ts";
 import { NAME_PATTERN, findAccount, loadRegistry, type Provider, type Registry } from "./registry.ts";
 import { DEFAULT_MAX_AGE_MS, ageLabel, getSnapshot, lastSnapshot, toPickInputs, type AccountUsage, type Snapshot } from "./snapshot.ts";
 import { openState, type SessionRow } from "./state.ts";
@@ -258,7 +258,8 @@ export function meshRows(input: MeshInput): MeshView {
   // registry's: rows from `lastSnapshot` carry none of their own.
   const last = input.lastPick ?? null;
   const lastAccount = last !== null ? findAccount(registry, last, provider) : null;
-  const heldBack = last !== null && reserveReached(lastAccount?.reservePercent, usageOf.get(last)?.usage?.weeklyAll);
+  const lastInput = last !== null ? inputOf.get(last) : null;
+  const heldBack = reserveReached(lastAccount?.reservePercent, lastInput ? budgetWindow(lastInput) : null);
   const remembered = !ranking.picks.length && unreachable && last !== null && wanted.has(last) && lastAccount && !heldBack ? last : null;
   const star = ranking.picks[0]?.name ?? remembered;
   const seen = rows.map((a) => a.observedAt).filter((t): t is number => t !== null);

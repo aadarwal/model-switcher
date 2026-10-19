@@ -892,6 +892,27 @@ async function codexWorld(codex: CodexSpec[]): Promise<World> {
 
 const configToml = (msHome: string, name: string) => path.join(msHome, "codex", name, "config.toml");
 
+test("unreachable Codex usage cannot bypass a remembered single-window reserve", async () => {
+  const w = await codexWorld([{ name: "work", unreachable: true }]);
+  const registryFile = path.join(w.msHome, "accounts.json");
+  const registry = JSON.parse(readFileSync(registryFile, "utf8"));
+  registry.accounts.find((a: { name: string; provider: string }) => a.name === "work" && a.provider === "codex").reservePercent = 30;
+  writeFileSync(registryFile, JSON.stringify(registry), { mode: 0o600 });
+  const snapshotFile = path.join(w.msHome, "snapshot.json");
+  const snapshot = JSON.parse(readFileSync(snapshotFile, "utf8"));
+  const row = snapshot.accounts.find((a: { name: string; provider: string }) => a.name === "work" && a.provider === "codex");
+  row.observedAt = Date.now() - 20 * 60_000;
+  row.usage = { session: { usedPercent: 75, resetsAt: null, windowSeconds: 18_000 }, weeklyAll: null, weeklyFable: null };
+  writeFileSync(snapshotFile, JSON.stringify(snapshot), { mode: 0o600 });
+  writeFileSync(path.join(w.msHome, "last-pick.json"), JSON.stringify({ "codex:any": { name: "work", at: Date.now() - 60_000 } }), { mode: 0o600 });
+
+  const r = run(["codex"], w.env());
+  assert.equal(r.code, 4, r.stderr);
+  assert.match(r.stderr, /held back by its owner's reserve \(30%; its last reading had the reported window at 75%\)/);
+  assert.equal((await readState(w)).sessions.length, 0);
+  assert.equal(existsSync(w.log), false, "no pane is created or changed");
+});
+
 test("ambiguous legacy full-auto refuses before preparing an account or touching tmux", async () => {
   const w = await codexWorld([{ name: "home", weekly: 10 }]);
   const { dir, stub } = stubDir();

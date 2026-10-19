@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pickAccounts, parseNeed, roomAfterReset, type PickInput } from "../src/pick.ts";
+import { budgetWindow, pickAccounts, parseNeed, roomAfterReset, type PickInput } from "../src/pick.ts";
 
 const w = (used: number, resets: string | null = "2026-09-20T00:00:00Z") => ({ usedPercent: used, resetsAt: resets });
 const acct = (name: string, o: Partial<PickInput> = {}): PickInput => ({
@@ -102,6 +102,15 @@ test("Codex accepts its only reported short window and applies reserve to that b
   assert.equal(pickAccounts([only], "any").picks[0]?.remaining, 0.5);
   assert.match(pickAccounts([{ ...only, session: w(70) }], "any").out[0]!.why, /reserved/);
   assert.equal(pickAccounts([{ ...only, provider: "claude" }], "any").picks.length, 0);
+});
+
+test("the shared budget follows the reported longest window without relaxing Claude requirements", () => {
+  const single = acct("single", { provider: "codex", weeklyAll: null });
+  assert.equal(budgetWindow(single), single.session);
+  assert.equal(budgetWindow({ ...single, provider: "claude" }), null);
+  const both = acct("both", { provider: "codex" });
+  assert.equal(budgetWindow(both), both.weeklyAll);
+  assert.equal(budgetWindow({ ...single, session: null }), null);
 });
 
 test("provider capacity gates exclude zero-percent accounts without fabricating their usage", () => {

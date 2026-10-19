@@ -21,12 +21,17 @@ export function parseNeed(s: string | undefined): Need | null {
 
 const ms = (iso: string | null) => (iso ? Date.parse(iso) : Number.POSITIVE_INFINITY);
 
-/** Has this account's week reached its owner's reserve (`ms accounts reserve`)?
- *  Automation stops using it at 100 − reserve of the weekly window: the one
- *  rule the chooser below, `ms status` and rebalance all read. */
-export function reserveReached(reservePercent: number | undefined, weeklyAll: Window | null | undefined): boolean {
+/** The longest reported budget. Codex may report just one short window;
+ * Claude still requires its separate weekly window. */
+export function budgetWindow(a: Pick<PickInput, "provider" | "session" | "weeklyAll">): Window | null {
+  return a.weeklyAll ?? (a.provider === "codex" ? a.session : null);
+}
+
+/** Has the account's reported budget reached its owner's reserve
+ * (`ms accounts reserve`)? Automation stops at 100 − reserve. */
+export function reserveReached(reservePercent: number | undefined, budget: Window | null | undefined): boolean {
   const reserve = reservePercent ?? 0;
-  return reserve > 0 && !!weeklyAll && Number.isFinite(weeklyAll.usedPercent) && weeklyAll.usedPercent >= 100 - reserve;
+  return reserve > 0 && !!budget && Number.isFinite(budget.usedPercent) && budget.usedPercent >= 100 - reserve;
 }
 
 /** A reset can restore room only after ALL exhausted required windows clear.
@@ -39,7 +44,7 @@ export function roomAfterReset(input: PickInput | undefined, need: Need, now: nu
   const blocked: ("session" | "weeklyAll" | "weeklyFable")[] = [];
   if (input.session && Number.isFinite(input.session.usedPercent) && input.session.usedPercent >= 100) blocked.push("session");
   if (input.weeklyAll && Number.isFinite(input.weeklyAll.usedPercent) && (input.weeklyAll.usedPercent >= 100 || reserveReached(input.reservePercent, input.weeklyAll))) blocked.push("weeklyAll");
-  if (input.provider === "codex" && !input.weeklyAll && input.session && reserveReached(input.reservePercent, input.session) && !blocked.includes("session")) blocked.push("session");
+  if (!input.weeklyAll && reserveReached(input.reservePercent, budgetWindow(input)) && !blocked.includes("session")) blocked.push("session");
   if (need === "fable" && input.weeklyFable && Number.isFinite(input.weeklyFable.usedPercent) && input.weeklyFable.usedPercent >= 100) blocked.push("weeklyFable");
   if (!blocked.length) return null;
   // A provider refusal can describe another gate. A reported window reset
@@ -75,7 +80,7 @@ export function pickAccounts(inputs: PickInput[], need: Need, exclude: string[] 
     if (a.weeklyAll && a.weeklyAll.usedPercent >= 100) { out.push({ name: a.name, why: "weekly window at 100" }); continue; }
     if (need === "fable" && a.weeklyFable!.usedPercent >= 100) { out.push({ name: a.name, why: "fable window at 100" }); continue; }
     const reserve = a.reservePercent ?? 0;
-    const budget = a.weeklyAll ?? a.session!;
+    const budget = budgetWindow(a)!;
     if (reserveReached(reserve, budget)) {
       out.push({ name: a.name, why: `reserved: owner keeps ${reserve}% (${a.weeklyAll ? "weekly" : "reported window"} ${budget.usedPercent}%)` });
       continue;

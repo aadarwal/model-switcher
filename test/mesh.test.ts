@@ -472,6 +472,21 @@ test("meshRows: usage unreachable, the ★ is the remembered pick a plain launch
   assert.equal(ranked.rows[0]!.name, "bravo");
 });
 
+test("meshRows: an unreachable remembered Codex pick honors the reserve on its sole short window", () => {
+  const snapshot: Snapshot = { takenAt: now(), registryError: null, accounts: [reading("single", {
+    provider: "codex", session: { used: 75, resetIn: 3 }, weekly: null,
+    observedAt: now() - 20 * 60_000, stale: true, error: "fetch failed", errorKind: "transient",
+  })] };
+  for (const reservePercent of [30, 20]) {
+    const registry: Registry = { version: 1, accounts: [account("single", { provider: "codex", reservePercent })] };
+    const v = meshRows({ provider: "codex", need: "any", names: ["single"], registry, snapshot,
+      ready: () => null, lastPick: "single", sessions: [], now: now() });
+    assert.equal(v.unreachable, true);
+    assert.equal(v.starredBy, reservePercent === 30 ? null : "last pick");
+    assert.equal(v.rows[0]!.mark === "★", reservePercent !== 30);
+  }
+});
+
 test("parseFzfVersion reads what fzf --version prints, and nothing else", () => {
   assert.deepEqual(parseFzfVersion("0.73.1 (Homebrew)"), [0, 73, 1]);
   assert.deepEqual(parseFzfVersion("0.53.0 (c4a9ccd)\n"), [0, 53, 0]);

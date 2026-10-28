@@ -47,7 +47,7 @@ import { RELEASE_BUDGET_MS, probeConversation, waitForWriterRelease, writerLockD
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { chooseAccount } from "./mesh.ts";
 import { CONTINUATION, logLine } from "./recover.ts";
-import { currentPane, outsideServer, shellWord, tmuxCommandFor, tmuxFor, tmuxFromEnv } from "./tmux.ts";
+import { currentPane, outsideServer, sessionWindowTarget, shellWord, tmuxCommandFor, tmuxFor, tmuxFromEnv } from "./tmux.ts";
 
 /** Exit codes, fixed by spec §7 so a caller can branch on them. */
 const EXIT_OK = 0;
@@ -756,7 +756,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     //     starts, so an `_exec` that fails immediately leaves a dead pane the
     //     hook can report, rather than a vanished pane and an orphaned row.
     const pane = tmux.hasSession(TOOL_SESSION)
-      ? tmux.newWindow(TOOL_SESSION, cwd, PLACEHOLDER)
+      ? tmux.newWindow(sessionWindowTarget(TOOL_SESSION), cwd, PLACEHOLDER)
       : tmux.newSession(TOOL_SESSION, cwd, PLACEHOLDER);
     if (!socket) socket = tmux.socketPath(pane) ?? "";
     const serverStart = tmux.serverIdentity();

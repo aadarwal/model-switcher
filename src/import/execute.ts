@@ -41,7 +41,7 @@ import { msBinary } from "../paths.ts";
 import { codexCommandFromArgv, defaultPs, providerOfArgv, type Candidate, type ProcessRow } from "./scan.ts";
 import { isCodexTuiCommand } from "../providers/codex-cli.ts";
 import { holdsWriterLock, RELEASE_BUDGET_MS } from "../codex-writer-lock.ts";
-import { shellQuote, type Tmux } from "../tmux.ts";
+import { sessionWindowTarget, shellQuote, type Tmux } from "../tmux.ts";
 import { configurationRefusal, keptFlags, type Plan, type PaneSpec } from "./plan.ts";
 import {
   OUTCOME_PLANNED, OUTCOME_STOPPED, candidateFields, killedOutcome, readManifest, resumeFailed, resumedOutcome,
@@ -608,7 +608,7 @@ function makePane(
   }
   const open = sessionsMade.has(sessionName) || tmux.hasSession(sessionName);
   const created = open
-    ? paneCreated(tmux, ["new-window", "-P", "-F", PANE_FORMAT, "-t", `${sessionName}:`, "-c", cwd, ...(pane.window ? ["-n", pane.window] : [])])
+    ? paneCreated(tmux, ["new-window", "-P", "-F", PANE_FORMAT, "-t", sessionWindowTarget(sessionName), "-c", cwd, ...(pane.window ? ["-n", pane.window] : [])])
     : paneCreated(tmux, ["new-session", "-d", "-P", "-F", PANE_FORMAT, "-s", sessionName, "-c", cwd, ...(pane.window ? ["-n", pane.window] : [])]);
   sessionsMade.add(sessionName);
   firstPaneOf.set(key, created.id);

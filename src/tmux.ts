@@ -4,6 +4,13 @@ export function shellQuote(args: string[]): string {
   return args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
 }
 
+/** A target-session that matches only a session with exactly this name. */
+export const exactSession = (name: string): string => `=${name}`;
+
+/** A target-window for a NEW window in the session named exactly `name`, at
+ *  its next free index (see `Tmux.newWindow`). */
+export const sessionWindowTarget = (name: string): string => `=${name}:`;
+
 /**
  * Which tmux server a launch or an import from this shell lands on — one rule,
  * asked by `ms claude`/`ms codex`, `ms import` and `ms attach` alike:
@@ -226,12 +233,14 @@ export class Tmux {
   /**
    * A new window, and the id of the pane it was born with.
    *
-   * `target` is a tmux target-window: a bare session name works, and
-   * `"<session>:"` is the unambiguous spelling of "that session, next free
-   * index" — worth using whenever the name is one we chose rather than one
-   * tmux gave us, because a bare name is looked up as a WINDOW of the current
-   * session first. `command` may be empty, which is how a pane is born
-   * holding the human's own shell (`ms import` types into that shell).
+   * `target` is a tmux target-window. For a session we name, pass
+   * `sessionWindowTarget(name)` (`=<name>:`): that session exactly, at its
+   * next free index. A bare name is looked up as a WINDOW of the human's
+   * current session first, so a window there named "ms" made `-t ms` mean
+   * that window's index ("create window failed: index 4 in use"), and a name
+   * without `=` also matches any session it is a prefix of. `command` may be
+   * empty, which is how a pane is born holding the human's own shell
+   * (`ms import` types into that shell).
    */
   newWindow(target: string, cwd: string, command: string[], name?: string): string {
     return this.must([
@@ -239,7 +248,9 @@ export class Tmux {
       ...(name ? ["-n", name] : []), ...(command.length ? [shellQuote(command)] : []),
     ]).trim();
   }
-  hasSession(name: string): boolean { return this.run(["has-session", "-t", name]).code === 0; }
+  /** A session named exactly `name`. Without the `=`, tmux also answers for
+   *  any session `name` is a prefix of: "ms" found "msdebug2". */
+  hasSession(name: string): boolean { return this.run(["has-session", "-t", exactSession(name)]).code === 0; }
   newSession(name: string, cwd: string, command: string[], windowName?: string): string {
     return this.must([
       "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name, "-c", cwd,
@@ -263,7 +274,7 @@ export class Tmux {
   }
   // The one deliberately unbounded call: an interactive attach lives as long as the session.
   attach(name: string): number {
-    const r = spawnSync("tmux", [...this.base(), "attach-session", "-t", name], { stdio: "inherit", env: this.env() });
+    const r = spawnSync("tmux", [...this.base(), "attach-session", "-t", exactSession(name)], { stdio: "inherit", env: this.env() });
     return r.status ?? 1;
   }
 }

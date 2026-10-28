@@ -571,7 +571,9 @@ test("outside tmux: the default server — a placeholder pane first, then the CL
 
   // The pane is made to exist FIRST, running something that cannot exit on
   // its own — never the CLI, which would start before the hook watching it.
-  assert.ok(lines.includes(`has-session -t ms`), lines.join("\n"));
+  // Every target names the session exactly (`=ms`): tmux would otherwise
+  // take any session starting with "ms" as this one.
+  assert.ok(lines.includes(`has-session -t =ms`), lines.join("\n"));
   const spawn = at("new-session");
   assert.equal(lines[spawn], `new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`);
   // The row's socket is read off the server the pane was born on, so the
@@ -588,7 +590,7 @@ test("outside tmux: the default server — a placeholder pane first, then the CL
   assert.ok(spawn < hook && hook < respawn, lines.join("\n"));
   assert.ok(respawn < attach, lines.join("\n"));
   assert.equal(attach, lines.length - 1);
-  assert.equal(lines[attach], `attach-session -t ms`);
+  assert.equal(lines[attach], `attach-session -t =ms`);
   assert.equal(lines[remain], `set-option -p -t %42 remain-on-exit on`);
 
   const m = lines[respawn]!.match(
@@ -628,9 +630,12 @@ test("outside tmux with the session already up: a new window in it", async () =>
   assert.equal(r.code, 0, r.stderr);
   const lines = logLines(w);
   assert.equal(lines.some((l) => l.includes("new-session")), false, lines.join("\n"));
-  assert.ok(lines.includes(`new-window -P -F #{pane_id} -t ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
+  // `=ms:` is session ms exactly, at its next free index. A bare `-t ms` is
+  // looked up as a WINDOW of the human's current session first, so a window
+  // there named "ms" turned the launch into "index N in use".
+  assert.ok(lines.includes(`new-window -P -F #{pane_id} -t =ms: -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
   assert.ok(lines.some((l) => l.includes("respawn-pane")), lines.join("\n"));
-  assert.equal(lines.at(-1), `attach-session -t ms`);
+  assert.equal(lines.at(-1), `attach-session -t =ms`);
   assert.equal((await sessionsAtRespawn(w))[0]!.pane, "%42");
 });
 
@@ -643,7 +648,7 @@ test("outside tmux with MS_TMUX_SOCKET: the private server on that socket, as be
   assert.ok(lines.includes(`-S ${sock} new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
   assert.equal(lines.some((l) => !l.startsWith(`-S ${sock} `)), false, lines.join("\n"));
   assert.equal(lines.some((l) => l.includes("socket_path")), false, "the override already names its socket");
-  assert.equal(lines.at(-1), `-S ${sock} attach-session -t ms`);
+  assert.equal(lines.at(-1), `-S ${sock} attach-session -t =ms`);
   assert.equal((await sessionsAtRespawn(w))[0]!.socket, sock);
 });
 
@@ -680,17 +685,17 @@ test("attach: the default server's ms session, or a named one; refuses with the 
   assert.equal(absent.code, 1);
   assert.match(absent.stderr, /^ms attach: no session "ms" on the default tmux server; see what is there with: tmux ls$/m);
   assert.equal(logLines(w).some((l) => l.includes("attach-session")), false, "nothing is attached to a session that is not there");
-  assert.ok(logLines(w).some((l) => l === `has-session -t ms`), logLines(w).join("\n"));
+  assert.ok(logLines(w).some((l) => l === `has-session -t =ms`), logLines(w).join("\n"));
 
   const w2 = await world();
   const r = run(["attach"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(logLines(w2).at(-1), `attach-session -t ms`);
+  assert.equal(logLines(w2).at(-1), `attach-session -t =ms`);
 
   // An import's session is named for its repo.
   const named = run(["attach", "data"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(named.code, 0, named.stderr);
-  assert.equal(logLines(w2).at(-1), `attach-session -t data`);
+  assert.equal(logLines(w2).at(-1), `attach-session -t =data`);
 
   const bad = run(["attach", "a", "b"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(bad.code, 2);
@@ -707,7 +712,7 @@ test("attach with MS_TMUX_SOCKET: that socket, and the tmux ls for it", async ()
   assert.match(absent.stderr, new RegExp(`^ms attach: no session "ms" on the tmux server on ${esc(sock)}; see what is there with: tmux -S ${esc(sock)} ls$`, "m"));
   const r = run(["attach"], w.env({ ...OUTSIDE, MS_TMUX_SOCKET: sock, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(logLines(w).at(-1), `-S ${sock} attach-session -t ms`);
+  assert.equal(logLines(w).at(-1), `-S ${sock} attach-session -t =ms`);
 });
 
 test("attach from inside tmux refuses rather than nesting", async () => {
@@ -1238,7 +1243,7 @@ test("outside tmux, ms codex takes the same default-server path", async () => {
   const lines = logLines(w);
   assert.ok(lines.includes(`new-session -d -P -F #{pane_id} -s ms -c ${CWD} 'sleep' '2147483647'`), lines.join("\n"));
   assert.ok(lines.some((l) => l.includes("respawn-pane")), lines.join("\n"));
-  assert.equal(lines.at(-1), `attach-session -t ms`);
+  assert.equal(lines.at(-1), `attach-session -t =ms`);
   assert.match(r.stderr, /^ms: home \(codex\) → pane %42$/m);
   const st = await readState(w);
   assert.equal(st.sessions[0]!.provider, "codex");

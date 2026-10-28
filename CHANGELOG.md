@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.4.3 — 2026-10-27
+
+### Launching from outside tmux works beside a window named "ms"
+
+- Target ms's own tmux session by its exact name. `ms claude`/`ms codex` run
+  outside tmux failed with "create window failed: index N in use" whenever the
+  human's current session had a window called `ms`. tmux looked the bare name
+  up as that window before it tried it as a session. A session whose name
+  merely starts with `ms` (such as `msdebug`) was also taken for ms's own. New
+  windows now go to `=ms:`, and `has-session` and `attach-session` take `=ms`.
+  `ms attach <name>` and `ms import`'s per-repo sessions match exactly too.
+
 ## 0.4.2 — 2026-10-27
 
 ### Panes come back as a shell again on tmux 3.8

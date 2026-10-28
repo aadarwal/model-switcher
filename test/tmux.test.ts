@@ -11,7 +11,7 @@ function setup() {
   stub("tmux", `printf '%s\\n' "$*" >> "${log}"
 case "$*" in
   *"#{pid}:#{start_time}"*) echo "4242:1789000000" ;;
-  *"#{pane_pid}"*) echo "777	2.1.272	0	/tmp/work	$MS_TMUX_DEAD_STATUS" ;;
+  *"#{pane_pid}"*) if [ -n "$MS_TMUX_PANE_LINE" ]; then printf '%s\\n' "$MS_TMUX_PANE_LINE"; else echo "777	2.1.272	0	/tmp/work	$MS_TMUX_DEAD_STATUS"; fi ;;
   *"#{pane_dead_status}"*) printf '%s\\n' "$MS_TMUX_DEAD_STATUS" ;;
   *"#{pane_dead}"*) printf '%s\\n' "$MS_TMUX_DEAD" ;;
   *"show-options -p"*) printf '%s\\n' '@ms_session s1' '@ms_generation 3' '@ms_note "has \\"quotes\\" inside"' '@ms_path "/tmp/a b"' '@ms_bs "x\\\\"' ;;
@@ -63,6 +63,28 @@ test("paneInfo and paneOptions parse the stub's answers", async () => {
     "@ms_bs": "x\\",
   });
   assert.equal(t.capture("%5"), "line one\nline two\n");
+});
+
+test("paneInfo reads tmux 3.8's dead pane, which has no pid and no path", async () => {
+  setup();
+  const { Tmux } = await import("../src/tmux.ts");
+  const t = new Tmux(null);
+  // tmux 3.8 blanks #{pane_pid} and #{pane_current_path} once the command
+  // has exited, so the answer for a corpse starts with a tab. Trimmed, every
+  // field shifted left: pane_dead was read from the empty path and the corpse
+  // came back alive, so no exit was ever handed back to a shell.
+  process.env.MS_TMUX_PANE_LINE = "\t'/opt/homebrew/opt/model-switcher/bin/ms'\t1\t\t0";
+  try {
+    assert.deepEqual(t.paneInfo("%5"), {
+      pid: 0,
+      command: "'/opt/homebrew/opt/model-switcher/bin/ms'",
+      dead: true,
+      cwd: "",
+      deadStatus: 0,
+    });
+  } finally {
+    delete process.env.MS_TMUX_PANE_LINE;
+  }
 });
 
 test("tmuxFromEnv reads the socket from $TMUX", async () => {

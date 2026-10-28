@@ -118,11 +118,17 @@ export class Tmux {
    * that was respawned between them reports dead-with-no-status — which a
    * caller then has to read as "no evidence" and fall back on something weaker.
    * A live pane's status field is empty, which parses to null.
+   *
+   * Only the newline is stripped, never the fields' own whitespace: tmux 3.8
+   * leaves `#{pane_pid}` and `#{pane_current_path}` empty on a dead pane, so
+   * the line starts with a tab. Trimmed, every field shifted left, the corpse
+   * read as alive, and no exit was handed back to a shell. Its pid reads as 0,
+   * which every caller already treats as no process.
    */
   paneInfo(pane: string): { pid: number; command: string; dead: boolean; cwd: string; deadStatus: number | null } | null {
     const r = this.run(["display-message", "-p", "-t", pane, "#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{pane_current_path}\t#{pane_dead_status}"]);
     if (r.code !== 0 || !r.stdout.trim()) return null;
-    const [pid, command, dead, cwd, status] = r.stdout.trim().split("\t");
+    const [pid, command, dead, cwd, status] = r.stdout.replace(/\r?\n$/, "").split("\t");
     const n = Number(status);
     return { pid: Number(pid), command, dead: dead === "1", cwd, deadStatus: status && Number.isInteger(n) ? n : null };
   }

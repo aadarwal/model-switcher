@@ -55,7 +55,8 @@ case "$1" in
     i=$(cat "$MS_TMUX_WIN_INDEX" 2>/dev/null || echo 5); i=$((i + 1)); printf '%s' "$i" > "$MS_TMUX_WIN_INDEX"
     printf '%%%s %s\n' "$n" "$i" ;;
   has-session)
-    grep -qxF "$3" "$MS_TMUX_SESSIONS" 2>/dev/null || exit 1 ;;
+    t=$(printf '%s' "$3" | sed 's/^=//')
+    grep -qxF "$t" "$MS_TMUX_SESSIONS" 2>/dev/null || exit 1 ;;
   list-sessions) cat "$MS_TMUX_SESSIONS" 2>/dev/null ;;
   display-message) cat "$MS_TMUX_DEAD" 2>/dev/null || printf '0\n' ;;
   capture-pane) cat "$MS_TMUX_SCREEN" 2>/dev/null ;;
@@ -310,7 +311,7 @@ test("an existing session is appended to rather than created", async (t) => {
   const { executeImport } = await import("../src/import/execute.ts");
   await executeImport(plan, w.file, w.deps);
   assert.deepEqual(verbs(w.tmuxLog()), ["has-session", "new-window", "send-keys"]);
-  assert.match(w.tmuxLog()[1]!, /new-window -P -F #\{pane_id\} #\{pane_index\} -t data: -c \/tmp -n main/);
+  assert.match(w.tmuxLog()[1]!, /new-window -P -F #\{pane_id\} #\{pane_index\} -t =data: -c \/tmp -n main/);
 });
 
 test("a fifth conversation lands in its own window, and that window's panes split ITS first pane", async (t) => {

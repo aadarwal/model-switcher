@@ -33,6 +33,9 @@ const SHELL = "/bin/testsh";
  * (it answers nothing), and `MS_TMUX_LIST_FAILS` (list-panes fails). Panes are
  * alive unless a test says otherwise (`MS_TMUX_PANE_DEAD=1`): a corpse is an
  * event, and a fixture that leaves every pane dead by accident tests nothing.
+ * A corpse keeps its pid and path, as tmux 3.7 reports one, unless
+ * `MS_TMUX_BLANK_DEAD=1` answers as tmux 3.8 does: no `#{pane_pid}` and no
+ * `#{pane_current_path}` once the command has exited.
  *
  * Three more answer per SOCKET, in tmux 3.x's own words (checked against tmux
  * 3.7c): a socket in `MS_TMUX_GONE` is a socket file nobody is listening on
@@ -57,7 +60,10 @@ case "$verb" in
     if [ "\${MS_TMUX_NO_SERVER:-0}" = "1" ]; then echo "lost server" >&2; exit 1; fi
     if [ -f "$deadfile" ]; then d=$(cat "$deadfile"); else d="\${MS_TMUX_PANE_DEAD:-0}"; fi
     case "$*" in
-      *"#{pane_pid}"*) printf '%s\\t%s\\t%s\\t%s\\t%s\\n' 4242 claude "$d" /tmp/work "\${MS_TMUX_DEAD_STATUS:-0}" ;;
+      *"#{pane_pid}"*)
+        pid=4242; cwd=/tmp/work
+        if [ "$d" = "1" ] && [ "\${MS_TMUX_BLANK_DEAD:-0}" = "1" ]; then pid=""; cwd=""; fi
+        printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "$pid" claude "$d" "$cwd" "\${MS_TMUX_DEAD_STATUS:-0}" ;;
       *"#{pane_dead_status}"*) if [ "\${MS_TMUX_STATUS_SPLIT:-0}" = "1" ]; then echo ""; else echo "\${MS_TMUX_DEAD_STATUS:-0}"; fi ;;
       *"#{pane_dead}"*) echo "$d" ;;
       *) echo "\${MS_TMUX_IDENTITY}" ;;
@@ -94,6 +100,7 @@ function world(): World {
   delete process.env.MS_TMUX_ENOENT;
   delete process.env.MS_TMUX_EACCES;
   delete process.env.MS_TMUX_PANE_DEAD;
+  delete process.env.MS_TMUX_BLANK_DEAD;
   delete process.env.MS_TMUX_DEAD_STATUS;
   delete process.env.MS_TMUX_STATUS_SPLIT;
   delete process.env.MS_TMUX_ON_RUNSHELL;
@@ -881,6 +888,35 @@ test("_pane_died: a normal end respawns the login shell and stops the session", 
   // The respawn made the pane live again, and a live pane is not a death.
   assert.equal(await paneDied(["s1"]), 0);
   assert.equal(respawns(w).length, 1, "exactly one forced respawn for one death");
+});
+
+test("_pane_died: tmux 3.8's corpse, with no pid and no path, still gets the login shell back", async () => {
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  // The corpse's answer starts with a tab. Read trimmed, it came back alive,
+  // and every ordinary exit (/exit, ctrl-c twice) was left as "Pane is dead"
+  // with the session still recorded as running.
+  process.env.MS_TMUX_BLANK_DEAD = "1";
+  withState((st) => st.createSession({ id: "s1", ...base }));
+  appendEvent({ t: nowSec(), kind: "ended", session: "s1", generation: 1, cliSessionId: "c1", kindDetail: "prompt_input_exit" });
+
+  assert.equal(await paneDied(["s1"]), 0);
+
+  assert.deepEqual(respawns(w), [`-S ${SOCK} respawn-pane -k -c /tmp/work -t %7 '${SHELL}' '-l'`]);
+  assert.equal(stateOf("s1"), "stopped");
+});
+
+test("reconcile settles tmux 3.8's corpse the hook missed", () => {
+  const w = world();
+  process.env.MS_TMUX_PANE_DEAD = "1";
+  process.env.MS_TMUX_BLANK_DEAD = "1";
+  withState((st) => st.createSession({ id: "s1", ...base }));
+  appendEvent({ t: nowSec(), kind: "ended", session: "s1", generation: 1, cliSessionId: "c1", kindDetail: "prompt_input_exit" });
+
+  reconcile();
+
+  assert.deepEqual(respawns(w), [`-S ${SOCK} respawn-pane -k -c /tmp/work -t %7 '${SHELL}' '-l'`]);
+  assert.equal(stateOf("s1"), "stopped");
 });
 
 test("_pane_died: no ended event for this generation appends died, parks, and leaves the pane", async () => {

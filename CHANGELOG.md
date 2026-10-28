@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.4.2 — 2026-10-27
+
+### Panes come back as a shell again on tmux 3.8
+
+- Read a dead pane correctly on tmux 3.8, which leaves its `#{pane_pid}` and
+  `#{pane_current_path}` empty. ms read every corpse as alive, so quitting a
+  managed CLI (`/exit`, ctrl-c twice) left "Pane is dead" on screen and the
+  session recorded as running, instead of handing the pane back to the login
+  shell. The pane-died hook and reconciliation both settle such a pane again,
+  and a corpse left over from 0.4.1 is handed back on the next `ms status`.
+
 ## 0.4.1 — 2026-10-19
 
 ### Current Claude and Codex compatibility

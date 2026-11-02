@@ -149,13 +149,13 @@ const ms = (iso: string | null): number => (iso ? Date.parse(iso) : Number.NaN);
  * reading is not one this rule may judge: a missing window, a percentage that
  * is not a number, or an account the snapshot has marked dead.
  *
- * Codex may report either window alone. Claude requires both.
+ * Codex may report either window alone. Claude requires its week; its 5 h
+ * window gates only while the usage API still reports one.
  */
 function gatingWindows(a: PickInput, need: Need): W[] | null {
   if (a.error) return null;
   const out: W[] = [];
   if (a.session) out.push(a.session);
-  else if (a.provider !== "codex") return null;
   if (!budgetWindow(a)) return null;
   if (a.weeklyAll) out.push(a.weeklyAll);
   if (need === "fable") {

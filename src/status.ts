@@ -89,14 +89,14 @@ export function accountState(a: AccountUsage, hasToken: boolean, reservePercent 
   // A successful HTTP response can still omit a required window or report
   // a nonfinite percentage. The chooser rejects that reading, so it cannot
   // be an `ok` row or inflate the pool's count of accounts with room.
-  // Codex Pro legitimately omits the session window; when present, it must
-  // be finite for both providers, just as pickAccounts requires.
+  // Either provider may omit the session window (Codex Pro; Claude since
+  // 2026-11-01); when present, it must be finite, just as pickAccounts
+  // requires.
   const u = a.usage;
   if (usageRequestsBlocked(u)) return "no room";
   if (!u || (!u.weeklyAll && a.provider !== "codex")
     || (!u.weeklyAll && !u.session)
     || (u.weeklyAll && (!Number.isFinite(u.weeklyAll.usedPercent) || u.weeklyAll.usedPercent < 0))
-    || (!u.session && a.provider !== "codex")
     || (u.session && (!Number.isFinite(u.session.usedPercent) || u.session.usedPercent < 0))) return "transient";
   // Last, and only ever in place of `ok`: everything above describes the
   // READING (missing, refused, old), and a fact about the reading outranks a

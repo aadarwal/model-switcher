@@ -227,7 +227,6 @@ for (const scenario of [
   { title: "missing launch credentials", usage: {}, unready: true },
   { title: "a rejected usage credential", usage: { error: "unauthorized", errorKind: "auth" } },
   { title: "a reading too stale for the chooser", usage: { stale: true, observedAt: now() - 20 * 60_000 } },
-  { title: "a missing required session window", usage: { session: null } },
   { title: "a malformed required Fable window", usage: { fable: { used: Number.NaN, resetIn: 1 } } },
   { title: "an infinite session percentage", usage: { session: { used: Number.POSITIVE_INFINITY, resetIn: 1 } } },
   { title: "a full window with no reset", usage: { session: { used: 100, resetIn: null } } },
@@ -251,6 +250,26 @@ test("meshHeader: no next-room promise when a blocked window has no known future
   const snapshot: Snapshot = { takenAt: now(), registryError: null, accounts: [reading("alpha", { session: { used: 100, resetIn: null } })] };
   const v = meshRows({ provider: "claude", need: "any", names: ["alpha"], registry, snapshot, ready: () => null, sessions: [], now: now() });
   assert.doesNotMatch(plain(meshHeader(v)[1]), /next room/);
+});
+
+test("meshHeader: Claude capacity can return without a reported session window", () => {
+  const current = now();
+  const registry: Registry = { version: 1, accounts: [account("alpha"), account("bravo")] };
+  const snapshot: Snapshot = {
+    takenAt: current, registryError: null,
+    accounts: [reading("alpha", { session: null, weekly: { used: 100, resetIn: 1 } }), reading("bravo", { session: null, weekly: { used: 100, resetIn: 36 } })],
+  };
+  const v = meshRows({ provider: "claude", need: "any", names: ["alpha", "bravo"], registry, snapshot, ready: () => null, sessions: [], now: current });
+  const status = plain(meshHeader(v)[1]);
+  assert.ok(status.includes("next room: alpha "), status);
+});
+
+test("meshRows: a Claude reading with only weekly windows ranks", () => {
+  const current = now();
+  const registry: Registry = { version: 1, accounts: [account("alpha")] };
+  const snapshot: Snapshot = { takenAt: current, registryError: null, accounts: [reading("alpha", { session: null })] };
+  const v = meshRows({ provider: "claude", need: "any", names: ["alpha"], registry, snapshot, ready: () => null, sessions: [], now: current });
+  assert.doesNotMatch(plain(meshHeader(v)[1]), /no account has room/);
 });
 
 test("meshHeader: Codex capacity can return without a reported session window", () => {

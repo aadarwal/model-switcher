@@ -66,13 +66,19 @@ test("unusable accounts and an unknown blocking reset cannot promise pool recove
     ...["auth", "no-grant", "no-token", "transient", "stale"].map((state) => account(state, { state, usage: full })),
     account("unknown", { state: "no room", usage: { ...full, weeklyAll: win(100) } }),
     account("past", { state: "no room", usage: { ...full, weeklyAll: win(100, -1) } }),
-    account("missing", { state: "no room", usage: { ...full, session: null } }),
     account("malformed", { state: "no room", usage: { ...full, weeklyAll: win(Number.NaN, 2) } }),
   ];
   const summary = poolSummaries(accounts, NOW).claude!;
   assert.equal(summary.withRoom, 0);
   assert.equal(summary.nextRoom, null);
   assert.equal(summary.lastAccount, null);
+});
+
+test("a Claude account with no session window recovers at its weekly reset", () => {
+  const a = account("weekly", { state: "no room", usage: { session: null, weeklyAll: win(100, 2), weeklyFable: win(0, 2) } });
+  assert.deepEqual(poolSummaries([a], NOW).claude?.nextRoom, { account: "weekly", resetsAt: after(2) });
+  const unknown = account("unknown", { state: "no room", usage: { session: null, weeklyAll: win(100), weeklyFable: null } });
+  assert.equal(poolSummaries([unknown], NOW).claude?.nextRoom, null);
 });
 
 test("pool summary text names the last account, its 5h usage, reset events and the next recovery", () => {

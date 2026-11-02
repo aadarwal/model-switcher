@@ -68,9 +68,12 @@ export function pickAccounts(inputs: PickInput[], need: Need, exclude: string[] 
     if (exclude.includes(a.name)) { out.push({ name: a.name, why: "excluded" }); continue; }
     if (a.error) { out.push({ name: a.name, why: `error: ${a.error}` }); continue; }
     if (a.requestsAllowed === false || a.limitReached === true) { out.push({ name: a.name, why: "provider reports no capacity" }); continue; }
-    // Codex Pro plans report no 5 h window at all (verified live 2026-09-16):
-    // a missing session window is not a broken reading there, only for Claude.
-    if (!a.session && a.provider !== "codex") { out.push({ name: a.name, why: "no session window" }); continue; }
+    // A missing 5 h window is not a broken reading: Codex Pro plans never
+    // reported one (verified live 2026-09-16), and Claude's usage API stopped
+    // reporting it for every account by 2026-11-01 (`five_hour: null`, no
+    // `session` limit; Claude Code's own rate_limits carry only `seven_day`).
+    // A window that IS reported still gates, below. Claude's week stays
+    // required, so an empty reading is still refused.
     if (a.session && (!Number.isFinite(a.session.usedPercent) || a.session.usedPercent < 0)) { out.push({ name: a.name, why: "malformed session percent" }); continue; }
     if (!a.weeklyAll && (a.provider !== "codex" || !a.session)) { out.push({ name: a.name, why: "no weekly window" }); continue; }
     if (a.weeklyAll && (!Number.isFinite(a.weeklyAll.usedPercent) || a.weeklyAll.usedPercent < 0)) { out.push({ name: a.name, why: "malformed weekly percent" }); continue; }

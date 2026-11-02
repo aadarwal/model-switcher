@@ -449,6 +449,13 @@ test("noninteractive aliases and internal subcommands are left alone from the ol
   }
 });
 
+test("Codex 0.164+'s migrate-nfs-db is a command, not a prompt", () => {
+  for (const version of ["0.164.0", "0.166.0"]) {
+    const command = ["codex", "migrate-nfs-db", "--help"];
+    assert.deepEqual(withNoDaemon(command, version), command, version);
+  }
+});
+
 test("a former command name remains a prompt, and the desktop app is a command only where Codex compiles it", () => {
   for (const version of ["0.157.0", "0.160.0", "0.162.1"]) {
     assert.deepEqual(withNoDaemon(["codex", "mcp-server"], version), ["codex", "--no-daemon", "mcp-server"]);

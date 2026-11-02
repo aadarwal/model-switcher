@@ -82,7 +82,7 @@ export const CODEX_NO_DAEMON_SINCE = "0.157.0";
 const NOT_THE_TUI = new Set([
   "exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "completion",
   "update", "doctor", "sandbox", "debug", "apply", "a", "queue", "archive", "delete", "migrate-rollouts",
-  "unarchive", "cloud", "cloud-tasks", "exec-server", "features", "help", "agents",
+  "migrate-nfs-db", "unarchive", "cloud", "cloud-tasks", "exec-server", "features", "help", "agents",
   "tcp-tunnel", "execpolicy", "responses-api-proxy", "stdio-to-uds",
 ]);
 

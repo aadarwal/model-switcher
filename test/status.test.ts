@@ -558,9 +558,19 @@ test("ms status and JSON pool counts match account states and warn about the las
   assert.match(text.stdout, /LAST ACCOUNT WITH ROOM \(dirk, 5H 42\.5% used\)/);
 });
 
+test("status counts a Claude reading with only weekly windows as room (the 5 h limit left the usage API)", async () => {
+  const { env } = await world({ panes: [], screens: {} });
+  const limits = [{ kind: "weekly_all", percent: 10, resets_at: "2026-11-04T21:00:00Z" }, { kind: "weekly_scoped", percent: 0, scope: { model: { display_name: "Fable" } } }];
+  const options = env({ MS_TEST_USAGE: JSON.stringify({ "at-dirk": { body: { limits } } }) });
+  const json = run(["status", "--json"], options);
+  assert.equal(json.code, 0, json.stderr);
+  const data = JSON.parse(json.stdout) as import("../src/status.ts").StatusJson;
+  assert.equal(data.accounts.find((a) => a.name === "dirk")?.state, "ok", json.stdout);
+  assert.ok((data.pools.claude?.withRoom ?? 0) >= 1, json.stdout);
+});
+
 for (const [description, limits] of [
   ["empty limits", []],
-  ["a missing session", [{ kind: "weekly_all", percent: 10 }]],
   ["a missing week", [{ kind: "session", percent: 10 }]],
   ["a malformed session", [{ kind: "session", percent: "broken" }, { kind: "weekly_all", percent: 10 }]],
   ["a nonfinite week", [{ kind: "session", percent: 10 }, { kind: "weekly_all", percent: "Infinity" }]],

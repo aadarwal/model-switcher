@@ -176,6 +176,30 @@ test("better-budget destinations can have one Codex window and still honor their
   assert.deepEqual(to(51), { move: false, better: "there", reason: "neither condition holds" });
 });
 
+test("Claude readings with no session window still rebalance on their weekly window", () => {
+  const near = decide(input({
+    accounts: [
+      acct("here", { session: null, weeklyAll: w(90, at(60)) }),
+      acct("there", { session: null, weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.deepEqual(near, { move: true, to: "there", better: "there", reason: "imminent-wall" });
+  const fine = decide(input({
+    accounts: [
+      acct("here", { session: null, weeklyAll: w(20, at(60)) }),
+      acct("there", { session: null, weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.deepEqual(fine, { move: false, better: "there", reason: "neither condition holds" });
+  const noWeek = decide(input({
+    accounts: [
+      acct("here", { session: null, weeklyAll: null }),
+      acct("there", { session: null, weeklyAll: w(20, at(48)) }),
+    ],
+  }));
+  assert.deepEqual(noWeek, { move: false, better: "there", reason: "the current account has no usable reading" });
+});
+
 test("rebalance does not judge a malformed single Codex budget as capacity", () => {
   const d = decide(input({
     session: sess({ provider: "codex" }),

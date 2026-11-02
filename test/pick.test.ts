@@ -85,14 +85,20 @@ test("parseNeed", () => {
   assert.equal(parseNeed(undefined), "any"); assert.equal(parseNeed("fable"), "fable"); assert.equal(parseNeed("fabel"), null);
 });
 
-test("a Codex account with no session window (Pro plans) is eligible on its weekly window; Claude still needs both", () => {
+test("an account with no session window is eligible on its weekly window: Codex Pro, and Claude since the 5 h limit left its usage API", () => {
   const weekly = { usedPercent: 30, resetsAt: "2026-09-21T11:00:00Z" };
   const r = pickAccounts([
     { name: "pro", provider: "codex", shared: false, reservePercent: 0, session: null, weeklyAll: weekly, weeklyFable: null, error: null },
     { name: "cl", provider: "claude", shared: false, reservePercent: 0, session: null, weeklyAll: weekly, weeklyFable: weekly, error: null },
   ], "any");
-  assert.deepEqual(r.picks.map((p) => p.name), ["pro"]);
-  assert.deepEqual(r.out, [{ name: "cl", why: "no session window" }]);
+  assert.deepEqual(r.picks.map((p) => p.name).sort(), ["cl", "pro"]);
+  assert.deepEqual(r.out, []);
+  assert.deepEqual(pickAccounts([{ name: "cl", provider: "claude", shared: false, reservePercent: 0, session: null, weeklyAll: weekly, weeklyFable: weekly, error: null }], "fable").picks.map((p) => p.name), ["cl"]);
+  // The week stays required for Claude: an empty reading is still refused.
+  const empty = pickAccounts([{ name: "cl", provider: "claude", shared: false, reservePercent: 0, session: null, weeklyAll: null, weeklyFable: null, error: null }], "any");
+  assert.deepEqual(empty.out, [{ name: "cl", why: "no weekly window" }]);
+  const fullWeek = pickAccounts([{ name: "cl", provider: "claude", shared: false, reservePercent: 0, session: null, weeklyAll: { usedPercent: 100, resetsAt: null }, weeklyFable: weekly, error: null }], "any");
+  assert.deepEqual(fullWeek.out, [{ name: "cl", why: "weekly window at 100" }]);
   const walled = pickAccounts([{ name: "pro", provider: "codex", shared: false, reservePercent: 0, session: null, weeklyAll: { usedPercent: 100, resetsAt: null }, weeklyFable: null, error: null }], "any");
   assert.deepEqual(walled.out, [{ name: "pro", why: "weekly window at 100" }]);
 });

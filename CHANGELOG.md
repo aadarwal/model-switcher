@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.4.4 — 2026-11-01
+
+### Claude launches work again now that the 5 h window is gone
+
+- Rank a Claude account on its weekly window when the usage API reports no
+  5 h window. By 2026-11-01, Claude's usage API had stopped reporting the 5 h
+  limit for every account: `five_hour` is null, and `limits` holds only the
+  weekly and Fable entries. ms still required a session window for Claude, so
+  `ms claude` (and HOMI's `cxx`) failed with "no account has room". Every
+  account showed as `transient`, and rebalance judged nothing. A missing session
+  window is now treated as it already was for Codex Pro plans. A session
+  window that is reported still gates, and the weekly window is still
+  required, so an empty or broken reading is still refused.
+- Leave Codex 0.164+'s experimental `migrate-nfs-db` subcommand alone instead
+  of adding the TUI-only `--no-daemon` flag to it. This fixes the nightly
+  canary failures (#58, #61, #62).
+
 ## 0.4.3 — 2026-10-27
 
 ### Launching from outside tmux works beside a window named "ms"

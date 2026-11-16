@@ -11,6 +11,9 @@ export const exactSession = (name: string): string => `=${name}`;
  *  its next free index (see `Tmux.newWindow`). */
 export const sessionWindowTarget = (name: string): string => `=${name}:`;
 
+/** A target-window for index `index` of the session named exactly `name`. */
+export const sessionWindowAt = (name: string, index: number): string => `=${name}:${index}`;
+
 /**
  * Which tmux server a launch or an import from this shell lands on — one rule,
  * asked by `ms claude`/`ms codex`, `ms import` and `ms attach` alike:
@@ -55,6 +58,22 @@ export function shellWord(w: string): string {
 /** `tmux ls` as the human should type it for one server. */
 export function tmuxCommandFor(socket: string | null, rest: string): string {
   return socket ? `tmux -S ${shellWord(socket)} ${rest}` : `tmux ${rest}`;
+}
+
+export type PaneLocation = { session: string; windowIndex: number; windowName: string | null };
+
+/** Session (its group's name when it has one), window index, and the window's
+ *  name when it is not an automatic one. Tab-separated; the name is last
+ *  because it is the only field that may itself hold a tab. */
+export const PANE_LOCATION_FORMAT = "#{?session_group,#{session_group},#{session_name}}\t#{window_index}\t#{?automatic-rename,,#{window_name}}";
+
+/** One `PANE_LOCATION_FORMAT` answer. Null for anything that is not one — an
+ *  empty line, a tmux that answered a different question — never a guess. */
+export function parsePaneLocation(line: string): PaneLocation | null {
+  const [session, index, ...name] = line.split("\t");
+  if (!session || index === undefined || !/^\d+$/.test(index)) return null;
+  const windowName = name.join("\t");
+  return { session, windowIndex: Number(index), windowName: windowName === "" ? null : windowName };
 }
 
 export class Tmux {
@@ -201,6 +220,36 @@ export class Tmux {
     const v = r.stdout.trim();
     return v === "1" ? true : v === "0" ? false : null;
   }
+  /**
+   * Where one pane sits: its session, its window's index there and the
+   * window's name. Null when tmux did not answer or answered with no session.
+   *
+   * The session is the GROUP's name when the pane's session belongs to one. A
+   * terminal tab that attaches through `new-session -t ms` gets a session of
+   * its own (`tab-…`) sharing every window of `ms`, and `display-message -t
+   * <pane>` may name either; the group name is the one that is still there
+   * after the tab is closed. Window indexes are the same across a group.
+   *
+   * The name is null while tmux is still naming the window itself
+   * (`automatic-rename`): that name is whatever runs in the pane this second
+   * (`zsh`, a version number), and a window re-created with it via `-n` would
+   * be pinned to it for good. Only a name somebody chose is worth keeping.
+   */
+  paneLocation(pane: string): PaneLocation | null {
+    const r = this.run(["display-message", "-p", "-t", pane, PANE_LOCATION_FORMAT]);
+    if (r.code !== 0) return null;
+    return parsePaneLocation(r.stdout.replace(/\r?\n$/, ""));
+  }
+  /** Every window of the session named exactly `name`, in index order; empty
+   *  when there is no such session (or no server). */
+  windows(name: string): { index: number; name: string }[] {
+    const r = this.run(["list-windows", "-t", exactSession(name), "-F", "#{window_index}\t#{window_name}"]);
+    if (r.code !== 0) return [];
+    return r.stdout.split("\n").filter((l) => l !== "").map((l) => {
+      const [index, ...rest] = l.split("\t");
+      return { index: Number(index), name: rest.join("\t") };
+    }).filter((w) => Number.isInteger(w.index)).sort((a, b) => a.index - b.index);
+  }
   setPaneOption(pane: string, name: string, value: string): void { this.must(["set-option", "-p", "-t", pane, name, value]); }
   unsetPaneOption(pane: string, name: string): void { this.run(["set-option", "-pu", "-t", pane, name]); }
   paneOptions(pane: string): Record<string, string> {
@@ -242,12 +291,34 @@ export class Tmux {
    * empty, which is how a pane is born holding the human's own shell
    * (`ms import` types into that shell).
    */
-  newWindow(target: string, cwd: string, command: string[], name?: string): string {
+  newWindow(target: string, cwd: string, command: string[], name?: string, detached = false): string {
     return this.must([
-      "new-window", "-P", "-F", "#{pane_id}", "-t", target, "-c", cwd,
+      "new-window", ...(detached ? ["-d"] : []), "-P", "-F", "#{pane_id}", "-t", target, "-c", cwd,
       ...(name ? ["-n", name] : []), ...(command.length ? [shellQuote(command)] : []),
     ]).trim();
   }
+  /** `$TERM` of the client this command runs for (`xterm-ghostty`,
+   *  `xterm-256color`, …): inside tmux, the one honest statement of which
+   *  terminal the human is looking through, since every other variable there
+   *  is the tmux server's. Null when tmux did not say. */
+  clientTermname(): string | null {
+    const r = this.run(["display-message", "-p", "#{client_termname}"]);
+    const v = r.stdout.trim();
+    return r.code === 0 && v ? v : null;
+  }
+  /** This server's own socket path, or null when it did not answer. */
+  ownSocketPath(): string | null {
+    const r = this.run(["display-message", "-p", "#{socket_path}"]);
+    const v = r.stdout.trim();
+    return r.code === 0 && v ? v : null;
+  }
+  /** Take one pane away (and its window, when it was the only pane). Best
+   *  effort: a pane that is already gone is the outcome asked for. */
+  killPane(pane: string): void { this.run(["kill-pane", "-t", pane]); }
+  /** Move the window holding `pane` to `target` (a target-window). False when
+   *  tmux refused — the index is taken, the pane is gone — which leaves the
+   *  window where it was. */
+  moveWindow(pane: string, target: string): boolean { return this.run(["move-window", "-d", "-s", pane, "-t", target]).code === 0; }
   /** A session named exactly `name`. Without the `=`, tmux also answers for
    *  any session `name` is a prefix of: "ms" found "msdebug2". */
   hasSession(name: string): boolean { return this.run(["has-session", "-t", exactSession(name)]).code === 0; }
@@ -275,6 +346,30 @@ export class Tmux {
   // The one deliberately unbounded call: an interactive attach lives as long as the session.
   attach(name: string): number {
     const r = spawnSync("tmux", [...this.base(), "attach-session", "-t", exactSession(name)], { stdio: "inherit", env: this.env() });
+    return r.status ?? 1;
+  }
+  /**
+   * Attach this terminal to ONE window of `session`, as a tab of its own.
+   *
+   * Through a new session in `session`'s group (`new-session -t`), which
+   * shares every window and keeps its own current one: two terminals attached
+   * to the same session follow each other from window to window, two attached
+   * through grouped sessions do not. `destroy-unattached` takes the extra
+   * session away when the tab closes, so closing a tab detaches and leaves
+   * nothing behind — the windows belong to `session`.
+   *
+   * `name` is the new session's; the caller makes it unique. Unbounded for the
+   * same reason `attach` is.
+   */
+  attachWindow(session: string, windowIndex: number, name: string): number {
+    const r = spawnSync("tmux", [
+      ...this.base(),
+      "new-session", "-t", exactSession(session), "-s", name, ";",
+      "select-window", "-t", sessionWindowAt(name, windowIndex), ";",
+      // A bare name here: `set-option -t` does not take the `=` form (checked
+      // on tmux 3.8, "no such session: =name"), and the name is ours.
+      "set-option", "-t", name, "destroy-unattached", "on",
+    ], { stdio: "inherit", env: this.env() });
     return r.status ?? 1;
   }
 }

@@ -40,7 +40,25 @@ export type SessionRow = { id: string; provider: Provider; cliSessionId: string 
    *  still rotates it, and every account change — a rotation, `ms rotate`,
    *  `ms switch` — writes null here in the same update that moves `account`
    *  (src/recover.ts): the pin lasts until the first wall, and no longer. */
-  pinnedAccount: string | null };
+  pinnedAccount: string | null;
+  /** Where the pane sat when it was last seen: the tmux session (its GROUP
+   *  name when it has one, so a per-tab grouped session reads as the session
+   *  it mirrors), the window's index there and the window's name. A pane id
+   *  means nothing once its server is gone; these three are what `ms restore`
+   *  (src/restore.ts) puts a conversation back by. Written at launch and
+   *  refreshed by reconciliation while the pane is present; null on a row
+   *  written before layouts were recorded and on one whose pane tmux never
+   *  described. */
+  tmuxSession: string | null;
+  windowIndex: number | null;
+  windowName: string | null;
+  /** When reconciliation closed this row out BECAUSE ITS TMUX SERVER WAS GONE
+   *  (nothing listening on its socket, or a different server there), in unix
+   *  seconds; null for every other ending — `ms stop`, an `/exit`, a pane the
+   *  human closed on a server that is still up. It is the difference between
+   *  "this stopped" and "this was taken down with everything else", which is
+   *  exactly the set `ms restore` brings back. */
+  lostAt: number | null };
 export type LaunchRow = { id: string; sessionId: string; generation: number; account: string; command: string[]; env: LaunchEnvironment; createdAt: number };
 export type WallKind = "session" | "weekly" | "fable" | "unknown";
 export type RecoveryRow = { id: number; sessionId: string; generation: number; turnId: string | null; kind: WallKind;
@@ -75,6 +93,7 @@ const SESSION_COLUMNS = new Set<string>([
   "provider", "cliSessionId", "cwd", "socket", "pane", "serverStart", "need",
   "account", "generation", "state", "desired", "flags", "wakeupAt",
   "transcriptPath", "rolloutOffset", "lastMoveAt", "pinnedAccount",
+  "tmuxSession", "windowIndex", "windowName", "lostAt",
 ]);
 
 /**
@@ -94,6 +113,10 @@ const ADDED_SESSION_COLUMNS: readonly [string, string][] = [
   ["rolloutOffset", "rolloutOffset INTEGER NOT NULL DEFAULT 0"],
   ["lastMoveAt", "lastMoveAt INTEGER"],
   ["pinnedAccount", "pinnedAccount TEXT"],
+  ["tmuxSession", "tmuxSession TEXT"],
+  ["windowIndex", "windowIndex INTEGER"],
+  ["windowName", "windowName TEXT"],
+  ["lostAt", "lostAt INTEGER"],
 ];
 
 function isUniqueConstraintError(e: unknown): boolean {
@@ -146,7 +169,7 @@ export class State {
    * same reason: a session that was only just created has never been moved.
    * `pinnedAccount` is optional rather than absent: only a hand-picked launch
    * (`ms claude mesh`) has one to give, and every other caller leaves it null. */
-  createSession(s: Omit<SessionRow, "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset" | "lastMoveAt" | "pinnedAccount">
+  createSession(s: Omit<SessionRow, "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset" | "lastMoveAt" | "pinnedAccount" | "tmuxSession" | "windowIndex" | "windowName" | "lostAt">
     & { pinnedAccount?: string | null }): void {
     const t = now();
     this.db.prepare(`INSERT INTO sessions (id,provider,cliSessionId,cwd,socket,pane,serverStart,need,account,generation,state,desired,flags,wakeupAt,createdAt,updatedAt,pinnedAccount)
@@ -222,6 +245,16 @@ export class State {
     const rec = this.pendingRecovery(id);
     if (rec) this.finishRecovery(rec.id, "obsolete");
     this.db.prepare("UPDATE sessions SET state='stopped', desired='stopped', wakeupAt=NULL, updatedAt=? WHERE id=?").run(now(), id);
+  }
+  /**
+   * Where the session's pane was last seen (`SessionRow.tmuxSession` and the
+   * two beside it). Its own statement, and one that leaves `updatedAt` alone:
+   * that stamp is what "stuck for N minutes" is measured from
+   * (src/reconcile.ts), and a window the human renamed or moved is not the
+   * session doing anything.
+   */
+  setLayout(id: string, at: { session: string; windowIndex: number; windowName: string | null }): void {
+    this.db.prepare("UPDATE sessions SET tmuxSession=?, windowIndex=?, windowName=? WHERE id=?").run(at.session, at.windowIndex, at.windowName, id);
   }
   updateSession(id: string, patch: Partial<SessionRow>): void {
     const cols = Object.keys(patch).filter((k) => SESSION_COLUMNS.has(k));

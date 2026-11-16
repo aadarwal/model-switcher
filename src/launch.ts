@@ -47,7 +47,8 @@ import { RELEASE_BUDGET_MS, probeConversation, waitForWriterRelease, writerLockD
 import { ensureCodexReady } from "./hooks/codex-install.ts";
 import { chooseAccount } from "./mesh.ts";
 import { CONTINUATION, logLine } from "./recover.ts";
-import { currentPane, outsideServer, sessionWindowTarget, shellWord, tmuxCommandFor, tmuxFor, tmuxFromEnv } from "./tmux.ts";
+import { currentPane, outsideServer, sessionWindowAt, sessionWindowTarget, shellWord, targetServer, tmuxCommandFor, tmuxFor, tmuxFromEnv, type Tmux } from "./tmux.ts";
+import { openTabs, tabsContext } from "./tabs.ts";
 
 /** Exit codes, fixed by spec §7 so a caller can branch on them. */
 const EXIT_OK = 0;
@@ -349,16 +350,50 @@ export function usageUnreachable(rows: AccountUsage[], inputs: PickInput[]): boo
  *
  * A session that is not there is a refusal, with the `tmux ls` that shows what
  * is: nothing of ours is resident, so there is nothing else to interpret.
+ *
+ * Two forms put the arrangement on screen back rather than one client:
+ *
+ *   * `--window <index>` attaches this terminal to that one window as a tab of
+ *     its own (`Tmux.attachWindow`): several terminals on one session each
+ *     keep their own current window, and closing one only detaches;
+ *   * `--tabs` opens a terminal tab per window of the session, each running
+ *     the form above (src/tabs.ts) — or prints those commands when this
+ *     terminal cannot be told to open tabs. It attaches nothing itself, so it
+ *     is the one form that also works from inside tmux.
  */
 export const attachVerb: Verb = async (argv) => {
-  if (argv.length > 1 || (argv[0] ?? "").startsWith("-")) {
-    process.stderr.write(`ms attach: unexpected argument ${JSON.stringify(argv[argv.length > 1 ? 1 : 0])}\nusage: ms attach [session]\n`);
+  const usage = "usage: ms attach [--window <index> | --tabs] [session]";
+  let window: number | null = null;
+  let tabs = false;
+  const names: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--tabs") { tabs = true; continue; }
+    if (a === "--window" || a.startsWith("--window=")) {
+      const v = a.startsWith("--window=") ? a.slice("--window=".length) : argv[++i];
+      if (v === undefined || !/^\d+$/.test(v)) {
+        process.stderr.write(`ms attach: --window needs a window index\n${usage}\n`);
+        return EXIT_USAGE_ERROR;
+      }
+      window = Number(v);
+      continue;
+    }
+    if (a.startsWith("-") || names.length) {
+      process.stderr.write(`ms attach: unexpected argument ${JSON.stringify(a)}\n${usage}\n`);
+      return EXIT_USAGE_ERROR;
+    }
+    names.push(a);
+  }
+  if (tabs && window !== null) {
+    process.stderr.write(`ms attach: --tabs opens every window; drop --window or drop --tabs\n${usage}\n`);
     return EXIT_USAGE_ERROR;
   }
-  const name = argv[0] ?? TOOL_SESSION;
-  const target = outsideServer();
+  const name = names[0] ?? TOOL_SESSION;
+  // `--tabs` attaches nothing itself, so inside tmux it means the server the
+  // human is standing in; every other form is the way back from OUTSIDE.
+  const target = tabs ? targetServer() : outsideServer();
   const where = target.socket ? `the tmux server on ${target.socket}` : "the default tmux server";
-  if (process.env.TMUX) {
+  if (process.env.TMUX && !tabs) {
     process.stderr.write(`ms attach: already inside tmux; detach first, or: tmux switch-client -t ${shellWord(name)}\n`);
     return EXIT_USAGE_ERROR;
   }
@@ -366,6 +401,18 @@ export const attachVerb: Verb = async (argv) => {
   if (!tmux.hasSession(name)) {
     process.stderr.write(`ms attach: no session "${name}" on ${where}; see what is there with: ${tmuxCommandFor(target.socket, "ls")}\n`);
     return EXIT_ACCOUNT;
+  }
+  if (tabs) {
+    const windows = tmux.windows(name);
+    openTabs(windows.map((w) => ({ session: name, windowIndex: w.index })), { msBin: msBinary(), shell: process.env.SHELL || "/bin/sh", ...tabsContext() });
+    return EXIT_OK;
+  }
+  if (window !== null) {
+    if (!tmux.windows(name).some((w) => w.index === window)) {
+      process.stderr.write(`ms attach: session "${name}" has no window ${window}; see them with: ${tmuxCommandFor(target.socket, `list-windows -t ${shellWord(name)}`)}\n`);
+      return EXIT_ACCOUNT;
+    }
+    return tmux.attachWindow(name, window, `${name}-tab-${window}-${process.pid}`);
   }
   return tmux.attach(name);
 };
@@ -430,6 +477,18 @@ export type LaunchExtras = {
    *  normally leaves null until its hook first reports, which is a row no
    *  rotation could resume in the meantime. */
   resumeId?: string | null;
+  /**
+   * WHERE the pane goes, for a caller that is placing a conversation rather
+   * than starting one where the human stands (`ms restore`, src/restore.ts):
+   * a new window of the tmux session named `session` — made if it is not
+   * there — in `cwd`, named `windowName` and at `windowIndex` when that index
+   * is free. The server is the one the caller is on (`targetServer`).
+   *
+   * Two things a placed launch never does, both because it is one of many:
+   * it never takes over the caller's own pane, even inside tmux, and it never
+   * attaches.
+   */
+  place?: { session: string; cwd: string; windowName: string | null; windowIndex: number | null };
 };
 
 function planFor(provider: Provider, parsed: Parsed, extras: LaunchExtras = {}): ProviderPlan {
@@ -657,7 +716,8 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   if (noRoom) say(`${account} has no room (${noRoom}) — launching anyway; the first wall will rotate it`);
 
   const msBin = msBinary();
-  const cwd = process.cwd();
+  const place = extras.place ?? null;
+  const cwd = place?.cwd ?? process.cwd();
 
   // The account's own home, made ready for THIS directory, before a row is
   // written or a pane is touched: a launch that cannot prepare the home has
@@ -696,8 +756,8 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   const command = plan.command(cliSessionId, cliArgs);
   // A hand pick says so on the one line the human reads.
   const label = `${plan.label(need)}${pinned ? ", pinned" : ""}`;
-  const inside = !!process.env.TMUX && !!process.env.TMUX_PANE;
-  const outside = outsideServer();
+  const inside = !place && !!process.env.TMUX && !!process.env.TMUX_PANE;
+  const outside = place ? targetServer() : outsideServer();
   const tmux = inside ? tmuxFromEnv() : tmuxFor(outside);
   // Inside tmux the socket is `$TMUX`'s. Outside, it is the override's — or,
   // on the default server, read off the server once the pane exists (below):
@@ -734,6 +794,7 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
       st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: launchEnv, createdAt: nowSeconds() });
       retireSuperseded(st, { id: sessionId, socket, pane, serverStart });
 
+      rememberLayout(st, tmux, sessionId, pane);
       tmux.remainOnExit(pane, true);
       tmux.setPaneOption(pane, "@ms_session", sessionId);
       tmux.setPaneDiedHook(pane, [msBin, "_pane_died", sessionId]);
@@ -755,19 +816,32 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     //   * `remain-on-exit` and the pane-died hook are in place before the CLI
     //     starts, so an `_exec` that fails immediately leaves a dead pane the
     //     hook can report, rather than a vanished pane and an orphaned row.
-    const pane = tmux.hasSession(TOOL_SESSION)
-      ? tmux.newWindow(sessionWindowTarget(TOOL_SESSION), cwd, PLACEHOLDER)
-      : tmux.newSession(TOOL_SESSION, cwd, PLACEHOLDER);
+    const pane = place
+      ? placedPane(tmux, place)
+      : tmux.hasSession(TOOL_SESSION)
+        ? tmux.newWindow(sessionWindowTarget(TOOL_SESSION), cwd, PLACEHOLDER)
+        : tmux.newSession(TOOL_SESSION, cwd, PLACEHOLDER);
     if (!socket) socket = tmux.socketPath(pane) ?? "";
-    const serverStart = tmux.serverIdentity();
-    st.createSession({
-      id: sessionId, provider, cliSessionId, cwd, socket, pane, serverStart,
-      need, account, generation: 1, state: "launching", desired: "running", flags: parsed.args,
-      pinnedAccount: pinned ? account : null,
-    });
-    st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: launchEnv, createdAt: nowSeconds() });
+    let serverStart: string;
+    try {
+      serverStart = tmux.serverIdentity();
+      st.createSession({
+        id: sessionId, provider, cliSessionId, cwd, socket, pane, serverStart,
+        need, account, generation: 1, state: "launching", desired: "running", flags: parsed.args,
+        pinnedAccount: pinned ? account : null,
+      });
+      st.createLaunch({ id: launchId, sessionId, generation: 1, account, command, env: launchEnv, createdAt: nowSeconds() });
+    } catch (e) {
+      // A placed launch is one of many, and its window holds the index the
+      // conversation is to come back at: a placeholder left behind with no row
+      // would keep that index from the retry, for good. (Once the row is
+      // written the pane is accounted for, and reconciliation owns it.)
+      if (place) tmux.killPane(pane);
+      throw e;
+    }
     retireSuperseded(st, { id: sessionId, socket, pane, serverStart });
 
+    rememberLayout(st, tmux, sessionId, pane);
     tmux.remainOnExit(pane, true);
     tmux.setPaneOption(pane, "@ms_session", sessionId);
     tmux.setPaneDiedHook(pane, [msBin, "_pane_died", sessionId]);
@@ -775,6 +849,8 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
     remember?.();
     process.stderr.write(`ms: ${account} (${label}) → pane ${pane}\n`);
     st.close(); // the attach below lasts as long as the session does
+    // A placed launch is one of several and its caller says where they went.
+    if (place) return EXIT_OK;
 
     // The launch has already happened. An attach that fails — no terminal, a
     // caller that is a script — is not a failed launch, so it must not become
@@ -786,6 +862,40 @@ export async function launchWith(provider: Provider, argv: string[], extras: Lau
   } finally {
     st.close(); // idempotent
   }
+}
+
+/**
+ * The pane for a placed launch (`LaunchExtras.place`): a new window of the
+ * named session, holding the placeholder.
+ *
+ * The window goes back at the index it is asked for when that index is free.
+ * In a session that already exists the index is given to `new-window` itself;
+ * in one this call makes, tmux puts the first window at its own base index and
+ * the window is moved afterwards. An index that is taken is not an error: the
+ * window goes to the next free one, which is where tmux would have put it.
+ */
+function placedPane(tmux: Tmux, place: NonNullable<LaunchExtras["place"]>): string {
+  const { session, cwd, windowName, windowIndex } = place;
+  const name = windowName ?? undefined;
+  if (!tmux.hasSession(session)) {
+    const pane = tmux.newSession(session, cwd, PLACEHOLDER, name);
+    if (windowIndex !== null && tmux.paneLocation(pane)?.windowIndex !== windowIndex) tmux.moveWindow(pane, sessionWindowAt(session, windowIndex));
+    return pane;
+  }
+  const free = windowIndex !== null && !tmux.windows(session).some((w) => w.index === windowIndex);
+  // Detached: a restore makes many windows, and each one made current would
+  // flip the view of whoever is attached to the session, once per window.
+  return tmux.newWindow(free ? sessionWindowAt(session, windowIndex!) : sessionWindowTarget(session), cwd, PLACEHOLDER, name, true);
+}
+
+/** Note where the new pane sits (src/state.ts `tmuxSession`), so a server
+ *  that dies before any verb reconciles still leaves a layout to restore.
+ *  Best effort: a launch is not worth failing over a note. */
+function rememberLayout(st: State, tmux: Tmux, sessionId: string, pane: string): void {
+  try {
+    const at = tmux.paneLocation(pane);
+    if (at) st.setLayout(sessionId, at);
+  } catch { /* reconciliation writes it on the next public verb */ }
 }
 
 /**

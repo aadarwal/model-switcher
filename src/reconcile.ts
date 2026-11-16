@@ -43,7 +43,7 @@ import type { Verb } from "./cli.ts"; // type-only: erased, no import cycle at r
 import { acquire, sweepStaleLocks, type Release } from "./lock.ts";
 import { ensureSessionDir, msBinary, p } from "./paths.ts";
 import { openState, type RecoveryRow, type SessionRow, type State } from "./state.ts";
-import { Tmux } from "./tmux.ts";
+import { PANE_LOCATION_FORMAT, parsePaneLocation, Tmux, type PaneLocation } from "./tmux.ts";
 
 /** A handoff or a launch that has not produced its event in this long has
  * failed in a way nothing else will report: park it for the human. */
@@ -118,7 +118,11 @@ export function ownerDead(owner: string | null): boolean {
  * question could not be answered at all — never "nothing there". `gone` is the
  * one failure that IS an answer: tmux said no server is listening on the
  * socket, so every pane ever recorded on it is gone with it. */
-type Look = { identity: string | null; panes: Set<string> | null; problem: string | null; gone: boolean };
+type Look = { identity: string | null; panes: Set<string> | null; problem: string | null; gone: boolean;
+  /** Where each listed pane sits, for the panes whose line said (src/tmux.ts
+   *  `PANE_LOCATION_FORMAT`). Read in the same `list-panes` that names them,
+   *  so remembering a session's layout costs no tmux call of its own. */
+  where: Map<string, PaneLocation> };
 
 /** The one line reconciliation reports for a socket it could not read. */
 const lookNote = (look: Look): string | null => (look.problem ? `${look.problem}; nothing repaired there` : null);
@@ -169,12 +173,25 @@ class Servers {
     // orphaned, `ms doctor --fix` repaired none of them, and `ms status`
     // counted them as sessions nothing would ever rotate (issue #21).
     const state = t.serverState();
-    if (state === "gone") return { identity: null, panes: new Set(), problem: null, gone: true };
-    if (state === "unreadable") return { identity: null, panes: null, problem: `could not read the tmux server on ${where}`, gone: false };
+    const nowhere = new Map<string, PaneLocation>();
+    if (state === "gone") return { identity: null, panes: new Set(), problem: null, gone: true, where: nowhere };
+    if (state === "unreadable") return { identity: null, panes: null, problem: `could not read the tmux server on ${where}`, gone: false, where: nowhere };
     const identity = state.up;
-    const r = t.run(["list-panes", "-a", "-F", "#{pane_id}"]);
-    if (r.code !== 0) return { identity, panes: null, problem: `could not list panes on ${where}`, gone: false };
-    return { identity, panes: new Set(r.stdout.split("\n").map((x) => x.trim()).filter(Boolean)), problem: null, gone: false };
+    const r = t.run(["list-panes", "-a", "-F", `#{pane_id}\t${PANE_LOCATION_FORMAT}`]);
+    if (r.code !== 0) return { identity, panes: null, problem: `could not list panes on ${where}`, gone: false, where: nowhere };
+    const panes = new Set<string>();
+    const at = new Map<string, PaneLocation>();
+    for (const line of r.stdout.split("\n")) {
+      const cut = line.indexOf("\t");
+      const pane = (cut < 0 ? line : line.slice(0, cut)).trim();
+      if (!pane) continue;
+      panes.add(pane);
+      // A pane in a session group is listed once per session of the group, and
+      // every one of those lines resolves to the same group name and index.
+      const loc = cut < 0 ? null : parsePaneLocation(line.slice(cut + 1));
+      if (loc && !at.has(pane)) at.set(pane, loc);
+    }
+    return { identity, panes, problem: null, gone: false, where: at };
   }
 }
 
@@ -293,9 +310,37 @@ function goneWhy(s: SessionRow, look: Look): string {
   return `it is not on the tmux server on ${where}`;
 }
 
+/**
+ * Keep the row's record of where its pane sits in step with what tmux just
+ * said. A pane id dies with its server; session, window index and window name
+ * are what `ms restore` (src/restore.ts) puts the conversation back by.
+ * Written only when it changed, and never for a pane tmux did not describe.
+ */
+function rememberLayout(st: State, s: SessionRow, look: Look): void {
+  const at = look.where.get(s.pane);
+  if (!at) return;
+  if (s.tmuxSession === at.session && s.windowIndex === at.windowIndex && s.windowName === at.windowName) return;
+  st.setLayout(s.id, at);
+}
+
+/** Did the pane go because its whole SERVER did? True for a socket nobody is
+ *  listening on and for a different server answering there; false for a pane
+ *  that is merely missing from a server that is still the same one, and for a
+ *  row that never recorded which server it was on (there is nothing to group
+ *  it with, so `ms restore` could never offer it).
+ *
+ *  This cannot tell a crash from a server the human shut down: tmux exits when
+ *  its last window closes, and a `kill-server` looks the same from here. Both
+ *  are stamped; the plan `ms restore` prints, and its question, are the check. */
+const serverLost = (s: SessionRow, look: Look): boolean =>
+  !!s.serverStart && (look.gone || (look.identity !== null && look.identity !== s.serverStart));
+
 /** (c) The pane is gone, so the session is over however it ended. */
 function stopGone(st: State, s: SessionRow, look: Look): string[] {
   closeOut(st, s);
+  // Taken down with its server, as opposed to ended: the one fact `ms restore`
+  // selects on, and nothing after this pass could reconstruct it.
+  if (serverLost(s, look)) st.updateSession(s.id, { lostAt: Math.floor(Date.now() / 1000) });
   const why = goneWhy(s, look);
   log(s.id, s.generation, `pane ${s.pane} is gone (${why}); marked stopped`);
   return [`session ${s.id}: pane ${s.pane} is gone (${why}), marked stopped`];
@@ -682,6 +727,7 @@ export function reconcile(): string[] {
           out.push(...stopGone(st, s, look)); // (c) — nothing else is worth asking about a gone pane
           continue;
         }
+        if (presence === "present") rememberLayout(st, s, look);
         if (s.state === "stopping") {
           out.push(...abandonedStopping(st, servers, s, presence)); // (g)
           continue;

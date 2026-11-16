@@ -65,6 +65,11 @@ globalThis.fetch = async (url, init = {}) => {
  *  identity query and the `-P -F #{pane_id}` spawns with a pane id, and says
  *  one terminal client is attached (the `mesh` picker's popup check).
  *
+ *  A pane's location (session, window index, window name) is
+ *  `MS_TMUX_LOCATION` and a session's windows are `MS_TMUX_WINDOWS`, both
+ *  written with backslash-t / backslash-n escapes; unset, tmux says nothing,
+ *  which is a pane nobody described and a session with no windows listed.
+ *
  *  `list-panes` answers `MS_TMUX_PANES` (space-separated), empty by default —
  *  every launch reconciles first, and a pane the server does not list is gone.
  *
@@ -74,7 +79,8 @@ globalThis.fetch = async (url, init = {}) => {
 const TMUX_STUB = `printf '%s\\n' "$*" >> "$MS_TMUX_LOG"
 if [ "$1" = "-S" ]; then shift 2; fi
 case "$1" in
-  display-message) case "$*" in *socket_path*) echo "${DEFAULT_SOCKET}" ;; *) echo "${IDENTITY}" ;; esac ;;
+  display-message) case "$*" in *socket_path*) echo "${DEFAULT_SOCKET}" ;; *window_index*) printf '%b\\n' "\${MS_TMUX_LOCATION:-}" ;; *) echo "${IDENTITY}" ;; esac ;;
+  list-windows) [ -z "\${MS_TMUX_WINDOWS:-}" ] || printf '%b\\n' "\${MS_TMUX_WINDOWS}" ;;
   list-clients) echo 0 ;;
   new-session|new-window) echo "%42" ;;
   list-panes) [ -z "\${MS_TMUX_PANES:-}" ] || printf '%s\\n' \${MS_TMUX_PANES} ;;
@@ -699,7 +705,7 @@ test("attach: the default server's ms session, or a named one; refuses with the 
 
   const bad = run(["attach", "a", "b"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(bad.code, 2);
-  assert.match(bad.stderr, /usage: ms attach \[session\]/);
+  assert.match(bad.stderr, /^ms attach: unexpected argument "b"\nusage: ms attach \[--window <index> \| --tabs\] \[session\]$/m);
   const flag = run(["attach", "--all"], w2.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(flag.code, 2);
 });
@@ -713,6 +719,148 @@ test("attach with MS_TMUX_SOCKET: that socket, and the tmux ls for it", async ()
   const r = run(["attach"], w.env({ ...OUTSIDE, MS_TMUX_SOCKET: sock, MS_TMUX_HAS_SESSION: "0" }));
   assert.equal(r.code, 0, r.stderr);
   assert.equal(logLines(w).at(-1), `-S ${sock} attach-session -t =ms`);
+});
+
+/** No terminal this suite could be told to open tabs in: a developer running
+ *  it from Ghostty must not get a window per test. */
+const NO_TERMINAL = { TERM_PROGRAM: "", GHOSTTY_RESOURCES_DIR: "" };
+const TWO_WINDOWS = { MS_TMUX_HAS_SESSION: "0", MS_TMUX_WINDOWS: "0\\tzsh\\n5\\tops" };
+
+test("attach --window: this terminal gets one window, through a grouped session of its own that goes away with the tab", async () => {
+  const w = await world();
+  const r = run(["attach", "--window", "5"], w.env({ ...OUTSIDE, ...TWO_WINDOWS }));
+  assert.equal(r.code, 0, r.stderr);
+  const last = logLines(w).at(-1)!;
+  const m = last.match(/^new-session -t =ms -s (ms-tab-5-\d+) ; select-window -t =(ms-tab-5-\d+):5 ; set-option -t (ms-tab-5-\d+) destroy-unattached on$/);
+  assert.ok(m, last);
+  assert.ok(m![1] === m![2] && m![2] === m![3], "one session name throughout");
+  assert.equal(logLines(w).some((l) => l.includes("attach-session")), false, "the session it attaches is its own, not ms itself");
+
+  const absent = run(["attach", "--window=3", "ms"], w.env({ ...OUTSIDE, ...TWO_WINDOWS }));
+  assert.equal(absent.code, 1);
+  assert.match(absent.stderr, /^ms attach: session "ms" has no window 3; see them with: tmux list-windows -t ms$/m);
+
+  for (const bad of [["attach", "--window"], ["attach", "--window", "two"], ["attach", "--tabs", "--window", "5"]]) {
+    const b = run(bad, w.env({ ...OUTSIDE, ...TWO_WINDOWS }));
+    assert.equal(b.code, 2, `${bad.join(" ")}: ${b.stderr}`);
+    assert.match(b.stderr, /usage: ms attach \[--window <index> \| --tabs\] \[session\]/);
+  }
+});
+
+test("attach --tabs in a terminal that cannot be scripted prints one attach line per window — from inside tmux too, since it attaches nothing itself", async () => {
+  const w = await world();
+  // Inside tmux, on a server that is not the default one: the windows are the
+  // ones on THIS server, and each line carries the socket ms attach must use.
+  const r = run(["attach", "--tabs"], w.env({ ...TWO_WINDOWS, ...NO_TERMINAL }));
+  assert.equal(r.code, 0, r.stderr);
+  const lines = r.stdout.trimEnd().split("\n");
+  assert.equal(lines.length, 2, r.stdout);
+  for (const [i, n] of [[0, 0], [1, 5]] as const) {
+    assert.ok(lines[i]!.startsWith(`MS_TMUX_SOCKET='${TMUX_SOCKET}' `) && lines[i]!.endsWith(`ms attach --window ${n} ms`), lines[i]);
+  }
+  assert.ok(logLines(w).some((l) => l.startsWith(`-S ${TMUX_SOCKET} list-windows -t =ms `)), logLines(w).join("\n"));
+  assert.match(r.stderr, /this terminal cannot be told to open tabs/);
+
+  // Outside tmux, the default server: nothing to say about a socket.
+  const out = await world();
+  const o = run(["attach", "--tabs"], out.env({ ...OUTSIDE, ...TWO_WINDOWS, ...NO_TERMINAL }));
+  assert.equal(o.code, 0, o.stderr);
+  assert.match(o.stdout, /^\S*ms attach --window 0 ms\n\S*ms attach --window 5 ms\n$/);
+  assert.equal(logLines(w).some((l) => l.includes("new-session") || l.includes("attach-session")), false, logLines(w).join("\n"));
+});
+
+// --- ms restore, through the real launch ------------------------------------
+
+const LOST_ID = "11111111-2222-4333-8444-555555555555";
+
+/** A conversation as a dead tmux server leaves it once reconciliation has run:
+ *  stopped, still wanted, stamped lost, with the window it sat in on record. */
+async function plantLost(w: World, over: { flags?: string[] } = {}): Promise<void> {
+  process.env.HOME = w.home; process.env.MS_HOME = w.msHome;
+  const { openState } = await import("../src/state.ts");
+  const st = openState();
+  try {
+    st.createSession({
+      id: "lost-1", provider: "claude", cliSessionId: LOST_ID, cwd: CWD, socket: DEFAULT_SOCKET, pane: "%3",
+      serverStart: "777:1700000000", need: "any", account: "gmail", generation: 1, state: "stopped", desired: "running",
+      flags: over.flags ?? ["--model", "opus", "--resume", "Read the brief."],
+    });
+    st.setLayout("lost-1", { session: "ms", windowIndex: 41, windowName: "reviewer" });
+    st.updateSession("lost-1", { lostAt: Math.floor(Date.now() / 1000) - 60 });
+  } finally {
+    st.close();
+  }
+}
+
+async function rowsOf(w: World) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(path.join(w.msHome, "state.sqlite"));
+  try {
+    return db.prepare("SELECT s.id, s.cliSessionId, s.cwd, s.pane, s.state, s.flags, s.tmuxSession, s.windowIndex, s.windowName, l.command FROM sessions s LEFT JOIN launches l ON l.sessionId = s.id ORDER BY s.createdAt, s.rowid").all() as unknown as
+      { id: string; cliSessionId: string; cwd: string; pane: string; state: string; flags: string; tmuxSession: string | null; windowIndex: number | null; windowName: string | null; command: string | null }[];
+  } finally {
+    db.close();
+  }
+}
+
+test("ms restore --yes: the lost conversation is resumed by its recorded id in a new window at its old index and name, hooked like any launch, and nothing attaches", async () => {
+  const w = await world();
+  await plantLost(w);
+  // From INSIDE tmux, on purpose: a restore must not take the caller's pane.
+  const r = run(["restore", "--yes", "--since", "all"], w.env({ MS_TMUX_HAS_SESSION: "0", MS_TMUX_WINDOWS: "0\\tzsh", MS_TMUX_LOCATION: "ms\\t41\\treviewer" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`^claude {4}${LOST_ID}  unknown {4}ms:41 \\(reviewer\\)  ${esc(CWD)}$`, "m"));
+  assert.match(r.stderr, /^ms restore: 1 of 1 conversation relaunched; see how each came up with: ms status$/m);
+
+  const lines = logLines(w);
+  const made = lines.filter((l) => l.includes("new-window") || l.includes("new-session"));
+  assert.deepEqual(made, [`-S ${TMUX_SOCKET} new-window -d -P -F #{pane_id} -t =ms:41 -c ${CWD} -n reviewer 'sleep' '2147483647'`]);
+  assert.ok(lines.some((l) => new RegExp(`^-S ${esc(TMUX_SOCKET)} respawn-pane -k -c ${esc(CWD)} -t %42 '\\S+' '_exec' '${UUID}'$`).test(l)), lines.join("\n"));
+  assert.ok(lines.includes(`-S ${TMUX_SOCKET} set-option -p -t %42 remain-on-exit on`), "hooked like any launch");
+  assert.equal(lines.some((l) => l.includes("-t %7")), false, `the caller's own pane is not touched:\n${lines.join("\n")}`);
+  assert.equal(lines.some((l) => l.includes("attach-session")), false, "a restore attaches nothing");
+
+  const rows = await rowsOf(w);
+  assert.equal(rows.length, 2);
+  const back = rows[1]!;
+  assert.deepEqual([back.cliSessionId, back.cwd, back.pane, back.tmuxSession, back.windowIndex, back.windowName], [LOST_ID, CWD, "%42", "ms", 41, "reviewer"]);
+  // The picker's bare --resume and the prompt it would have swallowed are
+  // gone; the recorded id is the one resume on the command line.
+  assert.deepEqual(JSON.parse(back.command!), ["claude", "--model", "opus", "--resume", LOST_ID]);
+
+  // Again: it is running now, so a second restore launches nothing.
+  const again = run(["restore", "--yes", "--since", "all"], w.env({ MS_TMUX_HAS_SESSION: "0", MS_TMUX_PANES: "%42" }));
+  assert.equal(again.code, 0, again.stderr);
+  assert.match(again.stdout, new RegExp(`^not restored: ${LOST_ID} \\(${esc(CWD)}\\): already running in pane %42`, "m"));
+  assert.equal((await rowsOf(w)).length, 2);
+});
+
+test("ms restore: an old index that is taken means the next free window; a session that is gone is made, and its first window moved to the old index", async () => {
+  const taken = await world();
+  await plantLost(taken);
+  const r1 = run(["restore", "--yes", "--since", "all"], taken.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0", MS_TMUX_WINDOWS: "0\\tzsh\\n41\\tsomething-else" }));
+  assert.equal(r1.code, 0, r1.stderr);
+  assert.ok(logLines(taken).includes(`new-window -d -P -F #{pane_id} -t =ms: -c ${CWD} -n reviewer 'sleep' '2147483647'`), logLines(taken).join("\n"));
+
+  const fresh = await world();
+  await plantLost(fresh);
+  const r2 = run(["restore", "--yes", "--since", "all"], fresh.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "1", MS_TMUX_LOCATION: "ms\\t0\\treviewer" }));
+  assert.equal(r2.code, 0, r2.stderr);
+  const lines = logLines(fresh);
+  const born = lines.indexOf(`new-session -d -P -F #{pane_id} -s ms -c ${CWD} -n reviewer 'sleep' '2147483647'`);
+  const moved = lines.indexOf(`move-window -d -s %42 -t =ms:41`);
+  assert.ok(born >= 0 && moved > born, lines.join("\n"));
+  assert.equal(lines.some((l) => l.includes("attach-session")), false);
+});
+
+test("ms restore --dry-run changes nothing: no window, no row", async () => {
+  const w = await world();
+  await plantLost(w);
+  const r = run(["restore", "--dry-run", "--since", "all"], w.env({ ...OUTSIDE, MS_TMUX_HAS_SESSION: "0" }));
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(LOST_ID));
+  assert.equal(existsSync(w.log), false, "tmux was not run at all");
+  assert.equal((await rowsOf(w)).length, 1);
 });
 
 test("attach from inside tmux refuses rather than nesting", async () => {

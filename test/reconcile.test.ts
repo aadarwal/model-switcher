@@ -70,7 +70,7 @@ case "$verb" in
     esac ;;
   list-panes)
     if [ "\${MS_TMUX_LIST_FAILS:-0}" = "1" ]; then echo "no server on socket" >&2; exit 1; fi
-    printf '%s\\n' \${MS_TMUX_PANES} ;;
+    if [ -n "\${MS_TMUX_PANE_LINES:-}" ]; then printf '%s\\n' "\$MS_TMUX_PANE_LINES"; else printf '%s\\n' \${MS_TMUX_PANES}; fi ;;
   respawn-pane) echo 0 > "$deadfile" ;;
   run-shell) if [ -n "\${MS_TMUX_ON_RUNSHELL}" ]; then eval "\$MS_TMUX_ON_RUNSHELL"; fi ;;
 esac
@@ -95,6 +95,7 @@ function world(): World {
   process.env.MS_BIN = MS_BIN;
   process.env.SHELL = SHELL;
   delete process.env.MS_TMUX_NO_SERVER;
+  delete process.env.MS_TMUX_PANE_LINES;
   delete process.env.MS_TMUX_LIST_FAILS;
   delete process.env.MS_TMUX_GONE;
   delete process.env.MS_TMUX_ENOENT;
@@ -114,7 +115,7 @@ const tmuxLines = (w: World): string[] =>
 const respawns = (w: World): string[] => tmuxLines(w).filter((l) => l.includes("respawn-pane"));
 const dispatches = (w: World): string[] => tmuxLines(w).filter((l) => l.includes("_recover"));
 
-const base: Omit<SessionRow, "id" | "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset" | "lastMoveAt" | "pinnedAccount"> = {
+const base: Omit<SessionRow, "id" | "wakeupAt" | "createdAt" | "updatedAt" | "transcriptPath" | "rolloutOffset" | "lastMoveAt" | "pinnedAccount" | "tmuxSession" | "windowIndex" | "windowName" | "lostAt"> = {
   provider: "claude", cliSessionId: "c1", cwd: "/tmp/work", socket: SOCK, pane: "%7",
   serverStart: IDENTITY, need: "any", account: "gmail", generation: 1,
   state: "running", desired: "running", flags: [],
@@ -345,6 +346,77 @@ test("(c) a session whose pane or tmux server is gone is stopped and its recover
 
   // A second run says nothing more: a stopped session is not repaired twice.
   assert.deepEqual(reconcile(), []);
+});
+
+// --- lost with the server, as opposed to ended (`ms restore` selects on it) --
+
+test("(c) lostAt is stamped only when the SERVER went: a pane missing from the same server is an ending, not a loss", () => {
+  const w = world();
+  const dead = `${SOCK}-dead`;
+  process.env.MS_TMUX_GONE = dead;
+  try {
+    withState((st) => {
+      st.createSession({ id: "s-closed", ...base, pane: "%9" });            // same server, pane closed by the human
+      st.createSession({ id: "s-restarted", ...base, serverStart: "1:1" }); // a different server answers on its socket
+      st.createSession({ id: "s-nobody", ...base, socket: dead });           // nothing listens on its socket
+      st.createSession({ id: "s-ok", ...base });
+      st.createSession({ id: "s-unplaced", ...base, socket: dead, serverStart: "" }); // never recorded its server
+    });
+    const before = nowSec();
+    reconcile();
+    withState((st) => {
+      assert.equal(st.getSession("s-closed")!.state, "stopped");
+      assert.equal(st.getSession("s-closed")!.lostAt, null, "its server is still the one it was started on");
+      for (const id of ["s-restarted", "s-nobody"]) {
+        const row = st.getSession(id)!;
+        assert.equal(row.state, "stopped");
+        assert.equal(row.desired, "running", "nobody asked for it to stop");
+        assert.ok(row.lostAt !== null && row.lostAt >= before, `${id} went with its server: ${row.lostAt}`);
+      }
+      assert.equal(st.getSession("s-ok")!.lostAt, null);
+      assert.equal(st.getSession("s-unplaced")!.state, "stopped");
+      assert.equal(st.getSession("s-unplaced")!.lostAt, null, "no server on record to have been lost with");
+    });
+  } finally {
+    delete process.env.MS_TMUX_GONE;
+  }
+  void w;
+});
+
+test("reconcile remembers where a present pane sits, from the pane listing it already makes, and leaves updatedAt alone", () => {
+  const w = world();
+  // %7 is listed twice, as a pane in a session group is (once per session of
+  // the group); %8's window is still named by tmux itself, so it has no name
+  // worth keeping; %9 is a line from a tmux that said only the pane id.
+  process.env.MS_TMUX_PANE_LINES = ["%7\tms\t41\trsi reviewer", "%7\tms\t41\trsi reviewer", "%8\twork\t3\t", "%9"].join("\n");
+  withState((st) => {
+    st.createSession({ id: "s-named", ...base, pane: "%7" });
+    st.createSession({ id: "s-auto", ...base, pane: "%8", cliSessionId: "c2" });
+    st.createSession({ id: "s-bare", ...base, pane: "%9", cliSessionId: "c3" });
+  });
+  planted(w.msHome, "UPDATE sessions SET updatedAt=?", 1000);
+
+  reconcile();
+
+  withState((st) => {
+    const named = st.getSession("s-named")!;
+    assert.deepEqual([named.tmuxSession, named.windowIndex, named.windowName], ["ms", 41, "rsi reviewer"]);
+    const auto = st.getSession("s-auto")!;
+    assert.deepEqual([auto.tmuxSession, auto.windowIndex, auto.windowName], ["work", 3, null]);
+    const bare = st.getSession("s-bare")!;
+    assert.deepEqual([bare.tmuxSession, bare.windowIndex, bare.windowName], [null, null, null], "a pane tmux did not describe is not guessed at");
+    assert.equal(bare.state, "running", "and it is still present");
+    assert.equal(named.updatedAt, 1000, "a layout note is not the session doing anything");
+  });
+  assert.equal(tmuxLines(w).filter((l) => l.includes("list-panes")).length, 1, "no tmux call of its own");
+
+  // The window is renamed and moved: the next pass follows it.
+  process.env.MS_TMUX_PANE_LINES = "%7\tms\t2\treview\n%8\twork\t3\t\n%9";
+  reconcile();
+  withState((st) => {
+    const named = st.getSession("s-named")!;
+    assert.deepEqual([named.tmuxSession, named.windowIndex, named.windowName], ["ms", 2, "review"]);
+  });
 });
 
 // --- (4) absence must be confirmed, never assumed -----------------------

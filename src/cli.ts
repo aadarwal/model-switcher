@@ -13,6 +13,7 @@ import { rotateVerb, stopVerb, switchVerb } from "./manual.ts";
 import { paneDied, reconcile } from "./reconcile.ts";
 import { recoverVerb } from "./recover.ts";
 import { rebalanceWorkerVerb } from "./rebalance.ts";
+import { restoreVerb } from "./restore-verb.ts";
 import { rebalanceVerb } from "./rebalance-verb.ts";
 import { status } from "./status.ts";
 import { calendar } from "./calendar.ts";
@@ -48,6 +49,8 @@ registerVerb("attach", attachVerb);
 registerVerb("adopt", adoptVerb);
 // `ms import`: bring conversations running outside tmux into it.
 registerVerb("import", importVerb);
+// `ms restore`: bring back the conversations a dead tmux server took down.
+registerVerb("restore", restoreVerb);
 registerVerb("_recover", recoverVerb);
 // The rebalance move: the human's own `ms switch` transaction, minus the
 // continuation, dispatched by tmux so it lives outside the CLI whose turn just
@@ -67,7 +70,7 @@ registerVerb("stop", stopVerb);
 registerVerb("dashboard", dashboard);
 
 const USAGE = `usage: ms <verb> [args]
-  setup | claude | codex | adopt | import | status | calendar | accounts | rotate | switch | rebalance | stop | doctor | attach | dashboard
+  setup | claude | codex | adopt | import | restore | status | calendar | accounts | rotate | switch | rebalance | stop | doctor | attach | dashboard
   (internal: _exec _hook _codex_watch _recover _rebalance _pane_died _statusline _mesh_rows _mesh_poll)`;
 
 

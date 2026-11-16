@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Bring back what a dead tmux server took down (#64)
+
+- `ms restore` relaunches the conversations that were lost with a tmux server:
+  one launch per conversation, resumed by its recorded id, in a new window of
+  the tmux session it sat in, under the window's old name and index. It shows
+  the plan and asks once; `--dry-run` stops at the plan and `--yes` skips the
+  question. `--since` (default `7d`) filters on the transcript's last model
+  turn. Nothing is sent to a restored conversation unless `--continue` is
+  given.
+- Reconciliation now records WHY a pane is gone. A session whose whole server
+  went away is stamped `lostAt`; one whose pane was closed on a server that is
+  still up is not. `ms restore` selects on that stamp, so a session `ms` saw
+  end is not relaunched. Only a loss reconciled by this version carries the
+  stamp; rows an older `ms` closed out cannot be restored.
+- Each session row remembers where its pane sits: tmux session (the group's
+  name for a grouped session), window index, and the window's name when it is
+  not an automatic one. It is written at launch and refreshed from the pane
+  listing reconciliation already makes, at no extra tmux call. Four additive
+  columns on `sessions`; an older `ms` ignores them.
+- `ms attach --window <index>` attaches one terminal to one window through a
+  grouped session of its own, so tabs do not follow each other and closing one
+  only detaches. `ms attach --tabs` (and `ms restore --tabs`) opens a tab per
+  window in Ghostty 1.3+ on macOS, and prints the attach commands in any
+  terminal it cannot script.
+- Not in this change: pane splits within a window, and launching several
+  restores at once (they run one after another).
+
 ## 0.4.4 — 2026-11-01
 
 ### Claude launches work again now that the 5 h window is gone

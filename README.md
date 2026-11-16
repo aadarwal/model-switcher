@@ -41,7 +41,7 @@ ms codex
 ms claude [mesh|--mesh] [--as <account>] [--need any|fable] [--continue] [-- <claude args>]
 ms codex  [mesh|--mesh] [--as <account>] [--need any|fable] [--continue] [-- <codex args>]
 ms adopt  <rollout-id|path> [--as <account>] [--continue] [-- <codex args>]
-ms attach [session]
+ms attach [--window <index> | --tabs] [session]
 ```
 
 - `ms claude` / `ms codex` — pick an account with room and start that CLI in the current tmux pane under the account's credential. Everything after `--` goes to the CLI unchanged.
@@ -52,6 +52,8 @@ ms attach [session]
 - `ms adopt` — take over a **Codex** conversation `ms` did not start, so it can be rotated like any other. See [rescuing a pane you didn't start with ms](#rescuing-a-pane-you-didnt-start-with-ms).
 - **Where it lands.** Inside tmux, the launch replaces the pane you typed it in. Outside tmux, it goes to the **default tmux server** — the one plain `tmux` talks to, started if it is not running — in session `ms`, and attaches; the session shows in `tmux ls` like any other.
 - `ms attach [session]` — attach to a session on the default tmux server: `ms` (what a bare launch makes) when no name is given, or an import's repo-named session. Plain `tmux attach -t <session>` does the same. With no such session it says so and names the `tmux ls` to run; inside tmux it refuses rather than nest.
+- `ms attach --window <index> [session]` — attach this terminal to that one window, as a tab of its own. It attaches through a new session in the target's group (`tmux new-session -t`), so several terminals on one session each keep their own current window instead of following each other, and the extra session is destroyed when the terminal closes. Closing the tab only detaches; the CLI keeps running.
+- `ms attach --tabs [session]` — open one terminal tab per window of the session, each running the `--window` form. Ghostty 1.3+ on macOS is driven through its AppleScript dictionary and gets one new window holding the tabs; inside tmux, Ghostty means the attached client's `$TERM` says so, not that the server was started from it. In any other terminal, over ssh, or when Ghostty declines to be scripted, the attach commands are printed one per line for you to paste, and the exit is still 0. It attaches nothing itself, so it also works from inside tmux.
 
 Exit codes for `ms claude` / `ms codex`: 0 launched, 1 the account (not registered, no launch
 credential on this device, an unreadable registry), 2 the command line itself (or `mesh` with no
@@ -90,6 +92,61 @@ ms import --status <manifest>
 
 Exit codes: 0 everything moved (or nothing had to), 1 at least one row failed, 2 the
 command line itself, or a confirmation nobody could answer.
+
+### Restore
+
+```
+ms restore [--since <window>] [--server <identity>] [--continue] [--tabs] [--dry-run] [--yes]
+```
+
+- `ms restore` — bring back the conversations that went down with a tmux server. When a
+  server dies (a crash, a `kill-server`, a reboot) every managed pane goes with it. The next
+  `ms` verb marks those sessions stopped and records that they were lost with their server,
+  as opposed to ended. `ms restore` lists them, asks once, and relaunches each conversation
+  in a new window of the tmux session it sat in, under the window's old name and at its old
+  index when that index is free.
+- **What comes back.** One launch per conversation, from its most recent session row,
+  resumed by the conversation id `ms` recorded. The launch's own flags are re-applied; a
+  recorded `--resume` (bare, by id or by name), `--continue` and any prompt the launch began
+  with are dropped. Each one goes through the ordinary launch, so the account is chosen as
+  for a hand-typed `ms claude -- --resume <id>`.
+- **What does not.** A session you stopped with `ms stop`, and one `ms` saw end (`/exit`, or
+  a closed pane noticed by a later `ms` verb) while the server was still up: those are not
+  in the plan at all. A row that never learned a conversation id, a conversation that is
+  already running again or was relaunched by an earlier restore, one that was idle before
+  `--since`, and one whose directory is gone are each listed with the reason.
+- **Prompts.** A prompt the original launch began with is dropped when `ms` can tell it is
+  one: a word after a Claude flag known to take no value (`--chrome`,
+  `--dangerously-skip-permissions`, …), after `--`, or with no flag before it. A word after
+  a flag `ms` does not know is kept as that flag's value.
+- `--since <window>` — only conversations whose last model turn is this recent: `30m`,
+  `2h`, `7d` (the default) or `all`. This reads the transcript's last turn, not the file's
+  modification time, which other things move. A conversation nothing can date is restored
+  only by `--since all`.
+- `--server <identity>` — restore the server with this identity (`<pid>:<start_time>`, as
+  the plan prints it) instead of the one lost most recently.
+- `--continue` — hand each restored conversation the continuation a rotation sends. Without
+  it the restore sends nothing of its own: the conversations come back idle at their prompt.
+- `--tabs` — afterwards, open a terminal tab per restored window, as `ms attach --tabs`
+  does.
+- `--dry-run` — print the plan and stop. `--yes` — do not ask. With no terminal to ask on
+  and no `--yes`, it refuses.
+
+Nothing is attached, no window is made current, and the pane you run it from is never taken
+over, inside tmux or out. A server you shut down yourself (`tmux kill-server`, or closing its
+last window) is recorded the same way as one that crashed, so its sessions are offered too:
+read the plan before you answer.
+Only a loss that this version of `ms` reconciled can be restored: the record that a session
+was lost with its server is written at that moment and cannot be reconstructed for older
+rows. A pane you closed that no `ms` verb noticed before the server died is recorded as lost
+with it. Windows go to the tmux server you run the restore on. One pane per window is
+restored; splits are not. Launches run one after another and the chooser ranks accounts on
+usage, so a large restore lands mostly on the account with the most room.
+
+Exit codes: 0 every conversation in the plan was relaunched (or there was nothing to
+restore), 1 at least one launch refused or the named server is not on record, 2 the command
+line itself, or a confirmation nobody could answer. A relaunch is the pane respawned on the
+resume command; `ms status` shows whether each conversation then came up.
 
 ### Running sessions
 

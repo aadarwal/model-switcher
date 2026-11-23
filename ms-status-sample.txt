@@ -1,0 +1,9 @@
+claude: 1/4 with room · 3 stale/logged out · resets in next 24 h: 0 · LAST ACCOUNT WITH ROOM (mit-englund-max)
+WARNING: 3 accounts need attention:
+  claude:claude-1  LOGGED OUT  logged out: sign-in expired or revoked; usage not refreshed; reading is from before its window reset; last good reading 37d ago  (last good 2026-10-16 20:00) — usage shown is not current
+      fix: ms accounts login claude-1 --provider claude --relogin
+  claude:claude-11  LOGGED OUT  logged out: no usage grant; usage never read  (never read) — usage shown is not current
+      fix: ms accounts login claude-11 --provider claude --relogin
+  claude:claude-9  STALE  usage not refreshed; last good reading 9h ago; last poll: 502 from /api/oauth/usage  (last good 2026-11-23 06:18) — usage shown is not current
+      fix: ms accounts verify claude-9 --provider claude
+

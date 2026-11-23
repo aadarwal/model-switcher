@@ -25,6 +25,7 @@ import { openState, type SessionRow, type State } from "./state.ts";
 import { readEvents, type Event } from "./events.ts";
 import { Tmux } from "./tmux.ts";
 import { wallKindFromText } from "./wall.ts";
+import { accountAttention, staleAfterMs, type Attention } from "./attention.ts";
 
 const SNAPSHOT_MAX_AGE_MS = 20_000;
 const CLEAR_SCREEN = "\x1b[2J\x1b[H";
@@ -153,7 +154,12 @@ export function localTimeCli(epochMs: number): string {
  *  one place, so `accountRow()` (the text table) and `statusJson()` (Plan 4
  *  Task 2's dashboard) compute it identically rather than one of them
  *  copying the other's logic. See review round 1 (P4-T2), findings 1 & 2. */
-export type AccountComputed = { label: string; state: AccountState; email: string | null; reservePercent: number };
+export type AccountComputed = {
+  label: string; state: AccountState; email: string | null; reservePercent: number;
+  /** Logged out, unverified, or showing numbers that are no longer current
+   *  (src/attention.ts); null when the account needs nothing. */
+  attention: Attention | null;
+};
 
 /** One live session as an account card lists it. */
 export type AccountSession = { id: string; pane: string; state: string };
@@ -176,10 +182,29 @@ export function sessionsByAccount(sessions: { id: string; provider: string; acco
  *  picker (src/mesh.ts) has just asked the launch's own credential check, and
  *  reading the token a second time to learn the same fact would be one more
  *  place a credential is read for no reason. */
-export function computeAccount(a: AccountUsage, registry: Registry, hasToken = !!readLaunchToken(a.name)): AccountComputed {
+export function computeAccount(a: AccountUsage, registry: Registry, hasToken = !!readLaunchToken(a.name), now = Date.now()): AccountComputed {
   const row = findAccount(registry, a.name, a.provider);
   const reservePercent = row?.reservePercent ?? 0;
-  return { label: row?.label ?? a.name, state: accountState(a, hasToken, reservePercent), email: row?.email ?? null, reservePercent };
+  const state = accountState(a, hasToken, reservePercent);
+  const attention = accountAttention({ ...a, state, identityVerified: row?.identityVerified }, now, staleAfterMs());
+  return { label: row?.label ?? a.name, state, email: row?.email ?? null, reservePercent, attention };
+}
+
+/** The warning block `ms status` prints above both tables: one line per
+ *  account that needs a human, each ending with the command that fixes it.
+ *  Empty when nothing does, so a healthy pool prints exactly what it did. */
+export function attentionLines(accounts: readonly (Pick<AccountUsage, "name" | "provider"> & { attention: Attention | null })[]): string[] {
+  const flagged = accounts.filter((a) => a.attention);
+  if (!flagged.length) return [];
+  const lines = [`WARNING: ${flagged.length} ${flagged.length === 1 ? "account needs" : "accounts need"} attention:`];
+  for (const a of flagged) {
+    const at = a.attention!;
+    const when = at.lastGoodAt === null ? "never read" : `last good ${localTimeCli(at.lastGoodAt)}`;
+    lines.push(`  ${a.provider}:${a.name}  ${at.loggedOut ? "LOGGED OUT" : at.stale ? "STALE" : "UNVERIFIED"}  ${at.detail}  (${when})${at.stale ? " — usage shown is not current" : ""}`);
+    lines.push(`      fix: ${at.fix}`);
+  }
+  lines.push("");
+  return lines;
 }
 
 function accountRow(a: AccountUsage, c: AccountComputed, live: number, showResetCredits: boolean): string[] {
@@ -439,6 +464,10 @@ async function render(json: boolean, all: boolean): Promise<string> {
       const summary = summaries[provider];
       if (summary) lines.push(poolSummaryText(provider, summary, now));
     }
+    // Under the summary lines (which already count them), above both tables:
+    // the numbers in the table are the last reading, and for these accounts
+    // that reading is not current.
+    lines.push(...attentionLines(accounts));
     const showResetCredits = accounts.some((a) => reportedResetCount(a.usage) !== null);
     lines.push(...table(
       // PROVIDER sits next to NAME for the same reason it sits next to

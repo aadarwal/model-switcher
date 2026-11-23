@@ -113,7 +113,11 @@ export type AccountRowView = {
   email?: string | null;
   /** Live sessions on this account (src/status.ts's sessionsByAccount). */
   sessions?: { id: string; pane: string; state: string }[];
+  /** src/attention.ts's verdict: logged out, unverified, or numbers that are
+   *  no longer current. Null or absent (an older /api/state) means nothing. */
+  attention?: AttentionView | null;
 };
+export type AttentionView = { reasons: string[]; detail: string; lastGoodAt: number | null; loggedOut: boolean; stale?: boolean; fix: string };
 export type SessionRowView = {
   id: string;
   pane: string;
@@ -236,7 +240,7 @@ export function poolSummariesHtml(pools: PoolSummaries | undefined, now: number)
     var provider = providers[i]!;
     var pool = pools && pools[provider];
     if (!pool) continue;
-    out += '<p class="ms-pool' + (pool.withRoom <= 1 ? " worry" : "") + '" data-provider="' + provider + '">' + esc(poolSummaryText(provider, pool, now)) + "</p>";
+    out += '<p class="ms-pool' + (pool.withRoom <= 1 || pool.needsAttention ? " worry" : "") + '" data-provider="' + provider + '">' + esc(poolSummaryText(provider, pool, now)) + "</p>";
   }
   return out;
 }
@@ -310,13 +314,17 @@ export function resetNote(iso: string | null | undefined): string {
  * have — the panel's rule that a missing window is absent, not a dash, lives
  * here so every caller gets it.
  */
-export function laneHtml(label: string, w: UsageWindow | undefined, dash: string): string {
+export function laneHtml(label: string, w: UsageWindow | undefined, dash: string, stale?: boolean, now?: number): string {
   if (!w || typeof w.usedPercent !== "number" || !isFinite(w.usedPercent)) return "";
   var pct = Math.max(0, Math.min(100, w.usedPercent));
   var idle = pct === 0;
   var note = resetNote(w.resetsAt) || windowResetState(w);
+  // A stale card's reset that has already gone by is not a reset still to
+  // come: say it passed, so "resets Sat 17 Oct" is never read as next Saturday.
+  var at = Date.parse(String(w.resetsAt || ""));
+  if (stale && isFinite(at) && at <= (typeof now === "number" ? now : Date.now())) note = note.replace(/^resets /, "reset ") + " · passed, stale";
   return (
-    '<div class="ms-lane">' +
+    '<div class="ms-lane"' + (stale ? " data-stale" : "") + ">" +
     '<div class="ms-lane-top">' +
     '<span class="ms-lane-label">' + esc(label) + "</span>" +
     '<span class="ms-lane-read">' +
@@ -335,12 +343,62 @@ export function laneHtml(label: string, w: UsageWindow | undefined, dash: string
  *  them: the session first, then the week. Claude's Fable lane only exists
  *  when Claude reports it; Codex never carries one, so nothing has to know
  *  which provider it is looking at. */
-export function accountLanesHtml(a: AccountRowView, dash: string): string {
+export function accountLanesHtml(a: AccountRowView, dash: string, now?: number): string {
   var u = a.usage || {};
+  // An older /api/state without `stale` meant every flagged account was.
+  var stale = !!a.attention && a.attention.stale !== false;
   return (
-    laneHtml("Session · " + windowPeriod(u.session, "5h"), u.session, dash) +
-    laneHtml(windowPeriod(u.weeklyAll, "Week") + " · all models", u.weeklyAll, dash) +
-    laneHtml(windowPeriod(u.weeklyFable, "Week") + " · Fable", u.weeklyFable, dash)
+    laneHtml("Session · " + windowPeriod(u.session, "5h"), u.session, dash, stale, now) +
+    laneHtml(windowPeriod(u.weeklyAll, "Week") + " · all models", u.weeklyAll, dash, stale, now) +
+    laneHtml(windowPeriod(u.weeklyFable, "Week") + " · Fable", u.weeklyFable, dash, stale, now)
+  );
+}
+
+/** `45s`, `12m`, `3h`, `37d`: whole units, largest first. The browser's copy
+ *  of src/attention.ts's `attentionAge` (a different name, so the two never
+ *  collide once bundled). */
+export function ageText(ms: number, now: number): string {
+  var s = Math.max(0, Math.floor((now - ms) / 1000));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
+}
+
+/** The card's badge: red for a sign-in that is gone, amber for numbers that
+ *  are merely old. Either way it says how old, because that is what the
+ *  bars below it can no longer say for themselves. */
+export function staleBadgeHtml(at: AttentionView, now: number): string {
+  if (at.stale === false) return '<span class="ms-stale" data-severity="warn">Identity unverified</span>';
+  var age = at.lastGoodAt === null ? "never updated" : "last updated " + ageText(at.lastGoodAt, now) + " ago";
+  return '<span class="ms-stale" data-severity="' + (at.loggedOut ? "critical" : "warn") + '">' + (at.loggedOut ? "Logged out · " : "") + "STALE — " + esc(age) + "</span>";
+}
+
+/** The banner over the whole page: one row per account that needs a human,
+ *  with what is wrong, when its numbers were last good, and the exact
+ *  command that fixes it. Empty when nothing needs attention. */
+export function attentionBannerHtml(accounts: AccountRowView[], now: number): string {
+  var flagged = accounts.filter(function (a) { return !!a.attention; });
+  if (!flagged.length) return "";
+  var loggedOut = flagged.filter(function (a) { return a.attention!.loggedOut; }).length;
+  var rows = flagged.map(function (a) {
+    var at = a.attention!;
+    var when = at.lastGoodAt === null ? "never read" : ageText(at.lastGoodAt, now) + " ago · " + localTime(at.lastGoodAt);
+    return (
+      '<li data-severity="' + (at.loggedOut ? "critical" : "warn") + '">' +
+      '<span class="ms-attn-who">' + esc(a.name) + ' <span class="ms-attn-prov">' + esc(providerLabel(a.provider || "")) + "</span></span>" +
+      '<span class="ms-attn-why">' + esc(at.detail) + "</span>" +
+      '<span class="ms-attn-when">last good: ' + esc(when) + "</span>" +
+      '<code class="ms-attn-fix">' + esc(at.fix) + "</code>" +
+      "</li>"
+    );
+  });
+  return (
+    '<div class="ms-attn" role="alert" data-severity="' + (loggedOut ? "critical" : "warn") + '">' +
+    '<div class="ms-attn-title">' + flagged.length + (flagged.length === 1 ? " account needs" : " accounts need") + " attention</div>" +
+    '<div class="ms-attn-sub">' + (loggedOut ? loggedOut + " logged out · " : "") + "usage shown for a stale account is the last reading ms got, not a current one — run the command under each to fix it.</div>" +
+    '<ul class="ms-attn-list">' + rows.join("") + "</ul>" +
+    "</div>"
   );
 }
 
@@ -358,18 +416,21 @@ export function accountSessionsHtml(sessions: { id: string; pane: string; state:
  *  the name doesn't, a chip for a STATE that isn't `ok`, then the meters.
  *  LABEL and STATE are `statusJson()`'s own computed words — rendered as
  *  given, never re-derived here. */
-export function accountRowHtml(a: AccountRowView, dash: string): string {
-  var lanes = accountLanesHtml(a, dash);
+export function accountRowHtml(a: AccountRowView, dash: string, now?: number): string {
+  var t = typeof now === "number" ? now : Date.now();
+  var lanes = accountLanesHtml(a, dash, t);
+  var at = a.attention || null;
   var showLabel = a.label && a.label !== a.name;
   var credits = reportedResetCount(a.usage);
   return (
-    '<section class="ms-acct">' +
+    '<section class="ms-acct"' + (at ? ' data-attention="' + (at.loggedOut ? "critical" : "warn") + '"' : "") + ">" +
     '<header class="ms-acct-head">' +
     '<h3 class="ms-name">' + esc(a.name) + "</h3>" +
     (a.state && a.state !== "ok" ? '<span class="' + chipClass(a.state) + '">' + esc(a.state) + "</span>" : "") +
     (showLabel ? '<span class="ms-meta">' + esc(a.label) + "</span>" : "") +
     "</header>" +
     (a.email ? '<div class="ms-email">' + esc(a.email) + "</div>" : "") +
+    (at ? '<div class="ms-attn-card">' + staleBadgeHtml(at, t) + '<div class="ms-attn-why">' + esc(at.detail) + '</div><code class="ms-attn-fix">' + esc(at.fix) + "</code></div>" : "") +
     (a.usage && a.usage.planType ? '<div class="ms-meta">Plan: ' + esc(a.usage.planType) + "</div>" : "") +
     (credits !== null ? '<div class="ms-meta">' + (a.stale || a.error || ["ok", "no room", "reserved"].indexOf(a.state) < 0 ? "Last reported resets available: " : "Resets available: ") + credits + "</div>" : "") +
     accountSessionsHtml(a.sessions) +
@@ -380,7 +441,7 @@ export function accountRowHtml(a: AccountRowView, dash: string): string {
 
 /** The whole panel: one group per provider present in the JSON, in the order
  *  the JSON names them, each behind its own brand rail. */
-export function accountGroupsHtml(accounts: AccountRowView[], dash: string): string {
+export function accountGroupsHtml(accounts: AccountRowView[], dash: string, now?: number): string {
   if (!accounts.length) return '<div class="ms-empty">no accounts</div>';
   var order: string[] = [];
   var byProvider: { [k: string]: AccountRowView[] } = {};
@@ -397,15 +458,16 @@ export function accountGroupsHtml(accounts: AccountRowView[], dash: string): str
     var key = order[g]!;
     var members = byProvider[key]!;
     var mark = providerMark(key);
+    var stale = members.filter(function (x) { return !!x.attention; }).length;
     out +=
       '<div class="ms-group" data-provider="' + esc(key) + '">' +
       '<div class="ms-rail">' +
       (mark ? '<span class="ms-rail-mark">' + mark + "</span>" : "") +
       '<span class="ms-rail-name">' + esc(providerLabel(key)) + "</span>" +
-      '<span class="ms-rail-count">' + members.length + " " + (members.length === 1 ? "account" : "accounts") + " · used</span>" +
+      '<span class="ms-rail-count">' + members.length + " " + (members.length === 1 ? "account" : "accounts") + " · used" + (stale ? ' · <span class="worry">' + stale + " stale/logged out</span>" : "") + "</span>" +
       "</div>" +
       '<div class="ms-group-grid">';
-    for (var m = 0; m < members.length; m++) out += accountRowHtml(members[m]!, dash);
+    for (var m = 0; m < members.length; m++) out += accountRowHtml(members[m]!, dash, now);
     out += "</div></div>";
   }
   return '<div class="ms-panel">' + out + "</div>";

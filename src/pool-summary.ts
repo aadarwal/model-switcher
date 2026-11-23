@@ -15,9 +15,12 @@ export type PoolSummary = {
   /** Complete fresh-provider coverage only. Partial reports are separate. */
   resetsAvailable?: number;
   reportedResetsAvailable?: { count: number; accounts: number; total: number };
+  /** Accounts logged out, unverified or with a reading that is no longer
+   *  current (src/attention.ts). Absent when none, or from an older caller. */
+  needsAttention?: number;
 };
 export type PoolSummaries = Partial<Record<Provider, PoolSummary>>;
-type PoolAccount = Pick<AccountUsage, "name" | "provider" | "usage" | "shared"> & { state: string; reservePercent: number; stale?: boolean; error?: string | null; errorKind?: string | null };
+type PoolAccount = Pick<AccountUsage, "name" | "provider" | "usage" | "shared"> & { state: string; reservePercent: number; stale?: boolean; error?: string | null; errorKind?: string | null; attention?: unknown };
 
 /** The table's computed state is authoritative for room counts. Scheduled
  *  resets are reported separately from capacity recovery, which requires
@@ -55,6 +58,7 @@ export function poolSummaries(accounts: readonly PoolAccount[], now: number): Po
     const knownCredits = members.map((a) => !a.stale && !a.error && !a.errorKind && ["ok", "no room", "reserved"].includes(a.state) ? reportedResetCount(a.usage) : null).filter((n): n is number => n !== null);
     const creditTotal = knownCredits.reduce((sum, n) => sum + n, 0);
     const sessionWindow = windowPeriod(last?.usage?.session, "");
+    const needsAttention = members.filter((a) => a.attention).length;
     pools[provider] = {
       withRoom: ready.length, total: members.length,
       resetsNext24h: [...resets.values()].sort((a, b) => Date.parse(a.resetsAt) - Date.parse(b.resetsAt) || a.account.localeCompare(b.account)),
@@ -63,6 +67,7 @@ export function poolSummaries(accounts: readonly PoolAccount[], now: number): Po
       ...(knownCredits.length && Number.isSafeInteger(creditTotal) ? knownCredits.length === members.length
         ? { resetsAvailable: creditTotal }
         : { reportedResetsAvailable: { count: creditTotal, accounts: knownCredits.length, total: members.length } } : {}),
+      ...(needsAttention ? { needsAttention } : {}),
     };
   }
   return pools;
@@ -77,7 +82,11 @@ export function poolResetTime(iso: string): string {
 /** Shared by status text and the browser. page.ts embeds this function and
  *  poolResetTime into its inline script. */
 export function poolSummaryText(provider: string, pool: PoolSummary, now: number): string {
-  var line = provider + ": " + pool.withRoom + "/" + pool.total + " with room · resets in next 24 h: " + pool.resetsNext24h.length;
+  var line = provider + ": " + pool.withRoom + "/" + pool.total + " with room";
+  // Second, not last: a pool that reads "0/14 with room" because twelve of
+  // the fourteen are logged out is a different problem from fourteen full ones.
+  if (pool.needsAttention) line += " · " + pool.needsAttention + " stale/logged out";
+  line += " · resets in next 24 h: " + pool.resetsNext24h.length;
   if (pool.resetsNext24h.length) {
     line += " (" + pool.resetsNext24h.map(function (r) { return r.account + " " + r.windows.join("+") + " " + poolResetTime(r.resetsAt); }).join(", ") + ")";
   }

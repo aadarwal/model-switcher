@@ -132,3 +132,13 @@ test("window reset dates do not promise recovery from an independent provider re
     assert.equal(summary.resetsNext24h.length, 2, "scheduled window events remain separate from a capacity promise");
   }
 });
+
+test("pool summaries count accounts that need attention and say so second, right after the room count", () => {
+  const flagged = { reasons: ["auth"], detail: "", lastGoodAt: null, loggedOut: true, stale: true, fix: "" };
+  const pools = poolSummaries([account("a"), account("b", { state: "auth", attention: flagged }), account("c", { state: "no-grant", attention: flagged })], NOW);
+  assert.equal(pools.claude?.needsAttention, 2);
+  assert.match(poolSummaryText("claude", pools.claude!, NOW), /^claude: 1\/3 with room · 2 stale\/logged out · resets in next 24 h: 0/);
+  const healthy = poolSummaries([account("a"), account("b", { attention: null })], NOW);
+  assert.equal("needsAttention" in healthy.claude!, false);
+  assert.doesNotMatch(poolSummaryText("claude", healthy.claude!, NOW), /stale/);
+});

@@ -558,6 +558,26 @@ test("ms status and JSON pool counts match account states and warn about the las
   assert.match(text.stdout, /LAST ACCOUNT WITH ROOM \(dirk, 5H 42\.5% used\)/);
 });
 
+test("ms status prints a warning block for logged-out and stale accounts, each with its fix, and --json carries the same verdict", async () => {
+  const { env } = await world({ panes: [], screens: {} });
+  const json = run(["status", "--json"], env());
+  assert.equal(json.code, 0, json.stderr);
+  const data = JSON.parse(json.stdout) as import("../src/status.ts").StatusJson;
+  const gmail = data.accounts.find((a) => a.name === "gmail")!;
+  assert.equal(gmail.state, "no-grant", json.stdout);
+  assert.equal(gmail.attention?.loggedOut, true, json.stdout);
+  assert.equal(gmail.attention?.fix, "ms accounts login gmail --provider claude --relogin");
+  assert.equal(data.pools.claude?.needsAttention, data.accounts.filter((a) => a.provider === "claude" && a.attention).length);
+
+  const text = run(["status"], env());
+  assert.equal(text.code, 0, text.stderr);
+  const lines = text.stdout.split("\n");
+  assert.match(lines[0]!, / stale\/logged out · /);
+  const warn = lines.findIndex((l) => l.startsWith("WARNING: "));
+  assert.ok(warn > 0 && warn < lines.findIndex((l) => l.startsWith("NAME ")), text.stdout);
+  assert.match(text.stdout, /\n {2}claude:gmail {2}LOGGED OUT {2}logged out: no usage grant.*\(never read\) — usage shown is not current\n {6}fix: ms accounts login gmail --provider claude --relogin\n/);
+});
+
 test("status counts a Claude reading with only weekly windows as room (the 5 h limit left the usage API)", async () => {
   const { env } = await world({ panes: [], screens: {} });
   const limits = [{ kind: "weekly_all", percent: 10, resets_at: "2026-11-04T21:00:00Z" }, { kind: "weekly_scoped", percent: 0, scope: { model: { display_name: "Fable" } } }];

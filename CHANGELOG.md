@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Logged-out and stale accounts are impossible to miss
+
+- Flag every account whose usage on screen is not current: an expired or
+  revoked sign-in (`auth`), a missing poll grant (`no-grant`) or launch token
+  (`no-token`), an unverified identity, a last good reading older than
+  `MS_STALE_AFTER_HOURS` (default 6), or a reading taken before a window reset
+  that has since passed. Those rows kept their last reading — weeks-old
+  "100% used" bars under a quiet `AUTH` chip read as a maxed-out pool, and
+  `claude: 0/14 with room` said nothing about why.
+- The dashboard opens with an "N accounts need attention" banner listing each
+  account, its reason, its last good reading and the exact fix command. Each
+  such card wears a red (logged out) or amber (stale) `STALE — last updated
+  <age> ago` badge, its bars turn grey, and a reset already gone by reads
+  `passed, stale` instead of `resets Sat 17 Oct`.
+- Pool summaries, in `ms status` and the dashboard, add `· N stale/logged out`;
+  `ms status` prints a `WARNING:` block with one fix per account under them.
+  `--json` carries `attention` per account and `pools.<provider>.needsAttention`.
+
 ## 0.4.4 — 2026-11-01
 
 ### Claude launches work again now that the 5 h window is gone

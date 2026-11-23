@@ -29,6 +29,9 @@ import {
   resetNote,
   accountRowHtml,
   accountGroupsHtml,
+  attentionBannerHtml,
+  staleBadgeHtml,
+  ageText,
   poolSummaryText,
   poolSummariesHtml,
   providerSegHtml,
@@ -1070,4 +1073,92 @@ test("calendarHtml: nothing upcoming reads as a sentence, never as an empty pane
 test("account cards render the status API's reserved state", () => {
   const html = accountRowHtml({ name: "codex-1", provider: "codex", label: "Owner", state: "reserved" }, "—");
   assert.match(html, />reserved<\/span>/);
+});
+
+// --- Accounts that need a human (src/attention.ts) -------------------------
+
+const ATT_NOW = Date.parse("2026-11-23T20:00:00Z");
+const DAY = 86_400_000;
+const LOGGED_OUT = {
+  reasons: ["auth", "stale", "reset-passed"],
+  detail: "logged out: sign-in expired or revoked; last good reading 37d ago",
+  lastGoodAt: ATT_NOW - 37 * DAY,
+  loggedOut: true,
+  stale: true,
+  fix: "ms accounts login claude-4 --provider claude --relogin",
+};
+const STALE_CARD: AccountRowView = {
+  name: "claude-4", provider: "claude", label: "claude-4", state: "auth",
+  usage: { session: null, weeklyAll: { usedPercent: 100, resetsAt: new Date(ATT_NOW - 30 * DAY).toISOString() }, weeklyFable: null },
+  attention: LOGGED_OUT,
+};
+
+test("accountRowHtml: a stale card wears a red badge with its age, names its fix, and greys every bar", () => {
+  const html = accountRowHtml(STALE_CARD, "—", ATT_NOW);
+  assert.ok(html.includes('<section class="ms-acct" data-attention="critical">'), html);
+  assert.ok(html.includes('<span class="ms-stale" data-severity="critical">Logged out · STALE — last updated 37d ago</span>'), html);
+  assert.ok(html.includes('<code class="ms-attn-fix">ms accounts login claude-4 --provider claude --relogin</code>'), html);
+  assert.ok(html.includes('<div class="ms-lane" data-stale>'), html);
+  // The reset already went by: never "resets Sat …" as if it were still to come.
+  assert.match(html, /reset \w{3} \d+ \w{3} \d\d:\d\d · passed, stale/);
+  assert.doesNotMatch(html, /resets \w{3}/);
+  // The number itself is preserved — greyed, not hidden.
+  assert.ok(html.includes("100% used"), html);
+});
+
+test("accountRowHtml: a healthy card is unchanged — no badge, no stale lanes", () => {
+  const html = accountRowHtml({ ...STALE_CARD, state: "ok", attention: null, usage: { weeklyAll: { usedPercent: 10, resetsAt: new Date(ATT_NOW + DAY).toISOString() } } }, "—", ATT_NOW);
+  assert.ok(html.startsWith('<section class="ms-acct">'), html);
+  assert.ok(!html.includes("ms-stale") && !html.includes("data-stale") && !html.includes("ms-attn"), html);
+  assert.match(html, /resets \w{3} /);
+});
+
+test("staleBadgeHtml: amber for numbers that are merely old, its own words for a never-read or unverified account", () => {
+  assert.equal(staleBadgeHtml({ ...LOGGED_OUT, loggedOut: false, lastGoodAt: ATT_NOW - 7 * 3_600_000 }, ATT_NOW), '<span class="ms-stale" data-severity="warn">STALE — last updated 7h ago</span>');
+  assert.match(staleBadgeHtml({ ...LOGGED_OUT, lastGoodAt: null }, ATT_NOW), /STALE — never updated/);
+  assert.match(staleBadgeHtml({ ...LOGGED_OUT, loggedOut: false, stale: false }, ATT_NOW), /Identity unverified/);
+  // An unverified identity over a fresh reading keeps its bars in colour.
+  assert.ok(!accountRowHtml({ ...STALE_CARD, attention: { ...LOGGED_OUT, loggedOut: false, stale: false } }, "—", ATT_NOW).includes("data-stale"));
+  assert.equal(ageText(ATT_NOW - 90_000, ATT_NOW), "1m");
+});
+
+test("attentionBannerHtml: one alert naming every flagged account, its reason, its last good reading and its fix — escaped", () => {
+  assert.equal(attentionBannerHtml([{ ...STALE_CARD, attention: null }], ATT_NOW), "");
+  const html = attentionBannerHtml([
+    STALE_CARD,
+    { name: "x<b>", provider: "codex", label: "x", state: "stale", attention: { ...LOGGED_OUT, loggedOut: false, detail: "usage not refreshed", fix: "ms accounts verify x<b> --provider codex" } },
+    { name: "fine", provider: "claude", label: "fine", state: "ok" },
+  ], ATT_NOW);
+  assert.ok(html.startsWith('<div class="ms-attn" role="alert" data-severity="critical">'), html);
+  assert.ok(html.includes('<div class="ms-attn-title">2 accounts need attention</div>'), html);
+  assert.ok(html.includes("1 logged out"), html);
+  assert.ok(html.includes("claude-4"), html);
+  assert.ok(html.includes("last good: 37d ago · "), html);
+  assert.ok(html.includes("ms accounts login claude-4 --provider claude --relogin"), html);
+  assert.ok(html.includes("x&lt;b&gt;") && !html.includes("x<b>"), html);
+  assert.ok(!html.includes("fine"), html);
+});
+
+test("accountGroupsHtml: the rail counts its stale/logged-out accounts", () => {
+  const html = accountGroupsHtml([STALE_CARD, { name: "ok", provider: "claude", label: "ok", state: "ok" }], "—", ATT_NOW);
+  assert.ok(html.includes('2 accounts · used · <span class="worry">1 stale/logged out</span>'), html);
+});
+
+test("the served page's own script puts the attention banner at the top and marks the pool line", async () => {
+  const pools = { claude: { withRoom: 0, total: 1, resetsNext24h: [], nextRoom: null, lastAccount: null, needsAttention: 1 } };
+  const dom = await runPage({ takenAt: Date.now(), accounts: [STALE_CARD], sessions: [], pools });
+  const banner = dom.el("#attention").innerHTML;
+  assert.ok(banner.includes("1 account needs attention"), banner);
+  assert.ok(banner.includes("ms accounts login claude-4 --provider claude --relogin"), banner);
+  assert.ok(dom.el("#accounts").innerHTML.includes("Logged out · STALE — last updated"), dom.el("#accounts").innerHTML);
+  assert.ok(dom.el("#pool-summary").innerHTML.includes('class="ms-pool worry"'));
+  assert.ok(dom.el("#pool-summary").innerHTML.includes("1 stale/logged out"));
+  const { renderDashboardPage } = await import("../src/dashboard/page.ts");
+  const page = renderDashboardPage();
+  assert.ok(page.indexOf('id="attention"') < page.indexOf('id="pool-summary"'), "the banner sits above the pool summary");
+});
+
+test("the served page's own script draws no banner for a healthy pool", async () => {
+  const dom = await runPage(TWO_PROVIDER_STATE);
+  assert.equal(dom.el("#attention").innerHTML, "");
 });

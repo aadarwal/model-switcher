@@ -70,6 +70,9 @@ import {
   accountSessionsHtml,
   accountRowHtml,
   accountGroupsHtml,
+  ageText,
+  staleBadgeHtml,
+  attentionBannerHtml,
   poolSummaryText,
   poolResetTime,
   poolSummariesHtml,
@@ -200,6 +203,53 @@ h2 { margin: 0; font-size: 13px; font-weight: 500; letter-spacing: -0.01em; colo
 .ms-fill[data-severity="high"] { background: var(--status-high); }
 .ms-fill[data-severity="critical"] { background: var(--status-critical); }
 @media (prefers-reduced-motion: reduce) { .ms-fill { transition: none; } }
+
+/* ———— Accounts that need a human ————
+   The one place the page shouts. A logged-out account keeps its last reading,
+   and that reading must never pass for a current one: the banner names every
+   such account and its fix, the card wears a badge saying how old its numbers
+   are, and its bars drop to grey so a stale 100% cannot read as a full pool. */
+.ms-attn {
+  --attn: var(--status-warn);
+  margin: 18px 0 0; padding: 13px 16px 12px;
+  border: 1px solid color-mix(in srgb, var(--attn) 55%, transparent);
+  border-left: 4px solid var(--attn); border-radius: 8px;
+  background: color-mix(in srgb, var(--attn) 11%, var(--surface));
+}
+.ms-attn[data-severity="critical"] { --attn: var(--status-critical); }
+.ms-attn-title { font-size: 14.5px; font-weight: 600; color: var(--ink); letter-spacing: -0.01em; }
+.ms-attn-title::before { content: "⚠ "; color: var(--attn); }
+.ms-attn-sub { font-size: 12px; color: var(--ink-2); margin: 3px 0 9px; }
+.ms-attn-list { list-style: none; margin: 0; padding: 0; }
+.ms-attn-list li {
+  display: grid; grid-template-columns: minmax(120px, 0.9fr) minmax(160px, 1.6fr) minmax(120px, 1fr); gap: 3px 14px;
+  align-items: baseline; padding: 7px 0 7px 10px; border-top: 1px solid var(--border); font-size: 12px;
+  border-left: 2px solid var(--status-warn);
+}
+.ms-attn-list li[data-severity="critical"] { border-left-color: var(--status-critical); }
+.ms-attn-who { color: var(--ink); font-weight: 500; overflow-wrap: anywhere; }
+.ms-attn-prov { color: var(--muted); font-weight: 400; margin-left: 4px; }
+.ms-attn-why { color: var(--ink-2); overflow-wrap: anywhere; }
+.ms-attn-when { color: var(--muted); font-variant-numeric: tabular-nums; }
+.ms-attn-fix {
+  grid-column: 1 / -1; font-family: var(--mono); font-size: 11.5px; color: var(--ink);
+  background: var(--plane); border: 1px solid var(--grid); border-radius: 4px; padding: 2px 6px; justify-self: start;
+  user-select: all; overflow-wrap: anywhere;
+}
+.ms-acct[data-attention] { background: color-mix(in srgb, var(--status-warn) 5%, var(--surface)); }
+.ms-acct[data-attention="critical"] { background: color-mix(in srgb, var(--status-critical) 7%, var(--surface)); }
+.ms-attn-card { margin: 2px 0 11px; display: grid; gap: 5px; }
+.ms-attn-card .ms-attn-why { font-size: 11.5px; }
+.ms-attn-card .ms-attn-fix { grid-column: auto; }
+.ms-stale {
+  justify-self: start; font-size: 10.5px; font-weight: 600; letter-spacing: 0.05em;
+  color: #111; background: var(--status-warn); border-radius: 4px; padding: 2px 7px 1.5px;
+}
+.ms-stale[data-severity="critical"] { background: var(--status-critical); color: var(--ink); }
+.ms-lane[data-stale] .ms-fill { background: var(--baseline) !important; }
+.ms-lane[data-stale] .ms-lane-value { color: var(--muted); font-weight: 400; text-decoration: line-through; text-decoration-color: var(--baseline); }
+.ms-lane[data-stale] .ms-lane-note, .ms-lane[data-stale] .ms-lane-label { color: var(--muted); }
+@media (max-width: 720px) { .ms-attn-list li { grid-template-columns: 1fr; } }
 
 /* ———— The sessions ledger ———— */
 .ms-scroll { overflow-x: auto; }
@@ -350,6 +400,9 @@ const EMBEDDED = [
   accountSessionsHtml,
   accountRowHtml,
   accountGroupsHtml,
+  ageText,
+  staleBadgeHtml,
+  attentionBannerHtml,
   poolSummaryText,
   poolResetTime,
   poolSummariesHtml,
@@ -430,7 +483,7 @@ ${EMBEDDED_FUNCTIONS}
   // computeAccount()) — rendered as given, never re-derived here. The panel
   // itself (groups, rails, cards, meters) is accountGroupsHtml().
   function renderAccounts(accounts) {
-    el("accounts").innerHTML = accountGroupsHtml(accounts, DASH);
+    el("accounts").innerHTML = accountGroupsHtml(accounts, DASH, Date.now());
   }
 
   function otherAccounts(accounts, provider, exclude) {
@@ -711,6 +764,7 @@ ${EMBEDDED_FUNCTIONS}
       currentAccounts = data.accounts || [];
       currentSessions = data.sessions || [];
       lastTakenAt = data.takenAt;
+      el("attention").innerHTML = attentionBannerHtml(currentAccounts, Date.now());
       el("pool-summary").innerHTML = poolSummariesHtml(data.pools, Date.now());
       renderAccounts(currentAccounts);
       renderSessions(currentSessions, currentAccounts);
@@ -755,6 +809,7 @@ export function renderDashboardPage(): string {
 <main>
   <h1>model-switcher</h1>
   <div class="meta" id="meta">reading…</div>
+  <div id="attention"></div>
   <div id="pool-summary" aria-live="polite"></div>
 
   <div id="accounts"></div>

@@ -583,7 +583,7 @@ cached per binary in `MS_HOME/cli-versions.json`, so a launch does not start the
 
 Once a day at most, a user-facing verb also checks for a newer `ms`: a detached background
 process makes **one unauthenticated GET** to
-`https://api.github.com/repos/aadarwal/model-switcher/releases/latest` (with a
+`https://api.github.com/repos/nonlocally/model-switcher/releases/latest` (with a
 `User-Agent: model-switcher/<version>` header and nothing else — no account, path, token or
 usage figure) and writes the answer to `MS_HOME/update-check.json`. The verb never waits for
 it; the next one prints `ms X.Y.Z is available (you have A.B.C) — brew upgrade model-switcher`

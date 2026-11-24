@@ -21,7 +21,7 @@ import {
 // starts the real detached child points it at a local server, never GitHub.
 
 test("the check asks GitHub's public releases API for this repository", () => {
-  assert.equal(RELEASES_URL, "https://api.github.com/repos/aadarwal/model-switcher/releases/latest");
+  assert.equal(RELEASES_URL, "https://api.github.com/repos/nonlocally/model-switcher/releases/latest");
 });
 
 test("updateCheckEnabled: on by default; off with MS_NO_UPDATE_CHECK, under CI, and under node:test", () => {

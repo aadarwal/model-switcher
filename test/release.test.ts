@@ -255,11 +255,11 @@ test("renderFormula substitutes all three fields and leaves no placeholder", () 
   const template = readFileSync(path.join(REAL_REPO, "packaging", "model-switcher.rb"), "utf8");
   const out = renderFormula(template, {
     version: "1.2.3",
-    url: "https://github.com/aadarwal/model-switcher/releases/download/v1.2.3/model-switcher-v1.2.3.tar.gz",
+    url: "https://github.com/nonlocally/model-switcher/releases/download/v1.2.3/model-switcher-v1.2.3.tar.gz",
     sha256: "d".repeat(64),
   });
   assert.ok(out.includes('version "1.2.3"'), out);
-  assert.ok(out.includes("https://github.com/aadarwal/model-switcher/releases/download/v1.2.3/model-switcher-v1.2.3.tar.gz"), out);
+  assert.ok(out.includes("https://github.com/nonlocally/model-switcher/releases/download/v1.2.3/model-switcher-v1.2.3.tar.gz"), out);
   assert.ok(out.includes(`sha256 "${"d".repeat(64)}"`), out);
   assert.ok(!out.includes("__VERSION__"), out);
   assert.ok(!out.includes("__URL__"), out);

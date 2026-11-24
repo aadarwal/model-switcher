@@ -65,7 +65,7 @@ test("compatNotices: ONE line naming the tested version, the found one, and what
   assert.equal(lines.length, 1);
   assert.equal(
     lines[0],
-    "ms 0.3.11 is tested up to Codex 0.160.0; you have 0.162.0 — if anything misbehaves: brew upgrade model-switcher, or report it with `ms doctor` output at https://github.com/aadarwal/model-switcher/issues",
+    "ms 0.3.11 is tested up to Codex 0.160.0; you have 0.162.0 — if anything misbehaves: brew upgrade model-switcher, or report it with `ms doctor` output at https://github.com/nonlocally/model-switcher/issues",
   );
 });
 

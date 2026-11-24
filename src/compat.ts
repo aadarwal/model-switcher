@@ -49,7 +49,7 @@ export const COMPAT: Readonly<Record<Cli, Compat>> = {
 export const VERIFIED_ON = "2026-10-19";
 
 /** Where a human reports a version that misbehaves. */
-export const ISSUES_URL = "https://github.com/aadarwal/model-switcher/issues";
+export const ISSUES_URL = "https://github.com/nonlocally/model-switcher/issues";
 
 /** `ms`'s own version, from the `package.json` beside the source tree or the
  *  bundle (`<repo>/src/..` and `<libexec>/dist/..` both hold one; the formula
@@ -218,7 +218,7 @@ export function cliSupportsFlag(bin: string, flag: string, cacheFile = path.join
 export function upgradeHint(env: NodeJS.ProcessEnv = process.env, here = fileURLToPath(import.meta.url)): string {
   const brew = /\/(?:opt|Cellar)\/model-switcher\//;
   if (brew.test(env.MS_BIN ?? "") || brew.test(here)) return "brew upgrade model-switcher";
-  return "see https://github.com/aadarwal/model-switcher/releases";
+  return "see https://github.com/nonlocally/model-switcher/releases";
 }
 
 export type Found = { cli: Cli; version: string };

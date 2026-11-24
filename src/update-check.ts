@@ -24,7 +24,7 @@ import path from "node:path";
 import { compareVersions, msVersion, parseVersion, upgradeHint, writeSmallJson } from "./compat.ts";
 import { msHome } from "./paths.ts";
 
-export const RELEASES_URL = "https://api.github.com/repos/aadarwal/model-switcher/releases/latest";
+export const RELEASES_URL = "https://api.github.com/repos/nonlocally/model-switcher/releases/latest";
 export const CHECK_EVERY_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 10_000;
 

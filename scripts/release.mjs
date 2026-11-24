@@ -308,7 +308,7 @@ function main() {
   if (!ghResult.ok) fail(`gh release create failed:\n${ghResult.stdout}${ghResult.stderr}`);
   if (ghResult.stdout.trim()) process.stdout.write(ghResult.stdout);
 
-  const url = `https://github.com/aadarwal/model-switcher/releases/download/${tag}/${path.basename(tarballPath)}`;
+  const url = `https://github.com/nonlocally/model-switcher/releases/download/${tag}/${path.basename(tarballPath)}`;
   const template = readFileSync(path.join(REPO_ROOT, "packaging", "model-switcher.rb"), "utf8");
   const rendered = renderFormula(template, { version, url, sha256 });
   const formulaPath = path.join(tapPath, "Formula", "model-switcher.rb");

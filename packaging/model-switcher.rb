@@ -1,6 +1,6 @@
 class ModelSwitcher < Formula
   desc "Run claude and codex on whichever subscription account has room, and rotate a walled pane in place"
-  homepage "https://github.com/aadarwal/model-switcher"
+  homepage "https://github.com/nonlocally/model-switcher"
   url "__URL__"
   sha256 "__SHA256__"
   version "__VERSION__"

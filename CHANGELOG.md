@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.4.5 — 2026-11-24
+
+### ms now lives at nonlocally/model-switcher
+
+- The repository moved from `aadarwal/model-switcher` to
+  `nonlocally/model-switcher`. The daily update check, the "report it at …"
+  issues link, the releases link, the release tarball URL and the formula's
+  homepage now point there. Older versions keep working: GitHub redirects the
+  old URLs, so their update check and `brew upgrade` still find new releases.
+  The formula stays in the `aadarwal/tap` tap, so nothing changes for anyone
+  who already installed it.
+
 ## 0.4.4 — 2026-11-01
 
 ### Claude launches work again now that the 5 h window is gone
